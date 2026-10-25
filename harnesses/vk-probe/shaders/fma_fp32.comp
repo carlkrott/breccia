@@ -1,0 +1,43 @@
+// FP32 peak-FMA probe: 8 independent dependent chains of fma() per thread.
+// Seeds come from a device-local buffer so the compiler cannot constant-fold the loop.
+// Recurrence: x = fma(x, a, b) with a = 1 + 1e-7, b = 5e-7 -> values stay in [1, ~e]
+// for any iteration count reachable in this benchmark (no inf, no denormals).
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Data { float d[]; };
+
+layout(push_constant) uniform Push {
+    uint iters;  // fma rounds per chain
+    uint elems;  // number of floats in the buffer
+} pc;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x % pc.elems;
+    float s = d[id];
+    float x0 = s;
+    float x1 = s + 1.0;
+    float x2 = s + 2.0;
+    float x3 = s + 3.0;
+    float x4 = s + 4.0;
+    float x5 = s + 5.0;
+    float x6 = s + 6.0;
+    float x7 = s + 7.0;
+
+    const float a = 1.0000001;
+    const float b = 0.0000005;
+
+    for (uint i = 0; i < pc.iters; ++i) {
+        x0 = fma(x0, a, b);
+        x1 = fma(x1, a, b);
+        x2 = fma(x2, a, b);
+        x3 = fma(x3, a, b);
+        x4 = fma(x4, a, b);
+        x5 = fma(x5, a, b);
+        x6 = fma(x6, a, b);
+        x7 = fma(x7, a, b);
+    }
+
+    d[id] = (x0 + x1) + (x2 + x3) + (x4 + x5) + (x6 + x7);
+}

@@ -1,0 +1,15 @@
+[package]
+name = "vk-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 0.2 raw Vulkan micro-benchmark harness (headless compute)"
+publish = false
+
+[dependencies]
+ash = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1

@@ -1,0 +1,22 @@
+// VRAM bandwidth probe: strided read of src + write of dst over two device-local buffers.
+// Pure copy traffic (no arithmetic) so the kernel is memory bound by construction.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Src { vec4 src_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Dst { vec4 dst_data[]; };
+
+layout(push_constant) uniform Push {
+    uint count;   // number of vec4 elements per buffer
+    uint stride;  // global thread count (== pc.count / 4 for the strided pattern)
+} pc;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+    uint step = pc.stride;
+    for (uint i = tid; i < pc.count; i += step) {
+        vec4 v = src_data[i];
+        dst_data[i] = v;
+    }
+}
