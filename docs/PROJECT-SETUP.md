@@ -50,6 +50,18 @@ spirv-val foo.spv
 # see docs/phase-0/ for the exact benchmark command lines used
 ```
 
+## Machine-specific hazards (learned the hard way — see docs/phase-0/)
+
+| Hazard | Effect | Workaround (encoded in `harnesses/bench_attrib.sh`) |
+|---|---|---|
+| `MESA_VK_DEVICE_SELECT=1002:164e!` in session env | Hides both discrete GPUs from **every** Vulkan process → silent iGPU-only runs (Vulkan 8× slower, llama-bench still reports success) | `env -u MESA_VK_DEVICE_SELECT` for any Vulkan command; `vulkaninfo` sanity check first |
+| korphaus not in `gpu-compute` group (`/dev/kfd` is root:gpu-compute) | HIP/HSA init silently fails → CPU fallback **mislabelled `ROCm`** by llama-bench | run HIP tools via `sudo -n` (passwordless), or through systemd units (they add `SupplementaryGroups=gpu-compute`) |
+| Setting `CUDA_VISIBLE_DEVICES`+`HIP_VISIBLE_DEVICES`+`ROCR_VISIBLE_DEVICES` together | Double-masking → HIP init fails outright (index 1 of a 1-device set is empty) | set **only** `CUDA_VISIBLE_DEVICES` |
+| `llama-bench -d N` does not isolate a device | Layer-split stays active across all visible GPUs; results identical for every `-d` | pin with visibility env, confirm with busy% sampling |
+| `ulimit -l` = 8 MiB | Any pinned (Tier-2) buffer pool fails at alloc time | units need `LimitMEMLOCK=infinity` (Strata precedent) |
+| gpu-manager monitor runs even when its unit is inactive | Stops idle GPU services when `MemAvailable < 4 GiB` — benchmark servers get evicted mid-window | keep requests in flight while measuring; restore service state after windows |
+| GPU DPM clock states | Same run at boosted vs idle clocks differs up to ~1.6× (273 vs 174 tok/s) | warm up / pin clocks for comparable numbers |
+
 ## Reference builds (baselines — do not rebuild without reason)
 
 | Build | Path | Backend |

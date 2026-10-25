@@ -29,5 +29,6 @@ Not cloned (documented deliberately): TensorRT-LLM (CUDA-only, huge; MTP pattern
 
 ## Per-engine assessment notes
 
-Fill one section per engine after hands-on reading: **how it works** (loading, scheduling, memory tiers, backend), **feature set** (what's directly usable for M1–M6), **lessons / anti-patterns for breccia**.
+- **[01-expert-streaming.md](reference-engines/01-expert-streaming.md)** — Strata, Infernix, ninfer, Basalt, capy-flash, colibri, MoE-Infinity, KTransformers: tiering, cache policy, prefetch; synthesis for M3.
+- **[02-kv-and-context.md](reference-engines/02-kv-and-context.md)** — llama.cpp, beellama (KVarN + precision tail), TurboQuant, IsoQuant/RotorQuant (⚠️ no license — algorithm reading only), vLLM, SGLang, ik_llama, mistral.rs, exo: KV quant lineage, radix trees, per-token KV numbers for our model, crate-layout sketch.
 
