@@ -27,6 +27,8 @@ pub struct DeviceReport {
     pub device: DeviceId,
     pub properties: Properties,
     pub vram_bandwidth_gbps: Option<Bandwidth>,
+    /// Second bandwidth pass with a small (cache-resident) working set.
+    pub vram_bandwidth_cache_gbps: Option<Bandwidth>,
     pub compute_gflops: Option<Compute>,
     pub pcie: Option<Pcie>,
     pub overlap: Option<Overlap>,

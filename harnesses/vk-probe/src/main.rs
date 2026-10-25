@@ -182,6 +182,16 @@ fn print_summary(rep: &DeviceReport) {
             b.seconds
         );
     }
+    if let Some(b) = &rep.vram_bandwidth_cache_gbps {
+        println!(
+            "    VRAM bandwidth (cache-resident window): copy {:.1} GB/s \
+             (2 x {} MiB, {} windows of {:.3}s)",
+            b.copy_gbps,
+            b.buffer_bytes >> 20,
+            b.iterations,
+            b.seconds
+        );
+    }
     if let Some(c) = &rep.compute_gflops {
         println!(
             "    compute: FP32 {:.0} GFLOPS | FP16 {} | {} threads x {} rounds x {} chains",

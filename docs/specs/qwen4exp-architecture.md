@@ -168,8 +168,8 @@ There is **no `output_norm`**: the final hyper-connection mixer *is* the output 
 
 ```
 HC_READ (build_hc_mix)                                  input R [hc, n_embd]
-  xn  = rmsnorm_per_stream(R, w_norm) * w_norm          w_norm: [n_embd, hc] gamma
-                                                        (RMS over one stream's 2560 dims)
+  xn  = rmsnorm(R, eps) * w_norm                         RMS over ONE stream (2560 dims), then
+                                                         gamma [n_embd, hc] applied elementwise
   lo  = silu( (xn @ w_down.T) / hc )                    w_down: [hc_dim, hc_lr] = [10240,320]
   gate= lo @ w_up.T                                    w_up:   [hc_lr, hc_dim] = [320,10240]
   gated = xn * sigmoid(gate)                            elementwise, per stream
@@ -484,8 +484,10 @@ bit-equal to the single-token kernel applied per token (`ST/include/strata/core/
   * `-cmoe` / `-ncmoe` use the shared regex `\.ffn_(up|down|gate|gate_up)_(ch|)exps`
     (`LC/common/common.h:1239`); `-otl`-style helpers build `blk\.N` + that regex
     (`common/common.h:1243-1245`).
-  These three tensors are ~55% of the model and the natural unit of offload (strata keeps them
-  on the CPU/pinned pool: `ST/include/strata/core/layer.hpp:126-166`).
+  These three tensors are by far the largest block - **39.97 GiB = 91.2% of shard 1 and ~57% of
+  the 70.6 GB file** (measured by summing `n_bytes` over all 1223 shard-1 tensors) - and they are
+  the natural unit of offload: strata keeps them on the CPU/pinned pool
+  (`ST/include/strata/core/layer.hpp:126-166`).
 
 ---
 
@@ -733,8 +735,9 @@ Three *different* per-layer states exist. Only 12 of 48 layers have anything res
 
 `36 * (3 MiB + 120 KiB) = ~112 MiB` per sequence, **independent of context length**. This is
 the "GDN state as pseudo-KV": the only thing that must be carried across steps, updated in place
-(`delta-net-base.cpp:552-556`, `ST/src/core/layer.cpp:220`). Strata's test suite names the
-combined structure `kv_hybrid_parity` (`ST/src/kernels/kv_hybrid_parity.cpp`).
+(`LC/src/models/delta-net-base.cpp:552-556`; strata's `gdn_layer`, `ST/src/core/layer.cpp:225-335`,
+zeroed at sequence start by `ST/src/core/layer.cpp:220`). strata's test suite names the combined
+structure `kv_hybrid_parity` (`ST/src/kernels/kv_hybrid_parity.cpp`).
 
 ### 12.4 The one remaining per-sequence state
 
@@ -855,3 +858,11 @@ rotated (`n_offs + n_dims <= ne0`, `ops.cpp:6360`).
 * **Q11 - RoPE section semantics under YaRN.** The artifact ships no `rope.scaling` keys
   (`qsa.hpp:121-125`); if a future build adds scaling, the `theta_e` branch and the pooled-key
   rotation at `pos 0` (`qsa.cu:200-215`) must be re-checked.
+* **Q12 - the "56B" in `general.size_label = 512x56B` is not the parameter count.** Counting from
+  the file's own shapes: routed experts alone are `48 * 512 * 3 * 2560 * 640 = 120.8B` params
+  (confirmed by their 39.97 GiB of storage at a measured ~2.84 bpw average), the PLE table is
+  `160 * 320001536 = 51.2B` rows (`ST/include/strata/kernels/ngram.hpp:9,46`), and the dense
+  parts are ~4.5B - roughly 176B stored rows in total. The per-token compute path touches ~6B of
+  them (2.36B routed experts + 0.24B shared + ~3.3B dense), plus 2.54B embedding/lm_head rows and
+  16x160 PLE rows. Size memory from these numbers, not from the label; clarify with the artifact's
+  provenance what `56B` denotes before quoting it anywhere.

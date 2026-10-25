@@ -35,6 +35,10 @@ pub struct Feats {
     pub subgroup_size_control: bool,
     pub compute_full_subgroups: bool,
     pub cooperative_matrix: bool,
+    /// Needed by vkResetQueryPool (Vulkan 1.2 core feature).
+    pub host_query_reset: bool,
+    /// Needed by the fp16 kernel's float16_t storage buffer (Vulkan 1.1 core feature).
+    pub storage_buffer16_bit_access: bool,
 }
 pub struct Dev {
     pub index: u32,
@@ -137,12 +141,16 @@ impl Host {
             let mut f16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
             let mut f64 = vk::PhysicalDeviceShaderAtomicInt64Features::default();
             let mut ftl = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+            let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+            let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
             let mut fcoop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
                 .push_next(&mut f16)
                 .push_next(&mut f64)
                 .push_next(&mut ftl)
+                .push_next(&mut f11)
+                .push_next(&mut f12)
                 .push_next(&mut f13);
             // Chaining KHR_cooperative_matrix is only meaningful if the device lists it;
             // drivers ignore unknown pNext structs, but stay tidy anyway.
@@ -172,6 +180,8 @@ impl Host {
                 subgroup_size_control: f13.subgroup_size_control != 0,
                 compute_full_subgroups: f13.compute_full_subgroups != 0,
                 cooperative_matrix: fcoop.cooperative_matrix != 0,
+                host_query_reset: f12.host_query_reset != 0,
+                storage_buffer16_bit_access: f11.storage_buffer16_bit_access != 0,
             };
 
             let families =
@@ -347,12 +357,22 @@ impl Gpu {
                     && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
             })
             .map(|i| i as u32);
+        // Otherwise prefer a *different* family that can still transfer (async
+        // compute/transfer queue); RADV exposes one on both cards.
+        let other_x = dev
+            .families
+            .iter()
+            .enumerate()
+            .find(|(i, f)| {
+                *i as u32 != fam_c && f.queue_flags.contains(vk::QueueFlags::TRANSFER)
+            })
+            .map(|(i, _)| i as u32);
         let any_x = dev
             .families
             .iter()
             .position(|f| f.queue_flags.contains(vk::QueueFlags::TRANSFER))
             .map(|i| i as u32);
-        let fam_x = dedicated_x.or(any_x);
+        let fam_x = dedicated_x.or(other_x).or(any_x);
 
         let (family_x, xfer_mode, queue_x_index) = match fam_x {
             Some(fx) if fx != fam_c => (fx, XferMode::DistinctFamily, 0),
@@ -389,13 +409,18 @@ impl Gpu {
             enabled_exts.push("VK_KHR_cooperative_matrix".to_string());
         }
 
-        let mut en_f16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
-        en_f16.shader_float16 = dev.feats.shader_float16 as u32;
-        let mut en_f64 = vk::PhysicalDeviceShaderAtomicInt64Features::default();
-        en_f64.shader_buffer_int64_atomics = dev.feats.atomic64_buffer as u32;
-        en_f64.shader_shared_int64_atomics = dev.feats.atomic64_shared as u32;
-        let mut en_ftl = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
-        en_ftl.timeline_semaphore = dev.feats.timeline_semaphore as u32;
+        // NOTE: Vulkan12Features already carries shaderFloat16/shaderInt8/atomic64/
+        // timeline/hostQueryReset — validation forbids also chaining the promoted
+        // per-feature structs alongside it (VUID-VkDeviceCreateInfo-pNext-02830).
+        let mut en_f12 = vk::PhysicalDeviceVulkan12Features::default();
+        en_f12.shader_float16 = dev.feats.shader_float16 as u32;
+        en_f12.shader_int8 = dev.feats.shader_int8 as u32;
+        en_f12.shader_buffer_int64_atomics = dev.feats.atomic64_buffer as u32;
+        en_f12.shader_shared_int64_atomics = dev.feats.atomic64_shared as u32;
+        en_f12.timeline_semaphore = dev.feats.timeline_semaphore as u32;
+        en_f12.host_query_reset = dev.feats.host_query_reset as u32;
+        let mut en_f11 = vk::PhysicalDeviceVulkan11Features::default();
+        en_f11.storage_buffer16_bit_access = dev.feats.storage_buffer16_bit_access as u32;
         let mut en_f13 = vk::PhysicalDeviceVulkan13Features::default();
         en_f13.subgroup_size_control = dev.feats.subgroup_size_control as u32;
         en_f13.compute_full_subgroups = dev.feats.compute_full_subgroups as u32;
@@ -403,9 +428,8 @@ impl Gpu {
         en_coop.cooperative_matrix = dev.feats.cooperative_matrix as u32;
 
         let mut feats2 = vk::PhysicalDeviceFeatures2::default()
-            .push_next(&mut en_f16)
-            .push_next(&mut en_f64)
-            .push_next(&mut en_ftl)
+            .push_next(&mut en_f11)
+            .push_next(&mut en_f12)
             .push_next(&mut en_f13);
         if enabled_exts.iter().any(|e| e == "VK_KHR_cooperative_matrix") {
             feats2 = feats2.push_next(&mut en_coop);
@@ -434,18 +458,13 @@ impl Gpu {
         let queue_x = unsafe { device.get_device_queue(family_x, queue_x_index) };
 
         // --- command pools / buffers / query pools ---------------------------
+        // Always separate command buffers (and pools) per queue: the overlap test
+        // submits both at once, and they must not alias when the "transfer" queue
+        // happens to be the same queue object as the compute queue.
         let (pool_c, cmd_c) = make_cmd_pool(&device, fam_c)?;
-        let (pool_x, cmd_x) = if family_x == fam_c && queue_x_index == 0 {
-            (pool_c, cmd_c)
-        } else {
-            make_cmd_pool(&device, family_x)?
-        };
+        let (pool_x, cmd_x) = make_cmd_pool(&device, family_x)?;
         let timer_c = make_timer(&device)?;
-        let timer_x = if family_x == fam_c && queue_x_index == 0 {
-            timer_c
-        } else {
-            make_timer(&device)?
-        };
+        let timer_x = make_timer(&device)?;
         let fam_c_props = dev.families[fam_c as usize];
         let fam_x_props = dev.families[family_x as usize];
 
@@ -870,13 +889,9 @@ impl Gpu {
     pub fn destroy(self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            if self.timer_x != self.timer_c {
-                self.device.destroy_query_pool(self.timer_x, None);
-            }
+            self.device.destroy_query_pool(self.timer_x, None);
             self.device.destroy_query_pool(self.timer_c, None);
-            if self.pool_x != self.pool_c {
-                self.device.destroy_command_pool(self.pool_x, None);
-            }
+            self.device.destroy_command_pool(self.pool_x, None);
             self.device.destroy_command_pool(self.pool_c, None);
             self.device.destroy_device(None);
         }

@@ -165,10 +165,7 @@ pub fn properties(dev: &Dev) -> Properties {
 // 2. VRAM bandwidth
 // ---------------------------------------------------------------------------
 
-fn bench_bandwidth(gpu: &Gpu, quick: bool) -> R<Bandwidth> {
-    let bytes: u64 = if quick { 128 << 20 } else { 512 << 20 };
-    let target = if quick { 0.05 } else { 0.2 };
-
+fn bench_bandwidth(gpu: &Gpu, bytes: u64, target: f64) -> R<Bandwidth> {
     let src = gpu.buf(
         bytes,
         vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -416,7 +413,13 @@ fn bench_compute(
 
     // --- fp16 ---
     let mut fp16_gflops = None;
-    let mut fp16_supported = gpu.feats.shader_float16;
+    let mut fp16_supported = gpu.feats.shader_float16 && gpu.feats.storage_buffer16_bit_access;
+    if gpu.feats.shader_float16 && !gpu.feats.storage_buffer16_bit_access {
+        notes.push(
+            "shaderFloat16 is present but storageBuffer16BitAccess is not -> fp16 test skipped"
+                .to_string(),
+        );
+    }
     if fp16_supported {
         match bench_fp16(gpu, staging, threads, rounds, target) {
             Ok(v) => {
@@ -428,7 +431,7 @@ fn bench_compute(
                 notes.push(format!("fp16 test failed, skipped: {e}"));
             }
         }
-    } else {
+    } else if !gpu.feats.shader_float16 {
         notes.push(
             "shaderFloat16 not supported by this device -> fp16 test skipped".to_string(),
         );
@@ -700,8 +703,10 @@ pub fn run_device(dev: &Dev, gpu: &Gpu, quick: bool) -> DeviceReport {
         ..Default::default()
     };
 
-    // 2. VRAM bandwidth
-    match bench_bandwidth(gpu, quick) {
+    // 2. VRAM bandwidth (DRAM-resident window first, then a cache-resident one)
+    let bw_bytes: u64 = if quick { 128 << 20 } else { 512 << 20 };
+    let bw_target = if quick { 0.05 } else { 0.2 };
+    match bench_bandwidth(gpu, bw_bytes, bw_target) {
         Ok(b) => {
             println!(
                 "  [{}] VRAM bandwidth: copy {:.1} GB/s (read {:.1}, write {:.1})",
@@ -712,6 +717,23 @@ pub fn run_device(dev: &Dev, gpu: &Gpu, quick: bool) -> DeviceReport {
         Err(e) => {
             rep.notes.push(format!("vram_bandwidth skipped: {e}"));
             eprintln!("  [{}] bandwidth failed: {e}", gpu.index);
+        }
+    }
+    // Small working set: on Navi 21 this fits the 128 MiB Infinity Cache and
+    // shows the cache-inflated figure; on Vega 20 it is just another DRAM pass.
+    let cache_bytes: u64 = if quick { 16 << 20 } else { 32 << 20 };
+    match bench_bandwidth(gpu, cache_bytes, bw_target) {
+        Ok(b) => {
+            println!(
+                "  [{}] VRAM bandwidth ({} MiB x2, cache-resident): copy {:.1} GB/s",
+                gpu.index,
+                cache_bytes >> 20,
+                b.copy_gbps
+            );
+            rep.vram_bandwidth_cache_gbps = Some(b);
+        }
+        Err(e) => {
+            rep.notes.push(format!("vram_bandwidth cache pass skipped: {e}"));
         }
     }
 
