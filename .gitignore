@@ -1,0 +1,31 @@
+# Third-party reference clones (manifest tracked at docs/reference-engines.md)
+/Reference Projects/
+
+# Rust workspace
+/target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Build artifacts (C/C++/shader harnesses)
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.spv
+
+# Model artifacts — never commit weights (live under /srv/strata-data)
+*.gguf
+*.bin
+*.rco
+*.safetensors
+
+# Logs and measurement outputs (summaries live in docs/, raw logs stay local)
+logs/
+*.log
+bench-results/*.raw
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
