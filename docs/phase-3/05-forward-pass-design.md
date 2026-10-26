@@ -6,7 +6,7 @@ Blueprint for the first end-to-end breccia token. Inputs: `docs/specs/qwen4exp-a
 
 From the measured production configuration (`docs/phase-0/01`): 20.79 tok/s = 48.1 ms/token, split as
 - **GPU lane** (RX 6950 XT + Radeon VII): 13,577 MiB of dense/attention weights + 13 expert blocks; decode GEMV at 271–470 GB/s per type (measured)
-- **CPU lane**: 35 blocks × 512 experts = ~52 GB of host-mapped expert weights read per token, plus PLE row gathers from the 28.8 GB lazily-mapped table
+- **CPU lane**: ~35 blocks of host-mapped experts, but only the **top-10 of 512 per layer** are touched per token: 42.9 GB of expert weights / 48 layers / 512 experts × 10 × 48 ≈ **0.84 GB read per token** (the 52 GB figure is the whole model, not the per-token working set), plus PLE row gathers from the 28.8 GB lazily-mapped table
 - MoE: 10 of 512 experts per layer per token (top-10), shared expert always
 
 The engine does not have to beat 48.1 ms by cleverness in M2 — it has to **match it first** (parity), then apply the measured levers (expert batching 3.4×, route-tail skipping, cache).
@@ -73,4 +73,4 @@ Sync policy: one command buffer per layer, timeline-semaphore handoff between th
 
 - **KV layout for QSA** must match the 12-layer paged scheme chosen for M5 (24 KiB/token f16) — decide now, not later.
 - **HC mixer algebra** has documented ambiguity in the spec (§ open questions); the ops report records the chosen interpretation — verify against reference activations before trusting end-to-end numbers.
-- **CPU expert lane** is the dominant cost (~52 GB/token). The graph must support host-side expert GEMV from mmap (CPU SIMD) or the parity target is unreachable; alternatively measure `--moe-cache-mib > 0` on the production side first (cheap 30-minute experiment, no engine code).
+- **CPU expert lane**: ~0.84 GB/token (top-10 × 48 layers), i.e. the 20.79 tok/s baseline sustains ~17.5 GB/s of host-side expert reads. The graph needs a vectorised host GEMV over mmap'd quants (AVX2), which should comfortably exceed that; `--moe-cache-mib > 0` on the production side remains a cheap external A/B.
