@@ -33,6 +33,8 @@ pub struct Staging {
     /// mapping can be created once and used until the buffer is destroyed.
     ptr: *mut u8,
     cap: u64,
+    /// Bytes reserved at the head for in-batch readbacks ([`block_region`]).
+    region: u64,
     /// Bytes moved and round trips taken, for the report.
     pub bytes_down: u64,
     pub bytes_up: u64,
@@ -48,11 +50,23 @@ pub struct Staging {
 /// a fence of its own.
 pub const BLOCK_REGION: u64 = 32 << 10;
 
+/// Bytes reserved at the head of a staging buffer for the in-batch readback: one
+/// [`BLOCK_REGION`] per token, so a whole prefill chunk's lane inputs fit.
+pub fn block_region(tokens: usize) -> u64 {
+    BLOCK_REGION * if tokens == 0 { 1 } else { tokens as u64 }
+}
+
 impl Staging {
     /// Allocate a staging buffer of `cap` bytes (rounded up to 4).
     pub fn new(gpu: &Gpu, cap: u64) -> Result<Self> {
+        Self::with_block_region(gpu, cap, 1)
+    }
+
+    /// [`Staging::new`] with room for `tokens` in-batch readback slots.
+    pub fn with_block_region(gpu: &Gpu, cap: u64, tokens: usize) -> Result<Self> {
         let cap = cap.max(64);
-        let size = cap + BLOCK_REGION + breccia_kernels::gemv::TAIL_PAD;
+        let region = block_region(tokens);
+        let size = cap + region + breccia_kernels::gemv::TAIL_PAD;
         let buf = gpu
             .buf(
                 size,
@@ -76,6 +90,7 @@ impl Staging {
             buf,
             ptr,
             cap,
+            region,
             bytes_down: 0,
             bytes_up: 0,
             trips_down: 0,
@@ -109,8 +124,9 @@ impl Staging {
     /// batch's segment, so the mapping is current.
     pub fn read_block(&self, off: u64, len: usize) -> &[u8] {
         assert!(
-            off.saturating_add(len as u64) <= BLOCK_REGION,
-            "read_block({off}, {len}) escapes the {BLOCK_REGION}-byte block region"
+            off.saturating_add(len as u64) <= self.region,
+            "read_block({off}, {len}) escapes the {}-byte block region",
+            self.region
         );
         // SAFETY: bounds checked against the region, which is inside the mapping
         // (`cap + BLOCK_REGION + TAIL_PAD`), and the memory is host-coherent.
@@ -143,7 +159,7 @@ impl Staging {
         let t0 = std::time::Instant::now();
         let mut offs = Vec::with_capacity(items.len());
         // Past the block region: the in-batch copies own the head of the mapping.
-        let mut at = BLOCK_REGION;
+        let mut at = self.region;
         for (_, _, n) in items {
             offs.push(at);
             at += *n as u64;
@@ -181,12 +197,12 @@ impl Staging {
         // `cap + BLOCK_REGION + TAIL_PAD` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                self.ptr.add(BLOCK_REGION as usize),
+                self.ptr.add(self.region as usize),
                 raw.as_mut_ptr(),
                 total as usize,
             )
         };
-        let base = BLOCK_REGION as usize;
+        let base = self.region as usize;
         let out = items
             .iter()
             .zip(offs.iter())
@@ -223,12 +239,12 @@ impl Staging {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 data.as_ptr(),
-                self.ptr.add(BLOCK_REGION as usize),
+                self.ptr.add(self.region as usize),
                 data.len(),
             )
         };
         let region = vk::BufferCopy::default()
-            .src_offset(BLOCK_REGION)
+            .src_offset(self.region)
             .dst_offset(0)
             .size(data.len() as u64);
         let src = self.buf.buf;

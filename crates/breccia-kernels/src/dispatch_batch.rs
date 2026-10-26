@@ -113,9 +113,12 @@ fn bump_open(gpu: &Gpu) {
     });
 }
 
-/// Sets a batch budgets for. A segment holds at most a block's ~30 dispatches,
-/// so 256 is a bounded, predictable budget with room to spare.
-pub const MAX_SETS: u32 = 256;
+/// Sets a batch budgets for.
+///
+/// A decode block records ~30 dispatches, but a **prefill chunk** records ~30 per
+/// token in one submission (§8s): 8 192 sets covers a 256-token chunk with room
+/// to spare, and the pool is reset (not recreated) per batch.
+pub const MAX_SETS: u32 = 8192;
 /// Storage bindings per set (the widest kernel in this crate declares 5).
 const MAX_BINDINGS: u32 = 8;
 

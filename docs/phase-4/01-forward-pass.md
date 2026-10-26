@@ -1429,6 +1429,88 @@ decode aggregate — real, but an order of magnitude smaller than the 11–36× 
 gap on the workload agents actually produce. Order: prefill grouping first, then
 AVX-512.
 
+## 8s. Grouped MoE over a prefill chunk: landed, bit-exact, and *slower* — the lane is decode-bound
+
+§8r projected that grouping the expert lane over a prefill chunk (read each
+expert's rows once, serve every token that routed to it) would take prefill from
+3.1 to ~27 tok/s per agent. The mechanism landed and is correct, and it **does not
+pay**: the lane is decode-bound, so grouping removes *bytes* and not *work*.
+Measured, not estimated:
+
+| prefill path | 2 agents x 300 | 4 agents x 300 |
+|---|---:|---:|
+| token by token (§8r baseline) | **6.13** tok/s/agent (48.9 s) | **3.14** (95.6 s) |
+| chunked, grouped lane, chunk 32 | — | 2.25 (133.1 s) |
+| chunked, grouped lane, chunk 64 | **5.37** (55.9 s) | 2.38 (125.8 s) |
+
+### What landed (behind `--prefill-chunk N`, default 0 = off)
+
+* **`ExpertPool::moe_topk_chunk`** — the grouped host-lane entry point. It buckets
+  the chunk's `(token, expert)` pairs, and each `(expert, row shard)` is one task
+  whose weight rows are read **once** and then served to every user of that expert
+  from L2/L3. Row dot products are **bit-identical** to the per-token lane
+  (`tests/cpu_experts.rs::grouped_chunk_lane_matches_the_per_token_lane`, worst
+  relative deviation 1.5e-8 over 32 tokens, deterministic across runs); only the
+  sum over an expert set is accumulated in expert-id order instead of router order.
+* **`Session::prefill(toks, pos0)`** — a real chunk loop: the chunk's whole dense
+  chain in **one submission** (pass 1: per token `HC_READ(attn)` … shared expert,
+  each followed by its five readback copies into a per-token slot of the staging
+  block region), then the grouped lane over the whole chunk, then the chunk's
+  per-token ffn `HC_WRITE`s in a **second submission** (pass 2). Two submissions
+  and two waits per block per chunk instead of two per token.
+* The dense chain still runs **per token** with the unchanged kernels: each token's
+  residual slice is swapped into the venue's single-token `r` (`swap_r_in`), which
+  is why the T=1 numerics are preserved by construction.
+* `--prefill-chunk N` on `bench token` and `bench agents`; the descriptor pool
+  budget went 256 → 8 192 sets because one chunk's submission records ~30
+  dispatches per token.
+
+### Per-token fallbacks (documented, as required)
+
+| stage | why it cannot take T | fallback |
+|---|---|---|
+| PLE (block 1) | the host block reads/writes the whole residual and keeps rolling hash/conv state per token | per-token `ple_step` inside the chunk, with a flush each (1 of 48 blocks) |
+| a device-resident block (`--gpu-experts`) | its `MoeCombine` writes `block_out` for one token and needs no host round trip | the whole token (dense + device MoE + `HC_WRITE`) per token, in the chunk's batch |
+| the T-batched dense chain | not attempted this pass (§8r item b) | per token, unchanged kernels |
+
+### The bug this found (and the parity gate caught it)
+
+`HC_WRITE` reads the `inject` partials the same token's `HC_READ(ffn)` produced. In
+a two-pass chunk the ffn writes of *all* tokens run after *all* the reads, so every
+token but the last was using the last token's inject values:
+
+| chunk size | top-1 logit (prompt `[760,13017]`) |
+|---|---:|
+| 1 (correct) | 17.5689 |
+| 2, before the fix | 17.6016 (**+0.03**, top-10 order already permuted) |
+| 4 / 8, before the fix | argmax flipped to the wrong token |
+| **2 / 4 / 8, after per-token inject slots** | **17.5689 — identical** |
+
+The 27-token prompt at chunk 32 and 64 now reproduces the reference sequence
+exactly (`[110563, 96847, 271, 248068, 198, 760, 1156, 369]`, top-1 `110563`
+`13.1705`), so prefill changes *how* the same tokens are computed and nothing else.
+
+### Why it is slower, and what that means
+
+§8c measured the lane as **decode-bound**, not bandwidth-bound: it scales with
+threads at 20.8 GB/s because the quantised decode is the cost, not the DRAM read.
+A grouped chunk still runs `m` dequantisations per expert (one per user) — `one_user`
+calls the same `gemv_into` per user, deliberately, to stay bit-identical — so it
+saves the DRAM traffic that was never the limit and adds task/channel overhead.
+The occupancy table in §8r (x0.57/x0.37/x0.20 of the bytes) is real but the bytes
+were not the constraint.
+
+**The fix is to amortise the *dequantisation*, not the read**: dequantise each
+weight block once into registers and dot all `m` activations of that expert from
+it. That is a new inner-loop form per quant type (the AVX2/AVX-512 dot gains a
+second activation), and it composes with AVX-512 — both are "more dot throughput
+per dequantised block", which is now the single highest-value lever for prefill
+*and* decode.
+
+Until then `--prefill-chunk` stays **off**: it is parity-correct and it is the
+substrate the amortising kernel plugs into, but as measured it is a 12-14 % tax on
+prompt ingestion.
+
 ## 9. Exact commands
 
 
@@ -1483,21 +1565,19 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 
 ## 10. What to do next, in order
 
-1. **Prefill, in this order**: (a) a grouped host-lane entry point (bucket a
-   chunk's `(token, expert)` pairs by expert, dequantise once, dot the `m` users)
-   — expected to cut expert bytes/token to × 0.20 at T = 256 and lift prefill from
-   3.1 to ~27 tok/s per agent; (b) the T-batched dense chain (three per-row GEMVs
-   need a batch form, chunked PLE, chunk-level QSA mask) → ~52 tok/s. Measured
-   baseline to beat: **3.1 tok/s/agent (4 × 300 tokens), 10.5 single-agent**.
-2. **AVX-512 on the lane** (second lever): 10–25 % on 67–75 % of a decode step.
-   Three kernels (IQ4_NL down, Q2_0 down, IQ3_S gate/up), runtime-detected, AVX2
-   kept.
-3. **Keep the parity gate strict in every multi-stream run.** §8q's device-affine
-   slot bug produced silently wrong tokens on half the agents for ~50 % of runs;
-   only `bench agents --same-prompt` (24/24) caught it.
-4. **Current gates**: 2 streams 20.0–20.3 tok/s (9 resident expert blocks each,
-   in-batch reads, reset-per-batch pools, parity 64/64); 4 agents × 27-prefix
-   20.19 aggregate; 4 agents × 300-prefix 11.14 decode with **3.14 tok/s prefill**.
-5. **A third card** buys 1.4× at agent lengths (lane-bound), 2× at short prefixes;
-   **GDN's delta rule** (217 GB/s, 2.6× off the ceiling) is the largest single
-   kernel left and only pays once the cards bind.
+1. **Amortise the dequantisation across a chunk's users** — the one change that
+   makes prefill fast. §8s showed grouping the *reads* saves bytes the lane was
+   never bound by (chunked prefill is 12-14 % *slower*); each expert's weight block
+   must be decoded once and dotted against all `m` of its users in the same
+   registers. This is also the AVX-512 opportunity: same inner loop, wider vector.
+2. **AVX-512 on the lane** (IQ4_NL down, Q2_0 down, IQ3_S gate/up): 10-25 % of a
+   decode step, and the prefill lever above is the same code path.
+3. **Keep the chunk loop**: `--prefill-chunk` is parity-correct (bit-identical
+   tokens, per-token inject slots fixed the one bug it had) and is the substrate
+   for (1); turn it on when the lane amortises.
+4. **Current gates**: 2 streams 20.0-20.3 tok/s decode (parity 64/64); 4 agents x
+   27-prefix 20.19 aggregate; 4 agents x 300-prefix 11.1 decode with **3.14 tok/s
+   prefill** (token by token — `--prefill-chunk` is slower today).
+5. **A third card** buys 1.4x at agent lengths; **GDN's delta rule** (217 GB/s,
+   2.6x off the ceiling) is the largest single kernel left and only pays once the
+   cards bind.

@@ -229,6 +229,10 @@ enum BenchKind {
         /// Record a block's readback inside the block's own batch
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         inbatch_read: bool,
+        /// Prefill chunk: feed the prompt `N` tokens at a time with the grouped
+        /// expert lane. `0` = token by token
+        #[arg(long, default_value_t = 0)]
+        prefill_chunk: usize,
         /// Blocks whose routed experts live in VRAM, per stream (`;`-separated)
         #[arg(long, value_name = "N[,N]")]
         gpu_experts: Option<String>,
@@ -312,6 +316,10 @@ enum BenchKind {
         /// removed round trip is worth 4-7 % of the aggregate (§8p).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         inbatch_read: bool,
+        /// Prefill chunk: feed the prompt `N` tokens at a time with the grouped
+        /// expert lane (§8s). `0` = token by token
+        #[arg(long, default_value_t = 0)]
+        prefill_chunk: usize,
     },
 }
 fn main() {
@@ -450,6 +458,7 @@ fn run(cli: Cli) -> Result<()> {
                     inbatch_read,
                     gpu_experts,
                     same_prompt,
+                    prefill_chunk,
                 }),
         } => bench_agents(AgentArgs {
             streams,
@@ -461,6 +470,7 @@ fn run(cli: Cli) -> Result<()> {
             inbatch_read,
             gpu_experts,
             same_prompt,
+            prefill_chunk,
         }),
         Command::Bench {
             kind:
@@ -484,6 +494,7 @@ fn run(cli: Cli) -> Result<()> {
                     gpu_experts,
                     streams,
                     inbatch_read,
+                    prefill_chunk,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -505,6 +516,7 @@ fn run(cli: Cli) -> Result<()> {
             gpu_experts,
             streams,
             inbatch_read,
+            prefill_chunk,
         }),
     }
 }
@@ -519,6 +531,7 @@ struct AgentArgs {
     inbatch_read: bool,
     gpu_experts: Option<String>,
     same_prompt: bool,
+    prefill_chunk: usize,
 }
 
 struct ProfileArgs {
@@ -1495,6 +1508,7 @@ struct TokenArgs {
     gpu_experts: Option<String>,
     streams: usize,
     inbatch_read: bool,
+    prefill_chunk: usize,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1527,9 +1541,21 @@ fn parse_prompt_ids(a: &TokenArgs) -> Result<Vec<u32>> {
 }
 
 /// Reset and feed every prompt token; returns the last token's logits.
-fn feed_prompt(sess: &mut breccia_engine::Session<'_>, prompt: &[u32]) -> Result<Vec<f32>> {
+fn feed_prompt(
+    sess: &mut breccia_engine::Session<'_>,
+    prompt: &[u32],
+    chunk: usize,
+) -> Result<Vec<f32>> {
     sess.reset()?;
     let mut logits = Vec::new();
+    if chunk > 0 {
+        let mut pos = 0usize;
+        for part in prompt.chunks(chunk) {
+            logits = sess.prefill(part, pos)?;
+            pos += part.len();
+        }
+        return Ok(logits);
+    }
     for (pos, &t) in prompt.iter().enumerate() {
         logits = sess.token(t, pos, None)?;
     }
@@ -1617,6 +1643,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         timers: a.timers,
         batching: a.batching,
         inbatch_read: a.inbatch_read,
+        prefill_chunk: a.prefill_chunk,
         probe: std::env::var_os("BRECCIA_GPU_TIME").is_some(),
         pool: None,
     };
@@ -1921,6 +1948,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         timers: true,
         batching: true,
         inbatch_read: a.inbatch_read,
+        prefill_chunk: a.prefill_chunk,
         probe: true,
         pool: None,
     };
@@ -1996,9 +2024,20 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         })
         .collect();
     let t_prompt = std::time::Instant::now();
-    for pos in 0..common {
-        let toks: Vec<u32> = padded.iter().map(|p| p[pos]).collect();
-        logits = multi.token_all(&toks, pos)?;
+    if a.prefill_chunk > 0 {
+        logits = vec![Vec::new(); n];
+        for (s, sess) in multi.streams.iter_mut().enumerate() {
+            let mut pos = 0usize;
+            for part in padded[s].chunks(a.prefill_chunk) {
+                logits[s] = sess.prefill(part, pos)?;
+                pos += part.len();
+            }
+        }
+    } else {
+        for pos in 0..common {
+            let toks: Vec<u32> = padded.iter().map(|p| p[pos]).collect();
+            logits = multi.token_all(&toks, pos)?;
+        }
     }
     let prompt_seconds = t_prompt.elapsed().as_secs_f64();
     let prompt_tokens = common * n;
@@ -2070,8 +2109,15 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
     }
     println!(
         "\nprefill  {prompt_tokens} prompt tokens ({common} x {n}) in {prompt_seconds:.2} s = \
-         {:.2} tok/s per agent (token-by-token; batched prefill is not implemented)",
-        prompt_tokens as f64 / prompt_seconds.max(1e-9) / n as f64
+         {:.2} tok/s per agent (chunk {} = {}, grouped lane {})",
+        prompt_tokens as f64 / prompt_seconds.max(1e-9) / n as f64,
+        a.prefill_chunk,
+        if a.prefill_chunk > 0 {
+            "chunked"
+        } else {
+            "token by token"
+        },
+        if a.prefill_chunk > 0 { "on" } else { "n/a" }
     );
     println!(
         "agents   {n} concurrent · {steps} measured steps · {:.2} s of decode",
@@ -2243,6 +2289,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         timers: a.timers,
         batching: a.batching,
         inbatch_read: a.inbatch_read,
+        prefill_chunk: a.prefill_chunk,
         probe: false,
         pool: None,
     };
@@ -2262,9 +2309,9 @@ fn bench_token(a: TokenArgs) -> Result<()> {
 
     // ---- A. one token, twice: finite logits and a stable top-1 -------------
     let t_first = std::time::Instant::now();
-    let l1 = feed_prompt(&mut sess, &prompt).context("the first forward pass")?;
+    let l1 = feed_prompt(&mut sess, &prompt, a.prefill_chunk).context("the first forward pass")?;
     let first_seconds = t_first.elapsed().as_secs_f64();
-    let l2 = feed_prompt(&mut sess, &prompt).context("the repeat forward pass")?;
+    let l2 = feed_prompt(&mut sess, &prompt, a.prefill_chunk).context("the repeat forward pass")?;
     let s1 = breccia_engine::LogitSummary::of_top(&l1, a.top_logits.max(10));
     let s2 = breccia_engine::LogitSummary::of(&l2);
     if let Some(path) = &a.dump_logits {

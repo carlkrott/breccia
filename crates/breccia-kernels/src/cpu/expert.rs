@@ -346,6 +346,10 @@ struct Shard {
     /// Offset of this shard's activation vector inside `x` (the whole
     /// activation for gate/up; `act_j` for down).
     x_off: usize,
+    /// Grouped form: `(destination slot, activation offset, weight)` for every
+    /// token that uses this expert. Empty means "the single-user form above" —
+    /// one activation at `x_off`, weight applied by the caller.
+    users: Arc<Vec<(usize, usize, f32)>>,
 }
 
 struct Done {
@@ -491,6 +495,7 @@ impl ExpertPool {
                 r1,
                 x: Arc::clone(&x),
                 x_off: 0,
+                users: Arc::new(Vec::new()),
             })
             .collect();
         let done1 = self.run_phase(tasks1)?;
@@ -524,6 +529,7 @@ impl ExpertPool {
                 r1,
                 x: Arc::clone(&act),
                 x_off: j * n_ff,
+                users: Arc::new(Vec::new()),
             })
             .collect();
         let done2 = self.run_phase(tasks2)?;
@@ -540,60 +546,114 @@ impl ExpertPool {
     }
 }
 
+/// `(expert, row range, users)` for one grouped phase task: the shard's row range
+/// and the `(slot, activation offset, weight)` of every token that uses it.
+type GroupedTask = (usize, usize, usize, Vec<(usize, usize, f32)>);
+
+/// One token's routing inside a prefill chunk: its top-k experts and weights.
+#[derive(Clone, Copy, Debug)]
+pub struct ChunkRoute<'a> {
+    pub ids: &'a [usize],
+    pub weights: &'a [f32],
+}
+
 /// One row-range GEMV straight out of the mmap. `None` if the slice geometry
 /// does not hold (a malformed plan; the caller skips the shard rather than
 /// panicking a worker).
 fn run_shard(set: &ShardSet, path: Path, shard: &Shard) -> Option<Vec<f32>> {
     let slices = shard.plan.slices(set, shard.expert).ok()?;
-    let plan = &shard.plan;
+    let plan = shard.plan;
     let rows = shard.r1 - shard.r0;
-    let mut values = vec![0f32; rows];
-    match shard.kind {
+    if shard.users.is_empty() {
+        // Single-token form: one activation, at `x_off`, weight applied by caller.
+        let mut values = vec![0f32; rows];
+        let ok = one_user(
+            &slices,
+            &plan,
+            path,
+            shard.kind,
+            rows,
+            shard.r0,
+            &shard.x,
+            shard.x_off,
+            &mut values,
+        );
+        return ok.then_some(values);
+    }
+    // Grouped form: every token that routed to this expert. The shard's weight
+    // rows are read once and then served from L2/L3 for the other users - that
+    // cache reuse is the whole point of grouping a chunk (§8r/§8s).
+    let m = shard.users.len();
+    let mut values = vec![0f32; rows * m];
+    for (u, &(_, x_off, _)) in shard.users.iter().enumerate() {
+        let ok = one_user(
+            &slices,
+            &plan,
+            path,
+            shard.kind,
+            rows,
+            shard.r0,
+            &shard.x,
+            x_off,
+            &mut values[u * rows..(u + 1) * rows],
+        );
+        if !ok {
+            return None;
+        }
+    }
+    Some(values)
+}
+
+/// One user's row-range GEMV against already-resolved slices: `values` receives
+/// `rows` results. `false` when the slice geometry does not hold (a malformed
+/// plan; the worker skips the shard rather than panicking).
+#[allow(clippy::too_many_arguments)]
+fn one_user(
+    slices: &ExpertSlices<'_>,
+    plan: &LayerPlan,
+    path: Path,
+    kind: ShardKind,
+    rows: usize,
+    r0: usize,
+    x: &[f32],
+    x_off: usize,
+    values: &mut [f32],
+) -> bool {
+    match kind {
         ShardKind::GateUp => {
-            let x = shard.x.get(..plan.n_embd)?;
+            let Some(xs) = x.get(x_off..x_off + plan.n_embd) else {
+                return false;
+            };
             let mut up = vec![0f32; rows];
             let g = plan.gate;
             let g_rb = crate::cpu::row_bytes(g.ty, g.cols);
-            gemv_into(
-                path,
-                g.ty,
-                slices.gate.get(shard.r0 * g_rb..)?,
-                rows,
-                g.cols,
-                x,
-                &mut values,
-            );
+            let Some(gv) = slices.gate.get(r0 * g_rb..) else {
+                return false;
+            };
+            gemv_into(path, g.ty, gv, rows, g.cols, xs, values);
             let u = plan.up;
             let u_rb = crate::cpu::row_bytes(u.ty, u.cols);
-            gemv_into(
-                path,
-                u.ty,
-                slices.up.get(shard.r0 * u_rb..)?,
-                rows,
-                u.cols,
-                x,
-                &mut up,
-            );
+            let Some(uv) = slices.up.get(r0 * u_rb..) else {
+                return false;
+            };
+            gemv_into(path, u.ty, uv, rows, u.cols, xs, &mut up);
             for (v, u) in values.iter_mut().zip(&up) {
                 *v = silu(*v) * u;
             }
         }
         ShardKind::Down => {
             let r = plan.down;
-            gemv_into(
-                path,
-                r.ty,
-                slices
-                    .down
-                    .get(shard.r0 * crate::cpu::row_bytes(r.ty, r.cols)..)?,
-                rows,
-                r.cols,
-                shard.x.get(shard.x_off..shard.x_off + r.cols)?,
-                &mut values,
-            );
+            let rb = crate::cpu::row_bytes(r.ty, r.cols);
+            let Some(dv) = slices.down.get(r0 * rb..) else {
+                return false;
+            };
+            let Some(xs) = x.get(x_off..x_off + r.cols) else {
+                return false;
+            };
+            gemv_into(path, r.ty, dv, rows, r.cols, xs, values);
         }
     }
-    Some(values)
+    true
 }
 
 fn shard_rows(rows: usize, s: usize, shards: usize) -> (usize, usize) {
@@ -601,6 +661,147 @@ fn shard_rows(rows: usize, s: usize, shards: usize) -> (usize, usize) {
     let r0 = (s * per).min(rows);
     let r1 = (r0 + per).min(rows);
     (r0, r1)
+}
+
+impl ExpertPool {
+    /// Routed-expert contribution of **T tokens at once**, grouped by expert.
+    ///
+    /// `x` is the chunk's `[T, n_embd]` activations and `out` its `[T, n_embd]`
+    /// outputs (accumulated, like [`ExpertPool::moe_topk`]). Instead of running
+    /// each token's top-10 separately, this buckets the `(token, expert)` pairs,
+    /// and each expert's rows are read **once per chunk** and reused for every
+    /// token that routed to it — the whole point of a prefill chunk
+    /// (`docs/phase-4/01-forward-pass.md` §8r/§8s).
+    ///
+    /// # Determinism
+    ///
+    /// Each row's dot product is bit-identical to the per-token path (same
+    /// kernel, same slice, same order). The *sum over an expert set* is
+    /// accumulated in **expert-id order** rather than the router's `j` order,
+    /// because grouping reorders the work; that changes the routed sum in the
+    /// last ulp (the same class of deviation the split-K `hc_down` takes, §8n).
+    /// The greedy-token parity gate is what decides whether that is acceptable.
+    pub fn moe_topk_chunk(
+        &mut self,
+        plan: &LayerPlan,
+        routes: &[ChunkRoute<'_>],
+        x: &[f32],
+        out: &mut [f32],
+    ) -> Result<usize> {
+        let t = routes.len();
+        let (n_ff, n_embd) = (plan.n_ff, plan.n_embd);
+        if t == 0 {
+            return Ok(0);
+        }
+        if x.len() < t * n_embd || out.len() < t * n_embd {
+            bail!(
+                "chunk of {t} needs {} activations and outputs, got {} and {}",
+                t * n_embd,
+                x.len(),
+                out.len()
+            );
+        }
+        // expert -> [(token, j)] in router order, so a token's pairs stay ordered.
+        let mut by: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
+        let mut k = 0usize;
+        for (token, r) in routes.iter().enumerate() {
+            if r.ids.len() != r.weights.len() {
+                bail!("{} expert ids vs {} weights", r.ids.len(), r.weights.len());
+            }
+            k = k.max(r.ids.len());
+            for (j, &id) in r.ids.iter().enumerate() {
+                by.entry(id).or_default().push((token, j));
+            }
+        }
+        let distinct = by.len();
+        let words = Arc::new(x[..t * n_embd].to_vec());
+
+        // ---- phase 1: gate+up+SwiGLU rows, one task per (expert, row shard) ----
+        let s1 = choose_shards(distinct * k, self.threads, n_ff).max(1);
+        let mut first: Vec<GroupedTask> = Vec::new();
+        for (&expert, users) in by.iter() {
+            let slots: Vec<(usize, usize, f32)> = users
+                .iter()
+                .map(|&(token, j)| (token * k + j, token * n_embd, 0.0))
+                .collect();
+            for s in 0..s1 {
+                let (r0, r1) = shard_rows(n_ff, s, s1);
+                first.push((expert, r0, r1, slots.clone()));
+            }
+        }
+        let tasks1: Vec<Shard> = first
+            .iter()
+            .enumerate()
+            .map(|(seq, &(expert, r0, r1, ref users))| Shard {
+                seq,
+                expert,
+                plan: *plan,
+                kind: ShardKind::GateUp,
+                r0,
+                r1,
+                x: Arc::clone(&words),
+                x_off: 0,
+                users: Arc::new(users.clone()),
+            })
+            .collect();
+        let done1 = self.run_phase(tasks1)?;
+        let mut act = vec![0f32; t * k * n_ff];
+        for (seq, &(_, r0, r1, ref users)) in first.iter().enumerate() {
+            let values = done1[seq]
+                .as_ref()
+                .with_context(|| format!("chunk phase-1 shard {seq} never returned"))?;
+            let rows = r1 - r0;
+            for (u, &(slot, _, _)) in users.iter().enumerate() {
+                act[slot * n_ff + r0..slot * n_ff + r1]
+                    .copy_from_slice(&values[u * rows..(u + 1) * rows]);
+            }
+        }
+
+        // ---- phase 2: down rows, weighted into each token's output ------------
+        let act = Arc::new(act);
+        let s2 = choose_shards(distinct * k, self.threads, n_embd).max(1);
+        let mut second: Vec<GroupedTask> = Vec::new();
+        for (&expert, users) in by.iter() {
+            let slots: Vec<(usize, usize, f32)> = users
+                .iter()
+                .map(|&(token, j)| (token, (token * k + j) * n_ff, routes[token].weights[j]))
+                .collect();
+            for s in 0..s2 {
+                let (r0, r1) = shard_rows(n_embd, s, s2);
+                second.push((expert, r0, r1, slots.clone()));
+            }
+        }
+        let tasks2: Vec<Shard> = second
+            .iter()
+            .enumerate()
+            .map(|(seq, &(expert, r0, r1, ref users))| Shard {
+                seq,
+                expert,
+                plan: *plan,
+                kind: ShardKind::Down,
+                r0,
+                r1,
+                x: Arc::clone(&act),
+                x_off: 0,
+                users: Arc::new(users.clone()),
+            })
+            .collect();
+        let done2 = self.run_phase(tasks2)?;
+        for (seq, &(_, r0, r1, ref users)) in second.iter().enumerate() {
+            let values = done2[seq]
+                .as_ref()
+                .with_context(|| format!("chunk phase-2 shard {seq} never returned"))?;
+            let rows = r1 - r0;
+            for (u, &(token, _, w)) in users.iter().enumerate() {
+                let dst = &mut out[token * n_embd + r0..token * n_embd + r1];
+                for (o, v) in dst.iter_mut().zip(&values[u * rows..(u + 1) * rows]) {
+                    *o += w * v;
+                }
+            }
+        }
+        Ok(plan.expert_kernel_bytes() * k * t)
+    }
 }
 
 impl Drop for ExpertPool {

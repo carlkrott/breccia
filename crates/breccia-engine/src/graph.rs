@@ -224,6 +224,16 @@ pub struct Venue<'m> {
     pub moe_map_down: Buf,
     pub moe_map: breccia_kernels::MoeMap<'m>,
     pub moe_combine: breccia_kernels::MoeCombine<'m>,
+    /// Chunked-prefill scratch: the chunk's gathered residual, one residual slice
+    /// per token (the dense chain runs per token, unchanged) and one host-visible
+    /// MoE mailbox per token (`docs/phase-4` §8s).
+    pub r_chunk: Option<Buf>,
+    pub r_slots: Vec<Buf>,
+    /// `HC_READ(ffn)`'s `inject` partials per token: the ffn `HC_WRITE` of every
+    /// token in a chunk runs after all the chunk's reads, so each token's inject
+    /// values have to be kept (§8s).
+    pub inject_slots: Vec<Buf>,
+    pub moe_out: Vec<Mailbox>,
     pub name: String,
 }
 
@@ -247,6 +257,11 @@ pub struct SessionCfg {
     /// `vkWaitForFences` of their own (§8o measured 0.55 ms/block of host time in
     /// a two-stream pair, where the GPU has slack).
     pub inbatch_read: bool,
+    /// Prefill chunk size: the prompt is fed `t` tokens at a time with one
+    /// submission per stage per chunk and the expert lane **grouped by expert**
+    /// over the chunk (§8s). `0` = token by token. Requires a single-device
+    /// placement (which is what a multi-stream session is).
+    pub prefill_chunk: usize,
     /// Enable the GPU-time probe (`BRECCIA_GPU_TIME=1` also turns it on).
     /// It stamps every batch, so a two-stream run can report per-card
     /// utilisation instead of only fence waits.
@@ -346,6 +361,16 @@ pub struct Session<'m> {
     pub batching: bool,
     /// See [`SessionCfg::inbatch_read`].
     pub inbatch_read: bool,
+    /// Tokens per prefill chunk (0 = token by token). The chunk's buffers live on
+    /// the venue; the dense chain runs **per token** (unchanged) and only the
+    /// expert lane is grouped (§8s).
+    pub prefill_chunk: usize,
+    /// Host-side per-token routing for the chunk's grouped lane, and the chunk's
+    /// token ids (the PLE hash needs them).
+    pf_ids: Vec<Vec<usize>>,
+    pf_weights: Vec<Vec<f32>>,
+    pf_mixed: Vec<f32>,
+    pf_toks: Vec<u32>,
     /// GPU-time probe (`BRECCIA_GPU_TIME=1`): one timestamp pool per device and
     /// the number of batches stamped so far (`None` = done or disabled).
     probe_pools: Vec<ash::vk::QueryPool>,
@@ -420,7 +445,12 @@ impl<'m> Session<'m> {
             } else {
                 192 << 10
             };
-            stagings.push(Staging::new(gpu, stage_cap)?);
+            let chunk_slots = if i == 0 && cfg.prefill_chunk > 0 && model.devices.len() == 1 {
+                cfg.prefill_chunk
+            } else {
+                1
+            };
+            stagings.push(Staging::with_block_region(gpu, stage_cap, chunk_slots)?);
             let alloc = |bytes: u64, what: &str| -> Result<Buf> {
                 breccia_kernels::gemv::alloc(gpu, bytes)
                     .with_context(|| format!("allocating {what} on device {i}"))
@@ -456,6 +486,32 @@ impl<'m> Session<'m> {
             let moe_map_gate = alloc((2 * k * ff) as u64 * 4, "moe map gate")?;
             let moe_map_up = alloc((2 * k * ff) as u64 * 4, "moe map up")?;
             let moe_map_down = alloc((2 * k * mc.n_embd) as u64 * 4, "moe map down")?;
+            let chunk = if i == 0 && cfg.prefill_chunk > 0 && model.devices.len() == 1 {
+                cfg.prefill_chunk
+            } else {
+                0
+            };
+            let (r_chunk, r_slots, inject_slots, moe_out) = {
+                let mut chunk_buf = None;
+                let mut slots = Vec::new();
+                let mut injects = Vec::new();
+                let mut boxes = Vec::new();
+                if chunk > 0 {
+                    chunk_buf = Some(alloc(
+                        (mc.hc_dim() * 4 * chunk) as u64,
+                        "the prefill chunk residual",
+                    )?);
+                    for t in 0..chunk {
+                        slots.push(alloc(
+                            mc.hc_dim() as u64 * 4,
+                            &format!("prefill residual slot {t}"),
+                        )?);
+                        injects.push(alloc(160, &format!("prefill inject slot {t}"))?);
+                        boxes.push(Mailbox::new(gpu, n * 4)?);
+                    }
+                }
+                (chunk_buf, slots, injects, boxes)
+            };
             let moe_map = breccia_kernels::MoeMap::new(gpu)?;
             let moe_combine = breccia_kernels::MoeCombine::new(gpu)?;
             venues.push(Venue {
@@ -493,6 +549,10 @@ impl<'m> Session<'m> {
                 moe_map_down,
                 moe_map,
                 moe_combine,
+                r_chunk,
+                r_slots,
+                inject_slots,
+                moe_out,
                 name: dev.info.name.clone(),
             });
         }
@@ -587,6 +647,15 @@ impl<'m> Session<'m> {
             dispatches: 0,
             batching: cfg.batching,
             inbatch_read: cfg.inbatch_read,
+            prefill_chunk: if model.devices.len() == 1 {
+                cfg.prefill_chunk
+            } else {
+                0
+            },
+            pf_ids: Vec::new(),
+            pf_weights: Vec::new(),
+            pf_mixed: Vec::new(),
+            pf_toks: Vec::new(),
             probe_pools: {
                 let on = cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some();
                 let mut v = Vec::with_capacity(model.devices.len());
@@ -1059,7 +1128,70 @@ impl<'m> Session<'m> {
         // Every dispatch from here to the MoE readback rides one command buffer.
         self.ensure_batch(dev)?;
 
-        // ---- (B) HC_READ(attn) -----------------------------------------------
+        let digests = self.record_dense_prelude(b, dev, pos, trace)?;
+
+        // ---- a block whose experts are resident: no host, no readback --------
+        if let Some(pe) = m.placed.get(&b) {
+            self.timers.mark(EXPERTS);
+            self.run_placed_moe(b, dev, pe, mc.n_embd, mc.n_ff, mc.n_expert_used)?;
+            self.timers.mark(HC_WRITE_F);
+            {
+                let v = &self.venues[dev];
+                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                v.hc.write(ws, &v.r, &v.block_out.buf, &v.r)?;
+            }
+            self.submit_batch()?;
+            return Ok(digests);
+        }
+
+        // The block's readback can ride this submission: five `cmd_copy_buffer`s
+        // into the staging block region plus a host-visibility barrier, so the
+        // host reads the mapping after the wait instead of paying a submission
+        // and a fence of its own (§8o).
+        if self.inbatch_read {
+            let k = mc.n_expert_used;
+            let gpu = m.devices[dev].gpu();
+            let v = &self.venues[dev];
+            let st = &self.stagings[dev];
+            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+            let offs = lane_offsets(mc.n_embd, k);
+            batch_cmd::record_copy(
+                gpu,
+                st.buffer(),
+                offs[0],
+                &ws.mixed,
+                0,
+                (mc.n_embd * 4) as u64,
+            )?;
+            batch_cmd::record_copy(gpu, st.buffer(), offs[1], &v.router_ids, 0, (k * 4) as u64)?;
+            batch_cmd::record_copy(gpu, st.buffer(), offs[2], &v.router_w, 0, (k * 4) as u64)?;
+            batch_cmd::record_copy(gpu, st.buffer(), offs[3], &v.sh, 0, (mc.n_embd * 4) as u64)?;
+            batch_cmd::record_copy(gpu, st.buffer(), offs[4], &v.sh_gate_logit, 0, 4)?;
+            batch_cmd::record_barrier_to_host(gpu)?;
+        }
+
+        // The host block's submission ends here: the readback is
+        // [`Session::finish_block`]'s job, after the wait.
+        self.submit_batch()?;
+        Ok(digests)
+    }
+
+    /// One token's dense chain for block `b`: `HC_READ(attn)`, the token mixer,
+    /// `HC_WRITE(attn)`, `HC_READ(ffn)`, the router and the shared expert — all
+    /// recorded into the open batch, with the venue's single-token scratch.
+    ///
+    /// Shared by the decode path ([`Session::submit_block`]) and the chunked
+    /// prefill, which swaps each token's residual into `v.r` and keeps the whole
+    /// chunk in one submission.
+    fn record_dense_prelude(
+        &mut self,
+        b: usize,
+        dev: usize,
+        pos: usize,
+        trace: &mut Option<&mut Vec<LayerTrace>>,
+    ) -> Result<BlockDigests> {
+        let m = self.model;
+        let mc = &m.cfg;
         self.timers.mark(HC_READ_A);
         {
             let v = &self.venues[dev];
@@ -1131,58 +1263,295 @@ impl<'m> Session<'m> {
             )?;
         }
 
-        // ---- a block whose experts are resident: no host, no readback --------
-        if let Some(pe) = m.placed.get(&b) {
-            self.timers.mark(EXPERTS);
-            self.run_placed_moe(b, dev, pe, mc.n_embd, mc.n_ff, mc.n_expert_used)?;
-            self.timers.mark(HC_WRITE_F);
-            {
-                let v = &self.venues[dev];
-                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-                v.hc.write(ws, &v.r, &v.block_out.buf, &v.r)?;
-            }
-            self.submit_batch()?;
-            return Ok(BlockDigests {
-                mixed_attn,
-                mixer_out,
-                mixed_ffn,
-            });
-        }
-
-        // The block's readback can ride this submission: five `cmd_copy_buffer`s
-        // into the staging block region plus a host-visibility barrier, so the
-        // host reads the mapping after the wait instead of paying a submission
-        // and a fence of its own (§8o).
-        if self.inbatch_read {
-            let k = mc.n_expert_used;
-            let gpu = m.devices[dev].gpu();
-            let v = &self.venues[dev];
-            let st = &self.stagings[dev];
-            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-            let offs = lane_offsets(mc.n_embd, k);
-            batch_cmd::record_copy(
-                gpu,
-                st.buffer(),
-                offs[0],
-                &ws.mixed,
-                0,
-                (mc.n_embd * 4) as u64,
-            )?;
-            batch_cmd::record_copy(gpu, st.buffer(), offs[1], &v.router_ids, 0, (k * 4) as u64)?;
-            batch_cmd::record_copy(gpu, st.buffer(), offs[2], &v.router_w, 0, (k * 4) as u64)?;
-            batch_cmd::record_copy(gpu, st.buffer(), offs[3], &v.sh, 0, (mc.n_embd * 4) as u64)?;
-            batch_cmd::record_copy(gpu, st.buffer(), offs[4], &v.sh_gate_logit, 0, 4)?;
-            batch_cmd::record_barrier_to_host(gpu)?;
-        }
-
-        // The host block's submission ends here: the readback is
-        // [`Session::finish_block`]'s job, after the wait.
-        self.submit_batch()?;
         Ok(BlockDigests {
             mixed_attn,
             mixer_out,
             mixed_ffn,
         })
+    }
+
+    /// Feed a **chunk** of `toks` in one pass: the dense chain still runs per
+    /// token (unchanged kernels, unchanged numerics), but the whole chunk rides
+    /// **one submission per stage**, and the routed experts are computed **once
+    /// per expert** across the chunk instead of once per token
+    /// (`moe_topk_chunk`, §8s).
+    ///
+    /// Requires a single-device placement (what a multi-stream session is) and a
+    /// configured [`SessionCfg::prefill_chunk`].
+    pub fn prefill(&mut self, toks: &[u32], pos0: usize) -> Result<Vec<f32>> {
+        let t = toks.len();
+        if t == 0 {
+            bail!("an empty prefill chunk");
+        }
+        let m = self.model;
+        let mc = &m.cfg;
+        if m.devices.len() != 1 {
+            bail!(
+                "chunked prefill needs a single-device placement (this model spans {} devices)",
+                m.devices.len()
+            );
+        }
+        if t > self.prefill_chunk {
+            bail!(
+                "prefill chunk of {t} tokens exceeds the configured chunk of {}",
+                self.prefill_chunk
+            );
+        }
+        if pos0 + t > mc.n_ctx_max {
+            bail!(
+                "chunk at {pos0}+{t} is past the context limit {}",
+                mc.n_ctx_max
+            );
+        }
+        let dev = 0;
+        let gpu = m.devices[dev].gpu();
+        let hc_dim = mc.hc_dim();
+        self.pf_toks.clear();
+        self.pf_toks.extend_from_slice(toks);
+
+        // ---- embed the chunk, then split it into per-token residual slots -----
+        self.flush()?;
+        self.timers.start();
+        self.pos = pos0 + t - 1;
+        if self.venues[dev].r_chunk.is_none() {
+            bail!("no prefill chunk buffer: was prefill_chunk set?");
+        }
+        {
+            let v = &self.venues[dev];
+            let table = m.token_embd()?;
+            let rows: Vec<u32> = toks
+                .iter()
+                .flat_map(|&x| std::iter::repeat_n(x, mc.hc))
+                .collect();
+            let rc = v
+                .r_chunk
+                .as_ref()
+                .ok_or_else(|| anyhow!("no prefill chunk buffer"))?;
+            let staged = v.emb.gather_staged(gpu, table, &rows, rc)?;
+            v.emb.release(gpu, &staged);
+        }
+        self.ensure_batch(dev)?;
+        for i in 0..t {
+            let v = &self.venues[dev];
+            batch_cmd::record_copy(
+                gpu,
+                &v.r_slots[i],
+                0,
+                v.r_chunk.as_ref().expect("the chunk residual"),
+                (i * hc_dim * 4) as u64,
+                (hc_dim * 4) as u64,
+            )?;
+        }
+        self.submit_batch()?;
+        self.flush()?;
+        self.timers.mark(PLE);
+
+        for b in 0..mc.n_layers {
+            self.prefill_block(b, t, pos0)?;
+        }
+
+        // ---- the head sees the chunk's last token only -----------------------
+        self.timers.mark(FINAL_HC);
+        self.swap_r_in(dev, t - 1);
+        self.submit_head()?;
+        let logits = self.finish_head()?;
+        self.swap_r_in(dev, t - 1);
+        self.timers.stop();
+        Ok(logits)
+    }
+
+    /// One block of a chunked prefill: the dense chain for every token of the
+    /// chunk in one submission, then the **grouped** expert lane, then the ffn
+    /// `HC_WRITE` for every token in a second submission.
+    fn prefill_block(&mut self, b: usize, t: usize, pos0: usize) -> Result<()> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let dev = 0;
+        let n_embd = mc.n_embd;
+        let k = mc.n_expert_used;
+        let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
+
+        // ---- PLE: per-token fallback (it needs the residual on the host) -----
+        if mc.is_ple_layer(b) {
+            self.timers.mark(PLE);
+            for i in 0..t {
+                self.swap_r_in(dev, i);
+                self.cur_tok = self.pf_toks[i];
+                self.ple_step(b)?;
+                self.swap_r_in(dev, i);
+            }
+        }
+
+        // ---- pass 1: the whole chunk's dense chain, one submission -----------
+        self.ensure_batch(dev)?;
+        for i in 0..t {
+            self.swap_r_in(dev, i);
+            self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace)?;
+            if m.placed.contains_key(&b) {
+                // A device-resident block needs no host round trip; run it whole
+                // (documented per-token fallback for that block only).
+                self.run_placed_moe(b, dev, &m.placed[&b], n_embd, mc.n_ff, k)?;
+                let v = &self.venues[dev];
+                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                v.hc.write(ws, &v.r, &v.block_out.buf, &v.r)?;
+            } else {
+                self.record_lane_copies(dev, i)?;
+                let v = &self.venues[dev];
+                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                batch_cmd::record_copy(
+                    self.model.devices[dev].gpu(),
+                    &v.inject_slots[i],
+                    0,
+                    &ws.inject,
+                    0,
+                    ws.inject.size.min(160),
+                )?;
+            }
+            self.swap_r_in(dev, i);
+        }
+        self.submit_batch()?;
+        self.flush()?;
+
+        if m.placed.contains_key(&b) {
+            return Ok(());
+        }
+
+        // ---- the grouped expert lane over the whole chunk --------------------
+        self.timers.mark(EXPERTS);
+        self.pf_ids.clear();
+        self.pf_weights.clear();
+        self.pf_mixed.clear();
+        let mut shared: Vec<f32> = Vec::with_capacity(t * n_embd);
+        let mut gates: Vec<f32> = Vec::with_capacity(t);
+        {
+            let st = &self.stagings[dev];
+            let offs = lane_offsets(n_embd, k);
+            for i in 0..t {
+                let base = crate::xfer::BLOCK_REGION * i as u64;
+                self.pf_mixed
+                    .extend_from_slice(&f32_from_bytes(st.read_block(base + offs[0], n_embd * 4)));
+                let ids: Vec<usize> = st
+                    .read_block(base + offs[1], k * 4)
+                    .chunks_exact(4)
+                    .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+                    .collect();
+                self.pf_ids.push(ids);
+                self.pf_weights
+                    .push(f32_from_bytes(st.read_block(base + offs[2], k * 4)));
+                shared
+                    .extend_from_slice(&f32_from_bytes(st.read_block(base + offs[3], n_embd * 4)));
+                let g = st.read_block(base + offs[4], 4);
+                gates.push(f32::from_le_bytes([g[0], g[1], g[2], g[3]]));
+            }
+        }
+        self.dev_down[dev] += (t * (n_embd * 2 + k * 8 + 4)) as u64;
+        let t_lane = std::time::Instant::now();
+        let mut out = vec![0f32; t * n_embd];
+        {
+            let routes: Vec<breccia_kernels::cpu::ChunkRoute<'_>> = (0..t)
+                .map(|i| breccia_kernels::cpu::ChunkRoute {
+                    ids: &self.pf_ids[i],
+                    weights: &self.pf_weights[i],
+                })
+                .collect();
+            let bytes = self
+                .pool
+                .lock()
+                .expect("the expert pool's lock")
+                .moe_topk_chunk(&m.layers[b].experts, &routes, &self.pf_mixed, &mut out)
+                .with_context(|| format!("the grouped expert lane on block {b}"))?;
+            self.expert_bytes += bytes as u64;
+        }
+        self.lane_s += t_lane.elapsed().as_secs_f64();
+        self.lane_covered_s += self.lane_s.min(0.0); // set by the driver when relevant
+        for i in 0..t {
+            let gate = 1.0 / (1.0 + (-gates[i]).exp());
+            let row = &mut out[i * n_embd..(i + 1) * n_embd];
+            for (o, sv) in row.iter_mut().zip(&shared[i * n_embd..(i + 1) * n_embd]) {
+                *o += sv * gate;
+            }
+            self.venues[dev].moe_out[i].write(&f32_to_bytes(row))?;
+            self.dev_up[dev] += (n_embd * 4) as u64;
+        }
+
+        // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
+        self.timers.mark(HC_WRITE_F);
+        self.ensure_batch(dev)?;
+        for i in 0..t {
+            self.swap_r_in(dev, i);
+            self.swap_inject_in(dev, i);
+            let v = &self.venues[dev];
+            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+            v.hc.write(ws, &v.r, &v.moe_out[i].buf, &v.r)?;
+            self.swap_inject_in(dev, i);
+            self.swap_r_in(dev, i);
+        }
+        self.submit_batch()?;
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Swap token `i`'s residual slice into the venue's single-token `r` (and
+    /// back), so the per-token dense chain runs verbatim on a chunk.
+    fn swap_r_in(&mut self, dev: usize, i: usize) {
+        let v = &mut self.venues[dev];
+        std::mem::swap(&mut v.r, &mut v.r_slots[i]);
+    }
+
+    /// Swap token `i`'s `inject` partials into the hc workspace (and back): the
+    /// ffn `HC_WRITE` needs the values its own `HC_READ(ffn)` produced.
+    fn swap_inject_in(&mut self, dev: usize, i: usize) {
+        let v = &mut self.venues[dev];
+        let Some(ws) = v.hc_ws.as_mut() else { return };
+        std::mem::swap(&mut ws.inject, &mut v.inject_slots[i]);
+    }
+
+    /// Record the five readback copies for token `slot` of a chunk into the
+    /// staging block region, plus the host-visibility barrier.
+    fn record_lane_copies(&self, dev: usize, slot: usize) -> Result<()> {
+        let mc = &self.model.cfg;
+        let k = mc.n_expert_used;
+        let gpu = self.model.devices[dev].gpu();
+        let v = &self.venues[dev];
+        let st = &self.stagings[dev];
+        let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+        let base = crate::xfer::BLOCK_REGION * slot as u64;
+        let offs = lane_offsets(mc.n_embd, k);
+        batch_cmd::record_copy(
+            gpu,
+            st.buffer(),
+            base + offs[0],
+            &ws.mixed,
+            0,
+            (mc.n_embd * 4) as u64,
+        )?;
+        batch_cmd::record_copy(
+            gpu,
+            st.buffer(),
+            base + offs[1],
+            &v.router_ids,
+            0,
+            (k * 4) as u64,
+        )?;
+        batch_cmd::record_copy(
+            gpu,
+            st.buffer(),
+            base + offs[2],
+            &v.router_w,
+            0,
+            (k * 4) as u64,
+        )?;
+        batch_cmd::record_copy(
+            gpu,
+            st.buffer(),
+            base + offs[3],
+            &v.sh,
+            0,
+            (mc.n_embd * 4) as u64,
+        )?;
+        batch_cmd::record_copy(gpu, st.buffer(), base + offs[4], &v.sh_gate_logit, 0, 4)?;
+        batch_cmd::record_barrier_to_host(gpu)?;
+        Ok(())
     }
 
     /// Wait for block `b`'s segment, read its MoE inputs, run the host expert
@@ -1730,9 +2099,18 @@ impl<'m> Session<'m> {
         let mut trace = debug;
         let mut pos = 0usize;
         let mut logits = Vec::new();
-        for &t in prompt {
-            logits = self.token(t, pos, None)?;
-            pos += 1;
+        if self.prefill_chunk > 0 {
+            // Chunked prompt pass (§8s): same tokens, same arithmetic, grouped
+            // expert lane.
+            for part in prompt.chunks(self.prefill_chunk) {
+                logits = self.prefill(part, pos)?;
+                pos += part.len();
+            }
+        } else {
+            for &t in prompt {
+                logits = self.token(t, pos, None)?;
+                pos += 1;
+            }
         }
         // The prompt is not part of the decode measurement.
         self.forwards = 0;
@@ -1823,6 +2201,15 @@ impl Drop for Session<'_> {
             }
             if let Some(l) = &v.logits {
                 gpu.destroy_buf(l);
+            }
+            if let Some(rc) = &v.r_chunk {
+                gpu.destroy_buf(rc);
+            }
+            for b in v.r_slots.iter().chain(v.inject_slots.iter()) {
+                gpu.destroy_buf(b);
+            }
+            for mb in &v.moe_out {
+                mb.release(gpu);
             }
             if let Some(ws) = v.hc_ws.take() {
                 v.hc.release(gpu, ws);

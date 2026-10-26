@@ -24,7 +24,8 @@ use std::time::Instant;
 
 use breccia_format::{ExpertRole, ExpertSlices, ShardSet};
 use breccia_kernels::cpu::{
-    expert_ffn, gemv_into, moe_topk_sequential, silu, ExpertPool, FfnScratch, LayerPlan, Path,
+    expert_ffn, gemv_into, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch,
+    LayerPlan, Path,
 };
 use breccia_kernels::{real, reference, QuantType};
 
@@ -355,6 +356,103 @@ fn topk_pool_is_bit_identical_to_the_single_threaded_path() {
             .expect("again");
         for (k, (a, b)) in again.iter().zip(&out).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "pool rerun element {k}");
+        }
+    }
+}
+
+/// The grouped chunk lane (prefill) against the per-token lane.
+///
+/// The grouped path reads each expert's rows once and serves every token that
+/// routed to it, so the work is reordered: each row's dot product must still be
+/// **bit**-identical to the per-token path, and the routed sum may differ only in
+/// the last ulp (the accumulation order over an expert set is expert-id order, not
+/// router order — stated in `moe_topk_chunk`).
+#[test]
+fn grouped_chunk_lane_matches_the_per_token_lane() {
+    let Some(set) = open_model() else { return };
+    let layout = set.layout().expect("layout");
+    let mut plans: Vec<LayerPlan> = Vec::new();
+    for block in layout.blocks().take(3) {
+        plans.push(LayerPlan::from_block(&set, block).expect("plan"));
+    }
+    for plan in plans {
+        let (n_embd, k) = (plan.n_embd, 10usize);
+        // A chunk of 32 tokens with overlapping, deterministic routings.
+        let t = 32usize;
+        let mut x = vec![0f32; t * n_embd];
+        let mut seed = 0x1234_5678u32;
+        for v in x.iter_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = ((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5;
+        }
+        let mut ids: Vec<Vec<usize>> = Vec::new();
+        let mut weights: Vec<Vec<f32>> = Vec::new();
+        for token in 0..t {
+            // 10 distinct experts out of 512, overlapping across tokens.
+            let mut row: Vec<usize> = Vec::new();
+            for j in 0..k {
+                let mut e = (token * 7 + j * 53) % plan.n_experts;
+                while row.contains(&e) {
+                    e = (e + 1) % plan.n_experts;
+                }
+                row.push(e);
+            }
+            ids.push(row);
+            weights.push((0..k).map(|j| 0.1 * (j as f32 + 1.0)).collect());
+        }
+
+        // Oracle: the per-token lane, accumulating in router order.
+        let mut want = vec![0f32; t * n_embd];
+        let mut bytes_seq = 0usize;
+        let mut pool = ExpertPool::new(Arc::clone(&set), 8, Path::Avx2);
+        for token in 0..t {
+            let mut out = vec![0f32; n_embd];
+            bytes_seq += pool
+                .moe_topk(
+                    &plan,
+                    &ids[token],
+                    &weights[token],
+                    &x[token * n_embd..],
+                    &mut out,
+                )
+                .expect("per-token");
+            want[token * n_embd..(token + 1) * n_embd].copy_from_slice(&out);
+        }
+
+        // Grouped.
+        let routes: Vec<ChunkRoute<'_>> = (0..t)
+            .map(|i| ChunkRoute {
+                ids: &ids[i],
+                weights: &weights[i],
+            })
+            .collect();
+        let mut got = vec![0f32; t * n_embd];
+        let mut pool = ExpertPool::new(Arc::clone(&set), 8, Path::Avx2);
+        let bytes = pool
+            .moe_topk_chunk(&plan, &routes, &x, &mut got)
+            .expect("grouped");
+        assert_eq!(bytes, bytes_seq, "bytes accounted");
+
+        let mut worst = 0f64;
+        for (a, b) in got.iter().zip(&want) {
+            worst = worst.max(rel(*a, f64::from(*b)));
+        }
+        println!(
+            "blk.{}: grouped vs per-token over {} tokens, worst relative {worst:.3e}",
+            plan.block, t
+        );
+        assert!(
+            worst <= 1e-6,
+            "blk.{}: grouped lane differs by {worst:.3e} (bit-identical rows expected)",
+            plan.block
+        );
+        // Determinism.
+        let mut again = vec![0f32; t * n_embd];
+        let mut pool = ExpertPool::new(Arc::clone(&set), 8, Path::Avx2);
+        pool.moe_topk_chunk(&plan, &routes, &x, &mut again)
+            .expect("grouped again");
+        for (k2, (a, b)) in again.iter().zip(&got).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "grouped rerun element {k2}");
         }
     }
 }

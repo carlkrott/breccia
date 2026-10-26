@@ -54,7 +54,7 @@ pub use bench::{
     PARITY_BAR_GBPS,
 };
 pub use expert::{
-    expert_ffn, moe_topk_sequential, silu, ExpertPool, FfnScratch, LayerPlan, RolePlan,
+    expert_ffn, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch, LayerPlan, RolePlan,
 };
 
 /// Which code path a dot product takes.
