@@ -179,6 +179,13 @@ impl std::fmt::Display for QuantType {
     }
 }
 
+/// Serialised as the canonical GGML name (`"IQ2_XS"`), not the Rust variant.
+impl serde::Serialize for QuantType {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.name())
+    }
+}
+
 impl std::str::FromStr for QuantType {
     type Err = String;
 

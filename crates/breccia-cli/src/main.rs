@@ -169,8 +169,38 @@ enum BenchKind {
         #[arg(long)]
         quick: bool,
     },
+    /// Phase 3 (CPU): host resident-expert lane — dequant+GEMV GB/s, MoE token
+    CpuExperts {
+        /// Quant type, repeatable (default: every type the model's experts use)
+        #[arg(long = "type", value_name = "IQ2_XS")]
+        types: Vec<String>,
+        /// Worker threads for the top-k token pass (default: physical cores/2,
+        /// capped at 16)
+        #[arg(long, value_name = "N")]
+        threads: Option<usize>,
+        /// Routed experts per block in the token pass (the model uses 10)
+        #[arg(long, default_value_t = 10)]
+        topk: usize,
+        /// GGUF glob for the model (default: the IQ3_XXS shards)
+        #[arg(long, value_name = "GLOB")]
+        gguf: Option<String>,
+        /// Expert slices per per-type cell (default: 96, 16 with --quick)
+        #[arg(long, value_name = "N")]
+        type_experts: Option<usize>,
+        /// Measure only the first N blocks (0 = all 48)
+        #[arg(long, default_value_t = 0)]
+        layers: usize,
+        /// Token-pass repetitions; the best is reported, the first is the cold one
+        #[arg(long, default_value_t = 3)]
+        reps: usize,
+        /// Write the full JSON report here
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
+        /// Short runs (fewer experts, fewer reps, no scalar token pass)
+        #[arg(long)]
+        quick: bool,
+    },
 }
-
 fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
@@ -203,7 +233,9 @@ fn run(cli: Cli) -> Result<()> {
                  [--json PATH] [--quick] [--real [--layer N] [--role gate|up|down] [--expert E]]\n                 \
                  [--experts 1,2,4,8,10,16] [--accum f32|f16]\n  \
                  breccia bench ops --op rmsnorm|rope|swiglu|softmax|router|emb_gather|hc|add|gdn|qsa \\\n                 \
-                 [--tokens 1,256] [--device <idx|pci>] [--json PATH] [--quick]"
+                 [--tokens 1,256] [--device <idx|pci>] [--json PATH] [--quick]\n  \
+                 breccia bench cpu-experts [--type IQ2_XS]... [--threads N] [--topk 10] \\\n                 \
+                 [--type-experts N] [--layers N] [--reps N] [--gguf GLOB] [--json PATH] [--quick]"
             );
             Ok(())
         }
@@ -264,6 +296,30 @@ fn run(cli: Cli) -> Result<()> {
             ops,
             tokens,
             device,
+            json,
+            quick,
+        }),
+        Command::Bench {
+            kind:
+                Some(BenchKind::CpuExperts {
+                    types,
+                    threads,
+                    topk,
+                    gguf,
+                    type_experts,
+                    layers,
+                    reps,
+                    json,
+                    quick,
+                }),
+        } => bench_cpu_experts(CpuExpertsArgs {
+            types,
+            threads,
+            topk,
+            gguf,
+            type_experts,
+            layers,
+            reps,
             json,
             quick,
         }),
@@ -1151,4 +1207,68 @@ fn print_ops_summary(rep: &breccia_kernels::OpsReport) {
             "partly wall clock"
         }
     );
+}
+
+// ---------------------------------------------------------------------------
+// bench cpu-experts (Phase 3, host resident-expert lane)
+// ---------------------------------------------------------------------------
+
+struct CpuExpertsArgs {
+    types: Vec<String>,
+    threads: Option<usize>,
+    topk: usize,
+    gguf: Option<String>,
+    type_experts: Option<usize>,
+    layers: usize,
+    reps: usize,
+    json: Option<PathBuf>,
+    quick: bool,
+}
+
+#[derive(serde::Serialize)]
+struct CpuExpertsBundle {
+    schema_version: u32,
+    runs: Vec<breccia_kernels::cpu::CpuExpertReport>,
+}
+
+fn bench_cpu_experts(args: CpuExpertsArgs) -> Result<()> {
+    use breccia_kernels::cpu::{self, CpuExpertBenchOptions};
+    use breccia_kernels::QuantType;
+
+    let types: Vec<QuantType> = args
+        .types
+        .iter()
+        .map(|t| t.parse::<QuantType>().map_err(|e| anyhow::anyhow!(e)))
+        .collect::<Result<_>>()?;
+
+    let opts = CpuExpertBenchOptions {
+        threads: args.threads.unwrap_or(0),
+        types,
+        topk: args.topk,
+        model_glob: args
+            .gguf
+            .clone()
+            .unwrap_or_else(|| cpu::DEFAULT_CPU_MODEL_GLOB.to_string()),
+        quick: args.quick,
+        reps: args.reps,
+        type_experts: args.type_experts.unwrap_or(0),
+        layers: args.layers,
+        json: args.json.clone(),
+    };
+    let report = cpu::run_cpu_expert_bench(&opts).context("CPU expert lane benchmark")?;
+    cpu::print_summary(&report);
+
+    if let Some(path) = &args.json {
+        let bundle = CpuExpertsBundle {
+            schema_version: cpu::CPU_EXPERTS_SCHEMA_VERSION,
+            runs: vec![report],
+        };
+        let text = serde_json::to_string_pretty(&bundle).context("serializing the report")?;
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
+        println!("\nwrote {}", path.display());
+    }
+    Ok(())
 }

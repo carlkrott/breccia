@@ -21,6 +21,7 @@
 //! | [`qsa`] | the QSA sublayer (12 layers): per-head q norm, paged f16 KV, lightning indexer, top-k selection, masked attention with the output gate |
 //! | [`proj`] | one projection, two dispatch shapes (decode `Gemv` / batched prefill `GemvBatch`) |
 //! | [`reference`] | scalar CPU port of `ggml-quants.c` (decode + dot) used as the conformance oracle |
+//! | [`cpu`] | the **host resident-expert lane**: AVX2/scalar fused decode+dot, the expert FFN (SwiGLU + GEMV), the per-token top-k thread pool, and `breccia bench cpu-experts` |
 //! | [`bench`] | `breccia bench gemv`: throughput vs bytes-read, plus a real-model mode that runs the kernel on an expert tensor straight out of the GGUF mapping |
 //!
 //! # Shape contract
@@ -43,6 +44,7 @@
 
 pub mod batch;
 pub mod bench;
+pub mod cpu;
 pub mod device;
 pub mod gdn;
 pub mod gemv;
