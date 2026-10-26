@@ -4,9 +4,17 @@ Standard trunk-based development with short-lived branches, Conventional Commits
 
 ## Repository identity
 
-- Local root: `/home/korphaus/projects/Breccia` (its own repo — **not** part of the `$HOME` repo that contains it; do not `git add` this repo into the home repo, and do not modify the home repo's ignore rules because of it).
-- GitHub remote: **not yet configured.** Add later with
-  `git remote add origin git@github.com:<owner>/breccia.git` once credentials/owner are decided.
+- Local root: `/home/korphaus/projects/Breccia` (its own repo — **not** part of the `$HOME` repo that contains it).
+- GitHub remote: **`origin` = https://github.com/carlkrott/breccia** — created **private** and pushed
+  2026-10-26 (publication gate approved by the user; `gh` CLI auth as `carlkrott`, SSH key also works).
+  Visibility stays **private** until the user explicitly says otherwise; flipping to public is the
+  irreversible direction.
+- **Pending cleanup:** the initial push carried a 65 MB build artifact in history
+  (`harnesses/vk-probe/target/...`, committed by mistake before `.gitignore` was fixed). Git warns
+  GH001. The rewrite (`filter-branch` dropping `harnesses/vk-probe/target`) is deferred until the
+  working tree is clean, then force-pushed — no collaborators exist, so this is safe.
+- The GitHub **MCP** server's configured token is stale (`Bad credentials`); use `gh`/git until it is
+  refreshed.
 
 ## Branching
 
