@@ -2106,6 +2106,90 @@ the fast one. Parity re-verified 32/32 on both devices.
   the 58 GB/s warm cache, and the actual lever (btrfs `read_ahead_kb`) is fixed at
   the filesystem, outside this engine.
 
+## 8y. The "decode regression" was the lane's default thread count, and the canonical gate
+
+Item 1 of the round was to reconcile the steady-state 2-stream gate (13.3-14.6
+aggregate, §8x) with the recorded 20.28/19.98 (§8q). **There is no code
+regression.** The two numbers are two different protocols, and the dominant
+difference is one default.
+
+### The A/B/A that closes it
+
+`bench token --streams 2 --devices 0000:0e:00.0,0000:03:00.0 --gen 32`, one window,
+same binary, only `--threads` varying (the lane's worker count):
+
+| threads | aggregate tok/s | lane (ms/step) | fence (ms/step) |
+|---|---:|---:|---:|
+| 8 (the old default: physical/2) | 14.71 / 14.73 | 85.7 / 86.3 | 32.3 / 31.9 |
+| 16 | 16.99 | 55.2 | 44.7 |
+| **32** | **20.19 / 20.77** | **41.2** | 39.5 / 36.6 |
+
+The recorded 20.28/19.98 of §8q was always run with **`--threads 32`** (that
+command line is in §8p). `default_threads()` returned physical cores / 2 = **8** on
+this 16-core/32-thread 7950X, so every run *without* the flag measured a
+lane-starved 14.7. The lane mixes ALU-bound dequantisation with memory stalls, so
+SMT genuinely helps it (+41 % aggregate, lane 86 -> 41 ms/step).
+
+Fixed by defaulting to **logical CPUs (capped at 32)**; with no flag at all the
+gate now reads **19.29 / 21.29** aggregate (lane 42.8 / 40.4). The latency-bound
+`GEMV` bench keeps its own physical/2 rule — that one measures one dispatch, not
+the lane.
+
+### Canonical two-stream decode gate (compare like with like)
+
+```bash
+timeout 1200 ./target/release/breccia bench token --streams 2 \
+  --devices 0000:0e:00.0,0000:03:00.0 \
+  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --gen 32 --runs 1        # threads now default to the logical CPU count
+```
+
+**Gate = 20.3 +- 1 tok/s aggregate** (19.3-21.3 over five runs in the §8y window),
+lane 40-43 ms/step, overlap 100 %. Do **not** compare it with
+`bench agents --prefix 64 --gen 8`, which pads agent 0's 27-token prompt to 64 by
+repeating its last id, runs the streams in the other device order, generates 8
+steps and — until this round — used 8 lane threads: it measures a different,
+lane-starved regime (13-15 aggregate). The `cache` line of §8x is unaffected and
+still worth quoting next to the rate.
+
+### Where the rest of the round went (and what did not land)
+
+The three remaining items are **not landed**; the measurements and the research's
+own refutations are recorded here so the next round starts from them:
+
+* **PLE gather batching (2)**: unchanged. The trace is `ple 1.3 -> 14.7 ms/token`
+  from §8w and the research prices the cold row at 65 µs with a 48x btrfs extent
+  over-read. The batching design is clear — one flush per chunk instead of two per
+  token, one `prefetch_rows` + one `gather_staged` over `T*16` rows, one
+  `read_batch` of `T` residuals/keys/values, `T` host blocks, one `record_copies`
+  writeback — and it needs the staging buffer's `cap` raised to
+  `chunk * (2*hc_dim + n_embd) * 4` (~12 MB at T = 128) because `read_batch` refuses
+  a total above it.
+* **The four missing multi-user GEMMs (3)**: unchanged (`IQ4_XS`, `Q4_K`, `Q5_K`,
+  `Q6_K`), so the T-batched shared expert is still blocked on kernels; the pattern
+  to copy is `gemm_iq4_nl.comp` + `gemm_body.glsl`, bit-identical per user, one
+  pipeline per type, and `PipelineSet::gemm` already caches them by type.
+* **Async expert prefetch (4)**: unchanged. §8x's number stands (429-530 µs per
+  streamed group against 67-84 resident); the fix is prefetching `e+1` while `e`
+  computes, and the ring depth should be derived from the measured record/step
+  ratio rather than the fixed 6 (`docs/research/04`).
+
+### Launch-side queue, corrected by the probe (do not adopt two of these)
+
+The `docs/research/04` probe (both cards, MI50 first) changes the launch queue:
+
+| idea | verdict |
+|---|---|
+| `vkCmdDispatchIndirect` | **refuted**: +0.77 µs (RX) / +1.65 µs (MI50) per dispatch, i.e. -1.2..-2.5 ms/token if adopted. Dropped. |
+| **barrier pruning** | **the launch-side win**: an unneeded dispatch costs 0.007 µs (RX) / 0.031 (MI50) but the per-dispatch compute->compute barrier costs 0.650 / 2.867 µs; 1 509 barriers = 0.98 / 4.32 ms = 1.4-6.1 % of the GPU half. Emit ~400/token where a real dependency exists, behind one flag, measure both cards. |
+| descriptor sets | `vkAllocateDescriptorSets` per dispatch, not recording, is the cost (recording is 68 ns/dispatch): pool or reset them per batch. |
+| placement | the MI50's dependency boundary is 4.4x the RX's: fine-grained dependent work to the RX, bulk/independent to the MI50. |
+| fused single-dispatch MoE, LMDeploy-style prefetch-before-wait | queue after the above. |
+
+And the correction that matters for this section: **launch count is 1-4 % of prefill
+time**, so the 20.3 -> 13.5 reconciliation was never going to be a launch story —
+it was one `usize` default.
+
 ## 9. Exact commands
 
 

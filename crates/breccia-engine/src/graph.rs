@@ -3084,27 +3084,25 @@ fn hc_read(v: &Venue<'_>, w: &HcW, r: &Buf) -> Result<()> {
     v.hc.read(ws, r, &hw)
 }
 
-/// Physical cores / 2, capped at 16 — the same default the host lane's own
-/// benchmark uses (`breccia-kernels::cpu::bench::default_threads`, which is not
-/// exported, so the rule is restated here).
+/// **Logical** CPUs, capped at 32 — the lane's thread count, and it is worth 41 %
+/// of the decode gate.
+///
+/// This used to be physical cores / 2 (8 on this 7950X), which measured 14.7
+/// tok/s aggregate on the two-stream gate against **20.2-20.8 at 32 threads**
+/// (lane 86 -> 41 ms/step, A/B/A in one window, `docs/phase-4` §8y): the lane mixes
+/// ALU-bound dequantisation with memory stalls, so SMT genuinely helps it, and the
+/// recorded gate of §8q was always run with `--threads 32`. Making 8 the default
+/// was the whole "decode regression".
 fn default_threads() -> usize {
     let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") else {
         return 8;
     };
-    let mut physical = String::new();
-    let mut seen: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
-    for line in text.lines() {
-        if let Some((k, v)) = line.split_once(':') {
-            match k.trim() {
-                "physical id" => physical = v.trim().to_string(),
-                "core id" => {
-                    seen.insert((physical.clone(), v.trim().to_string()));
-                }
-                _ => {}
-            }
-        }
-    }
-    (seen.len().max(1) / 2).clamp(1, 16)
+    let logical = text
+        .lines()
+        .filter(|l| l.starts_with("processor"))
+        .count()
+        .max(1);
+    logical.clamp(1, 32)
 }
 
 /// The quant type of one named tensor.
