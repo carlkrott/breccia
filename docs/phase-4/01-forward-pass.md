@@ -2310,6 +2310,22 @@ in a single invocation, which the AGENTS "one type per invocation" rule exists t
 prevent, and (b) a MI50-specific path (wave64) that only the display card exercises.
 The MI50 run is therefore done one type per process, never as a sweep.
 
+**And it passes there too.** MI50 (the display card), validation on, `timeout 90`,
+one type per process: IQ4_XS, Q4_K, Q5_K, Q6_K all **0.000e0**, `m = 1`
+bit-identical, 0 validation messages, no fault. So the four kernels are **not** the
+crash cause as a kernel defect — they are correct on both cards and both subgroup
+shapes.
+
+What the incident correlates with is the **sweep**: the crash came from
+`gemm_many`'s `multi_user_gemm` test, which walked up to 24 (block, role, type) cells
+in *one process* — and `a3c01e5` had just raised that cap from 6 to 24. Many new
+dispatch shapes in a single invocation is precisely what AGENTS.md's "one quant type
+per invocation" rule exists to prevent. That test now takes a `BRECCIA_GEMM_TYPE`
+filter and defaults to **4** cells, with the rule stated at the call site. Two
+lessons recorded: a *kernel* passing individually does not clear a *sweep*, and the
+display card is the MI50 — the order in AGENTS.md is now RX first, which is what this
+validation used.
+
 ### 2. The shared-expert T-batch: not wired
 
 It needs a chunk-level shape that does not exist yet: `mixed` for all `T` tokens in

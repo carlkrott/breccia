@@ -65,6 +65,21 @@ fn multi_user_gemm_matches_the_single_user_gemv() {
     // Every (block, role) whose type has a multi-user kernel: the delivered set
     // covers `down` (IQ4_NL, Q2_0) and `gate`/`up` (IQ2_*, IQ3_*, and since §8aa
     // also IQ4_XS, Q4_K, Q5_K, Q6_K — the shared expert's types).
+    // AGENTS.md: one quant type per invocation. `BRECCIA_GEMM_TYPE` narrows the
+    // sweep further; the default walks only a few cells because the 2026-10-26
+    // reboot correlated with many new dispatch shapes in a single process.
+    let only: Option<QuantType> = std::env::var("BRECCIA_GEMM_TYPE").ok().and_then(|s| {
+        match s.trim().to_ascii_uppercase().as_str() {
+            "IQ4_NL" => Some(QuantType::Iq4Nl),
+            "Q2_0" => Some(QuantType::Q2_0),
+            "IQ2_XXS" => Some(QuantType::Iq2Xxs),
+            "IQ2_XS" => Some(QuantType::Iq2Xs),
+            "IQ2_S" => Some(QuantType::Iq2S),
+            "IQ3_XXS" => Some(QuantType::Iq3Xxs),
+            "IQ3_S" => Some(QuantType::Iq3S),
+            _ => None,
+        }
+    });
     let mut cells: Vec<(usize, ExpertRole, QuantType)> = Vec::new();
     for block in layout.blocks() {
         let plan = LayerPlan::from_block(&set, block).expect("plan");
@@ -83,12 +98,13 @@ fn multi_user_gemm_matches_the_single_user_gemv() {
                     | QuantType::Q4K
                     | QuantType::Q5K
                     | QuantType::Q6K
-            ) && !cells.iter().any(|c| c.1 == role && c.2 == ty)
+            ) && only.is_none_or(|o| o == ty)
+                && !cells.iter().any(|c| c.1 == role && c.2 == ty)
             {
                 cells.push((plan.block, role, ty));
             }
         }
-        if cells.len() >= 24 {
+        if cells.len() >= 4 {
             break;
         }
     }
