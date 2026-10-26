@@ -23,6 +23,8 @@ Cargo workspace (`breccia-cli`, `breccia-profile`, `breccia-vk`, `breccia-kernel
 
 **Gate B** → printed partition plan for the IQ3_XXS shards that matches measured reality.
 
+**Gate B: PASSED 2026-10-26** — `breccia profile --dry-run-plan` prints measured roles + IQ3_XXS placement within the measured budget; `breccia serve --dry-run-plan` resolves the production HIP argv onto Vulkan by PCI identity (ordinals proven unstable — see docs/phase-1/profile-report.md).
+
 ## Phase 2 — `breccia-vk` async harness (M1b)
 
 Dual `VkDevice`, `gpu-allocator` pools, transfer-queue DMA rings + timeline semaphores, host-pinned staging, io_uring reader; overlap benchmark proving streaming with zero compute stalls. (Under the hybrid pivot this crate narrows to transfer orchestration + RDNA compute.)

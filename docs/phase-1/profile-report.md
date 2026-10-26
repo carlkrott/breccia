@@ -233,3 +233,30 @@ confirmed stale-environment artifact**.
 
 No systemd services, `Reference Projects/`, `/srv` weights, or other agents' crates were touched;
 nothing was committed by this task.
+
+## Post-integration findings (2026-10-26, `breccia serve --dry-run-plan`)
+
+**Vulkan device ordinals are not stable on this host.** Across six calibration runs
+the enumeration order varied (`[RX, VII, iGPU]` vs `[RX, VII]` — the integrated
+device intermittently drops out of RADV enumeration entirely). Consequences:
+
+1. Any `ROCmN -> VulkanN` ordinal mapping is wrong-by-construction: on this machine
+   HIP 0 = RX 6950 XT while a 3-device Vulkan enumeration can put the iGPU at 0.
+2. `breccia serve --dry-run-plan` therefore resolves HIP aliases by **PCI identity**:
+   `rocm-smi --showbus` gives HIP ordinal → PCI bus, and the cached profile's
+   `pci_address` gives the Vulkan device. Output states "bound by PCI identity at
+   launch"; ordinals are explicitly ignored. If rocm-smi or the profile is missing
+   the tool degrades to an ordinal fallback *with a warning*, never silently.
+3. The fingerprint's compute-device filter (above) is the same principle: stable
+   identity, not enumeration position. Device *selection* in Phase 2 must use
+   `VkPhysicalDeviceIDProperties`/PCI bus, not `GGML_VK_VISIBLE_DEVICES`-style indices.
+
+Verified end-to-end: the exact `qwen-dual-serve.sh` argv parses, resolves
+`ROCm0 -> RX 6950 XT [0000:03:00.0]`, `ROCm1 -> Radeon VII [0000:0e:00.0]`,
+compiles the `-ot` regex map, and exits without touching the GPU.
+
+**Gate B (printed partition plan matching measured reality): PASSED** —
+`breccia profile --dry-run-plan` prints the measured role table + IQ3_XXS placement
+(13,577 MiB GPU weights inside the 30.5 GiB measured budget; expert-parallel default;
+Tier-3 on the measured 671 GB SSD at 390 MB/s), and `breccia serve --dry-run-plan`
+resolves a production launch onto that hardware.
