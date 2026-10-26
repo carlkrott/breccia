@@ -4,7 +4,7 @@ Every number in `docs/` came from a command in this file or its phase report. Al
 
 Reference hardware (measurements do not transfer verbatim to other systems): Ryzen 9 7950X, 58 GB DDR5, RX 6950 XT (gfx1030, 16 GB GDDR6, Infinity Cache) + Radeon VII/MI50 (gfx906, 16 GB HBM2), Mesa RADV 26.2.4, ROCm 7.2, Linux 6.18.
 
-Model files are **not** in this repository. The target is `Qwen3.8-Flash-Next-GSQC-RCO-IQ3_XXS` (75 GB, 2 shards) plus the vision projector, Strata pack and MTP artifacts; place them anywhere and adjust `-m`/`--mmproj`.
+Model files are **not** in this repository. The target is `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` (75 GB, 2 shards) plus the vision projector, Strata pack and MTP artifacts; place them anywhere and adjust `-m`/`--mmproj`.
 
 ## 1. Baselines (llama.cpp HIP, the number to beat)
 
