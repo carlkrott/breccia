@@ -215,15 +215,20 @@ mod tests {
 
     #[test]
     fn only_compute_devices_enter_the_fingerprint() {
-        let mut d = crate::schema::DeviceIdentity::default();
-        d.device_type = "DISCRETE_GPU".into();
+        let mut d = crate::schema::DeviceIdentity {
+            device_type: "DISCRETE_GPU".into(),
+            ..Default::default()
+        };
         assert!(is_compute_device(&d));
         d.device_type = "EXTERNAL_GPU".into();
         assert!(is_compute_device(&d));
         // Flaky-in-enumeration / never-scheduled device types must not invalidate.
         for t in ["INTEGRATED_GPU", "CPU", "VIRTUAL_GPU", "OTHER", ""] {
             d.device_type = t.into();
-            assert!(!is_compute_device(&d), "{t:?} must not enter the fingerprint");
+            assert!(
+                !is_compute_device(&d),
+                "{t:?} must not enter the fingerprint"
+            );
         }
     }
 }
