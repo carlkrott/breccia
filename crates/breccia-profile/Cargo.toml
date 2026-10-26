@@ -3,9 +3,13 @@ name = "breccia-profile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Hardware discovery + calibration → ~/.config/breccia/hw_profile.json (M1a)"
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-anyhow.workspace = true
-thiserror.workspace = true
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+breccia-vk = { path = "../breccia-vk" }
+libc = "0.2"

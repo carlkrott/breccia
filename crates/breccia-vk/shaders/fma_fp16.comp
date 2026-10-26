@@ -1,0 +1,43 @@
+// FP16 (shaderFloat16) peak-FMA probe: same structure as fma_fp32.comp with float16_t.
+// a = 1 + 1e-3 and b = 5e-4 keep x in [1, ~e^(iters*1e-3)] -- safe in fp16 range
+// (max 65504) for the iteration counts used here. Requires shaderFloat16 feature.
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Data { float16_t d[]; };
+
+layout(push_constant) uniform Push {
+    uint iters;
+    uint elems;
+} pc;
+
+void main() {
+    uint id = gl_GlobalInvocationID.x % pc.elems;
+    float16_t s = d[id];
+    float16_t x0 = s;
+    float16_t x1 = s + float16_t(1.0);
+    float16_t x2 = s + float16_t(2.0);
+    float16_t x3 = s + float16_t(3.0);
+    float16_t x4 = s + float16_t(4.0);
+    float16_t x5 = s + float16_t(5.0);
+    float16_t x6 = s + float16_t(6.0);
+    float16_t x7 = s + float16_t(7.0);
+
+    const float16_t a = float16_t(1.001);
+    const float16_t b = float16_t(0.0005);
+
+    for (uint i = 0; i < pc.iters; ++i) {
+        x0 = fma(x0, a, b);
+        x1 = fma(x1, a, b);
+        x2 = fma(x2, a, b);
+        x3 = fma(x3, a, b);
+        x4 = fma(x4, a, b);
+        x5 = fma(x5, a, b);
+        x6 = fma(x6, a, b);
+        x7 = fma(x7, a, b);
+    }
+
+    d[id] = (((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7)));
+}
