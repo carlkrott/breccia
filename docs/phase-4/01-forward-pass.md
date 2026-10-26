@@ -2285,10 +2285,30 @@ into `build.rs` and `GemmMany::new`, so `PipelineSet::gemm` now caches **eleven*
 types instead of seven. **They are not validated yet**, and the reason matters: the
 `gemm_many` test walks *routed-expert* plans, and this artifact's routed experts are
 only `IQ2_*/IQ3_*/IQ4_NL/Q2_0` — the four new types appear on the **shared** expert
-(`ffn_{gate,up,down}_shexp`), which has no `LayerPlan`. So the kernels compile,
-dispatch and pass validation, but there is **no bit-identity claim** until a test
-builds them from a dense tensor (next round's first job, its own `GemmMany` vs
-`Gemv` comparison).
+(`ffn_{gate,up,down}_shexp`), which has no `LayerPlan`. So the kernels compile and dispatch, but there was **no bit-identity claim** until a
+dense fixture existed.
+
+**Update — validated on the RX.** `tests/gemm_many.rs::dense_shared_expert_gemm_matches_the_gemv`
+takes a real `ffn_{gate,up,down}_shexp` tensor of the requested type
+(`BRECCIA_GEMM_TYPE`, **one type per invocation**), runs `GemmMany` at
+`m = USERS_MAX` and compares every user against a single-user `Gemv` on the same
+weights. On the **RX 6950 XT** (headless card, validation on, `timeout 90`):
+
+| type | tensor | worst relative | m = 1 bit-identical | validation |
+|---|---|---:|---|---|
+| IQ4_XS | blk.0.ffn_gate_shexp [640x2560] | **0.000e0** | yes | 0 messages |
+| Q4_K | blk.2.ffn_gate_shexp | **0.000e0** | yes | 0 messages |
+| Q5_K | blk.2.ffn_up_shexp | **0.000e0** | yes | 0 messages |
+| Q6_K | blk.6.ffn_up_shexp | **0.000e0** | yes | 0 messages |
+
+So the four kernels are arithmetically and address-wise correct for this artifact's
+shared-expert geometry — which matters because the 2026-10-26 reboot was attributed
+to them (AGENTS.md incident log). The crash therefore cannot be explained by a wrong
+`BLOCK_WORDS`/`QK`/`DEQUANT_UNIT`: the remaining suspects are (a) the *old test*
+sweeping up to 24 routed-expert cells in one process, i.e. several of these shaders
+in a single invocation, which the AGENTS "one type per invocation" rule exists to
+prevent, and (b) a MI50-specific path (wave64) that only the display card exercises.
+The MI50 run is therefore done one type per process, never as a sweep.
 
 ### 2. The shared-expert T-batch: not wired
 

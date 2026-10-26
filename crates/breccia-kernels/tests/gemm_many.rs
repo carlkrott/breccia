@@ -287,3 +287,123 @@ fn fan_in_matches_moe_combine_and_the_cpu_reference() {
     assert!(worst_t <= 1e-5, "fan-in differs from f64 by {worst_t:.3e}");
     drop(guard);
 }
+
+/// **Dense** (shared-expert) conformance for the multi-user GEMMs, one type per
+/// invocation.
+///
+/// The routed-expert test above walks `LayerPlan`s, and this artifact's routed
+/// experts never use `IQ4_XS`/`Q4_K`/`Q5_K`/`Q6_K` — those four appear on the
+/// **shared** expert (`ffn_{gate,up,down}_shexp`), which has no plan. So the four
+/// kernels §8aa added need this fixture: take the real dense tensor, run the
+/// multi-user GEMM for `m = USERS_MAX`, and compare every user against a
+/// single-user `Gemv` on the same weights.
+///
+/// `BRECCIA_GEMM_TYPE` selects exactly one type (AGENTS.md: one quant type per
+/// invocation, so a fault is attributable). On 2026-10-26 a run of these four
+/// shaders on the **display** GPU (the MI50) hard-reset the machine; the RX is the
+/// headless card and goes first.
+#[test]
+fn dense_shared_expert_gemm_matches_the_gemv() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("dense_gemm: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let Ok(want) = std::env::var("BRECCIA_GEMM_TYPE") else {
+        eprintln!("dense_gemm: SKIPPED - set BRECCIA_GEMM_TYPE=IQ4_XS|Q4_K|Q5_K|Q6_K");
+        return;
+    };
+    let ty = match want.trim().to_ascii_uppercase().as_str() {
+        "IQ4_XS" => QuantType::Iq4Xs,
+        "Q4_K" => QuantType::Q4K,
+        "Q5_K" => QuantType::Q5K,
+        "Q6_K" => QuantType::Q6K,
+        other => {
+            eprintln!("dense_gemm: {other} is not one of the four");
+            return;
+        }
+    };
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else {
+        eprintln!("dense_gemm: no device for {selector}");
+        return;
+    };
+    let set = match ShardSet::open_glob(MODEL_GLOB) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("dense_gemm: no model: {e}");
+            return;
+        }
+    };
+    // Find the first shared-expert tensor of the requested type.
+    let mut found: Option<(String, usize, usize)> = None;
+    'outer: for b in 0..48 {
+        for role in ["gate", "up", "down"] {
+            let name = format!("blk.{b}.ffn_{role}_shexp.weight");
+            let Some(t) = set.tensor(&name) else { continue };
+            if QuantType::from_ggml(t.ty()) != Some(ty) {
+                continue;
+            }
+            found = Some((name, t.ne1() as usize, t.ne0() as usize));
+            break 'outer;
+        }
+    }
+    let Some((name, rows, cols)) = found else {
+        eprintln!("dense_gemm: this artifact has no {want} shared-expert tensor");
+        return;
+    };
+    println!("dense_gemm: {name} [{rows} x {cols}] {}", ty.name());
+    let t = set.tensor(&name).expect("tensor");
+    let gpu = &dev.gpu;
+    let w = breccia_kernels::gemv::upload(gpu, t.as_slice()).expect("upload");
+    let m = USERS_MAX;
+    let xs: Vec<Vec<f32>> = (0..m)
+        .map(|u| {
+            (0..cols)
+                .map(|i| (((i * 7 + u * 13) % 29) as f32 - 14.0) * 0.011)
+                .collect()
+        })
+        .collect();
+    let flat: Vec<f32> = xs.iter().flatten().copied().collect();
+    let x = breccia_kernels::ops::upload_f32(gpu, &flat).expect("x");
+    let out_many = alloc(gpu, (m * rows * 4) as u64).expect("out_many");
+    let many = GemmMany::new(gpu, ty).expect("gemm pipeline");
+    many.run(&w, &x, &out_many, rows, cols, m).expect("gemm");
+    let got = breccia_kernels::ops::download_f32(gpu, &out_many, m * rows).expect("down");
+    let single = Gemv::new(gpu, ty, rows, cols).expect("gemv");
+    let out_ref = alloc(gpu, (rows * 4) as u64).expect("out_ref");
+    let mut worst = 0f64;
+    let mut same_m1 = true;
+    for u in 0..m {
+        let xu = breccia_kernels::ops::upload_f32(gpu, &xs[u]).expect("xu");
+        single.run(&w, &xu, &out_ref).expect("gemv run");
+        let want = breccia_kernels::ops::download_f32(gpu, &out_ref, rows).expect("down ref");
+        for r in 0..rows {
+            let (a, b) = (got[u * rows + r], want[r]);
+            let rel = if b.abs() > 1e-6 {
+                ((a - b).abs() / b.abs()) as f64
+            } else {
+                (a - b).abs() as f64
+            };
+            worst = worst.max(rel);
+            if u == 0 && a.to_bits() != b.to_bits() {
+                same_m1 = false;
+            }
+        }
+        gpu.destroy_buf(&xu);
+    }
+    println!(
+        "dense_gemm: {} worst relative {worst:.3e}, m = 1 bit-identical: {same_m1}",
+        ty.name()
+    );
+    assert!(
+        worst <= 1e-6,
+        "{}: multi-user differs by {worst:.3e}",
+        ty.name()
+    );
+    assert!(same_m1, "{}: m = 1 must be bit-identical", ty.name());
+    gpu.destroy_buf(&out_ref);
+    gpu.destroy_buf(&out_many);
+    gpu.destroy_buf(&x);
+    gpu.destroy_buf(&w);
+    let _ = vk::WHOLE_SIZE;
+}
