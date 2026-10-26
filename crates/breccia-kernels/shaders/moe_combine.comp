@@ -1,0 +1,36 @@
+#version 450
+// Routed-expert combine, on device: `out = sum_j w_j * down_j + shared * sigmoid(g)`
+// — the exact expression the host lane computes today, minus the round trip.
+//
+// Taking the *gate logit* rather than the sigmoid keeps the scalar on the device
+// (`Act::Sigmoid`/`Scale` would need it as a push constant, i.e. on the host).
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer In { float IN[]; };      // [experts * cols]
+layout(std430, binding = 1) readonly buffer Wt { float WEIGHTS[]; }; // [experts]
+layout(std430, binding = 2) readonly buffer Sh { float SH[]; };      // [cols]
+layout(std430, binding = 3) readonly buffer Gl { float GATE[]; };    // [1] gate logit
+layout(std430, binding = 4) writeonly buffer Out { float O[]; };     // [cols]
+
+layout(push_constant) uniform Params {
+    uint experts;
+    uint cols;
+    uint pad0;
+    uint pad1;
+} pc;
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint i = wg * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.cols) {
+        return;
+    }
+    float acc = 0.0;
+    for (uint j = 0u; j < pc.experts; ++j) {
+        acc += WEIGHTS[j] * IN[j * pc.cols + i];
+    }
+    float g = 1.0 / (1.0 + exp(-GATE[0]));
+    O[i] = acc + SH[i] * g;
+}

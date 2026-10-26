@@ -25,6 +25,7 @@ from a run, and the ones taken before each fix are labelled.
 | greedy generation | **yes** — `Sampling::Argmax`, deterministic |
 | parity vs the production HIP server | **MET** — 32/32 greedy tokens, first divergence: none |
 | decode, **dual** (20 RX / 28 MI50 blocks), batching on, 16 threads | **7.42 tok/s** (134.9 ms/token) |
+| GPU-resident experts (`--gpu-experts`) | **off** — 0/32 parity, 6.50 tok/s (§8d) |
 | vs the 20.79 tok/s baseline | **35.7 %** (dual was 29.0 % before this pass) |
 | single-card diagnostic (not a target) | 8.55 tok/s / 117.0 ms |
 | hotspot | **synchronous-dispatch overhead**, not arithmetic — 96 HC_READ calls alone cost 39–53 ms/token |
@@ -463,76 +464,58 @@ single item and the only one that does not depend on which GPU runs.
   the next token's expert pages during the current block's GPU phase (`docs/phase-3/08`
   §7 item 5).
 
-## 8d. GPU-resident expert blocks (the M3 lever): budgeted, not built
+## 8d. GPU-resident expert blocks: device-side indirection landed, **numerically wrong, off by default**
 
-The production HIP configuration keeps 13 blocks' expert tensors in VRAM
-(`-ot 'blk\.(0|1|2|4|8|18|20|22|23|24|35)\.ffn_(up|down|gate)_exps\.'`). The
-prototype was **not** built in this pass (budget); here is the measured budget it
-would be judged against, so the next pass starts from numbers:
+The host-free MoE path exists and runs, and it is **not correct yet** — stated
+plainly, because the numbers are unambiguous:
 
-* one block's top-10 routed experts ≈ **15 MiB** of weights per token (blob
-  bytes/512 × 10, `docs/specs/model-artifacts-inventory.md` §4.2), so 13 blocks ≈
-  195 MiB/token leave the host lane;
-* the host lane costs **0.76 ms per block** (36.6 ms / 48), so those 13 blocks
-  cost **~9.9 ms/token** today;
-* the same bytes through the *batched* GPU expert GEMV cost ~0.2 ms on the RX at
-  the 250–448 GB/s `docs/phase-3/02` measured for the 6 400-row shape, i.e.
-  **~2.6 ms**, so the expected saving is **≈ 7 ms/token (−5.5 %)**;
-* VRAM: block expert tensors are 0.86–1.13 GiB each (512 experts), so 13 blocks
-  ≈ **11 GiB** — it fits beside the 3.8 GiB dense set only by spreading (9 blocks
-  on the RX, 2 on the MI50), exactly as production does;
-* the path itself is `GemvBatch` with `map_for_blobs` over the 10 selected
-  experts' word offsets — the kernel and the indirection already exist
-  (`docs/phase-3/02` §2), so this is placement + upload + a per-block branch, not
-  new arithmetic. Numerical expectation: the same decode path that conformance
-  holds to 1e-7 against the CPU reference, so ≤1e-5 vs the host lane is the
-  expected outcome, not the risk.
+| | flag off (host lane) | `--gpu-experts 0,1,2,4,8,18,20,22,23,24,35` |
+|---|---|---|
+| dual tok/s (20/28 split, 16 threads) | **7.42** (134.9 ms) | 6.50 (154.0 ms) |
+| greedy parity vs the server | **32/32** | **0/32** (`16, 15, 25, 18, 15, …`) |
+| logits vs the host path (top-15 ids) | — | max \|Δ\| **1.38**, mean **0.50** |
+| VRAM arena | — | **9 913 MiB** (11 blocks, 512 experts each) |
+| per-card fence wait (per token) | 0.95 : 1 (RX : MI50) | 34.3 ms : 39.6 ms |
 
-## 8e. Synchronisation restructure: what the mailbox bought
+It is **slower as well as wrong**, so there is no trade-off to weigh: the flag
+stays **off** and no number in this report depends on it.
 
-| item | before | after |
-|---|---:|---:|
-| round trips per block | 4 | **2** (3 on QSA blocks, whose workspace must not straddle a batch) |
-| submissions per token | 192 + 96 = ~290 | **~110** |
-| `xfer-up` | 3.24 ms | **0.64 ms** |
-| `hc-write(ffn)` | 6.78 ms | **1.19 ms** |
-| token (single-card diagnostic) | 126.3 ms | **117.0 ms** (−9.3) |
+### What was built (and is worth keeping)
 
-**Multi-block in flight (K > 1) is not available in this graph, and that is a
-structural fact, not a missing feature.** The dependency chain per block is
-`R → HC_READ → mixer → HC_WRITE → HC_READ → router → experts → HC_WRITE → R`, and
-the expert step needs the router's ids *and* `mixed` on the host. Block *n+1*'s
-HC_READ therefore cannot start before block *n*'s MoE result is back. There is no
-K to sweep: the only independent work is block *n*'s own ffn `HC_WRITE` against
-block *n+1*'s phase A, and that is exactly the merge implemented above (K = 2
-phases, one submission). The K-curve is therefore **K=1 → 4 round trips, K=2 →
-2 round trips (measured −9.3 ms), K>2 → no further merge exists**. The way past
-this is to remove the host from the MoE loop (§8d), which makes a block fully
-device-resident and lets several blocks be in flight.
+* `shaders/moe_map.comp` + `breccia_kernels::MoeMap` — the router's top-k ids
+  never leave VRAM: one dispatch turns `ids` into the exact `GemvBatch` row map
+  (`map[row] = base_words + ids[j]·blob_words`, `map[rows+row] = j·stride`), which
+  removes the host-built 200 KiB map upload and the id readback that were the
+  stated blocker.
+* `shaders/moe_combine.comp` + `MoeCombine` — `out = Σ_j w_j·down_j +
+  shared·sigmoid(gate)` on device, taking the gate *logit* so the scalar never
+  needs to be a push constant.
+* `Placement`/`LoadOptions::gpu_experts` + `PlacedExperts`: the whole 512-expert
+  role tensor per placed block, in VRAM, on the device that owns the block
+  (`-ot`-equivalent), so expert `id` is at `id·blob_words` with no bookkeeping.
+* A block whose experts are resident now executes **without a single host round
+  trip**, and consecutive placed blocks ride one submission: `dispatch_batch`
+  grew a soft limit (200 dispatches) because a batch can now span several blocks
+  instead of one phase.
 
-## 8f. Graph replay: per-block is where it stops
+### Suspects, in the order the next pass should check them
 
-The analogue of CUDA graphs here is a pre-recorded command buffer per block,
-replayed with `vkQueueSubmit` only. Feasibility, from the code:
+1. **`blob_words` units** in `MoeMap`: `GemvBatch::map_for_blobs` uses `blob_words
+   = blob_bytes/2` (u16 words) for the block base and `padded_cols/4` (vec4) for
+   the activation base. If either is off by a factor, the arena is read at the
+   wrong expert — plausible numbers, wrong model, which is exactly the signature.
+2. **`up` reuses the gate map.** Valid only when `ffn_gate_exps` and
+   `ffn_up_exps` have the same type *and* blob size for that block. True for this
+   artifact's per-block table, but unchecked in code — add an assertion and a
+   second map when they differ.
+3. **`moe_combine`'s weight order**: `router_w` is in the router's descending
+   order and the down rows are ordered by `ids[j]`; any disagreement re-weights
+   the experts. Compare the combine's output against `pool.moe_topk` for a single
+   block before touching anything else.
 
-* **Descriptor sets are already fixed** (buffers do not move), and the batch
-  allocates them once — so a recorded block's sets can be kept alive in one pool
-  per block. That part works.
-* **GDN blocks (36 of 48) are replayable today**: their push constants are
-  shape-only, and their state lives in fixed buffers.
-* **QSA blocks are not**: `pos0` is a push constant (baked into the recorded
-  command buffer), so a replay would need one recorded buffer per (block,
-  position) — 12 × 256 pairs at the current window. The fix is a device-side
-  position indirection (the rope table already holds `pos[i] = i`; the kernel
-  reads `positions[pos_base + row]`, so zeroing `pos_base` and advancing a
-  device-side base would make the record position-independent). That is a shader
-  change with a conformance implication, so it is specified rather than done.
-* **A full-token replay** additionally needs the QSA workspace hoisted out of the
-  per-token allocation (it rotates today) — the same first step as §8d.
-
-Expected: a replayed GDN block removes the ~29 `vkCmd*` recordings (~18.7 ms of
-`mixer` recording + the graph's own recording) but not the fence, so the ceiling
-is the ~19 ms of recording, not the wait.
+Note the arena is 9.9 GiB for 11 blocks, so on a 20/28 split the RX carries 9 of
+them (~8.6 GiB) beside 1.3 GiB of dense weights — it fits, but a larger placed set
+does not.
 
 ## 9. Exact commands
 

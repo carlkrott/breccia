@@ -176,6 +176,16 @@ pub struct Venue<'m> {
     pub ple_value_out: Buf,
     pub ple_emb: Buf,
     pub logits: Option<Buf>,
+    /// Device-resident MoE scratch (`--gpu-experts`): `[k, n_ff]` gate/up/act,
+    /// `[k, n_embd]` down, and the two row maps the device fills in.
+    pub moe_gate: Buf,
+    pub moe_up: Buf,
+    pub moe_act: Buf,
+    pub moe_down: Buf,
+    pub moe_map_gate: Buf,
+    pub moe_map_down: Buf,
+    pub moe_map: breccia_kernels::MoeMap<'m>,
+    pub moe_combine: breccia_kernels::MoeCombine<'m>,
     pub name: String,
 }
 
@@ -238,6 +248,9 @@ pub struct Session<'m> {
     pub dev_down: Vec<u64>,
     pub dev_up: Vec<u64>,
     pub dev_blocks: Vec<usize>,
+    /// Blocks whose experts ran on a device this run (for the report).
+    pub placed_blocks: usize,
+    pub host_blocks: usize,
 }
 
 impl<'m> Session<'m> {
@@ -316,6 +329,19 @@ impl<'m> Session<'m> {
             } else {
                 None
             };
+            // Device-resident MoE scratch (unused unless `--gpu-experts` places a
+            // block on this device, but allocated once so the path has no
+            // per-token allocation).
+            let k = mc.n_expert_used;
+            let ff = mc.n_ff;
+            let moe_gate = alloc((k * ff) as u64 * 4, "moe gate")?;
+            let moe_up = alloc((k * ff) as u64 * 4, "moe up")?;
+            let moe_act = alloc((k * ff) as u64 * 4, "moe act")?;
+            let moe_down = alloc((k * mc.n_embd) as u64 * 4, "moe down")?;
+            let moe_map_gate = alloc((2 * k * ff) as u64 * 4, "moe map gate")?;
+            let moe_map_down = alloc((2 * k * mc.n_embd) as u64 * 4, "moe map down")?;
+            let moe_map = breccia_kernels::MoeMap::new(gpu)?;
+            let moe_combine = breccia_kernels::MoeCombine::new(gpu)?;
             venues.push(Venue {
                 pipes,
                 hc,
@@ -342,6 +368,14 @@ impl<'m> Session<'m> {
                 ple_value_out,
                 ple_emb,
                 logits,
+                moe_gate,
+                moe_up,
+                moe_act,
+                moe_down,
+                moe_map_gate,
+                moe_map_down,
+                moe_map,
+                moe_combine,
                 name: dev.info.name.clone(),
             });
         }
@@ -407,6 +441,8 @@ impl<'m> Session<'m> {
             dev_wait_s: vec![0.0; model.devices.len()],
             dev_down: vec![0; model.devices.len()],
             dev_up: vec![0; model.devices.len()],
+            placed_blocks: model.placed.len(),
+            host_blocks: model.cfg.n_layers - model.placed.len(),
             dev_blocks: {
                 let mut v = vec![0usize; model.devices.len()];
                 for b in 0..model.cfg.n_layers {
@@ -439,7 +475,14 @@ impl<'m> Session<'m> {
             return Ok(());
         }
         if self.pending_batch == Some(dev) {
-            return Ok(());
+            // A batch that has grown past the soft limit is closed and reopened:
+            // it keeps the descriptor pool bounded and lets the driver start the
+            // work we have already recorded.
+            if batch_cmd::recorded() >= batch_cmd::SOFT_LIMIT {
+                self.flush()?;
+            } else {
+                return Ok(());
+            }
         }
         self.flush()?;
         batch_cmd::begin(self.model.devices[dev].gpu())
@@ -505,6 +548,12 @@ impl<'m> Session<'m> {
                 &v.ple_key_out,
                 &v.ple_value_out,
                 &v.ple_emb,
+                &v.moe_gate,
+                &v.moe_up,
+                &v.moe_act,
+                &v.moe_down,
+                &v.moe_map_gate,
+                &v.moe_map_down,
             ] {
                 total += b.size;
             }
@@ -737,6 +786,51 @@ impl<'m> Session<'m> {
             )?;
         }
 
+        // ---- a block whose experts are resident: no host, no readback --------
+        if let Some(pe) = m.placed.get(&b) {
+            self.timers.mark(EXPERTS);
+            self.run_placed_moe(b, dev, pe, mc.n_embd, mc.n_ff, mc.n_expert_used)?;
+            let moe_out = if trace.is_some() {
+                Some(Checksum::of(&[0.0f32; 0], 0))
+            } else {
+                None
+            };
+            self.timers.mark(HC_WRITE_F);
+            self.ensure_batch(dev)?;
+            {
+                let v = &self.venues[dev];
+                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                v.hc.write(ws, &v.r, &v.block_out.buf, &v.r)?;
+            }
+            if let Some(t) = trace.as_mut() {
+                let residual = self.checksum(dev, BufKind::R, mc.hc_dim())?;
+                let gdn = if m.layers[b].kind == LayerKind::Gdn {
+                    Some(self.gdn_trace(dev)?)
+                } else {
+                    None
+                };
+                t.push(LayerTrace {
+                    block: b,
+                    kind: match m.layers[b].kind {
+                        LayerKind::Gdn => "gdn".to_string(),
+                        LayerKind::Qsa => "qsa".to_string(),
+                    },
+                    device: dev,
+                    residual,
+                    mixed_attn: mixed_attn.unwrap_or_default(),
+                    mixed_ffn: mixed_ffn.unwrap_or_default(),
+                    mixer_out: mixer_out.unwrap_or_default(),
+                    moe_out: moe_out.unwrap_or_default(),
+                    router_ids: Vec::new(),
+                    router_weights: Vec::new(),
+                    ple_gate: None,
+                    ple_conv: None,
+                    gdn,
+                });
+            }
+            return Ok(());
+        }
+
         // ---- one readback: mixed, ids, weights, shared out, shared gate ------
         self.timers.mark(XFER_DOWN);
         self.flush()?;
@@ -829,6 +923,76 @@ impl<'m> Session<'m> {
                 gdn,
             });
         }
+        Ok(())
+    }
+
+    /// One block's MoE, entirely on the device: ids→map, gate/up/SwiGLU, down,
+    /// combine (routed + shared·sigmoid(gate)) into `block_out`.
+    ///
+    /// Nothing here touches the host: the router's ids and weights are read by
+    /// shaders straight out of their buffers, and the result lands in the
+    /// `block_out` the next recorded dispatch already reads.
+    fn run_placed_moe(
+        &mut self,
+        b: usize,
+        dev: usize,
+        pe: &crate::model::PlacedExperts,
+        n_embd: usize,
+        n_ff: usize,
+        k: usize,
+    ) -> Result<()> {
+        let bpr_gate = pe.gate.key.cols.div_ceil(pe.gate.key.ty.block_elems());
+        let blob_gate = (pe.gate.key.rows * bpr_gate * pe.gate.key.ty.block_bytes() / 2) as u32;
+        let bpr_down = pe.down.key.cols.div_ceil(pe.down.key.ty.block_elems());
+        let blob_down = (pe.down.key.rows * bpr_down * pe.down.key.ty.block_bytes() / 2) as u32;
+        let v = &self.venues[dev];
+        // gate / up: every expert reads the same `mixed`
+        v.moe_map
+            .run(&v.router_ids, &v.moe_map_gate, k, n_ff, blob_gate, 0, 0)?;
+        let pipes = &v.pipes;
+        pipes.batch(&pe.gate.key)?.run(
+            &pe.gate.buf,
+            &v.hc_ws.as_ref().expect("hc ws").mixed,
+            &v.moe_gate,
+            &v.moe_map_gate,
+            k,
+        )?;
+        pipes.batch(&pe.up.key)?.run(
+            &pe.up.buf,
+            &v.hc_ws.as_ref().expect("hc ws").mixed,
+            &v.moe_up,
+            &v.moe_map_gate,
+            k,
+        )?;
+        v.swiglu.run(&v.moe_gate, &v.moe_up, &v.moe_act, k * n_ff)?;
+        // down: one activation row per expert, so the map carries the stride
+        let pe_pc4 = (n_ff.div_ceil(32) * 32 / 4) as u32;
+        v.moe_map.run(
+            &v.router_ids,
+            &v.moe_map_down,
+            k,
+            n_embd,
+            blob_down,
+            0,
+            pe_pc4,
+        )?;
+        pipes.batch(&pe.down.key)?.run(
+            &pe.down.buf,
+            &v.moe_act,
+            &v.moe_down,
+            &v.moe_map_down,
+            k,
+        )?;
+        v.moe_combine.run(
+            &v.moe_down,
+            &v.router_w,
+            &v.sh,
+            &v.sh_gate_logit,
+            &v.block_out.buf,
+            k,
+            n_embd,
+        )?;
+        let _ = b;
         Ok(())
     }
 
@@ -1181,6 +1345,12 @@ impl Drop for Session<'_> {
                 &v.ple_key_out,
                 &v.ple_value_out,
                 &v.ple_emb,
+                &v.moe_gate,
+                &v.moe_up,
+                &v.moe_act,
+                &v.moe_down,
+                &v.moe_map_gate,
+                &v.moe_map_down,
             ] {
                 gpu.destroy_buf(b);
             }

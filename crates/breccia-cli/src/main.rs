@@ -257,6 +257,11 @@ enum BenchKind {
         /// balance the dense weight bytes across the devices.
         #[arg(long, value_name = "N[,N]")]
         split_blocks: Option<String>,
+        /// Blocks whose routed experts live in VRAM (`-ot`-equivalent), each on
+        /// the device that owns the block. Production mapping:
+        /// `0,1,2,4,8,18,20,22,23,24,35`
+        #[arg(long, value_name = "N[,N]")]
+        gpu_experts: Option<String>,
     },
 }
 fn main() {
@@ -402,6 +407,7 @@ fn run(cli: Cli) -> Result<()> {
                     top_logits,
                     batching,
                     split_blocks,
+                    gpu_experts,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -420,6 +426,7 @@ fn run(cli: Cli) -> Result<()> {
             top_logits,
             batching,
             split_blocks,
+            gpu_experts,
         }),
     }
 }
@@ -1395,6 +1402,7 @@ struct TokenArgs {
     top_logits: usize,
     batching: bool,
     split_blocks: Option<String>,
+    gpu_experts: Option<String>,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1460,6 +1468,15 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                     .filter_map(|t| t.trim().parse::<usize>().ok())
                     .collect()
             }),
+            gpu_experts: a
+                .gpu_experts
+                .as_ref()
+                .map(|s| {
+                    s.split(',')
+                        .filter_map(|t| t.trim().parse::<usize>().ok())
+                        .collect()
+                })
+                .unwrap_or_default(),
             verbose: true,
         },
     )
@@ -1714,6 +1731,17 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         debug_layers: traces,
         notes,
     };
+    println!(
+        "\nexperts  {} block(s) on device ({:.0} MiB arena), {} on the host lane",
+        sess.placed_blocks,
+        model
+            .placed
+            .values()
+            .map(|p| p.gate.buf.size + p.up.buf.size + p.down.buf.size)
+            .sum::<u64>() as f64
+            / (1 << 20) as f64,
+        sess.host_blocks
+    );
     println!("\nper device (per generated token):");
     for line in sess.per_device(forwards / runs_n.max(1.0).floor() as usize) {
         println!("  {line}");

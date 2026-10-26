@@ -103,6 +103,9 @@ const SHADERS: &[&str] = &[
     "qsa_topk",
     "qsa_attn_scores",
     "qsa_attn_apply",
+    // Host-free MoE: device-side expert indirection + the routed combine.
+    "moe_map",
+    "moe_combine",
 ];
 
 fn main() {

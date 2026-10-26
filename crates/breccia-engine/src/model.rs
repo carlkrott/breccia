@@ -54,6 +54,25 @@ impl PipeKey {
     }
 }
 
+/// One block's routed experts, resident in VRAM (`-ot`-equivalent).
+///
+/// The whole role tensor is uploaded — all 512 experts — exactly as the
+/// production HIP config does with `-ot 'blk\.N\.ffn_(up|down|gate)_exps\.=ROCmM'`,
+/// so expert `id` sits at `id * blob_words` with no per-block bookkeeping.
+pub struct PlacedExperts {
+    pub block: usize,
+    pub device: usize,
+    pub gate: W,
+    pub up: W,
+    pub down: W,
+}
+
+impl PlacedExperts {
+    fn bytes(&self) -> u64 {
+        self.gate.buf.size + self.up.buf.size + self.down.buf.size
+    }
+}
+
 /// A projection weight plus the pipeline shape it needs.
 pub struct W {
     pub buf: Buf,
@@ -254,6 +273,8 @@ pub struct Model {
     pub out_hc_down: W,
     pub out_hc_up: W,
     pub ple: Option<PleRaw>,
+    /// Blocks whose routed experts live in VRAM, keyed by block.
+    pub placed: std::collections::BTreeMap<usize, PlacedExperts>,
     pub stats: LoadStats,
     /// Distinct pipelines the graph will need, discovered at load.
     pub keys: BTreeSet<PipeKey>,
@@ -269,6 +290,9 @@ pub struct LoadOptions {
     /// Explicit block counts per device (`--split-blocks 21,27`). `None` = balance
     /// the dense bytes evenly.
     pub blocks: Option<Vec<usize>>,
+    /// Blocks whose experts go to VRAM (`--gpu-experts 0,1,2,4,8,18,20,22,23,24,35`),
+    /// each on the device that owns the block.
+    pub gpu_experts: Vec<usize>,
     pub verbose: bool,
 }
 
@@ -278,6 +302,7 @@ impl Default for LoadOptions {
             devices: Vec::new(),
             ctx_capacity: 256,
             blocks: None,
+            gpu_experts: Vec::new(),
             verbose: true,
         }
     }
@@ -515,6 +540,34 @@ impl Model {
             Some(pr)
         };
 
+        // --- routed experts that live in VRAM (`-ot`) -------------------------
+        let mut placed = std::collections::BTreeMap::new();
+        for &b in &opts.gpu_experts {
+            if b >= cfg.n_layers {
+                bail!("--gpu-experts lists block {b} of {}", cfg.n_layers);
+            }
+            let dev = placement.device_of(b);
+            let gpu = devices[dev].gpu();
+            let t0 = std::time::Instant::now();
+            let gate = w(gpu, &shards, &format!("blk.{b}.ffn_gate_exps.weight"))?;
+            let up = w(gpu, &shards, &format!("blk.{b}.ffn_up_exps.weight"))?;
+            let down = w(gpu, &shards, &format!("blk.{b}.ffn_down_exps.weight"))?;
+            keys.insert(gate.key);
+            keys.insert(up.key);
+            keys.insert(down.key);
+            per_device_upload[dev] += t0.elapsed().as_secs_f64();
+            placed.insert(
+                b,
+                PlacedExperts {
+                    block: b,
+                    device: dev,
+                    gate,
+                    up,
+                    down,
+                },
+            );
+        }
+
         let upload_seconds: f64 = per_device_upload.iter().sum();
         let dense_bytes: u64 = layers.iter().map(|l| l.bytes).sum::<u64>()
             + out_hc_norm.size
@@ -584,6 +637,16 @@ impl Model {
                 upload_seconds: per_device_upload[i],
             });
         }
+        for (dev, pe) in &placed {
+            let _ = dev;
+            plan.push(format!(
+                "expert  blk.{:<2} -> device {}  arena {:>5} MiB (512 experts, {})",
+                pe.block,
+                pe.device,
+                pe.bytes() >> 20,
+                pe.gate.key.ty.name()
+            ));
+        }
         plan.push(format!(
             "host    experts {} MiB mmap (demand-paged, top-{} of {} per block) + PLE {} MiB lazy \
              + token_embd {} MiB staged",
@@ -623,6 +686,7 @@ impl Model {
             out_hc_down,
             out_hc_up,
             ple,
+            placed,
             stats,
             keys,
         })
@@ -677,6 +741,12 @@ impl Drop for Model {
                 gpu.destroy_buf(&w.buf);
             }
         }
+        for pe in self.placed.values() {
+            let gpu = self.devices[pe.device].gpu();
+            for w in [&pe.gate, &pe.up, &pe.down] {
+                gpu.destroy_buf(&w.buf);
+            }
+        }
         if let Some(p) = &self.ple {
             let dev = self.placement.device_of(self.cfg.ple.layers[0]);
             let gpu = self.devices[dev].gpu();
@@ -689,6 +759,7 @@ impl Drop for Model {
 /// Every compiled projection pipeline of one device, keyed by shape.
 pub struct PipelineSet<'g> {
     map: std::collections::BTreeMap<PipeKey, Gemv<'g>>,
+    batch: std::collections::BTreeMap<PipeKey, breccia_kernels::GemvBatch<'g>>,
 }
 
 impl<'g> PipelineSet<'g> {
@@ -706,7 +777,41 @@ impl<'g> PipelineSet<'g> {
             })?;
             map.insert(*k, g);
         }
-        Ok(PipelineSet { map })
+        // The batched form is only needed for expert roles, and only for the
+        // blocks that are resident; the caller registers those keys, so compile
+        // a batch for every key that is one of the model's expert shapes.
+        let mut batch = std::collections::BTreeMap::new();
+        for k in keys {
+            let is_expert_role =
+                (k.rows == 640 && k.cols == 2560) || (k.rows == 2560 && k.cols == 640);
+            if !is_expert_role {
+                continue;
+            }
+            batch.insert(
+                *k,
+                breccia_kernels::GemvBatch::new(gpu, k.ty, k.rows, k.cols).with_context(|| {
+                    format!(
+                        "compiling the batched {} {}x{} expert pipeline",
+                        k.ty.name(),
+                        k.rows,
+                        k.cols
+                    )
+                })?,
+            );
+        }
+        Ok(PipelineSet { map, batch })
+    }
+
+    /// The batched (multi-expert) pipeline for an expert role shape.
+    pub fn batch(&self, k: &PipeKey) -> Result<&breccia_kernels::GemvBatch<'g>> {
+        self.batch.get(k).ok_or_else(|| {
+            anyhow!(
+                "no batched expert pipeline for {} {}x{}",
+                k.ty.name(),
+                k.rows,
+                k.cols
+            )
+        })
     }
 
     pub fn get(&self, k: &PipeKey) -> Result<&Gemv<'g>> {

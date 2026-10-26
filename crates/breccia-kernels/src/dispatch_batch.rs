@@ -52,10 +52,16 @@ thread_local! {
     static POOL: Cell<vk::DescriptorPool> = const { Cell::new(vk::DescriptorPool::null()) };
 }
 
-/// Sets a batch budgets for (the biggest phase here is ~35 dispatches).
-const MAX_SETS: u32 = 64;
+/// Sets a batch budgets for. A batch no longer holds one block: with the experts
+/// resident the MoE phase needs no host round trip, so consecutive blocks ride
+/// the same submission until the engine flushes (`docs/phase-4` §8g). 256 sets is
+/// a bounded, predictable budget; the engine also flushes well before it.
+pub const MAX_SETS: u32 = 256;
 /// Storage bindings per set (the widest kernel in this crate declares 5).
 const MAX_BINDINGS: u32 = 8;
+
+/// Dispatches after which the engine should flush and start a new batch.
+pub const SOFT_LIMIT: u32 = 200;
 
 /// Is a batch open on this thread?
 pub fn is_open() -> bool {
