@@ -72,6 +72,63 @@ pub struct Placement {
 }
 
 impl Placement {
+    /// Explicit plan: `counts[i]` blocks on device `i`, in order. The last
+    /// device also carries the tail (head + final mixer).
+    ///
+    /// This is what `--split-blocks` drives: the balanced split assumes the two
+    /// cards are equally good at the *graph*, and on this host they are not (the
+    /// MI50's synchronous-dispatch round trip is ~36 µs, the RX's ~64 µs), so the
+    /// balance is a measurement, not an arithmetic mean of the dense bytes.
+    pub fn explicit(
+        devices: Vec<DeviceSpec>,
+        layer_bytes: &[u64],
+        tail_bytes: u64,
+        counts: &[usize],
+    ) -> Result<Self> {
+        let n = layer_bytes.len();
+        if devices.len() != counts.len() {
+            bail!(
+                "{} devices but {} block counts",
+                devices.len(),
+                counts.len()
+            );
+        }
+        if counts.iter().sum::<usize>() != n {
+            bail!(
+                "block counts {counts:?} sum to {}, but the model has {n} blocks",
+                counts.iter().sum::<usize>()
+            );
+        }
+        let mut layer_device = vec![0usize; n];
+        let mut bytes = vec![0u64; devices.len()];
+        let mut runs = Vec::new();
+        let mut at = 0usize;
+        for (dev, &c) in counts.iter().enumerate() {
+            let end = at + c;
+            for (b, slot) in layer_device.iter_mut().enumerate().take(end).skip(at) {
+                *slot = dev;
+                bytes[dev] += layer_bytes[b];
+            }
+            let mut run_bytes = bytes[dev];
+            if dev + 1 == devices.len() {
+                run_bytes += tail_bytes;
+                bytes[dev] = run_bytes;
+            }
+            runs.push(LayerRun {
+                device: dev,
+                blocks: (at, end),
+                bytes: run_bytes,
+            });
+            at = end;
+        }
+        Ok(Placement {
+            devices,
+            layer_device,
+            bytes,
+            runs,
+        })
+    }
+
     /// Single-device plan: everything on device 0.
     pub fn single(dev: DeviceSpec, layer_bytes: &[u64]) -> Self {
         let total: u64 = layer_bytes.iter().sum();

@@ -24,9 +24,9 @@ from a run, and the ones taken before each fix are labelled.
 | first end-to-end token | **yes** — 248 320 finite logits, repeat bit-identical, top-1 stable |
 | greedy generation | **yes** — `Sampling::Argmax`, deterministic |
 | parity vs the production HIP server | **MET** — 32/32 greedy tokens, first divergence: none |
-| decode, MI50-only, batching on, 3×32 warm | **6.74 tok/s** (148.3 ms/token) |
-| decode, MI50-only, batching on, 16 host threads | **6.55 tok/s** (152.8 ms) — see §9 |
-| vs the 20.79 tok/s baseline | **32.4 %** (24.6 % without batching) |
+| decode, MI50-only, batching on, 16 host threads | **7.92 tok/s** (126.3 ms/token) |
+| vs the 20.79 tok/s baseline | **38.1 %** (24.6 % before batching, 28.0 % with batching alone) |
+| best dual configuration | **0 blocks on the RX** — see §5.3 |
 | hotspot | **synchronous-dispatch overhead**, not arithmetic — 96 HC_READ calls alone cost 39–53 ms/token |
 
 ---
@@ -202,9 +202,49 @@ under `timeout`, engine only (the parity server is stopped).
 | RX-only | **on** | **5.30** | **188.6** | **25.5 %** | **−65.6 ms** |
 | dual `0000:03:00.0,0000:0e:00.0` | off | 4.62 | 216.6 | 22.2 % | |
 | dual | **on** | **6.03** | **165.9** | **29.0 %** | **−50.6 ms** |
-| MI50-only, 16 host threads | on | 6.55 | 152.8 | 31.5 % | −42.5 |
+| MI50-only, 8 host threads | on | 6.74 | 148.3 | 32.4 % | −47.0 |
+| **MI50-only, 16 host threads** | **on** | **7.92** | **126.3** | **38.1 %** | −69.0 |
+| MI50-only, 16 host threads | off | 6.43 | 155.5 | 30.9 % | |
 
-Against the plan's target (−40 ms MI50 / −70 ms RX): **MI50 119 %, RX 94 %**.
+Against the plan's target (−40 ms MI50 / −70 ms RX): **batching alone 119 % on the
+MI50 and 94 % on the RX; batching + 16 threads −69.0 ms (−36 %) on the MI50.**
+(The 16-thread rows were measured with the CLI's `--batching` default fixed — the
+first sweep through the thread curve had the flag overridden to `false`, which is
+why the earlier note said 152.8 ms for what is really the batching-*off* 16-thread
+cell.)
+
+### 5.3 Dual-GPU: the balance is the wrong lever (measured)
+
+`--split-blocks` makes the block assignment explicit. Warm cache, 3×32, batching
+on, 16 threads, same prompt; **all four configurations generate the same 32
+tokens (32/32 vs the server, bit-identical to each other)**:
+
+| config (RX blocks, MI50 blocks) | tok/s | ms/token | vs 20.79 | inferred cost per block |
+|---|---:|---:|---:|---|
+| MI50-only (single device) | 6.43 | 155.5 | 30.9 % | 3.24 ms (MI50) |
+| **0, 48** (dual plan, all on the MI50) | **6.49** | **154.1** | **31.2 %** | 3.24 ms |
+| 21, 27 | 5.30 | 188.6 | 25.5 % | 4.80 ms (RX) |
+| 27, 21 (the old default) | 5.03 | 199.0 | 24.2 % | 4.80 ms |
+| **0, 48 + batching + 16 threads** | **7.84** | **127.5** | 37.7 % | — |
+
+Two things fall out:
+
+1. **An RX block costs ~1.48× an MI50 block** (4.80 vs 3.24 ms). The model is
+   consistent across the splits: 21×3.24 + 27×4.80 = 198 ms ≈ the measured 199.
+2. **Every split is worse than putting everything on the faster card**, and the
+   `0, 48` control shows the dual *plan* costs nothing when the RX is idle
+   (154.1 vs 155.5 ms) — so the loss is entirely the work placed on the RX plus
+   the PCIe hand-off of the 40 KiB residual stack.
+
+**Recommendation:** for this graph, place **all 48 blocks on the MI50** and leave
+the RX available but idle (`--devices 0000:03:00.0,0000:0e:00.0 --split-blocks 0,48`,
+or simply `--devices 0000:0e:00.0`). The RX wins only if its per-block cost drops
+below the MI50's — it is currently 1.48× worse, so it needs **≥ 32 % off** its
+per-dispatch round trip (or a graph where the weights, not the dispatch count,
+dominate: they do not, dense is 3.2 GiB). The concrete route is the same one that
+made batching pay: fewer submissions per block, i.e. arena/workspace hoisting and
+a fused HC read, plus checking RADV's per-submit cost on the display card (64 µs
+vs the MI50's 36 µs, measured on an idle desktop).
 
 **Parity invariant.** All six configurations generate the *same* 32 tokens, and
 they are the server's 32 (32/32 each). Batching changes timing, not arithmetic.
@@ -357,7 +397,38 @@ phase completes at the *fence*, so it is charged to the stage after it
 with batching on: the same work, attributed to the wait instead of to the
 dispatches. The totals are the honest number.
 
-## 8b. Next hotspot: the host expert lane
+## 8b. Next hotspot, measured after batching (MI50, batching on, 16 threads, 126.3 ms)
+
+| item | ms/token | share | what it is |
+|---|---:|---:|---|
+| block fence wait (`xfer-down`) | **42.4** | 33.7 % | the GPU half of all 48 blocks, charged to the phase's fence |
+| `experts(host)` | **36.6** | 29.0 % | the AVX2 lane, 799 MiB of expert reads |
+| `mixer` (record) | 18.7 | 14.9 % | 36 GDN + 12 QSA sublayers, ~20 dispatches each |
+| `head` | 7.3 | 5.8 % | 248 320 × 2560 Q5_K GEMV |
+| `hc-write(ffn)` | 6.8 | 5.4 % | one HC write per block + its submit |
+
+The three biggest are therefore: **the block's GPU time (42 ms), the host expert
+lane (37 ms), and the mixer's dispatches (19 ms of recording + their share of the
+42 ms)**. Two levers, in order of value per unit of risk:
+
+1. **Host-visible `block_out` (plan, not implemented — budget).** With batching,
+   the MoE result still goes up through `Staging::write`, i.e. one
+   record+submit+wait per block: 48 × 161–193 µs = **7.7–9.3 ms/token**. Making
+   `block_out` a permanently-mapped `HOST_VISIBLE|HOST_COHERENT` buffer turns the
+   upload into a `memcpy` (`vkQueueSubmit` is already a host-write barrier for
+   coherent memory, and the ffn `HC_WRITE` is the next submit), removing that
+   round trip. The same trick applies to `router_ids`, `router_w`, `sh` and
+   `sh_gate` on the readback side, but not to `mixed` — five kernels read it, so
+   it must stay device-local.
+2. **A fused HC_READ (shader work, not implemented).** The HC path is 96 phases ×
+   5 dispatches = **480 of the ~1 200 recorded dispatches per token**, and
+   `docs/phase-3/04` §7.2 already lists the fold: `norm` + `down` in one dispatch
+   removes 96 dispatches and hides the `down` GEMV's under-filled grid
+   (22.75 µs for 6.29 MiB on the RX). Expected 3–6 ms; it needs a new shader and
+   a conformance case, which is kernel work with real risk, so it is scheduled
+   rather than done.
+
+## 8c. Next hotspot: the host expert lane
 
 Post-batching MI50 breakdown (148.3 ms): the host expert lane is the largest
 single item and the only one that does not depend on which GPU runs.
@@ -390,12 +461,35 @@ single item and the only one that does not depend on which GPU runs.
   `#[target_feature(enable = "avx512vNNI")]` subset that is stable for all of
   these), and would buy ~4–9 ms of a 152 ms token. The structural lever is
   better: fewer expert bytes per token.
-* **What actually moves this**: (a) `--threads 16`, +0.8 tok/s; (b) the `-ot`
-  parity we do not implement — put *some* blocks' experts in VRAM, which removes
-  their host reads entirely (this is where the production engine's 13.6 GB
-  placement gets its speed); (c) fold the SwiGLU into the gate/up shard walk (it
-  already is, in the pool) and prefetch the next token's expert pages during the
-  GPU half of the current block. (a) is free and is in this report; (b) is M3.
+* **What actually moves this**: (a) `--threads 16`, +1.5 tok/s — done and
+  recommended; (b) the `-ot` parity we do not implement (§8d); (c) prefetching
+  the next token's expert pages during the current block's GPU phase (`docs/phase-3/08`
+  §7 item 5).
+
+## 8d. GPU-resident expert blocks (the M3 lever): budgeted, not built
+
+The production HIP configuration keeps 13 blocks' expert tensors in VRAM
+(`-ot 'blk\.(0|1|2|4|8|18|20|22|23|24|35)\.ffn_(up|down|gate)_exps\.'`). The
+prototype was **not** built in this pass (budget); here is the measured budget it
+would be judged against, so the next pass starts from numbers:
+
+* one block's top-10 routed experts ≈ **15 MiB** of weights per token (blob
+  bytes/512 × 10, `docs/specs/model-artifacts-inventory.md` §4.2), so 13 blocks ≈
+  195 MiB/token leave the host lane;
+* the host lane costs **0.76 ms per block** (36.6 ms / 48), so those 13 blocks
+  cost **~9.9 ms/token** today;
+* the same bytes through the *batched* GPU expert GEMV cost ~0.2 ms on the RX at
+  the 250–448 GB/s `docs/phase-3/02` measured for the 6 400-row shape, i.e.
+  **~2.6 ms**, so the expected saving is **≈ 7 ms/token (−5.5 %)**;
+* VRAM: block expert tensors are 0.86–1.13 GiB each (512 experts), so 13 blocks
+  ≈ **11 GiB** — it fits beside the 3.8 GiB dense set only by spreading (9 blocks
+  on the RX, 2 on the MI50), exactly as production does;
+* the path itself is `GemvBatch` with `map_for_blobs` over the 10 selected
+  experts' word offsets — the kernel and the indirection already exist
+  (`docs/phase-3/02` §2), so this is placement + upload + a per-block branch, not
+  new arithmetic. Numerical expectation: the same decode path that conformance
+  holds to 1e-7 against the CPU reference, so ≤1e-5 vs the host lane is the
+  expected outcome, not the risk.
 
 ## 9. Exact commands
 

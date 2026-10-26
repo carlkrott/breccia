@@ -266,6 +266,9 @@ pub struct LoadOptions {
     pub devices: Vec<String>,
     /// KV cells the session may use (the indexer selection width caps here too).
     pub ctx_capacity: usize,
+    /// Explicit block counts per device (`--split-blocks 21,27`). `None` = balance
+    /// the dense bytes evenly.
+    pub blocks: Option<Vec<usize>>,
     pub verbose: bool,
 }
 
@@ -274,6 +277,7 @@ impl Default for LoadOptions {
         LoadOptions {
             devices: Vec::new(),
             ctx_capacity: 256,
+            blocks: None,
             verbose: true,
         }
     }
@@ -332,7 +336,19 @@ impl Model {
                 .map(|d| placement::DeviceSpec::parse(d))
                 .collect()
         };
-        let placement = Placement::balanced(specs, &layer_bytes, tail_bytes);
+        let placement = match &opts.blocks {
+            Some(counts) => {
+                if counts.len() != specs.len() {
+                    bail!(
+                        "--split-blocks lists {} devices but {} were requested",
+                        counts.len(),
+                        specs.len()
+                    );
+                }
+                Placement::explicit(specs, &layer_bytes, tail_bytes, counts)?
+            }
+            None => Placement::balanced(specs, &layer_bytes, tail_bytes),
+        };
         let mut devices = Vec::with_capacity(placement.devices.len());
         for spec in &placement.devices {
             devices.push(

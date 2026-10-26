@@ -249,10 +249,14 @@ enum BenchKind {
         /// How many logits `--dump-logits` keeps
         #[arg(long, default_value_t = 256)]
         top_logits: usize,
-        /// Record each GPU phase into one command buffer (experimental: the
-        /// mechanism is verified bit-identical, the graph integration is not)
-        #[arg(long)]
+        /// Record each GPU phase into one command buffer and submit it once.
+        /// On by default; `--batching false` is the reference path (and the A/B)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         batching: bool,
+        /// Blocks per device, comma separated (`--split-blocks 21,27`). Default:
+        /// balance the dense weight bytes across the devices.
+        #[arg(long, value_name = "N[,N]")]
+        split_blocks: Option<String>,
     },
 }
 fn main() {
@@ -397,6 +401,7 @@ fn run(cli: Cli) -> Result<()> {
                     dump_logits,
                     top_logits,
                     batching,
+                    split_blocks,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -414,6 +419,7 @@ fn run(cli: Cli) -> Result<()> {
             dump_logits,
             top_logits,
             batching,
+            split_blocks,
         }),
     }
 }
@@ -1388,6 +1394,7 @@ struct TokenArgs {
     dump_logits: Option<PathBuf>,
     top_logits: usize,
     batching: bool,
+    split_blocks: Option<String>,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1448,6 +1455,11 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         &breccia_engine::LoadOptions {
             devices: a.devices.clone(),
             ctx_capacity: a.ctx,
+            blocks: a.split_blocks.as_ref().map(|s| {
+                s.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .collect()
+            }),
             verbose: true,
         },
     )
