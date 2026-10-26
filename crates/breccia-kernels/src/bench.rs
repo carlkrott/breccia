@@ -19,6 +19,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::batch::{map_to_bytes, GemvBatch, XLayout};
 use crate::device::Device;
 use crate::gemv::{alloc, download, upload, Gemv, GemvTiming};
 use crate::quant::QuantType;
@@ -79,6 +80,10 @@ pub struct GemvBenchOptions {
     /// Real mode on an arbitrary tensor name instead of an expert role
     /// (e.g. `output.weight` for Q5_K, `token_embd.weight` for IQ3_S).
     pub real_tensor: Option<String>,
+    /// Batched multi-expert mode: run the whole expert set in one dispatch for
+    /// each requested expert count (empty = off). Shapes come from
+    /// `--rows/--cols` or default to the model's 640x2560 routed-expert shape.
+    pub experts: Vec<usize>,
 }
 
 /// The shapes that matter for one decode step of this model
@@ -111,12 +116,32 @@ pub fn default_types() -> Vec<QuantType> {
         QuantType::Q2_0,
         QuantType::Iq2Xxs,
         QuantType::Iq2Xs,
+        QuantType::Iq2S,
         QuantType::Iq3Xxs,
         QuantType::Iq4Nl,
+        QuantType::Iq4Xs,
+        QuantType::Q4K,
         QuantType::Q5K,
+        QuantType::Q6K,
         QuantType::Bf16,
         QuantType::F32,
     ]
+}
+
+/// The routed-expert shape of one expert (`docs/specs/qwen4exp-architecture.md`
+/// §5.4: `n_embd = 2560`, `n_ff = 640`), used by batched mode unless the caller
+/// passes `--rows/--cols`.
+pub fn default_expert_shape() -> Shape {
+    Shape::new(640, 2560)
+}
+
+/// Expert counts batched mode sweeps when the caller names none.
+pub fn default_expert_counts(quick: bool) -> Vec<usize> {
+    if quick {
+        vec![1, 10]
+    } else {
+        vec![1, 2, 4, 8, 10, 16]
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +159,9 @@ pub struct GemvReport {
     pub synthetic: Vec<Cell>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub real: Vec<RealCell>,
+    /// Batched multi-expert cells (one dispatch over N experts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub batch: Vec<BatchCell>,
     pub warnings: Vec<String>,
 }
 
@@ -191,6 +219,58 @@ pub struct RealCell {
     pub conformance_rows: usize,
     /// Wall time spent paging the tensor in + uploading it (one-off, not part of GB/s).
     pub upload_seconds: f64,
+}
+
+/// One batched multi-expert cell: the same expert set run as a per-expert loop
+/// and as one [`crate::GemvBatch`] dispatch, in the same process/run, so the
+/// before/after is apples to apples.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchCell {
+    pub ty: String,
+    pub quant_id: u32,
+    /// Shape of **one** expert (`rows_per_expert x cols`).
+    pub shape: Shape,
+    pub experts: usize,
+    /// Packed weight bytes per expert, and the whole set.
+    pub blob_bytes: u64,
+    pub total_bytes: u64,
+    /// `shared` (one x vector for all experts, MoE gate/up) or `per-expert`
+    /// (one per expert, MoE down).
+    pub x_layout: String,
+    /// Per-expert-loop baseline: `experts` single-expert dispatches, no split-K.
+    pub loop_seconds: f64,
+    pub loop_seconds_all: Vec<f64>,
+    /// Same loop with the per-expert split-K factor the single-expert API
+    /// recommends (`Gemv::recommended_splits`), when it is > 1.
+    pub loop_split_seconds: Option<f64>,
+    pub loop_split_splits: u32,
+    /// One batched dispatch covering all `experts`.
+    pub batched_seconds: f64,
+    pub batched_seconds_all: Vec<f64>,
+    /// `loop_seconds / batched_seconds`.
+    pub speedup: f64,
+    /// Per-expert latency of one single-expert dispatch (context for the
+    /// latency-bound regime).
+    pub single_expert_seconds: f64,
+    pub loop_gbps: f64,
+    pub batched_gbps: f64,
+    pub reference_gbps: Option<f64>,
+    pub percent_of_reference: Option<f64>,
+    pub tokens_per_s_equivalent: f64,
+    pub iters: u32,
+    pub used_timestamps: bool,
+    /// Real-model mode: the tensor and which experts were batched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tensor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert_ids: Option<Vec<usize>>,
+    /// Real-model mode: max |GPU - CPU reference| / max(1, |CPU|) on real bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conformance_max_rel: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conformance_rows: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_seconds: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -294,11 +374,21 @@ pub fn run_gemv_bench(opts: &GemvBenchOptions) -> Result<GemvReport> {
         quick: opts.quick,
         synthetic: Vec::new(),
         real: Vec::new(),
+        batch: Vec::new(),
         warnings,
     };
 
     if opts.real {
-        report.real = crate::real::run(&dev, opts)?;
+        if opts.experts.is_empty() {
+            report.real = crate::real::run(&dev, opts)?;
+        } else {
+            report.batch = crate::real::run_batch(&dev, opts)?;
+        }
+        return Ok(report);
+    }
+
+    if !opts.experts.is_empty() {
+        report.batch = run_batch_cells(&dev, opts, &reference)?;
         return Ok(report);
     }
 
@@ -347,6 +437,217 @@ fn clock_warmup(dev: &Device, secs: f64) -> Result<()> {
         return Err(anyhow!("warm-up ran zero iterations"));
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Batched multi-expert mode
+// ---------------------------------------------------------------------------
+
+/// Synthetic batched sweep: for each type and each expert count, the same
+/// expert set is run as a per-expert loop and as one batched dispatch.
+fn run_batch_cells(
+    dev: &Device,
+    opts: &GemvBenchOptions,
+    reference: &ReferenceBandwidth,
+) -> Result<Vec<BatchCell>> {
+    let types = if opts.types.is_empty() {
+        default_types()
+    } else {
+        opts.types.clone()
+    };
+    let shape = opts
+        .shapes
+        .first()
+        .copied()
+        .unwrap_or_else(default_expert_shape);
+    let counts = if opts.experts.is_empty() {
+        default_expert_counts(opts.quick)
+    } else {
+        opts.experts.clone()
+    };
+    let window = if opts.quick { 0.05 } else { 0.25 };
+    let repeats = if opts.quick { 1 } else { 3 };
+
+    let mut cells = Vec::new();
+    for ty in types {
+        for &experts in &counts {
+            if experts == 0 {
+                return Err(anyhow!("--experts needs at least 1"));
+            }
+            for layout in [XLayout::Shared, XLayout::PerExpert] {
+                cells.push(
+                    run_batch_cell(dev, ty, shape, experts, layout, window, repeats, reference)
+                        .with_context(|| format!("{ty} {shape} x{experts} ({layout:?})"))?,
+                );
+            }
+        }
+    }
+    Ok(cells)
+}
+
+/// One batched cell: upload `experts` synthetic expert blobs into one buffer,
+/// then time (a) `experts` single-expert dispatches and (b) one batched
+/// dispatch over the whole set.
+///
+/// The loop baseline re-dispatches the first blob instead of walking all of
+/// them: at this shape the whole set is 7 MB of weights (10 x 640x2560 IQ3_S),
+/// i.e. Infinity-Cache resident like the single blob, so both variants read the
+/// same bytes from DRAM and the difference the cell measures is dispatch
+/// latency and grid occupancy — which is the effect under test.
+#[allow(clippy::too_many_arguments)]
+fn run_batch_cell(
+    dev: &Device,
+    ty: QuantType,
+    shape: Shape,
+    experts: usize,
+    layout: XLayout,
+    window: f64,
+    repeats: usize,
+    reference: &ReferenceBandwidth,
+) -> Result<BatchCell> {
+    let gpu = dev.gpu();
+    let single = Gemv::new(gpu, ty, shape.rows, shape.cols)?;
+    let batch = GemvBatch::new(gpu, ty, shape.rows, shape.cols)?;
+
+    // One synthetic blob per expert (distinct weights, distinct activations),
+    // concatenated in W exactly like the M3 slot ring holds them.
+    let padded = batch.padded_cols();
+    let mut w_bytes = Vec::with_capacity(batch.total_bytes(experts) as usize);
+    let mut x_all = Vec::with_capacity(layout.vectors(experts) * padded);
+    let mut first_x = None;
+    for e in 0..experts {
+        let (packed, x) = crate::real::synthetic_inputs(
+            ty,
+            shape,
+            0x5eed_1234 ^ (e as u64).wrapping_mul(0x9e37_79b9),
+        );
+        if e == 0 {
+            first_x = Some(x.clone());
+        }
+        w_bytes.extend_from_slice(&packed);
+        if layout == XLayout::PerExpert {
+            x_all.extend_from_slice(&x);
+        }
+    }
+    if layout == XLayout::Shared {
+        x_all = first_x.expect("at least one expert");
+    }
+
+    let w = upload(gpu, &w_bytes).context("uploading the expert set")?;
+    let x = upload(gpu, &f32_to_bytes(&x_all)).context("uploading x")?;
+    let out = alloc(gpu, (batch.rows(experts) * 4) as u64).context("allocating output")?;
+    let map_host = batch.map(experts, layout);
+    let map = upload(gpu, &map_to_bytes(&map_host)).context("uploading the row map")?;
+
+    // Loop baseline buffers: the single-expert pipeline reads expert 0's blob.
+    let w0 = upload(gpu, &w_bytes[..batch.blob_bytes() as usize]).context("uploading blob 0")?;
+    let x0 = upload(gpu, &f32_to_bytes(&x_all[..padded])).context("uploading x0")?;
+    let out0 = alloc(gpu, (shape.rows * 4) as u64).context("allocating single output")?;
+
+    // Warm-ups (discarded) for both paths, then three timed windows.
+    single
+        .run(&w0, &x0, &out0)
+        .context("warm-up single-expert GEMV")?;
+    batch
+        .run(&w, &x, &out, &map, experts)
+        .context("warm-up batched GEMV")?;
+    batch
+        .run_timed(&w, &x, &out, &map, experts, 0.05)
+        .context("warm-up batched window")?;
+
+    let mut single_all = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        single_all.push(single.run_timed(&w0, &x0, &out0, window)?.per_iter_s);
+    }
+    let single_s = best(&single_all);
+
+    let mut loop_all = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        loop_all.push(
+            single
+                .run_looped_timed(&w0, &x0, &out0, experts, window)?
+                .per_iter_s,
+        );
+    }
+    let loop_s = best(&loop_all);
+
+    // The same loop with the split-K factor the single-expert API recommends.
+    let loop_splits = single.recommended_splits();
+    let loop_split_s = if loop_splits > 1 {
+        let part = alloc(gpu, single.partial_bytes(loop_splits)).context("allocating partials")?;
+        single
+            .run_split(&w0, &x0, &part, &out0, loop_splits)
+            .context("warm-up split loop")?;
+        let mut all = Vec::with_capacity(repeats);
+        for _ in 0..repeats {
+            all.push(
+                single
+                    .run_split_looped_timed(&w0, &x0, &part, &out0, loop_splits, experts, window)?
+                    .per_iter_s,
+            );
+        }
+        gpu.destroy_buf(&part);
+        Some(best(&all))
+    } else {
+        None
+    };
+
+    let mut batched_all = Vec::with_capacity(repeats);
+    let mut iters = 0;
+    let mut used_ts = true;
+    for _ in 0..repeats {
+        let t = batch.run_timed(&w, &x, &out, &map, experts, window)?;
+        batched_all.push(t.per_iter_s);
+        iters = t.iters;
+        used_ts &= t.used_timestamps;
+    }
+    let batched_s = best(&batched_all);
+
+    let total_bytes = batch.total_bytes(experts);
+    let gbps = |s: f64| total_bytes as f64 / s / 1e9;
+    let cell = BatchCell {
+        ty: ty.name().to_string(),
+        quant_id: ty.ggml_id(),
+        shape,
+        experts,
+        blob_bytes: batch.blob_bytes(),
+        total_bytes,
+        x_layout: match layout {
+            XLayout::Shared => "shared",
+            XLayout::PerExpert => "per-expert",
+        }
+        .to_string(),
+        loop_seconds: loop_s,
+        loop_seconds_all: loop_all,
+        loop_split_seconds: loop_split_s,
+        loop_split_splits: loop_splits,
+        batched_seconds: batched_s,
+        batched_seconds_all: batched_all,
+        speedup: loop_s / batched_s,
+        single_expert_seconds: single_s,
+        loop_gbps: gbps(loop_s),
+        batched_gbps: gbps(batched_s),
+        reference_gbps: reference.gbps,
+        percent_of_reference: reference.gbps.map(|bw| 100.0 * gbps(batched_s) / bw),
+        tokens_per_s_equivalent: 1.0 / batched_s,
+        iters,
+        used_timestamps: used_ts,
+        tensor: None,
+        expert_ids: None,
+        conformance_max_rel: None,
+        conformance_rows: None,
+        upload_seconds: None,
+    };
+
+    for b in [&w, &x, &out, &map, &w0, &x0, &out0] {
+        gpu.destroy_buf(b);
+    }
+    Ok(cell)
+}
+
+/// Best (minimum) of the measured windows.
+fn best(v: &[f64]) -> f64 {
+    v.iter().cloned().fold(f64::INFINITY, f64::min)
 }
 
 fn splits_for(gemv: &Gemv<'_>, forced: Option<u32>) -> u32 {

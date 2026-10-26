@@ -3,8 +3,9 @@
 
 The oracle is the *actual* `ggml/src/ggml-quants.c` of the reference clone, not a
 re-typed copy: `tools/refcheck_drv.c` includes `ggml-quants.h` and calls
-`dequantize_row_iq2_xxs` / `..._iq2_xs` / `..._iq3_xxs` / `..._iq3_s` /
-`..._iq4_nl` / `..._q5_K` / `..._q2_0` directly. Both sides read the same random
+`dequantize_row_iq2_xxs` / `..._iq2_xs` / `..._iq2_s` / `..._iq3_xxs` /
+`..._iq3_s` / `..._iq4_nl` / `..._iq4_xs` / `..._q4_K` / `..._q5_K` / `..._q6_K` /
+`..._q2_0` directly. Both sides read the same random
 block bytes and must produce the same fp32 stream.
 
     python3 tools/refcheck.py [--blocks 2000] [--c-driver PATH]
@@ -35,9 +36,13 @@ TYPES = [
     ("IQ2_XXS", 16, 66, 256, [0]),
     ("IQ2_XS", 17, 74, 256, [0]),
     ("IQ3_XXS", 18, 98, 256, [0]),
+    ("IQ2_S", 22, 82, 256, [0]),
     ("IQ3_S", 21, 110, 256, [0]),
     ("IQ4_NL", 20, 18, 32, [0]),
+    ("IQ4_XS", 23, 136, 256, [0]),
+    ("Q4_K", 12, 144, 256, [0, 2]),
     ("Q5_K", 13, 176, 256, [0, 2]),
+    ("Q6_K", 14, 210, 256, [208]),
     ("Q2_0", 42, 18, 64, [0]),
 ]
 

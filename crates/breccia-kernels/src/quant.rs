@@ -6,7 +6,7 @@
 //!
 //! | kernel type | kernel block | bytes | notes |
 //! |---|---|---|---|
-//! | IQ2_XXS / IQ2_XS / IQ3_XXS / IQ3_S / Q5_K | 256 elems | 66 / 74 / 98 / 110 / 176 | one warp per super-block |
+//! | IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / Q4_K / Q5_K / Q6_K / IQ4_XS | 256 elems | 66 / 74 / 82 / 98 / 110 / 144 / 176 / 210 / 136 | one warp per super-block |
 //! | IQ4_NL | 32 | 18 | 4 units per block, 8 blocks per warp iteration |
 //! | Q2_0 (fork) | 64 | 18 | 16 B 2-bit codes + fp16 scale |
 //! | BF16 / F32 | 8 | 16 / 32 | *virtual* blocks: GGML stores these per element, the kernels treat 8 elements as one block so every type shares the same unit-of-8 decode contract |
@@ -23,9 +23,13 @@ pub enum QuantType {
     Iq2Xxs,
     Iq2Xs,
     Iq3Xxs,
+    Iq2S,
     Iq3S,
     Iq4Nl,
+    Iq4Xs,
+    Q4K,
     Q5K,
+    Q6K,
     Q2_0,
     Bf16,
     F32,
@@ -33,14 +37,18 @@ pub enum QuantType {
 
 impl QuantType {
     /// Every type this crate implements a kernel for.
-    pub const ALL: [QuantType; 9] = [
+    pub const ALL: [QuantType; 13] = [
         QuantType::Iq3S,
         QuantType::Q2_0,
         QuantType::Iq2Xxs,
         QuantType::Iq2Xs,
+        QuantType::Iq2S,
         QuantType::Iq3Xxs,
         QuantType::Iq4Nl,
+        QuantType::Iq4Xs,
+        QuantType::Q4K,
         QuantType::Q5K,
+        QuantType::Q6K,
         QuantType::Bf16,
         QuantType::F32,
     ];
@@ -50,10 +58,14 @@ impl QuantType {
         match self {
             QuantType::Iq2Xxs => "IQ2_XXS",
             QuantType::Iq2Xs => "IQ2_XS",
+            QuantType::Iq2S => "IQ2_S",
             QuantType::Iq3Xxs => "IQ3_XXS",
             QuantType::Iq3S => "IQ3_S",
             QuantType::Iq4Nl => "IQ4_NL",
+            QuantType::Iq4Xs => "IQ4_XS",
+            QuantType::Q4K => "Q4_K",
             QuantType::Q5K => "Q5_K",
+            QuantType::Q6K => "Q6_K",
             QuantType::Q2_0 => "Q2_0",
             QuantType::Bf16 => "BF16",
             QuantType::F32 => "F32",
@@ -64,12 +76,16 @@ impl QuantType {
     pub const fn ggml_id(self) -> u32 {
         match self {
             QuantType::F32 => 0,
+            QuantType::Q4K => 12,
             QuantType::Q5K => 13,
+            QuantType::Q6K => 14,
             QuantType::Iq2Xxs => 16,
             QuantType::Iq2Xs => 17,
             QuantType::Iq3Xxs => 18,
             QuantType::Iq4Nl => 20,
             QuantType::Iq3S => 21,
+            QuantType::Iq2S => 22,
+            QuantType::Iq4Xs => 23,
             QuantType::Bf16 => 30,
             QuantType::Q2_0 => 42,
         }
@@ -80,10 +96,14 @@ impl QuantType {
         match self {
             QuantType::Iq2Xxs => "iq2_xxs",
             QuantType::Iq2Xs => "iq2_xs",
+            QuantType::Iq2S => "iq2_s",
             QuantType::Iq3Xxs => "iq3_xxs",
             QuantType::Iq3S => "iq3_s",
             QuantType::Iq4Nl => "iq4_nl",
+            QuantType::Iq4Xs => "iq4_xs",
+            QuantType::Q4K => "q4_k",
             QuantType::Q5K => "q5_k",
+            QuantType::Q6K => "q6_k",
             QuantType::Q2_0 => "q2_0",
             QuantType::Bf16 => "bf16",
             QuantType::F32 => "f32",
@@ -105,10 +125,14 @@ impl QuantType {
         match self {
             QuantType::Iq2Xxs => 66,
             QuantType::Iq2Xs => 74,
+            QuantType::Iq2S => 82,
             QuantType::Iq3Xxs => 98,
             QuantType::Iq3S => 110,
             QuantType::Iq4Nl => 18,
+            QuantType::Iq4Xs => 136,
+            QuantType::Q4K => 144,
             QuantType::Q5K => 176,
+            QuantType::Q6K => 210,
             QuantType::Q2_0 => 18,
             QuantType::Bf16 => 16,
             QuantType::F32 => 32,
@@ -166,17 +190,16 @@ impl std::str::FromStr for QuantType {
     }
 }
 
-/// Types present in the target model that this work order deliberately leaves
-/// for the next kernel pass (counts from `docs/specs/model-artifacts-inventory.md`
-/// §4.2: tensors per type in shard 1).
+/// Types present in later artefacts that this crate still does not implement
+/// (counts from `docs/specs/model-artifacts-inventory.md` §4.2: tensors per type
+/// in shard 1 — all four real-model types have kernels as of
+/// `docs/phase-3/02-expert-batching-quants.md`).
 pub const NOT_IMPLEMENTED: &[(&str, &str, u32)] = &[
-    ("IQ4_XS", "256/136", 67),
-    ("Q6_K", "256/210", 71),
-    ("Q4_K", "256/144", 45),
-    ("IQ2_S", "256/82", 20),
     ("Q2_K", "256/84", 0),
     ("Q3_K", "256/110", 0),
     ("Q8_0", "32/34", 0),
+    ("Q4_0", "32/18", 0),
+    ("Q5_0", "32/22", 0),
 ];
 
 #[cfg(test)]
@@ -221,5 +244,9 @@ mod tests {
         assert!((QuantType::Iq2Xxs.bits_per_value() - 2.0625).abs() < 1e-12);
         assert!((QuantType::Iq3S.bits_per_value() - 3.4375).abs() < 1e-12);
         assert_eq!(QuantType::Q5K.bits_per_value(), 5.5);
+        assert!((QuantType::Iq2S.bits_per_value() - 2.5625).abs() < 1e-12);
+        assert!((QuantType::Iq4Xs.bits_per_value() - 4.25).abs() < 1e-12);
+        assert_eq!(QuantType::Q4K.bits_per_value(), 4.5);
+        assert!((QuantType::Q6K.bits_per_value() - 6.5625).abs() < 1e-12);
     }
 }

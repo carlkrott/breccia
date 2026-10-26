@@ -309,6 +309,78 @@ impl<'g> Gemv<'g> {
         self.bind(w, x, partials)
     }
 
+    /// Time `reps` consecutive single-pass dispatches per iteration — the
+    /// per-expert loop a MoE layer issues when it does *not* batch
+    /// ([`crate::GemvBatch`]). `per_iter_s` is the whole group's latency.
+    pub fn run_looped_timed(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        reps: usize,
+        target_s: f64,
+    ) -> Result<GemvTiming> {
+        self.bind(w, x, out)?;
+        let reps = reps.max(1) as u32;
+        let t = self
+            .gpu
+            .run_timed(Qc::C, target_s, |d, cmd, n| {
+                for _ in 0..n {
+                    for _ in 0..reps {
+                        self.dispatch_split(d, cmd, 1);
+                        unsafe { Gpu::barrier_all(d, cmd) };
+                    }
+                }
+            })
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(GemvTiming {
+            per_iter_s: t.per_iter_s,
+            iters: t.iters,
+            total_s: t.total_s,
+            used_timestamps: t.used_timestamps,
+        })
+    }
+
+    /// Split-K variant of [`Gemv::run_looped_timed`] (loop baseline with the
+    /// per-expert split factor the engine would otherwise use).
+    #[allow(clippy::too_many_arguments)] // buffers + splits + reps + window
+    pub fn run_split_looped_timed(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        partials: &Buf,
+        out: &Buf,
+        splits: u32,
+        reps: usize,
+        target_s: f64,
+    ) -> Result<GemvTiming> {
+        let splits = splits.max(1);
+        self.bind(w, x, partials)?;
+        self.gpu
+            .bind_kernel(&self.reduce, &[partials.buf, out.buf])
+            .map_err(|e| anyhow!("{e}"))?;
+        let reps = reps.max(1) as u32;
+        let t = self
+            .gpu
+            .run_timed(Qc::C, target_s, |d, cmd, n| {
+                for _ in 0..n {
+                    for _ in 0..reps {
+                        self.dispatch_split(d, cmd, splits);
+                        unsafe { Gpu::barrier_all(d, cmd) };
+                        self.dispatch_reduce(d, cmd, splits);
+                        unsafe { Gpu::barrier_all(d, cmd) };
+                    }
+                }
+            })
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok(GemvTiming {
+            per_iter_s: t.per_iter_s,
+            iters: t.iters,
+            total_s: t.total_s,
+            used_timestamps: t.used_timestamps,
+        })
+    }
+
     /// Time `target_s` worth of repeated GEMVs (timestamps bracket the window).
     pub fn run_timed(&self, w: &Buf, x: &Buf, out: &Buf, target_s: f64) -> Result<GemvTiming> {
         self.bind(w, x, out)?;
@@ -344,7 +416,7 @@ impl Drop for Gemv<'_> {
 /// The quant tables as little-endian u32 bytes, ready for `binding = 3`.
 pub fn table_bytes() -> Vec<u8> {
     let mut out = Vec::with_capacity(crate::tables::GPU_TABLE_WORDS.len() * 4);
-    for w in crate::tables::GPU_TABLE_WORDS {
+    for w in crate::tables::GPU_TABLE_WORDS.iter() {
         out.extend_from_slice(&w.to_le_bytes());
     }
     out
@@ -443,8 +515,22 @@ pub fn dequant_to_f32(
 // Buffer helpers (device-local + staging; never raw host-visible weights)
 // ---------------------------------------------------------------------------
 
-/// Allocate a device-local storage buffer.
+/// Bytes added to every device-local allocation.
+///
+/// A GPU read one element past the end of a storage buffer is not "garbage", it
+/// is a UTCL2 permission fault that kills the process and, on a display card,
+/// can take the machine down (2026-10-26: a conformance run did exactly that —
+/// `docs/phase-3/02-expert-batching-quants.md` §4). Decode kernels read blocks
+/// with `u16`/`u32`/`vec4` loads whose last access can be wider than the field
+/// being consumed on some compilations, and every one of these buffers ends
+/// exactly at the last byte the kernel uses. 64 B of slack costs nothing at
+/// these sizes and makes a tail read land in mapped memory.
+pub const TAIL_PAD: u64 = 64;
+
+/// Allocate a device-local storage buffer (always `size + TAIL_PAD` bytes long;
+/// callers may only rely on the first `size`, and the kernels only touch those).
 pub fn alloc(gpu: &Gpu, size: u64) -> Result<Buf> {
+    let size = size + TAIL_PAD;
     gpu.buf(
         size.max(4),
         vk::BufferUsageFlags::STORAGE_BUFFER
@@ -520,10 +606,14 @@ fn gemv_spv(ty: QuantType) -> &'static [u8] {
     match ty {
         QuantType::Iq2Xxs => spv!("gemv_iq2_xxs"),
         QuantType::Iq2Xs => spv!("gemv_iq2_xs"),
+        QuantType::Iq2S => spv!("gemv_iq2_s"),
         QuantType::Iq3Xxs => spv!("gemv_iq3_xxs"),
         QuantType::Iq3S => spv!("gemv_iq3_s"),
         QuantType::Iq4Nl => spv!("gemv_iq4_nl"),
+        QuantType::Iq4Xs => spv!("gemv_iq4_xs"),
+        QuantType::Q4K => spv!("gemv_q4_k"),
         QuantType::Q5K => spv!("gemv_q5_k"),
+        QuantType::Q6K => spv!("gemv_q6_k"),
         QuantType::Q2_0 => spv!("gemv_q2_0"),
         QuantType::Bf16 => spv!("gemv_bf16"),
         QuantType::F32 => spv!("gemv_f32"),
@@ -534,10 +624,14 @@ fn dequant_spv(ty: QuantType) -> &'static [u8] {
     match ty {
         QuantType::Iq2Xxs => spv!("dequant_iq2_xxs"),
         QuantType::Iq2Xs => spv!("dequant_iq2_xs"),
+        QuantType::Iq2S => spv!("dequant_iq2_s"),
         QuantType::Iq3Xxs => spv!("dequant_iq3_xxs"),
         QuantType::Iq3S => spv!("dequant_iq3_s"),
         QuantType::Iq4Nl => spv!("dequant_iq4_nl"),
+        QuantType::Iq4Xs => spv!("dequant_iq4_xs"),
+        QuantType::Q4K => spv!("dequant_q4_k"),
         QuantType::Q5K => spv!("dequant_q5_k"),
+        QuantType::Q6K => spv!("dequant_q6_k"),
         QuantType::Q2_0 => spv!("dequant_q2_0"),
         QuantType::Bf16 => spv!("dequant_bf16"),
         QuantType::F32 => spv!("dequant_f32"),

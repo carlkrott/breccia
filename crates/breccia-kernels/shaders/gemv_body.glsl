@@ -42,6 +42,29 @@ layout(local_size_x = 256) in;
 #define UNITS (QK / 8u)
 #define STEP (UNITS >= LANES ? 1u : (LANES / UNITS))
 
+// --- batched multi-expert dispatch (MoE decode shape) -----------------------
+// With BRECCIA_EXPERT_MAP the kernel reads a per-row indirection table instead
+// of assuming row r starts at r*bpr blocks: N experts' blobs are concatenated
+// in one device buffer (the M3 slot-ring layout) and each row names its blob
+// base, so one dispatch covers the layer's whole routed set (10 x 640 rows in
+// this model) instead of 10 latency-bound 640-row dispatches
+// (docs/phase-3/02-expert-batching-quants.md).
+//
+//   M[0 .. rows)       row weight base, in 16-bit words into W
+//   M[rows .. 2*rows)  row activation base, in vec4 units into X
+//
+// The activation base is what makes per-expert x-vectors work: the down
+// projection consumes a different SwiGLU intermediate per expert, while
+// gate/up consume one shared vector (X_BASE = 0 for every row).
+#ifdef BRECCIA_EXPERT_MAP
+layout(std430, binding = 4) readonly buffer RowMap { uint M[]; };
+#define ROW_BASE(r) (M[r])
+#define X_BASE(r) (M[pc.rows + (r)])
+#else
+#define ROW_BASE(r) ((r) * pc.bpr * BLOCK_WORDS)
+#define X_BASE(r) 0u
+#endif
+
 void main() {
     uint lane = gl_LocalInvocationID.x % LANES;
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
@@ -62,7 +85,8 @@ void main() {
     const uint b_start = min(chunk * sid, bpr);
     const uint b_end = min(b_start + chunk, bpr);
 
-    const uint row_base = row * bpr * BLOCK_WORDS;
+    const uint row_base = ROW_BASE(row);
+    const uint xb = X_BASE(row); // vec4 units
 
     float acc0 = 0.0;
     float acc1 = 0.0;
@@ -77,10 +101,10 @@ void main() {
         DEQUANT_UNIT(row_base + b * BLOCK_WORDS, u, v);
         float s;
         if (b < full) {
-            vec4 xa = X[e >> 2u];
-            vec4 xb = X[(e >> 2u) + 1u];
+            vec4 xa = X[xb + (e >> 2u)];
+            vec4 xc = X[xb + (e >> 2u) + 1u];
             s = dot(vec4(v[0], v[1], v[2], v[3]), xa) +
-                dot(vec4(v[4], v[5], v[6], v[7]), xb);
+                dot(vec4(v[4], v[5], v[6], v[7]), xc);
         } else {
             // Trailing partial block: mask per element. `X` is padded by the
             // host to a multiple of 8 elements with zeros, so no reads escape.
@@ -88,7 +112,7 @@ void main() {
             for (uint j = 0u; j < 8u; ++j) {
                 uint idx = e + j;
                 if (idx < pc.cols) {
-                    s += v[j] * X[idx >> 2u][idx & 3u];
+                    s += v[j] * X[xb + (idx >> 2u)][idx & 3u];
                 }
             }
         }

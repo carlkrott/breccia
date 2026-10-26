@@ -37,7 +37,9 @@ Per-invocation rules, mandatory once a test touches GPU memory:
 2. **Risky/new kernel paths run on the Radeon VII (MI50) first** — it drives no display, so a fault there does not freeze the desktop. Resolve devices by PCI identity (`0000:0e:00.0`), never by enumeration ordinal. Only run on the RX 6950 XT (`0000:03:00.0`, the display card) after MI50 passes.
 3. **One GPU process at a time.** No parallel benches, no benches during agent work on the same card.
 4. Enable `VK_LAYER_KHRONOS_validation` for first runs of new shader code and record any VU messages; RADV page faults on illegal command streams are otherwise silent until the box freezes.
-5. Conformance: run **one quant type per invocation** (`--exact`/env selector) so a fault is attributable; never sweep all types in one go after touching shader includes.
+5. Conformance: run **one quant type per invocation** so a fault is attributable; never sweep all types in one go after touching shader includes. GPU tests are opt-in by explicit device: `cargo test` skips them unless `BRECCIA_KERNEL_DEVICE` is set. Safe first run:
+   `timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation BRECCIA_KERNEL_DEVICE=0000:0e:00.0 BRECCIA_QTYPE=IQ3_S cargo test -p breccia-kernels --test conformance`
+   then repeat on `0000:03:00.0` only after the MI50 passes.
 6. After any GPU fault, check `journalctl -b -1` for `amdgpu ... page fault` / `Illegal opcode` and capture the process/thread names before rebooting.
 
 ## Git

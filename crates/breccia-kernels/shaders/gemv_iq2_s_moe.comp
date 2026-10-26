@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+//
+// Batched multi-expert gemv for IQ2_S — row-indirection variant of
+// gemv_iq2_s.comp (docs/phase-3/02-expert-batching-quants.md).
+// Decode semantics: shaders/blocks.glsl (dequantize_row_iq2_s).
+// Adapted from ggml-vulkan (MIT), vulkan-shaders/mul_mat_vec_*.comp and
+// dequant_funcs.glsl, llama.cpp commit 6050b46.
+//
+#define QK 256u
+#define BLOCK_WORDS 41u
+#include "blocks.glsl"
+#define DEQUANT_UNIT dequant_iq2_s_unit
+#define BRECCIA_EXPERT_MAP 1
+#include "gemv_body.glsl"

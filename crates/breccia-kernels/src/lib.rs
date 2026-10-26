@@ -14,6 +14,7 @@
 //! | [`QuantType`] | the nine types with a kernel, in kernel (block) geometry |
 //! | [`Gemv`] | device-independent `{type, rows, cols}` + compiled pipeline; [`Gemv::run`] dispatches one decode+GEMV |
 //! | [`dequant_to_f32`] | standalone block dequantiser (same decode path, used by conformance tests and by anything that needs f32 weights) |
+//! | [`GemvBatch`] | one dispatch over N routed experts' blobs (row indirection + per-expert `x`), the MoE decode shape |
 //! | [`reference`] | scalar CPU port of `ggml-quants.c` (decode + dot) used as the conformance oracle |
 //! | [`bench`] | `breccia bench gemv`: throughput vs bytes-read, plus a real-model mode that runs the kernel on an expert tensor straight out of the GGUF mapping |
 //!
@@ -35,6 +36,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod batch;
 pub mod bench;
 pub mod device;
 pub mod gemv;
@@ -43,7 +45,8 @@ pub mod real;
 pub mod reference;
 pub(crate) mod tables;
 
-pub use bench::{run_gemv_bench, GemvBenchOptions, GemvReport, Shape};
+pub use batch::{GemvBatch, XLayout};
+pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
 pub use gemv::{dequant_to_f32, Gemv, GemvTiming};
 pub use quant::QuantType;
@@ -66,6 +69,8 @@ mod tests {
             ("TBL_IQ3XXS_GRID", crate::tables::TBL_IQ3XXS_GRID),
             ("TBL_IQ3S_GRID", crate::tables::TBL_IQ3S_GRID),
             ("TBL_IQ4NL_VALUES", crate::tables::TBL_IQ4NL_VALUES),
+            ("TBL_IQ2S_LO", crate::tables::TBL_IQ2S_LO),
+            ("TBL_IQ2S_HI", crate::tables::TBL_IQ2S_HI),
         ];
         for (name, want) in checks {
             let needle = format!("#define {name} ");
@@ -83,11 +88,92 @@ mod tests {
                 "{name} in shaders/blocks.glsl disagrees with tables::{name}"
             );
         }
-        let words = crate::tables::GPU_TABLE_WORDS_LEN;
+        // The buffer must end exactly after the last table (the IQ2_S grid is
+        // the newest one: 1024 u64 entries split into lo/hi u32 words).
         assert_eq!(
-            words,
-            crate::tables::TBL_IQ4NL_VALUES + 16,
-            "table buffer length must end after the IQ4_NL values"
+            crate::tables::GPU_TABLE_WORDS_LEN,
+            crate::tables::TBL_IQ2S_HI + 1024,
+            "table buffer length must end after the IQ2_S grid"
+        );
+    }
+
+    /// Every table accessor in `blocks.glsl` must mask its index to its own
+    /// table's length, and the masked range must fit the uploaded buffer.
+    ///
+    /// This is the static half of the "a bad index must never become an
+    /// out-of-bounds SSBO read" guard: an OOB read of a storage buffer is a GPU
+    /// page fault (process death, and on a display card a frozen machine), not a
+    /// wrong number. The indices are packet bits today, so the masks are
+    /// belt-and-braces — but they are what makes that statement checkable.
+    #[test]
+    fn table_accessors_are_bounded() {
+        use crate::tables as t;
+        let glsl = include_str!("../shaders/blocks.glsl");
+        // (accessor, host base, mask in the shader, entries in the table)
+        let checks: [(&str, usize, u32, u32); 10] = [
+            ("sign_code", t::TBL_SIGNS, 127, 128),
+            ("grid_iq2xxs_lo", t::TBL_IQ2XXS_LO, 255, 256),
+            ("grid_iq2xxs_hi", t::TBL_IQ2XXS_HI, 255, 256),
+            ("grid_iq2xs_lo", t::TBL_IQ2XS_LO, 511, 512),
+            ("grid_iq2xs_hi", t::TBL_IQ2XS_HI, 511, 512),
+            ("grid_iq3xxs", t::TBL_IQ3XXS_GRID, 255, 256),
+            ("grid_iq3s", t::TBL_IQ3S_GRID, 511, 512),
+            ("grid_iq2s_lo", t::TBL_IQ2S_LO, 1023, 1024),
+            ("grid_iq2s_hi", t::TBL_IQ2S_HI, 1023, 1024),
+            ("iq4nl_value", t::TBL_IQ4NL_VALUES, 15, 16),
+        ];
+        for (name, base, mask, entries) in checks {
+            let needle = format!("{name}(uint ");
+            let line = glsl
+                .lines()
+                .find(|l| l.contains(&needle) && l.trim_start().starts_with(['u', 'f', 'i']))
+                .unwrap_or_else(|| panic!("shaders/blocks.glsl lacks the `{name}` accessor"));
+            assert!(
+                line.contains(&format!("& {mask}u")),
+                "{name} must mask its index to {} entries, found: {}",
+                entries,
+                line.trim()
+            );
+            assert_eq!(mask + 1, entries, "{name} mask vs table size");
+            assert!(
+                base + entries as usize <= t::GPU_TABLE_WORDS_LEN,
+                "{name}: table [{base}, +{entries}) runs past the uploaded buffer ({})",
+                t::GPU_TABLE_WORDS_LEN
+            );
+        }
+    }
+
+    /// No decode unit may turn a float into an index: the scale is data, and a
+    /// NaN scale converted to an integer is exactly how a decode kernel becomes
+    /// an out-of-bounds memory read. The scale may only ever be multiplied into
+    /// a value (`docs/phase-3/02-expert-batching-quants.md` §4.3).
+    #[test]
+    fn no_float_to_integer_conversion_in_a_decode_unit() {
+        let glsl = include_str!("../shaders/blocks.glsl");
+        // Scale-carrying float identifiers used by the decode units.
+        let floats = ["d", "db", "dl", "dm", "dmin", "sc ", "dv"];
+        let mut offenders = Vec::new();
+        for (n, line) in glsl.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("").trim();
+            if code.is_empty() || code.starts_with('*') {
+                continue;
+            }
+            // `int(x)` / `uint(x)` where x is one of the scale values.
+            for f in floats {
+                let f = f.trim();
+                for cast in ["int(", "uint("] {
+                    let pat = format!("{cast}{f})");
+                    let pat2 = format!("{cast}{f} ");
+                    if code.contains(&pat) || code.contains(&pat2) {
+                        offenders.push(format!("line {}: {}", n + 1, code));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "float->integer conversion of a scale value (would make a NaN scale \
+             an out-of-bounds index): {offenders:#?}"
         );
     }
 }

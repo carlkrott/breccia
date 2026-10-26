@@ -37,6 +37,7 @@ TABLES = [
     ("iq2xs_grid", "uint64_t", 512),
     ("iq3xxs_grid", "uint32_t", 256),
     ("iq3s_grid", "uint32_t", 512),
+    ("iq2s_grid", "uint64_t", 1024),
     ("kvalues_iq4nl", "int8_t", 16),
 ]
 
@@ -82,6 +83,10 @@ GPU_LAYOUT = [
     ("TBL_IQ3S_GRID", "iq3s_grid", "u32"),
     ("TBL_SIGNS", "ksigns_iq2xs", "u32"),
     ("TBL_IQ4NL_VALUES", "kvalues_iq4nl", "i32"),
+    # Appended after the tables the first kernel pass shipped, so no existing
+    # TBL_* offset moved (the shader defines are checked against these).
+    ("TBL_IQ2S_LO", "iq2s_grid", "lo"),
+    ("TBL_IQ2S_HI", "iq2s_grid", "hi"),
 ]
 
 
@@ -111,7 +116,10 @@ def emit_rust(tables, path):
             ty, fmt = "u8", lambda v: str(v)
         else:
             ty, fmt = "i8", lambda v: str(v)
-        lines.append(f"pub const {name.upper()}: [{ty}; {len(vals)}] = [")
+        # `static` for the big data tables: a 4096+ element `const` array is
+        # copied at every use site and trips clippy::large_const_arrays.
+        kind = "static" if len(vals) > 512 else "const"
+        lines.append(f"pub {kind} {name.upper()}: [{ty}; {len(vals)}] = [")
         body = ",\n".join(
             "    " + ", ".join(fmt(v) for v in vals[i : i + 8])
             for i in range(0, len(vals), 8)
@@ -121,7 +129,7 @@ def emit_rust(tables, path):
     for name, off in offsets:
         lines.append(f"pub const {name}: usize = {off};")
     lines.append(f"\npub const GPU_TABLE_WORDS_LEN: usize = {len(words)};\n")
-    lines.append("pub const GPU_TABLE_WORDS: [u32; GPU_TABLE_WORDS_LEN] = [")
+    lines.append("pub static GPU_TABLE_WORDS: [u32; GPU_TABLE_WORDS_LEN] = [")
     body = ",\n".join(
         "    " + ", ".join(f"0x{v:08x}" for v in words[i : i + 8])
         for i in range(0, len(words), 8)

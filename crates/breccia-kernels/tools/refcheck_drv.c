@@ -40,7 +40,7 @@ int main(int argc, char **argv) {
 
     size_t ne = 0;
     switch (ty) {
-        case 13: case 16: case 17: case 18: case 21: ne = 256; break;
+        case 12: case 13: case 14: case 16: case 17: case 18: case 21: case 22: case 23: ne = 256; break;
         case 20: ne = 32; break;
         case 42: ne = 64; break;
         default: fprintf(stderr, "unsupported type %d\n", ty); return 4;
@@ -55,6 +55,10 @@ int main(int argc, char **argv) {
         case 20: dequantize_row_iq4_nl((const block_iq4_nl *)in, out, (int64_t)ne * n); break;
         case 13: dequantize_row_q5_K  ((const block_q5_K   *)in, out, (int64_t)ne * n); break;
         case 42: dequantize_row_q2_0  ((const block_q2_0   *)in, out, (int64_t)ne * n); break;
+        case 22: dequantize_row_iq2_s ((const block_iq2_s  *)in, out, (int64_t)ne * n); break;
+        case 23: dequantize_row_iq4_xs((const block_iq4_xs *)in, out, (int64_t)ne * n); break;
+        case 12: dequantize_row_q4_K  ((const block_q4_K   *)in, out, (int64_t)ne * n); break;
+        case 14: dequantize_row_q6_K  ((const block_q6_K   *)in, out, (int64_t)ne * n); break;
     }
     fwrite(out, sizeof(float), ne * (size_t)n, stdout);
     return 0;

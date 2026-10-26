@@ -10,6 +10,7 @@
 //! breccia profile [--reprofile] [--quick] [--json PATH] [--dry-run-plan] [--print-fingerprint]
 //! breccia bench transfer [--device <profile-index|pci>]... [--json PATH] [--quick]
 //! breccia bench gemv [--type T]... [--rows N --cols N] [--device <idx|pci>]... [--json PATH] [--quick] [--real]
+//! breccia bench gemv --experts 1,2,4,8,10,16 [--type T]... [--rows N --cols N]   # batched MoE decode
 //! ```
 //!
 //! Behaviour: with a cached profile whose fingerprint matches (and whose
@@ -36,6 +37,10 @@ struct Cli {
     command: Command,
 }
 
+// The `bench gemv` variant carries the whole decode-benchmark surface (paths,
+// names, expert counts); this is a parse-only enum built once per process, so
+// boxing it to equalise variant sizes would only add noise.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Hardware discovery + calibration → hw_profile.json (M1a)
@@ -132,6 +137,11 @@ enum BenchKind {
         /// (e.g. output.weight for Q5_K)
         #[arg(long, value_name = "NAME")]
         tensor: Option<String>,
+        /// Batched multi-expert (MoE decode) mode: expert counts to batch in one
+        /// dispatch, e.g. --experts 1,2,4,8,10,16 (repeatable). Compares against
+        /// the per-expert loop in the same run.
+        #[arg(long, value_name = "N[,N...]", value_delimiter = ',')]
+        experts: Vec<usize>,
     },
 }
 
@@ -164,7 +174,8 @@ fn run(cli: Cli) -> Result<()> {
                 "bench: available harnesses\n  \
                  breccia bench transfer [--device <idx|pci>]... [--json PATH] [--quick]\n  \
                  breccia bench gemv [--type IQ3_S]... [--rows N --cols N] [--device <idx|pci>]... \\\n                 \
-                 [--json PATH] [--quick] [--real [--layer N] [--role gate|up|down] [--expert E]]"
+                 [--json PATH] [--quick] [--real [--layer N] [--role gate|up|down] [--expert E]]\n                 \
+                 [--experts 1,2,4,8,10,16]"
             );
             Ok(())
         }
@@ -192,6 +203,7 @@ fn run(cli: Cli) -> Result<()> {
                     expert,
                     splits,
                     tensor,
+                    experts,
                 }),
         } => bench_gemv(GemvArgs {
             types,
@@ -207,6 +219,7 @@ fn run(cli: Cli) -> Result<()> {
             expert,
             splits,
             tensor,
+            experts,
         }),
     }
 }
@@ -709,6 +722,7 @@ struct GemvArgs {
     expert: Option<usize>,
     splits: Option<u32>,
     tensor: Option<String>,
+    experts: Vec<usize>,
 }
 
 /// Everything a `bench gemv` JSON file contains: one run per device, because
@@ -765,6 +779,7 @@ fn bench_gemv(args: GemvArgs) -> Result<()> {
             real_expert: args.expert,
             splits: args.splits,
             real_tensor: args.tensor.clone(),
+            experts: args.experts.clone(),
         };
         let report = breccia_kernels::run_gemv_bench(&opts)
             .with_context(|| format!("GEMV benchmark on {dev}"))?;
@@ -807,6 +822,55 @@ fn print_gemv_summary(rep: &breccia_kernels::GemvReport) {
     }
     for w in &rep.warnings {
         println!("  warning: {w}");
+    }
+
+    if !rep.batch.is_empty() {
+        println!(
+            "\n  batched multi-expert (one dispatch over N experts, per-expert loop measured in the same run)"
+        );
+        println!(
+            "  {:<8} {:>11} {:>4} {:>9} {:>11} {:>11} {:>8} {:>9} {:>8}",
+            "type",
+            "expert",
+            "N",
+            "x-layout",
+            "loop ms",
+            "batched ms",
+            "speedup",
+            "loop GB/s",
+            "bt GB/s"
+        );
+        for c in &rep.batch {
+            println!(
+                "  {:<8} {:>11} {:>4} {:>9} {:>11.3} {:>11.3} {:>7.2}x {:>9.1} {:>8.1}{}",
+                c.ty,
+                c.shape.to_string(),
+                c.experts,
+                c.x_layout,
+                c.loop_seconds * 1e3,
+                c.batched_seconds * 1e3,
+                c.speedup,
+                c.loop_gbps,
+                c.batched_gbps,
+                c.percent_of_reference
+                    .map(|p| format!(" ({p:.0}% of DRAM)"))
+                    .unwrap_or_default()
+            );
+            if let (Some(t), Some(rel)) = (&c.tensor, c.conformance_max_rel) {
+                println!(
+                    "           {} · experts {:?} · {} MiB read · conformance {} rows max rel {:.2e}{}",
+                    t,
+                    c.expert_ids.clone().unwrap_or_default(),
+                    c.total_bytes >> 20,
+                    c.conformance_rows.unwrap_or(0),
+                    rel,
+                    c.upload_seconds
+                        .map(|s| format!(" · upload {s:.2} s"))
+                        .unwrap_or_default()
+                );
+            }
+        }
+        return;
     }
 
     if !rep.real.is_empty() {

@@ -19,7 +19,8 @@
 use anyhow::{anyhow, Context, Result};
 use breccia_format::{ExpertBlock, ShardSet, TensorView};
 
-use crate::bench::{read_out, GemvBenchOptions, RealCell, Shape};
+use crate::batch::{map_to_bytes, GemvBatch, XLayout};
+use crate::bench::{f32_to_bytes, read_out, BatchCell, GemvBenchOptions, RealCell, Shape};
 use crate::device::Device;
 use crate::gemv::{alloc, upload, Gemv};
 use crate::quant::QuantType;
@@ -90,14 +91,34 @@ fn f32_to_f16_lossy_bits(v: f32) -> u16 {
     ((bits + round) >> 16) as u16
 }
 
-/// Write a plausible fp16 scale (and Q5_K min) into a block.
+/// Byte offsets of the fp16 scale fields inside a block of `ty`.
+///
+/// Every type stores `d` at the front except Q6_K, whose super-block scale is
+/// the last field (`ggml-common.h`: `ggml_half d` after `scales[16]`), and the
+/// two K-types with a minimum (`dmin` at byte 2). Used by the synthetic data
+/// generator and by the degenerate-scale tests, so "the scale field" is defined
+/// in exactly one place.
+pub fn scale_offsets(ty: QuantType) -> &'static [usize] {
+    match ty {
+        QuantType::Q4K | QuantType::Q5K => &[0, 2],
+        QuantType::Q6K => &[208],
+        QuantType::Bf16 | QuantType::F32 => &[],
+        _ => &[0],
+    }
+}
+
+/// Write plausible fp16 scale fields into a block.
 fn write_scale(ty: QuantType, blk: &mut [u8], rng: &mut XorShift64) {
-    // 2^-6 .. 2^0, the range the real artefacts use for per-block scales.
-    let d = rng.next_f32() * 0.015 + 0.0005;
-    blk[0..2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
-    if ty == QuantType::Q5K {
-        let m = rng.next_f32() * 0.01;
-        blk[2..4].copy_from_slice(&f32_to_f16(m).to_le_bytes());
+    // 2^-6 .. 2^0, the range the real artefacts use for per-block scales; the
+    // minimum field gets an order of magnitude less so `d*q - dmin*m` stays
+    // dominated by the quantised term, as in the real tensors.
+    for (i, &off) in scale_offsets(ty).iter().enumerate() {
+        let v = if i == 0 {
+            rng.next_f32() * 0.015 + 0.0005
+        } else {
+            rng.next_f32() * 0.0015
+        };
+        blk[off..off + 2].copy_from_slice(&f32_to_f16(v).to_le_bytes());
     }
 }
 
@@ -342,6 +363,222 @@ fn run_tensor(
         conformance_rows: check_rows,
         upload_seconds,
     }])
+}
+
+// ---------------------------------------------------------------------------
+// Batched multi-expert mode on the real tensors
+// ---------------------------------------------------------------------------
+
+/// Run the first `N` experts of a role tensor as one batched dispatch, with the
+/// per-expert loop measured in the same process for the before/after number.
+///
+/// Experts are contiguous inside a GGUF role tensor (`[ne0, ne1, 512]`), so
+/// experts `0..N` are the single zero-copy slice `[0, N * blob_bytes)`: nothing
+/// is copied out of the mapping, and the upload is the page-in of exactly the
+/// benchmarked blobs.
+pub fn run_batch(dev: &Device, opts: &GemvBenchOptions) -> Result<Vec<BatchCell>> {
+    let glob = opts
+        .real_model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MODEL_GLOB.to_string());
+    let shards = ShardSet::open_glob(&glob).with_context(|| {
+        format!("opening the model shards {glob} (real mode needs /srv/strata-data)")
+    })?;
+
+    let tensor: TensorView<'_> = if let Some(name) = &opts.real_tensor {
+        shards
+            .tensor(name)
+            .ok_or_else(|| anyhow!("tensor {name} is not in {glob}"))?
+    } else {
+        let layout = shards.layout().context("model layout")?;
+        let block = layout
+            .block(opts.real_layer)
+            .ok_or_else(|| anyhow!("block {} does not exist in {glob}", opts.real_layer))?;
+        match opts.real_role.as_str() {
+            "gate" | "gate_exps" | "ffn_gate_exps" => block.gate,
+            "up" | "up_exps" | "ffn_up_exps" => block.up,
+            "down" | "down_exps" | "ffn_down_exps" => block.down,
+            other => return Err(anyhow!("--real-role must be gate|up|down, got {other:?}")),
+        }
+    };
+
+    let ty = QuantType::from_ggml(tensor.ty()).ok_or_else(|| {
+        anyhow!(
+            "{} is {} which has no kernel yet",
+            tensor.name(),
+            tensor.ty()
+        )
+    })?;
+    let cols = tensor.dims()[0] as usize;
+    let rows_per_expert = tensor.dims()[1] as usize;
+    let available = tensor.dims().get(2).copied().unwrap_or(1) as usize;
+    let counters: Vec<usize> = if opts.experts.is_empty() {
+        crate::bench::default_expert_counts(opts.quick)
+            .into_iter()
+            .filter(|n| *n <= available)
+            .collect()
+    } else {
+        opts.experts
+            .iter()
+            .copied()
+            .filter(|n| *n <= available)
+            .collect()
+    };
+    if counters.is_empty() {
+        return Err(anyhow!(
+            "no expert count to run: tensor has {available} experts, asked for {:?}",
+            opts.experts
+        ));
+    }
+
+    let gpu = dev.gpu();
+    let shape = Shape::new(rows_per_expert, cols);
+    let batch = GemvBatch::new(gpu, ty, rows_per_expert, cols)?;
+    let blob = batch.blob_bytes() as usize;
+    if blob * available != tensor.n_bytes() as usize {
+        return Err(anyhow!(
+            "kernel geometry disagrees with the tensor: {} B/expert x {available} != {} B",
+            blob,
+            tensor.n_bytes()
+        ));
+    }
+
+    let all = tensor.as_slice();
+    let max_n = *counters.iter().max().expect("non-empty");
+    let t_up = std::time::Instant::now();
+    // Zero-copy view of experts 0..max_n (expert-major in the GGUF tensor).
+    let w = upload(gpu, &all[..blob * max_n]).context("uploading the expert blobs")?;
+    // Distinct activations per expert: the routed `down` projection consumes a
+    // different SwiGLU intermediate per expert (gate/up would share one, which
+    // is the XLayout::Shared cell).
+    let padded = batch.padded_cols();
+    let mut x_per_expert = Vec::with_capacity(padded * max_n);
+    let mut xs = Vec::with_capacity(max_n);
+    for e in 0..max_n {
+        let (_, x) = synthetic_inputs(ty, shape, 0xdead_beef ^ (e as u64).wrapping_mul(0x9f1));
+        x_per_expert.extend_from_slice(&x);
+        xs.push(x);
+    }
+    let x_shared = xs[0].clone();
+    let x_pe = upload(gpu, &f32_to_bytes(&x_per_expert)).context("uploading x (per expert)")?;
+    let x_sh = upload(gpu, &f32_to_bytes(&x_shared)).context("uploading x (shared)")?;
+    let upload_seconds = t_up.elapsed().as_secs_f64();
+
+    let out = alloc(gpu, (batch.rows(max_n) * 4) as u64).context("allocating output")?;
+    let w0 = upload(gpu, &all[..blob]).context("uploading blob 0")?;
+    let x0 = upload(gpu, &f32_to_bytes(&xs[0])).context("uploading x0")?;
+    let out0 = alloc(gpu, (rows_per_expert * 4) as u64).context("allocating single output")?;
+    let single = Gemv::new(gpu, ty, rows_per_expert, cols)?;
+
+    let window = if opts.quick { 0.15 } else { 0.3 };
+    let repeats = if opts.quick { 2 } else { 3 };
+    let (reference_gbps, _) = reference_for(&dev.info.device_id);
+
+    let mut cells = Vec::new();
+    for &experts in &counters {
+        for layout in [XLayout::PerExpert, XLayout::Shared] {
+            let xb = match layout {
+                XLayout::PerExpert => &x_pe,
+                XLayout::Shared => &x_sh,
+            };
+            let map_host = batch.map(experts, layout);
+            let map = upload(gpu, &map_to_bytes(&map_host)).context("uploading the row map")?;
+
+            // Warm-ups then three windows, same protocol as the synthetic cells.
+            single.run(&w0, &x0, &out0).context("warm-up single GEMV")?;
+            batch
+                .run(&w, xb, &out, &map, experts)
+                .context("warm-up batched GEMV")?;
+            batch
+                .run_timed(&w, xb, &out, &map, experts, 0.05)
+                .context("warm-up batched window")?;
+            let mut batch_all = Vec::with_capacity(repeats);
+            let mut iters = 0;
+            let mut used_ts = true;
+            for _ in 0..repeats {
+                let t = batch.run_timed(&w, xb, &out, &map, experts, window)?;
+                batch_all.push(t.per_iter_s);
+                iters = t.iters;
+                used_ts &= t.used_timestamps;
+            }
+            let mut loop_all = Vec::with_capacity(repeats);
+            for _ in 0..repeats {
+                loop_all.push(
+                    single
+                        .run_looped_timed(&w0, &x0, &out0, experts, window)?
+                        .per_iter_s,
+                );
+            }
+            let batched_s = batch_all.iter().cloned().fold(f64::INFINITY, f64::min);
+            let loop_s = loop_all.iter().cloned().fold(f64::INFINITY, f64::min);
+
+            // Conformance on real quantised bytes: 4 rows of each of the first
+            // two experts, against the CPU reference with that expert's x.
+            let got = read_out(dev, &out, batch.rows(experts))?;
+            let check_rows = rows_per_expert.min(4);
+            let mut max_rel = 0.0f64;
+            for e in 0..experts.min(2) {
+                let blob_bytes = &all[e * blob..(e + 1) * blob];
+                let row_bytes = blob / rows_per_expert;
+                let x = match layout {
+                    XLayout::PerExpert => &xs[e],
+                    XLayout::Shared => &x_shared,
+                };
+                for r in 0..check_rows {
+                    let cpu = crate::reference::dot_row(
+                        ty,
+                        &blob_bytes[r * row_bytes..(r + 1) * row_bytes],
+                        cols,
+                        x,
+                    );
+                    let g = f64::from(got[e * rows_per_expert + r]);
+                    max_rel = max_rel.max((g - cpu).abs() / cpu.abs().max(1.0));
+                }
+            }
+
+            let total_bytes = batch.total_bytes(experts);
+            let gbps = |s: f64| total_bytes as f64 / s / 1e9;
+            cells.push(BatchCell {
+                ty: ty.name().to_string(),
+                quant_id: ty.ggml_id(),
+                shape,
+                experts,
+                blob_bytes: batch.blob_bytes(),
+                total_bytes,
+                x_layout: match layout {
+                    XLayout::Shared => "shared",
+                    XLayout::PerExpert => "per-expert",
+                }
+                .to_string(),
+                loop_seconds: loop_s,
+                loop_seconds_all: loop_all,
+                loop_split_seconds: None,
+                loop_split_splits: 1,
+                batched_seconds: batched_s,
+                batched_seconds_all: batch_all,
+                speedup: loop_s / batched_s,
+                single_expert_seconds: single.run_timed(&w0, &x0, &out0, 0.05)?.per_iter_s,
+                loop_gbps: gbps(loop_s),
+                batched_gbps: gbps(batched_s),
+                reference_gbps,
+                percent_of_reference: reference_gbps.map(|bw| 100.0 * gbps(batched_s) / bw),
+                tokens_per_s_equivalent: 1.0 / batched_s,
+                iters,
+                used_timestamps: used_ts,
+                tensor: Some(tensor.name().to_string()),
+                expert_ids: Some((0..experts).collect()),
+                conformance_max_rel: Some(max_rel),
+                conformance_rows: Some(check_rows * experts.min(2)),
+                upload_seconds: Some(upload_seconds),
+            });
+            gpu.destroy_buf(&map);
+        }
+    }
+
+    for b in [&w, &x_pe, &x_sh, &out, &w0, &x0, &out0] {
+        gpu.destroy_buf(b);
+    }
+    Ok(cells)
 }
 
 fn reference_for(device_id: &str) -> (Option<f64>, Option<String>) {

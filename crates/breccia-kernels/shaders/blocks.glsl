@@ -45,14 +45,27 @@ layout(std430, binding = 3) readonly buffer QuantTables { uint T[]; };
 #define TBL_IQ3XXS_GRID 1536u
 #define TBL_IQ3S_GRID 1792u
 #define TBL_IQ4NL_VALUES 2432u
+// Appended for the second kernel pass (IQ2_S's 1024-entry u64 grid): the
+// earlier offsets above are untouched.
+#define TBL_IQ2S_LO 2448u
+#define TBL_IQ2S_HI 3472u
 
-uint sign_code(uint i) { return T[TBL_SIGNS + (i & 127u)]; }
-uint grid_iq3xxs(uint i) { return T[TBL_IQ3XXS_GRID + i]; }
-uint grid_iq3s(uint i) { return T[TBL_IQ3S_GRID + i]; }
-uint grid_iq2xxs_lo(uint i) { return T[TBL_IQ2XXS_LO + i]; }
-uint grid_iq2xxs_hi(uint i) { return T[TBL_IQ2XXS_HI + i]; }
-uint grid_iq2xs_lo(uint i) { return T[TBL_IQ2XS_LO + i]; }
-uint grid_iq2xs_hi(uint i) { return T[TBL_IQ2XS_HI + i]; }
+// Every table accessor masks its index to the table's own length. The indices
+// themselves are *packet bits* (grid/sign codes), never float data — but the
+// mask makes the address provably in-bounds even if a caller (or a future
+// decode unit) hands over an unmasked value: a bad index must never be able to
+// turn into an out-of-bounds SSBO read, which faults the GPU rather than
+// returning garbage (docs/phase-3/02-expert-batching-quants.md §4).
+// `lib.rs::table_accessors_are_bounded` checks these masks against the bases.
+uint sign_code(uint i) { return T[TBL_SIGNS + (i & 127u)]; }        // 128
+uint grid_iq2xxs_lo(uint i) { return T[TBL_IQ2XXS_LO + (i & 255u)]; } // 256
+uint grid_iq2xxs_hi(uint i) { return T[TBL_IQ2XXS_HI + (i & 255u)]; } // 256
+uint grid_iq2xs_lo(uint i) { return T[TBL_IQ2XS_LO + (i & 511u)]; }   // 512
+uint grid_iq2xs_hi(uint i) { return T[TBL_IQ2XS_HI + (i & 511u)]; }   // 512
+uint grid_iq3xxs(uint i) { return T[TBL_IQ3XXS_GRID + (i & 255u)]; }  // 256
+uint grid_iq3s(uint i) { return T[TBL_IQ3S_GRID + (i & 511u)]; }      // 512
+uint grid_iq2s_lo(uint i) { return T[TBL_IQ2S_LO + (i & 1023u)]; }    // 1024
+uint grid_iq2s_hi(uint i) { return T[TBL_IQ2S_HI + (i & 1023u)]; }    // 1024
 /// IQ4_NL non-linear values are int8 -127..113, stored as int32 words.
 float iq4nl_value(uint q) { return float(int(T[TBL_IQ4NL_VALUES + (q & 15u)])); }
 
@@ -79,6 +92,18 @@ uint byte2(uint w, uint i) { return (uint(W[w]) >> (8u * i)) & 0xffu; }
 // fp16 -> fp32. Exact (hardware conversion), keeps subnormals/inf/nan.
 float f16_at(uint w) { return unpackHalf2x16(uint(W[w])).x; }
 
+/// Byte `b` of the block whose first word is `off` (b = 0 is the low byte).
+uint block_byte(uint off, uint b) { return byte2(off + (b >> 1u), b & 1u); }
+
+/// Signed byte `b` of the block (int8 fields: Q6_K scales).
+int block_i8(uint off, uint b) {
+    int v = int(block_byte(off, b));
+    return (v & 0x80) != 0 ? v - 256 : v;
+}
+
+
+// K-quant block scale byte (`scales[i]` of Q4_K/Q5_K: 12 bytes at block byte 4).
+uint scale_byte_k(uint off, uint i) { return byte2(off + 2u + (i >> 1u), i & 1u); }
 
 // ---- IQ2_XXS  (256 elements / 66 B) ---------------------------------------
 
@@ -116,6 +141,31 @@ void dequant_iq2_xs_unit(uint off, uint u, out float v[8]) {
     uint sgn = sign_code(qs >> 9u);
     uint lo = grid_iq2xs_lo(idx);
     uint hi = grid_iq2xs_hi(idx);
+    for (uint j = 0u; j < 8u; ++j) {
+        uint g = j < 4u ? byte4(lo, j) : byte4(hi, j - 4u);
+        float t = db * float(g);
+        v[j] = (sgn & (1u << j)) != 0u ? -t : t;
+    }
+}
+
+// ---- IQ2_S  (256 elements / 82 B) -----------------------------------------
+
+// d: word 0 | qs: bytes 2..33 (one 8-bit grid index per 8-element unit) |
+// signs: bytes 34..65 (one sign byte per unit) | qh: bytes 66..73 (2 extra
+// index bits per 32-element group) | scales: bytes 74..81 (2 nibbles/group).
+void dequant_iq2_s_unit(uint off, uint u, out float v[8]) {
+    uint ib32 = u >> 2u;
+    uint l = u & 3u;
+    uint q = byte2(off + 1u + (u >> 1u), u & 1u);         // qs[u]        byte 2+u
+    uint h = byte2(off + 33u + (ib32 >> 1u), ib32 & 1u);  // qh[ib32]     byte 66+
+    uint sc = byte2(off + 37u + (ib32 >> 1u), ib32 & 1u); // scales[ib32] byte 74+
+    uint nib = l < 2u ? (sc & 0x0fu) : (sc >> 4u);
+    float db = f16_at(off) * (0.5 + float(nib)) * 0.25;
+    // 8 packet bits + 2 extra bits per group = a 10-bit grid index (0..1023).
+    uint idx = (q | ((h << (8u - 2u * l)) & 0x300u)) & 1023u;
+    uint sgn = byte2(off + 17u + (u >> 1u), u & 1u);      // signs[u]     byte 34+u
+    uint lo = grid_iq2s_lo(idx);
+    uint hi = grid_iq2s_hi(idx);
     for (uint j = 0u; j < 8u; ++j) {
         uint g = j < 4u ? byte4(lo, j) : byte4(hi, j - 4u);
         float t = db * float(g);
@@ -187,11 +237,63 @@ void dequant_iq4_nl_unit(uint off, uint u, out float v[8]) {
     }
 }
 
+// ---- IQ4_XS  (256 elements / 136 B) ---------------------------------------
+
+// d: word 0 | scales_h: u16 at byte 2 | scales_l: bytes 4..7 | qs: bytes
+// 8..135 (16 bytes per 32-element group). Same nibble order as IQ4_NL (low
+// nibbles are the group's first 16 elements, high nibbles the last 16), plus a
+// per-32-element scale: dl = d * (scale6 - 32).
+void dequant_iq4_xs_unit(uint off, uint u, out float v[8]) {
+    uint ib = u >> 2u;      // 32-element group 0..7
+    uint h = u & 3u;        // 8-element unit inside the group
+    uint si = ib >> 1u;     // scales_l index 0..3 (one nibble pair per 2 groups)
+    uint sh = u16_at(off + 1u);
+    uint sl = byte2(off + 2u + (si >> 1u), si & 1u);
+    uint ls = ((sl >> (4u * (ib & 1u))) & 0x0fu) | (((sh >> (2u * ib)) & 3u) << 4u);
+    float dl = f16_at(off) * float(int(ls) - 32);
+    uint base = off + 4u + 8u * ib + 4u * (h & 1u); // qs[ib*16 + h*8 .. +8] -> 4 words
+    uint hi = h >> 1u;
+    for (uint j = 0u; j < 8u; ++j) {
+        uint b = byte2(base + (j >> 1u), j & 1u);
+        uint q = hi == 0u ? (b & 0x0fu) : (b >> 4u);
+        v[j] = dl * iq4nl_value(q);
+    }
+}
+
+// ---- Q4_K  (256 elements / 144 B) -----------------------------------------
+
+// dm: words 0..1 | scales: bytes 4..15 (get_scale_min_k4) | qs: bytes 16..143.
+// element = d*sc*q - dmin*m, q = low nibble for the sub-block's first 32
+// elements, high nibble for the second.
+void dequant_q4_k_unit(uint off, uint u, out float v[8]) {
+    uint g = u >> 3u;      // 64-element group 0..3
+    uint s = u & 7u;       // 8-element unit inside the group
+    uint sub = s >> 2u;    // 32-element sub-block 0..1
+    uint j = 2u * g + sub; // sub-block index 0..7 (get_scale_min_k4)
+    uint sc;
+    uint mn;
+    if (j < 4u) {
+        sc = scale_byte_k(off, j) & 63u;
+        mn = scale_byte_k(off, j + 4u) & 63u;
+    } else {
+        sc = (scale_byte_k(off, j + 4u) & 0x0fu) | ((scale_byte_k(off, j - 4u) >> 6u) << 4u);
+        mn = (scale_byte_k(off, j + 4u) >> 4u) | ((scale_byte_k(off, j) >> 6u) << 4u);
+    }
+    float d = f16_at(off) * float(sc);
+    float dm = f16_at(off + 1u) * float(mn);
+    uint l0 = (s & 3u) * 8u;          // element offset inside the 32-element sub-block
+    uint qbase = off + 8u + 16u * g;  // qs byte 16 + 32*g, in words
+    for (uint jj = 0u; jj < 8u; ++jj) {
+        uint b = byte2(qbase + ((l0 + jj) >> 1u), (l0 + jj) & 1u);
+        uint q = sub == 0u ? (b & 0x0fu) : (b >> 4u);
+        v[jj] = d * float(q) - dm;
+    }
+}
+
 // ---- Q5_K  (256 elements / 176 B) -----------------------------------------
 
 // dm: words 0..1 | scales: bytes 4..15 | qh: bytes 16..47 | qs: bytes 48..175
 // weight = d*sc*q - dmin*m, q = 4-bit nibble + 5th bit from qh (bit 2g/2g+1).
-uint q5k_scale_byte(uint off, uint i) { return byte2(off + 2u + (i >> 1u), i & 1u); }
 
 void dequant_q5_k_unit(uint off, uint u, out float v[8]) {
     uint g = u >> 3u;     // 64-element group 0..3
@@ -200,11 +302,11 @@ void dequant_q5_k_unit(uint off, uint u, out float v[8]) {
     uint sc;
     uint mn;
     if (j < 4u) {
-        sc = q5k_scale_byte(off, j) & 63u;
-        mn = q5k_scale_byte(off, j + 4u) & 63u;
+        sc = scale_byte_k(off, j) & 63u;
+        mn = scale_byte_k(off, j + 4u) & 63u;
     } else {
-        sc = (q5k_scale_byte(off, j + 4u) & 0x0fu) | ((q5k_scale_byte(off, j - 4u) >> 6u) << 4u);
-        mn = (q5k_scale_byte(off, j + 4u) >> 4u) | ((q5k_scale_byte(off, j) >> 6u) << 4u);
+        sc = (scale_byte_k(off, j + 4u) & 0x0fu) | ((scale_byte_k(off, j - 4u) >> 6u) << 4u);
+        mn = (scale_byte_k(off, j + 4u) >> 4u) | ((scale_byte_k(off, j) >> 6u) << 4u);
     }
     float d = f16_at(off) * float(sc);
     float dm = f16_at(off + 1u) * float(mn);
@@ -218,6 +320,33 @@ void dequant_q5_k_unit(uint off, uint u, out float v[8]) {
         uint hb = byte2(off + 8u + ((l0 + jj) >> 1u), (l0 + jj) & 1u);
         uint q = nib + ((hb & mask) != 0u ? 16u : 0u);
         v[jj] = d * float(q) - dm;
+    }
+}
+
+// ---- Q6_K  (256 elements / 210 B) -----------------------------------------
+
+// ql: bytes 0..127 (low 4 bits) | qh: bytes 128..191 (high 2 bits) | scales:
+// bytes 192..207 (16 int8) | d: word 104. Per 128-element half and 32-element
+// quarter q (0..3): value = d * sc[grp*8 + l/16 + 2q] * (nib | hi2<<4 - 32),
+// where the low nibble comes from ql[l] (q even) or ql[l+32] (q odd).
+void dequant_q6_k_unit(uint off, uint u, out float v[8]) {
+    uint grp = u >> 4u;         // 128-element half 0..1
+    uint q = (u >> 2u) & 3u;    // 32-element quarter 0..3
+    uint l0 = (u & 3u) * 8u;    // element offset inside the quarter
+    uint ql = grp * 64u + l0;   // byte of ql for this unit
+    uint qh = 128u + grp * 32u + l0;
+    uint sc0 = 192u + grp * 8u + 2u * q;
+    float d = f16_at(off + 104u);
+    uint shift = 2u * q;
+    for (uint jj = 0u; jj < 8u; ++jj) {
+        uint l = l0 + jj;
+        uint hb = block_byte(off, qh + jj);
+        uint nb = block_byte(off, ql + jj + ((q & 1u) != 0u ? 32u : 0u));
+        uint nib = q >= 2u ? (nb >> 4u) : (nb & 0x0fu);
+        uint hi2 = (hb >> shift) & 3u;
+        int qv = int(nib | (hi2 << 4u)) - 32;
+        int sc = block_i8(off, sc0 + (l >> 4u));
+        v[jj] = d * float(sc) * float(qv);
     }
 }
 

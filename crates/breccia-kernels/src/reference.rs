@@ -8,10 +8,14 @@
 //! |---|---|
 //! | IQ2_XXS | `dequantize_row_iq2_xxs` |
 //! | IQ2_XS | `dequantize_row_iq2_xs` |
+//! | IQ2_S | `dequantize_row_iq2_s` |
 //! | IQ3_XXS | `dequantize_row_iq3_xxs` |
 //! | IQ3_S | `dequantize_row_iq3_s` |
 //! | IQ4_NL | `dequantize_row_iq4_nl` |
+//! | IQ4_XS | `dequantize_row_iq4_xs` |
+//! | Q4_K | `dequantize_row_q4_K` + `get_scale_min_k4` |
 //! | Q5_K | `dequantize_row_q5_K` + `get_scale_min_k4` |
+//! | Q6_K | `dequantize_row_q6_K` |
 //! | Q2_0 | `dequantize_row_q2_0` |
 //! | BF16 / F32 | raw widening |
 //!
@@ -21,7 +25,7 @@
 //! bit-identical GPU emulation — conformance uses `f32`-scale tolerances.
 
 use crate::quant::QuantType;
-use crate::tables::{IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL};
+use crate::tables::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KVALUES_IQ4NL};
 
 /// Exact fp16 → fp32 widening (keeps subnormals, `±inf`, NaN).
 ///
@@ -142,6 +146,28 @@ pub fn dequant_block(ty: QuantType, blk: &[u8], out: &mut Vec<f32>) {
                 }
             }
         }
+        QuantType::Iq2S => {
+            // d: word 0 | qs: bytes 2..33 | signs: bytes 34..65 | qh: bytes
+            // 66..73 | scales: bytes 74..81.
+            let d = scale(blk, 0);
+            for ib32 in 0..8usize {
+                let h = blk[66 + ib32];
+                let sc = blk[74 + ib32];
+                let lo = f32::from(sc & 0xf);
+                let hi = f32::from(sc >> 4);
+                for l in 0..4usize {
+                    let u = 4 * ib32 + l;
+                    let dl = d * (0.5 + if l / 2 == 0 { lo } else { hi }) * 0.25;
+                    let idx = usize::from(blk[2 + u]) | ((usize::from(h) << (8 - 2 * l)) & 0x300);
+                    let grid = IQ2S_GRID[idx];
+                    let signs = u32::from(blk[34 + u]);
+                    for j in 0..8 {
+                        let g = ((grid >> (8 * j)) & 0xff) as f32;
+                        out.push(dl * g * sign_bit(signs, j));
+                    }
+                }
+            }
+        }
         QuantType::Iq3Xxs => {
             let d = scale(blk, 0);
             for ib32 in 0..8 {
@@ -205,6 +231,59 @@ pub fn dequant_block(ty: QuantType, blk: &[u8], out: &mut Vec<f32>) {
                 out.push(d * f32::from(KVALUES_IQ4NL[(qs[j] >> 4) as usize]));
             }
         }
+        QuantType::Iq4Xs => {
+            // d: word 0 | scales_h: u16 at byte 2 | scales_l: bytes 4..7 |
+            // qs: 16 bytes per 32-element group from byte 8.
+            let d = scale(blk, 0);
+            let sh = w16(blk, 1);
+            for ib in 0..8usize {
+                let sl = blk[4 + ib / 2];
+                let ls = ((sl >> (4 * (ib % 2))) & 0xf) | ((((sh >> (2 * ib)) & 3) << 4) as u8);
+                let dl = d * (f32::from(ls) - 32.0);
+                let qs = &blk[8 + 16 * ib..8 + 16 * ib + 16];
+                for j in 0..16 {
+                    out.push(dl * f32::from(KVALUES_IQ4NL[(qs[j] & 0xf) as usize]));
+                }
+                for j in 0..16 {
+                    out.push(dl * f32::from(KVALUES_IQ4NL[(qs[j] >> 4) as usize]));
+                }
+            }
+        }
+        QuantType::Q4K => {
+            // dm: words 0..1 | scales: bytes 4..15 | qs: bytes 16..143.
+            let d = f16_to_f32(w16(blk, 0));
+            let dmin = f16_to_f32(w16(blk, 1));
+            let qscale = |i: usize| b16(blk, 2 + i / 2, i & 1);
+            for group in 0..4usize {
+                let (mut sc1, mut m1, mut sc2, mut m2) = (0u8, 0u8, 0u8, 0u8);
+                for (k, j) in [(0usize, 2 * group), (1, 2 * group + 1)] {
+                    let (s, m) = if j < 4 {
+                        (qscale(j) & 63, qscale(j + 4) & 63)
+                    } else {
+                        (
+                            (qscale(j + 4) & 0xf) | ((qscale(j - 4) >> 6) << 4),
+                            (qscale(j + 4) >> 4) | ((qscale(j) >> 6) << 4),
+                        )
+                    };
+                    if k == 0 {
+                        sc1 = s;
+                        m1 = m;
+                    } else {
+                        sc2 = s;
+                        m2 = m;
+                    }
+                }
+                let (d1, dm1) = (d * f32::from(sc1), dmin * f32::from(m1));
+                let (d2, dm2) = (d * f32::from(sc2), dmin * f32::from(m2));
+                let qs = &blk[16 + 32 * group..16 + 32 * group + 32];
+                for &b in qs {
+                    out.push(d1 * f32::from(b & 0xf) - dm1);
+                }
+                for &b in qs {
+                    out.push(d2 * f32::from(b >> 4) - dm2);
+                }
+            }
+        }
         QuantType::Q5K => {
             let d = f16_to_f32(w16(blk, 0));
             let dmin = f16_to_f32(w16(blk, 1));
@@ -250,6 +329,26 @@ pub fn dequant_block(ty: QuantType, blk: &[u8], out: &mut Vec<f32>) {
                             0
                         };
                     out.push(d2 * f32::from(q) - dm2);
+                }
+            }
+        }
+        QuantType::Q6K => {
+            // ql: bytes 0..127 | qh: bytes 128..191 | scales: bytes 192..207
+            // (int8) | d: word 104. Element order is quarter-major inside each
+            // 128-element half, so the pushes follow the element index.
+            let d = f16_to_f32(w16(blk, 104));
+            for g in 0..2usize {
+                for q in 0..4usize {
+                    for l in 0..32usize {
+                        let is = l / 16;
+                        let base = g * 64 + l;
+                        let nb = blk[if q % 2 == 0 { base } else { base + 32 }];
+                        let nib = if q >= 2 { nb >> 4 } else { nb & 0xf };
+                        let hi2 = (blk[128 + g * 32 + l] >> (2 * q)) & 3;
+                        let qv = i16::from(nib | (hi2 << 4)) - 32;
+                        let sc = f32::from(blk[192 + g * 8 + is + 2 * q] as i8);
+                        out.push(d * sc * f32::from(qv));
+                    }
                 }
             }
         }
