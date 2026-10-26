@@ -467,3 +467,12 @@ Both cards expose a **16 GB BAR** (entire VRAM host-mapped), and Vulkan advertis
 Today every per-block handoff goes through host-coherent system memory with explicit copies/fences (mailbox + readback path). These types allow **the handoff buffers themselves to live in VRAM, directly CPU-mapped**: the expert lane reads its input and writes its result in place — no staging copies, no extra submissions. Payloads are 10–40 KiB, so even the MI50's 2.9 GB/s BAR is irrelevant (latency-bound), and `0x00c7` is explicitly built for cached host access.
 
 Expected: trims the mailbox/readback slice of the host-lane critical path (currently 55–71% of the step) and removes a class of fence round trips. Effort S–M; risk low (a memory-type selection plus mapping lifetime); measure with 2- and 4-stream `bench token`/`bench agents` plus the unchanged parity gate. It composes with every ranked item above, including the merged-prefill stream (item 1), where the CPU never touches the activations at all.
+
+> **Status after §8u (measured):** the merged-MoE byte budget is
+> **72.3 MiB/token at chunk 128** (11.1x fewer expert bytes than the 799 MiB/token
+> the host lane moves), and the routing is more concentrated than a uniform model
+> predicts (~370 of 512 experts per block per 128-token chunk). Derived per-token
+> costs at that budget: PCIe 2.6 ms (RX) / 25 ms (MI50, so hot experts must be
+> resident), GEMM ~0.5-1 ms, dispatch ~0.6 ms — all two orders below the host
+> lane's 163-320 ms. The remaining work is the multi-user GEMM shader, hot-expert
+> residence and an m-user fan-in; nothing in the budget argues against it.

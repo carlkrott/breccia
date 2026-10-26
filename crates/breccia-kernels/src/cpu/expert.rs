@@ -300,6 +300,9 @@ pub fn expert_ffn(
 /// worker re-derives its slices from the same mapping.
 pub struct ExpertPool {
     threads: usize,
+    /// Distinct experts the last [`ExpertPool::moe_topk_chunk`] call touched (the
+    /// number the merged-MoE byte budget is built on, §8u).
+    pub last_distinct: usize,
     tx: Vec<Sender<Msg>>,
     rx: Receiver<Done>,
     handles: Vec<JoinHandle<()>>,
@@ -402,6 +405,7 @@ impl ExpertPool {
         drop(done_tx);
         Self {
             threads,
+            last_distinct: 0,
             tx,
             rx,
             handles,
@@ -751,6 +755,7 @@ impl ExpertPool {
             }
         }
         let distinct = by.len();
+        self.last_distinct = distinct;
         let words = Arc::new(x[..t * n_embd].to_vec());
 
         // ---- phase 1: gate+up+SwiGLU rows, one task per (expert, row shard) ----

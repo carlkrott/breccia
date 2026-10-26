@@ -371,6 +371,12 @@ pub struct Session<'m> {
     pf_weights: Vec<Vec<f32>>,
     pf_mixed: Vec<f32>,
     pf_toks: Vec<u32>,
+    /// Distinct experts the chunk's grouped lane touched, and the expert bytes a
+    /// **merged** (device-side, once-per-expert) pass would move for it — the
+    /// measured budget of §8u.
+    pf_distinct: usize,
+    pf_merged_bytes: u64,
+    pf_tokens: usize,
     /// GPU-time probe (`BRECCIA_GPU_TIME=1`): one timestamp pool per device and
     /// the number of batches stamped so far (`None` = done or disabled).
     probe_pools: Vec<ash::vk::QueryPool>,
@@ -656,6 +662,9 @@ impl<'m> Session<'m> {
             pf_weights: Vec::new(),
             pf_mixed: Vec::new(),
             pf_toks: Vec::new(),
+            pf_distinct: 0,
+            pf_merged_bytes: 0,
+            pf_tokens: 0,
             probe_pools: {
                 let on = cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some();
                 let mut v = Vec::with_capacity(model.devices.len());
@@ -859,6 +868,9 @@ impl<'m> Session<'m> {
 
     /// Zero the per-run counters (the decode window starts after the prompt).
     pub fn reset_counters(&mut self) -> Result<()> {
+        self.pf_distinct = 0;
+        self.pf_merged_bytes = 0;
+        self.pf_tokens = 0;
         self.forwards = 0;
         self.expert_bytes = 0;
         self.lane_s = 0.0;
@@ -1308,6 +1320,7 @@ impl<'m> Session<'m> {
         let hc_dim = mc.hc_dim();
         self.pf_toks.clear();
         self.pf_toks.extend_from_slice(toks);
+        self.pf_tokens += t;
 
         // ---- embed the chunk, then split it into per-token residual slots -----
         self.flush()?;
@@ -1461,6 +1474,13 @@ impl<'m> Session<'m> {
                 .moe_topk_chunk(&m.layers[b].experts, &routes, &self.pf_mixed, &mut out)
                 .with_context(|| format!("the grouped expert lane on block {b}"))?;
             self.expert_bytes += bytes as u64;
+            let distinct = self
+                .pool
+                .lock()
+                .map(|p| p.last_distinct)
+                .unwrap_or_default();
+            self.pf_distinct += distinct;
+            self.pf_merged_bytes += (distinct as u64) * m.layers[b].experts.expert_bytes() as u64;
         }
         self.lane_s += t_lane.elapsed().as_secs_f64();
         self.lane_covered_s += self.lane_s.min(0.0); // set by the driver when relevant
@@ -1552,6 +1572,12 @@ impl<'m> Session<'m> {
         batch_cmd::record_copy(gpu, st.buffer(), base + offs[4], &v.sh_gate_logit, 0, 4)?;
         batch_cmd::record_barrier_to_host(gpu)?;
         Ok(())
+    }
+
+    /// The last chunked pass's merged-MoE budget: `(distinct experts summed over
+    /// blocks, expert bytes a once-per-expert device pass would move, tokens)`.
+    pub fn merged_prefill_budget(&self) -> (usize, u64, usize) {
+        (self.pf_distinct, self.pf_merged_bytes, self.pf_tokens)
     }
 
     /// Wait for block `b`'s segment, read its MoE inputs, run the host expert

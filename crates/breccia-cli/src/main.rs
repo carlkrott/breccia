@@ -2041,6 +2041,15 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
     }
     let prompt_seconds = t_prompt.elapsed().as_secs_f64();
     let prompt_tokens = common * n;
+    // The merged-MoE budget of the whole prompt, captured before the counters are
+    // zeroed for the decode window (§8u).
+    let merged_budget = multi
+        .streams
+        .iter()
+        .fold((0usize, 0u64, 0usize), |acc, st| {
+            let (d, b, t) = st.merged_prefill_budget();
+            (acc.0 + d, acc.1 + b, acc.2 + t)
+        });
     // The prompt is not part of the decode measurement (counters, probe, timers).
     for s in multi.streams.iter_mut() {
         s.reset_counters()?;
@@ -2106,6 +2115,19 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
             }
             None => per_card.push((pci, vec![i], b)),
         }
+    }
+    let (distinct, merged_bytes, pf_tokens) = merged_budget;
+    if pf_tokens > 0 {
+        println!(
+            "merged   {} tokens: {} distinct expert uses (summed over 48 blocks), \
+             {:.1} GiB of expert bytes if each is touched once ({:.1} MiB/token, \
+             vs {:.1} MiB/token token-by-token)",
+            pf_tokens,
+            distinct,
+            merged_bytes as f64 / (1u64 << 30) as f64,
+            merged_bytes as f64 / pf_tokens as f64 / (1u64 << 20) as f64,
+            799.0
+        );
     }
     println!(
         "\nprefill  {prompt_tokens} prompt tokens ({common} x {n}) in {prompt_seconds:.2} s = \

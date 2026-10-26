@@ -1577,6 +1577,63 @@ token); it now shares one empty list.
 2. Then AVX-512 16-wide on the same shape, and chunk 256 (needs the pool at 8 192
    sets) where `m = 5`.
 
+## 8u. Merged MoE for prefill: the byte budget measured (11x), the kernel not written
+
+The survey (`02-untried-levers.md` item 1) says the prefill win is merged MoE on the
+**GPU**: route a whole chunk, touch each distinct expert once, run one quantised
+**GEMM** (m users x 640 outputs) per expert. §8t proved the CPU-lane version cannot
+get there (m = 1.75-2.5 users per expert). This pass measured the budget that
+decides the design and did **not** write the kernel; the numbers below are why it
+should still be built, and what it will cost.
+
+### The measured budget (not modelled)
+
+`bench agents` now prints the merged budget from the chunk's **actual routing**: for
+every block and chunk it counts the distinct experts the grouped lane touched and
+multiplies by the block's expert bytes (2 agents x 300-token prefixes, `--threads 32`):
+
+| chunk | prompt tokens | distinct expert uses (48 blocks) | expert bytes if touched once | per token | vs token-by-token |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 88 (last chunk) | 5 985 | 10.0 GiB | 115.9 MiB | **6.9x** |
+| **128** | **600 (whole prompt)** | **25 769** | **42.4 GiB** | **72.3 MiB** | **11.1x** |
+
+Two findings, both better than the §8r model:
+
+* the reduction is real and large: **799 -> 72 MiB/token (11x)** at chunk 128;
+* **routing is far more concentrated than uniform**: 512 experts, top-10, yet a
+  128-token chunk touches ~370 of them per block (uniform occupancy would say 470)
+  and the whole 300-token prompt touches 537 - the trained router has hot experts,
+  which is exactly what a merged pass exploits.
+
+### What that implies per token (from measured rates, dual)
+
+| cost | at 72.3 MiB/token | note |
+|---|---:|---|
+| PCIe, everything streamed to the RX | **2.6 ms** | 28.7 GB/s measured (§5.3) |
+| PCIe, everything streamed to the MI50 | 25 ms | gen3 x4, 2.9 GB/s - so hot experts must stay resident |
+| GEMM compute | ~0.5-1 ms | 5 users/expert x 640 x 2560 per expert at the measured 78-448 GB/s |
+| dispatch | ~0.6 ms | ~138 GEMM dispatches per token at 4.5 us each (§8l) |
+| **today (host lane)** | **163-320 ms** | 6.13 tok/s per agent, 2 agents |
+
+Every term is two orders of magnitude below the host lane. **The blocker is
+implementation, not arithmetic:** there is no multi-user GEMM shader (every GEMV
+here is one row per workgroup, m = 1), the per-expert streaming path through
+`TransferRing` is per-block round trips (~0.8 ms each, §8k) and would dominate at
+~370 experts x 48 blocks, and the accumulate-weighted-outputs step needs a
+per-token fan-in on the device. That is the next pass's work, in this order:
+
+1. one shader: per expert, decode each weight block once into registers/LDS and FMA
+   `m` activation rows (start with `IQ4_NL`+`Q2_0` for `down`, then the `IQ2_*`/
+   `IQ3_*` gate/up pair with the SwiGLU);
+2. hot-expert residence: the measured routing is concentrated enough that a
+   per-device arena of a few hundred experts covers most of a chunk - much cheaper
+   than streaming 370 x 1.19 MiB per block;
+3. the fan-in: `MoeCombine` already accumulates weighted rows; it needs an m-user
+   form (one per token, `k` terms) which is the same shape as its current loop.
+
+`--prefill-chunk` remains the chunk driver (parity-clean, §8s/§8t); the merged path
+plugs into `prefill_block` where the grouped lane is called today.
+
 ## 9. Exact commands
 
 
