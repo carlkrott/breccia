@@ -338,6 +338,23 @@ impl Mailbox {
         Ok(())
     }
 
+    /// Copy `data` into the mapping at `off` — the streamed-expert path writes one
+    /// expert's blobs into its slot without disturbing the others (§8x).
+    pub fn write_at(&self, off: u64, data: &[u8]) -> Result<()> {
+        if off.saturating_add(data.len() as u64) > self.size {
+            return Err(anyhow!(
+                "mailbox write of {} bytes at {off} escapes a {}-byte buffer",
+                data.len(),
+                self.size
+            ));
+        }
+        // SAFETY: bounds checked above; the mapping covers `size + TAIL_PAD`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(off as usize), data.len());
+        }
+        Ok(())
+    }
+
     /// Copy the mapping out into `out`. No driver call, no submission — the
     /// caller must have waited for the batch that wrote it (the chunked prefill
     /// reads the chunk's router ids this way once per block, §8v).

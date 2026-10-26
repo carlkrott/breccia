@@ -6,6 +6,24 @@ Reference hardware (measurements do not transfer verbatim to other systems): Ryz
 
 Model files are **not** in this repository. The target is `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` (75 GB, 2 shards) plus the vision projector, Strata pack and MTP artifacts; place them anywhere and adjust `-m`/`--mmproj`.
 
+## 0. Machine prerequisite — btrfs BDI read-ahead (found 2026-10-26)
+
+The root filesystem is btrfs and the per-BDI read-ahead was **8 MiB**, which causes ~9× read
+amplification on random small records (expert blobs and the 90-byte PLE records) and caps cold
+reads at 0.7–1.1 GB/s. The block-device `queue/read_ahead_kb` is a **no-op for btrfs** — the knob
+that matters is the BDI:
+
+```bash
+sudo sh -c 'for b in /sys/class/bdi/btrfs-*; do echo 128 > "$b/read_ahead_kb"; done'
+# verify
+for b in /sys/class/bdi/btrfs-*/; do echo "$(basename $b)=$(cat $b/read_ahead_kb)"; done
+```
+
+Measured effect (`docs/research/03-io-and-exllamav2.md`): cold expert reads **0.7–1.1 → 4.7–5.4
+GB/s**, read amplification **9× → 1.05×**, cold model load 28 s → 4 s. Do **not** use `O_DIRECT`
+(5.9 GB/s cold but throws away the 58 GB/s warm page cache), `FADV_RANDOM` (ignored by btrfs) or
+`MADV_RANDOM` (1.4–2× worse). Persist via a udev/systemd rule if the box reboots often.
+
 ## 1. Baselines (llama.cpp HIP, the number to beat)
 
 ```bash

@@ -534,6 +534,9 @@ pub fn record_copy(
         transfer_barrier(&gpu.device, cmd);
         gpu.device
             .cmd_copy_buffer(cmd, src.buf, dst.buf, std::slice::from_ref(&region));
+        // See `record_copies`: the compute-scoped dispatch barrier does not cover
+        // COPY -> COMPUTE, so the copy closes its own dependency.
+        transfer_barrier(&gpu.device, cmd);
     }
     Ok(())
 }
@@ -604,10 +607,18 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
         return Ok(());
     }
     unsafe {
+        // Before: the writes this copy consumes (shader or earlier transfer).
         transfer_barrier(&gpu.device, cmd);
         for (src, dst, regions) in &groups {
             gpu.device.cmd_copy_buffer(cmd, *src, *dst, regions);
         }
+        // **After**: the dispatches that read the copied bytes. The per-dispatch
+        // fence is compute-scoped now (`Gpu::barrier_compute_on`, §8w), which by
+        // construction does not cover COPY -> COMPUTE, so a copy that feeds a
+        // dispatch must close its own dependency. Without this the streamed-expert
+        // GEMMs race their uploads — measured as non-deterministic logits on the
+        // MI50 (max |Δlogit| 2.46 between two identical prompts, §8x).
+        transfer_barrier(&gpu.device, cmd);
     }
     Ok(())
 }

@@ -238,6 +238,12 @@ enum BenchKind {
         /// of one GEMV per token
         #[arg(long, default_value_t = false)]
         prefill_merged: bool,
+        /// Extra complete generations before the measured window, so the page
+        /// cache holds this run's experts. `0` = the cold number; `1` is the
+        /// steady-state one (the product-relevant figure for agents). The storage
+        /// bytes re-read are printed on the `cache` line either way.
+        #[arg(long, default_value_t = 0)]
+        warm: usize,
         /// Blocks whose routed experts live in VRAM, per stream (`;`-separated)
         #[arg(long, value_name = "N[,N]")]
         gpu_experts: Option<String>,
@@ -328,6 +334,9 @@ enum BenchKind {
         /// Merged prefill (§8v): one multi-user GEMM per distinct resident expert
         #[arg(long, default_value_t = false)]
         prefill_merged: bool,
+        /// Extra complete generations before the measured window (`0` = cold)
+        #[arg(long, default_value_t = 0)]
+        warm: usize,
     },
 }
 fn main() {
@@ -468,6 +477,7 @@ fn run(cli: Cli) -> Result<()> {
                     same_prompt,
                     prefill_chunk,
                     prefill_merged,
+                    warm,
                 }),
         } => bench_agents(AgentArgs {
             streams,
@@ -481,6 +491,7 @@ fn run(cli: Cli) -> Result<()> {
             same_prompt,
             prefill_chunk,
             prefill_merged,
+            warm,
         }),
         Command::Bench {
             kind:
@@ -506,6 +517,7 @@ fn run(cli: Cli) -> Result<()> {
                     inbatch_read,
                     prefill_chunk,
                     prefill_merged,
+                    warm,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -529,6 +541,7 @@ fn run(cli: Cli) -> Result<()> {
             inbatch_read,
             prefill_chunk,
             prefill_merged,
+            warm,
         }),
     }
 }
@@ -545,6 +558,7 @@ struct AgentArgs {
     same_prompt: bool,
     prefill_chunk: usize,
     prefill_merged: bool,
+    warm: usize,
 }
 
 struct ProfileArgs {
@@ -1523,6 +1537,7 @@ struct TokenArgs {
     inbatch_read: bool,
     prefill_chunk: usize,
     prefill_merged: bool,
+    warm: usize,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1695,15 +1710,24 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         );
     }
 
-    // ---- warm pass (page cache; discarded) --------------------------------
-    let warm = multi
-        .generate(prompt, a.gen.min(8))
-        .context("the warm pass")?;
-    println!(
-        "warm     {:.2} tok/s aggregate ({:.2} tok/s per stream)",
-        warm.aggregate_tokens_per_s(),
-        warm.stream_tokens_per_s()
-    );
+    // ---- warm passes: `--warm N` full generations before the window ----------
+    // One is the steady-state protocol: the first generation faults this run's
+    // experts in from NVMe (tens of GB), the following one measures what a served
+    // agent actually feels.
+    let warm_runs = a.warm;
+    for k in 0..warm_runs.max(1) {
+        let r0 = io_read_mib();
+        let w = multi
+            .generate(prompt, a.gen.min(8))
+            .with_context(|| format!("warm pass {k}"))?;
+        let r1 = io_read_mib();
+        println!(
+            "warm {k}  {:.2} tok/s aggregate ({:.2} tok/s per stream) · {:.2} GiB storage read",
+            w.aggregate_tokens_per_s(),
+            w.stream_tokens_per_s(),
+            (r1 - r0) / 1024.0
+        );
+    }
     for s in multi.streams.iter_mut() {
         s.reset_counters()?;
     }
@@ -2004,16 +2028,29 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         prompts.iter().map(|p| p.len()).collect::<Vec<_>>()
     );
 
-    // ---- warm pass (page cache + pipelines; discarded) --------------------
-    multi
-        .generate(&prompts[0], a.gen.min(8))
-        .context("the warm pass")?;
+    // ---- warm passes: `--warm N` generations before the window --------------
+    // Cold, this box re-reads tens of GB of experts from NVMe inside the measured
+    // window (41 GB of experts + 27 GB of PLE against 58 GB of RAM), so the cold
+    // rate is an I/O number and `--warm 1` is the steady-state one.
+    for k in 0..a.warm.max(1) {
+        let r0 = io_read_mib();
+        let w = multi
+            .generate(&prompts[0], a.gen.min(8))
+            .with_context(|| format!("warm pass {k}"))?;
+        println!(
+            "warm {k}  {:.2} tok/s aggregate ({:.2} tok/s per stream) · {:.2} GiB storage read",
+            w.aggregate_tokens_per_s(),
+            w.stream_tokens_per_s(),
+            (io_read_mib() - r0) / 1024.0
+        );
+    }
     for s in multi.streams.iter_mut() {
         s.reset_counters()?;
     }
     breccia_kernels::batch_cmd::reset_record_seconds();
     multi.t_finish = 0.0;
     multi.t_submit = 0.0;
+    let read_before = io_read_mib();
 
     // ---- the measured run: one generate() per agent is not possible (they must
     // interleave), so drive token_all directly over all agents' prompts --------
@@ -2172,6 +2209,21 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
                 bytes as f64 / (1u64 << 30) as f64,
                 gemm_s * 1e6 / groups as f64
             );
+            let (sb, sf, sw) = multi.streams.iter().fold((0u64, 0.0, 0.0), |acc, st| {
+                let (b, f, w) = st.merged_stream_detail();
+                (acc.0 + b, acc.1 + f, acc.2 + w)
+            });
+            if sb > 0 {
+                println!(
+                    "stream   {:.1} GiB of expert blobs copied out of the mmap in {:.1} ms \
+                     ({:.1} GiB/s), {:.1} ms waiting on the staging ring ({} experts per submit)",
+                    sb as f64 / (1u64 << 30) as f64,
+                    sf * 1e3,
+                    sb as f64 / (1u64 << 30) as f64 / sf.max(1e-9),
+                    sw * 1e3,
+                    breccia_engine::graph::STREAM_SLOTS
+                );
+            }
         }
     }
     println!(
@@ -2185,6 +2237,13 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
             "token by token"
         },
         if a.prefill_chunk > 0 { "on" } else { "n/a" }
+    );
+    println!(
+        "cache    {:.2} GiB read from storage during the measured window ({:.1} MiB per prompt \
+         token) · --warm {}",
+        (io_read_mib() - read_before) / 1024.0,
+        (io_read_mib() - read_before) / prompt_tokens.max(1) as f64,
+        a.warm
     );
     println!(
         "agents   {n} concurrent · {steps} measured steps · {:.2} s of decode",
@@ -2273,6 +2332,25 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
 }
 
 /// The reference prompt's ids (the ones `parity.py` captured), or a fallback.
+/// Bytes this process has pulled **from storage** (page faults included), from
+/// `/proc/self/io`. The measurement box cannot hold the model — 41 GB of experts +
+/// 27 GB of PLE against 58 GB of RAM — so a cold run re-reads tens of GB and the
+/// host expert lane stalls on NVMe. Printing this next to the rate is what makes a
+/// "cold" and a "steady-state" number distinguishable instead of guessed at.
+fn io_read_mib() -> f64 {
+    let Ok(text) = std::fs::read_to_string("/proc/self/io") else {
+        return 0.0;
+    };
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("read_bytes:") {
+            if let Ok(b) = v.trim().parse::<u64>() {
+                return b as f64 / (1u64 << 20) as f64;
+            }
+        }
+    }
+    0.0
+}
+
 fn parse_reference_prompt() -> Vec<u32> {
     let path = "/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids";
     std::fs::read_to_string(path)
@@ -2439,7 +2517,22 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         );
     }
 
+    // ---- warm generations (`--warm N`): steady-state protocol ---------------
+    for k in 0..a.warm {
+        let r0 = io_read_mib();
+        let w = sess
+            .generate(&prompt, a.gen, None)
+            .with_context(|| format!("warm generation {k}"))?;
+        println!(
+            "warm {k}  {:.2} tok/s ({:.2} ms/token) · {:.2} GiB storage read",
+            w.tokens_per_s(),
+            w.ms_per_token(),
+            (io_read_mib() - r0) / 1024.0
+        );
+    }
+
     // ---- B/C. measured generations ----------------------------------------
+    let read_before = io_read_mib();
     let mut runs = Vec::with_capacity(a.runs);
     let mut stages_acc: Vec<f64> = vec![0.0; breccia_engine::STAGES.len()];
     let mut traces: Vec<breccia_engine::LayerTrace> = Vec::new();
@@ -2602,6 +2695,13 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         debug_layers: traces,
         notes,
     };
+    println!(
+        "cache    {:.2} GiB read from storage during the measured window ({:.1} MiB per prompt \
+         token) · --warm {}",
+        (io_read_mib() - read_before) / 1024.0,
+        (io_read_mib() - read_before) / prompt.len().max(1) as f64,
+        a.warm
+    );
     println!(
         "\nexperts  {} block(s) on device ({:.0} MiB arena), {} on the host lane",
         sess.placed_blocks,

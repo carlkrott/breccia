@@ -216,7 +216,24 @@ pub struct PfChunk {
     down: Buf,
     /// `[T, n_embd]`, the fan-in's output.
     out: Buf,
+    /// **Streamed** (non-resident) experts: `STREAM_SLOTS` host-visible slots, each
+    /// laid out `[gate | up | down]`, so one host memcpy per distinct expert
+    /// replaces the lane's per-token dequantisation (§8x). The slot is copied to
+    /// the device inside the batch; eight experts ride one submit.
+    stream: Mailbox,
+    /// One expert's three blobs on the device, for the streamed path.
+    sf_gate: Buf,
+    sf_up: Buf,
+    sf_down: Buf,
+    /// Per-slot stride inside [`PfChunk::stream`], and the per-role byte counts.
+    slot_stride: u64,
+    g_bytes: u64,
+    u_bytes: u64,
+    d_bytes: u64,
 }
+
+/// In-flight streamed experts per submit (see [`PfChunk::stream`]).
+pub const STREAM_SLOTS: usize = 8;
 
 impl PfChunk {
     fn bytes(&self) -> u64 {
@@ -239,6 +256,10 @@ impl PfChunk {
                 &self.act,
                 &self.down,
                 &self.out,
+                &self.stream.buf,
+                &self.sf_gate,
+                &self.sf_up,
+                &self.sf_down,
             ]
             .iter()
             .map(|b| b.size)
@@ -248,6 +269,7 @@ impl PfChunk {
     fn release(&self, gpu: &breccia_vk::ctx::Gpu) {
         self.ids.release(gpu);
         self.slots.release(gpu);
+        self.stream.release(gpu);
         for b in [
             &self.w,
             &self.mixed,
@@ -260,6 +282,9 @@ impl PfChunk {
             &self.act,
             &self.down,
             &self.out,
+            &self.sf_gate,
+            &self.sf_up,
+            &self.sf_down,
         ] {
             gpu.destroy_buf(b);
         }
@@ -476,6 +501,11 @@ pub struct Session<'m> {
     /// read out of the arena (§8v).
     pf_gemm_s: f64,
     pf_fanin_s: f64,
+    /// Streamed (non-resident) experts: bytes memcpy'd from the mmap, host seconds
+    /// in those copies, and host seconds waiting for the staging ring.
+    pf_stream_bytes: u64,
+    pf_stream_fill_s: f64,
+    pf_stream_wait_s: f64,
     pf_merged_dispatches: u64,
     pf_arena_bytes: u64,
     pf_merged_experts: usize,
@@ -638,6 +668,21 @@ impl<'m> Session<'m> {
                 let nb = mc.n_embd as u64 * 4;
                 let nfb = mc.n_ff as u64 * 4;
                 let users = breccia_kernels::gemm::USERS_MAX as u64;
+                // Streamed experts: the largest role blob among the blocks that
+                // are **not** resident (the resident ones address the arena).
+                let (mut g_max, mut u_max, mut d_max) = (0usize, 0usize, 0usize);
+                for b in 0..mc.n_layers {
+                    if model.placed.contains_key(&b) {
+                        continue;
+                    }
+                    let e = &model.layers[b].experts;
+                    g_max = g_max.max(e.gate.bytes());
+                    u_max = u_max.max(e.up.bytes());
+                    d_max = d_max.max(e.down.bytes());
+                }
+                let align = |v: usize| ((v as u64 + 255) & !255) as u64;
+                let (gb, ub, db) = (align(g_max), align(u_max), align(d_max));
+                let slot_stride = gb + ub + db;
                 Some(PfChunk {
                     ids: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
                     w: alloc(chunk as u64 * k as u64 * 4, "prefill router weights")?,
@@ -652,6 +697,14 @@ impl<'m> Session<'m> {
                     act: alloc(users * nfb, "prefill expert act")?,
                     down: alloc(users * nb, "prefill expert down")?,
                     out: alloc(chunk as u64 * nb, "prefill merged out")?,
+                    stream: Mailbox::new(gpu, STREAM_SLOTS as u64 * slot_stride)?,
+                    sf_gate: alloc(gb.max(16), "streamed expert gate")?,
+                    sf_up: alloc(ub.max(16), "streamed expert up")?,
+                    sf_down: alloc(db.max(16), "streamed expert down")?,
+                    slot_stride,
+                    g_bytes: gb,
+                    u_bytes: ub,
+                    d_bytes: db,
                 })
             } else {
                 None
@@ -807,6 +860,9 @@ impl<'m> Session<'m> {
             pf_toks: Vec::new(),
             pf_gemm_s: 0.0,
             pf_fanin_s: 0.0,
+            pf_stream_bytes: 0,
+            pf_stream_fill_s: 0.0,
+            pf_stream_wait_s: 0.0,
             pf_merged_dispatches: 0,
             pf_arena_bytes: 0,
             pf_merged_experts: 0,
@@ -1023,6 +1079,9 @@ impl<'m> Session<'m> {
         self.pf_tokens = 0;
         self.pf_gemm_s = 0.0;
         self.pf_fanin_s = 0.0;
+        self.pf_stream_bytes = 0;
+        self.pf_stream_fill_s = 0.0;
+        self.pf_stream_wait_s = 0.0;
         self.pf_merged_dispatches = 0;
         self.pf_arena_bytes = 0;
         self.pf_merged_experts = 0;
@@ -1580,16 +1639,21 @@ impl<'m> Session<'m> {
         // `(token, expert)` pairs and runs one multi-user GEMM per distinct expert
         // instead of one GEMV per token. A block whose role type has no multi-user
         // GEMM, or a session without the chunk scratch, keeps the path below.
-        if self.prefill_merged {
-            if let Some(pe) = m.placed.get(&b) {
-                let pipes = &self.venues[dev].pipes;
-                let ready = self.venues[dev].pf.is_some()
-                    && [pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty]
-                        .iter()
-                        .all(|ty| pipes.gemm(*ty).is_some());
-                if ready {
-                    return self.prefill_block_merged(b, t, pos0, pe);
-                }
+        if self.prefill_merged && self.venues[dev].pf.is_some() {
+            let pe = m.placed.get(&b);
+            let plan = &m.layers[b].experts;
+            let (gt, ut, dt) = match pe {
+                Some(pe) => (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty),
+                None => (plan.gate.ty, plan.up.ty, plan.down.ty),
+            };
+            let pipes = &self.venues[dev].pipes;
+            // A role type with no multi-user GEMM keeps the per-token path for
+            // that block (documented fallback, §8v/§8x).
+            let ready = [gt, ut, dt]
+                .iter()
+                .all(|ty| pipes.gemm(*ty).is_some());
+            if ready {
+                return self.prefill_block_merged(b, t, pos0, pe);
             }
         }
 
@@ -1760,6 +1824,57 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// Copy expert `e` of block `b` out of the mmap into streamed slot `slot`.
+    ///
+    /// This is the whole replacement for the host lane's per-token work: the lane
+    /// decoded the same expert `m` times (once per token that routed to it) and
+    /// dotted each separately; here the blob is copied **once per chunk** and the
+    /// dequantisation happens once per *user group* on the GPU. A chunk of 128
+    /// tokens gives 8-13 users per distinct expert, so the bytes read from the
+    /// mmap drop by that factor too — which matters because the lane is I/O-bound
+    /// on this box (§8x).
+    fn fill_stream_slot(
+        &mut self,
+        dev: usize,
+        b: usize,
+        expert: usize,
+        slot: usize,
+    ) -> Result<()> {
+        let m = self.model;
+        let t0 = std::time::Instant::now();
+        let slices = m.layers[b]
+            .experts
+            .slices(&m.shards, expert)
+            .with_context(|| format!("streaming blk.{b} expert {expert}"))?;
+        let total = {
+            let pf = self.venues[dev]
+                .pf
+                .as_ref()
+                .expect("the merged prefill scratch");
+            let off = slot as u64 * pf.slot_stride;
+            let (g, u, d) = (pf.g_bytes, pf.u_bytes, pf.d_bytes);
+            if (slices.gate.len() as u64) > g
+                || (slices.up.len() as u64) > u
+                || (slices.down.len() as u64) > d
+            {
+                bail!(
+                    "blk.{b} expert {expert}: a role blob ({} / {} / {}) exceeds the streamed \
+                     slots ({g} / {u} / {d})",
+                    slices.gate.len(),
+                    slices.up.len(),
+                    slices.down.len()
+                );
+            }
+            pf.stream.write_at(off, slices.gate)?;
+            pf.stream.write_at(off + g, slices.up)?;
+            pf.stream.write_at(off + g + u, slices.down)?;
+            slices.gate.len() + slices.up.len() + slices.down.len()
+        };
+        self.pf_stream_bytes += total as u64;
+        self.pf_stream_fill_s += t0.elapsed().as_secs_f64();
+        Ok(())
+    }
+
     /// One block of a chunk with the **merged** expert pass (§8v).
     ///
     /// Pass 1 is the same dense chain per token, but a block whose experts are
@@ -1779,7 +1894,7 @@ impl<'m> Session<'m> {
         b: usize,
         t: usize,
         pos0: usize,
-        pe: &'m crate::model::PlacedExperts,
+        pe: Option<&'m crate::model::PlacedExperts>,
     ) -> Result<()> {
         let m = self.model;
         let mc = &m.cfg;
@@ -1788,7 +1903,15 @@ impl<'m> Session<'m> {
         let n_ff = mc.n_ff;
         let k = mc.n_expert_used;
         let gpu = m.devices[dev].gpu();
-        let (gate_ty, up_ty, down_ty) = (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty);
+        let plan = &m.layers[b].experts;
+        let (gate_ty, up_ty, down_ty) = match pe {
+            Some(pe) => (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty),
+            None => (plan.gate.ty, plan.up.ty, plan.down.ty),
+        };
+        // A **streamed** block (no arena): each distinct expert's three blobs are
+        // copied once per chunk out of the mmap into a host-visible slot and then
+        // to the device, and the multi-user GEMM runs on them with base 0.
+        let streamed = pe.is_none();
         // Each expert's blob, in the 16-bit words the GEMM's base push constant
         // takes (the arena holds all 512 experts back to back).
         let words = |ty: breccia_kernels::QuantType, rows: usize, cols: usize| -> u32 {
@@ -1914,8 +2037,31 @@ impl<'m> Session<'m> {
         self.timers.mark(EXPERTS);
         self.ensure_batch(dev)?;
         let t_gemm = std::time::Instant::now();
-        for (e, base, users) in &groups {
+        // Streamed blocks walk the distinct experts in slot order; one submit per
+        // STREAM_SLOTS experts bounds the host-visible staging (and is the ring
+        // wait this pass reports).
+        let mut expert_index = 0usize;
+        let mut prev_expert: Option<usize> = None;
+        for (e, base, users) in groups.iter() {
             let mu = users.len();
+            // First group of a new distinct expert: stream it (once per chunk).
+            let new_expert = Some(*e) != prev_expert;
+            if streamed && new_expert {
+                prev_expert = Some(*e);
+                // Refill a slot; when the slots are exhausted, drain first so the
+                // in-flight copies never see the next expert's bytes.
+                if expert_index > 0 && expert_index % STREAM_SLOTS == 0 {
+                    let t0 = std::time::Instant::now();
+                    self.submit_batch()?;
+                    self.flush()?;
+                    self.pf_stream_wait_s += t0.elapsed().as_secs_f64();
+                    self.ensure_batch(dev)?;
+                }
+                self.fill_stream_slot(dev, b, *e, expert_index % STREAM_SLOTS)?;
+                expert_index += 1;
+            } else if !streamed {
+                prev_expert = Some(*e);
+            }
             {
                 let v = &self.venues[dev];
                 let pf = v.pf.as_ref().expect("the merged prefill scratch");
@@ -1923,6 +2069,25 @@ impl<'m> Session<'m> {
                 let gate = pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
                 let up = pipes.gemm(up_ty).expect("the up multi-user GEMM");
                 let down = pipes.gemm(down_ty).expect("the down multi-user GEMM");
+                if streamed && new_expert && expert_index > 0 {
+                    let slot = (expert_index - 1) % STREAM_SLOTS;
+                    // slot -> device, three region groups, one barrier.
+                    let off = slot as u64 * pf.slot_stride;
+                    batch_cmd::record_copies(
+                        gpu,
+                        &[
+                            (&pf.sf_gate, 0, &pf.stream.buf, off, pf.g_bytes),
+                            (&pf.sf_up, 0, &pf.stream.buf, off + pf.g_bytes, pf.u_bytes),
+                            (
+                                &pf.sf_down,
+                                0,
+                                &pf.stream.buf,
+                                off + pf.g_bytes + pf.u_bytes,
+                                pf.d_bytes,
+                            ),
+                        ],
+                    )?;
+                }
                 // Gather the group's activation rows (a run of consecutive tokens
                 // is one copy), then one weights read at the expert's arena base.
                 let mut rows: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
@@ -1942,19 +2107,23 @@ impl<'m> Session<'m> {
                     a = z;
                 }
                 batch_cmd::record_copies(gpu, &rows)?;
-                let wbase = |words: u32| (*e as u32) * words;
-                gate.run_at(&pe.gate.buf, &pf.x, &pf.gg, n_ff, n_embd, mu, wbase(wgate))?;
-                up.run_at(&pe.up.buf, &pf.x, &pf.uu, n_ff, n_embd, mu, wbase(wup))?;
+                // Resident: the arena holds all 512 experts, so the base is the
+                // expert's own offset. Streamed: the slot *is* expert `e`, base 0.
+                let (gbuf, ubuf, dbuf, gb, ub, db) = match pe {
+                    Some(pe) => (
+                        &pe.gate.buf,
+                        &pe.up.buf,
+                        &pe.down.buf,
+                        (*e as u32) * wgate,
+                        (*e as u32) * wup,
+                        (*e as u32) * wdown,
+                    ),
+                    None => (&pf.sf_gate, &pf.sf_up, &pf.sf_down, 0u32, 0u32, 0u32),
+                };
+                gate.run_at(gbuf, &pf.x, &pf.gg, n_ff, n_embd, mu, gb)?;
+                up.run_at(ubuf, &pf.x, &pf.uu, n_ff, n_embd, mu, ub)?;
                 v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
-                down.run_at(
-                    &pe.down.buf,
-                    &pf.act,
-                    &pf.down,
-                    n_embd,
-                    n_ff,
-                    mu,
-                    wbase(wdown),
-                )?;
+                down.run_at(dbuf, &pf.act, &pf.down, n_embd, n_ff, mu, db)?;
                 batch_cmd::record_copy(
                     gpu,
                     &pf.scratch,
@@ -2035,14 +2204,24 @@ impl<'m> Session<'m> {
         self.pf_distinct += distinct;
         self.pf_merged_bytes += distinct as u64 * expert_bytes;
         if std::env::var_os("BRECCIA_TRACE_MERGED").is_some() {
+            let (sb, sf, sw) = (
+                self.pf_stream_bytes,
+                self.pf_stream_fill_s,
+                self.pf_stream_wait_s,
+            );
             eprintln!(
-                "merged blk {b:>2} t={t} distinct={distinct} groups={} slots={} \
-                 gemm={:.2} ms fanin={:.3} ms dispatches={dispatches} arena={:.1} MiB",
+                "merged blk {b:>2} t={t} {} distinct={distinct} groups={} slots={} \
+                 gemm={:.2} ms fanin={:.3} ms dispatches={dispatches} arena={:.1} MiB \
+                 streamed(cum)={:.1} MiB fill={:.1} ms wait={:.1} ms",
+                if streamed { "streamed" } else { "resident" },
                 groups.len(),
                 t * k,
                 gemm_s * 1e3,
                 fanin_s * 1e3,
-                (distinct as u64 * expert_bytes) as f64 / (1u64 << 20) as f64
+                (distinct as u64 * expert_bytes) as f64 / (1u64 << 20) as f64,
+                sb as f64 / (1u64 << 20) as f64,
+                sf * 1e3,
+                sw * 1e3
             );
         }
         Ok(())
@@ -2096,6 +2275,17 @@ impl<'m> Session<'m> {
     /// blocks, expert bytes a once-per-expert device pass would move, tokens)`.
     pub fn merged_prefill_budget(&self) -> (usize, u64, usize) {
         (self.pf_distinct, self.pf_merged_bytes, self.pf_tokens)
+    }
+
+    /// Streamed-expert accounting for the last window: `(bytes copied out of the
+    /// mmap, host seconds in those copies, host seconds waiting on the staging
+    /// ring)`.
+    pub fn merged_stream_detail(&self) -> (u64, f64, f64) {
+        (
+            self.pf_stream_bytes,
+            self.pf_stream_fill_s,
+            self.pf_stream_wait_s,
+        )
     }
 
     /// The merged prefill pass's cost breakdown for the last measured window:
