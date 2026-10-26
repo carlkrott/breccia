@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/breccia-flags",
+    "crates/breccia-vk",
+    "crates/breccia-profile",
+    "crates/breccia-kernels",
+    "crates/breccia-format",
+    "crates/breccia-cache",
+    "crates/breccia-draft",
+    "crates/breccia-server",
+    "crates/breccia-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/OWNER/breccia" # set at publication time
+
+[workspace.dependencies]
+# GPU / Vulkan (primary backend)
+ash = "0.38"
+gpu-allocator = "0.27"
+# Async & IO
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "fs", "sync"] }
+# CLI & config (llama.cpp-compatible flag surface)
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Fingerprinting / hashing
+blake3 = "1"
+# Error handling
+anyhow = "1"
+thiserror = "1"
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+debug = true # symbolized profiles for perf work; strip at packaging
+lto = "thin"

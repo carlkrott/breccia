@@ -17,6 +17,8 @@ Source of truth for scope. Each phase ends in a gate: the gate report lives in `
 
 ## Phase 1 — Workspace + `breccia-profile` (M1a)
 
+**Decision (user, 2026-10-26): Vulkan is the primary backend** for breccia — overriding Gate A's "HIP = reference compute backend" recommendation — **while keeping HIP-style launch flags**: the engine must accept the existing llama.cpp/HIP flag surface (the exact `qwen-dual-serve.sh` invocation, including `ROCm0/ROCm1` device names) and run it on the Vulkan backend by default. Backend selectable (`--backend vulkan|hip|auto`, default `vulkan`). Gate A's hardware findings (MI50 = no PCIe streaming, expert-parallel default, RX = streaming home) still bind the design; HIP remains a supported secondary backend, not the development focus.
+
 Cargo workspace (`breccia-cli`, `breccia-profile`, `breccia-vk`, `breccia-kernels`, `breccia-format`, `breccia-cache`, `breccia-draft`, `breccia-server`). `breccia-profile`: device discovery (heaps, queue families, subgroup 32/64, extension probe), CPU/RAM/NVMe probe, calibration micro-benchmarks, `hw_profile.json` + BLAKE3 fingerprint, `--reprofile` / `--dry-run-plan` / `--override-role`.
 
 **Gate B** → printed partition plan for the IQ3_XXS shards that matches measured reality.
