@@ -62,6 +62,15 @@ Every time an implementation or test subagent is launched, launch **one paired r
 
 Output goes to `docs/research/NN-<engine>.md`; the rotation and coverage table live in `docs/research/README.md`. Research subagents are read-only and never modify engine code. Implementation agents cite the research item they consume.
 
+## Grouped rounds (standing rule, 2026-10-26)
+
+Each implementation/test round should carry **several independent improvements**, not one. Group by domain so nothing contends:
+
+- **Safe to group**: changes in different files/subsystems (e.g. one GPU-dispatch fusion + one host-lane change + one Vulkan-flag experiment), each with its own flag and its own measured delta, all verifiable in one alternating sweep.
+- **Do not group**: two edits to the same hot path (attribution becomes impossible), or two changes that must be measured in the same configuration space (one at a time).
+- Every grouped item still needs: its own before/after number, the parity gate (bit-identical where applicable), and a revert path (flag or patch) if it does not pay.
+- Research findings from the paired research subagent are folded into the same round where they are independent, so a round typically lands: 1 big item + 2–3 small independent items + 1 research-driven experiment.
+
 ## Git
 
 See `docs/GIT-WORKFLOW.md`. Remote exists and is **public** (`origin` = github.com/carlkrott/breccia); push to `main` after `scripts/verify.sh` passes. Making the repo public was explicitly approved on 2026-10-26; publishing anything else (releases, packages, other remotes) still needs a fresh gate.
