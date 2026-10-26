@@ -111,6 +111,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "breccia-flags",
+ "breccia-kernels",
  "breccia-profile",
  "breccia-vk",
  "clap",
@@ -157,9 +158,13 @@ name = "breccia-kernels"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
+ "breccia-format",
+ "breccia-vk",
  "serde",
  "serde_json",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

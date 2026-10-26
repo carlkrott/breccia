@@ -9,6 +9,7 @@
 //! ```text
 //! breccia profile [--reprofile] [--quick] [--json PATH] [--dry-run-plan] [--print-fingerprint]
 //! breccia bench transfer [--device <profile-index|pci>]... [--json PATH] [--quick]
+//! breccia bench gemv [--type T]... [--rows N --cols N] [--device <idx|pci>]... [--json PATH] [--quick] [--real]
 //! ```
 //!
 //! Behaviour: with a cached profile whose fingerprint matches (and whose
@@ -88,6 +89,50 @@ enum BenchKind {
         #[arg(long)]
         quick: bool,
     },
+    /// Phase 3: fused dequant+GEMV decode kernels — GB/s vs bytes read
+    Gemv {
+        /// Quant type, repeatable (default: every implemented type)
+        #[arg(long = "type", value_name = "IQ3_S")]
+        types: Vec<String>,
+        /// Output rows (default: the model's decode shapes)
+        #[arg(long)]
+        rows: Option<usize>,
+        /// Row length in elements (default: paired with --rows)
+        #[arg(long)]
+        cols: Option<usize>,
+        /// Device by cached-profile index or PCI address (repeatable);
+        /// default = every discrete GPU
+        #[arg(long = "device", value_name = "PROFILE_INDEX|PCI")]
+        device: Vec<String>,
+        /// Write the full JSON report here
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
+        /// Short benchmark windows (CI-speed, noisier numbers)
+        #[arg(long)]
+        quick: bool,
+        /// Run the kernel on a real expert tensor from the GGUF (mmap, no copy)
+        #[arg(long)]
+        real: bool,
+        /// GGUF glob for --real (default: the IQ3_XXS shards)
+        #[arg(long, value_name = "GLOB")]
+        gguf: Option<String>,
+        /// Block (layer) index for --real
+        #[arg(long, default_value_t = 0)]
+        layer: usize,
+        /// Expert role for --real: gate | up | down
+        #[arg(long, default_value = "gate")]
+        role: String,
+        /// Restrict --real to one expert (adds a CPU conformance check)
+        #[arg(long, value_name = "E")]
+        expert: Option<usize>,
+        /// Force a split-K factor (default: automatic — see docs/phase-3 §4.2)
+        #[arg(long, value_name = "N")]
+        splits: Option<u32>,
+        /// Real mode on a named tensor instead of an expert role
+        /// (e.g. output.weight for Q5_K)
+        #[arg(long, value_name = "NAME")]
+        tensor: Option<String>,
+    },
 }
 
 fn main() {
@@ -117,7 +162,9 @@ fn run(cli: Cli) -> Result<()> {
         Command::Bench { kind: None } => {
             println!(
                 "bench: available harnesses\n  \
-                 breccia bench transfer [--device <idx|pci>]... [--json PATH] [--quick]"
+                 breccia bench transfer [--device <idx|pci>]... [--json PATH] [--quick]\n  \
+                 breccia bench gemv [--type IQ3_S]... [--rows N --cols N] [--device <idx|pci>]... \\\n                 \
+                 [--json PATH] [--quick] [--real [--layer N] [--role gate|up|down] [--expert E]]"
             );
             Ok(())
         }
@@ -129,6 +176,38 @@ fn run(cli: Cli) -> Result<()> {
                     quick,
                 }),
         } => bench_transfer(device, json, quick),
+        Command::Bench {
+            kind:
+                Some(BenchKind::Gemv {
+                    types,
+                    rows,
+                    cols,
+                    device,
+                    json,
+                    quick,
+                    real,
+                    gguf,
+                    layer,
+                    role,
+                    expert,
+                    splits,
+                    tensor,
+                }),
+        } => bench_gemv(GemvArgs {
+            types,
+            rows,
+            cols,
+            device,
+            json,
+            quick,
+            real,
+            gguf,
+            layer,
+            role,
+            expert,
+            splits,
+            tensor,
+        }),
     }
 }
 
@@ -609,5 +688,188 @@ mod tests {
     fn garbage_spec_is_rejected() {
         assert!(selector_for("rx6950", None).is_err());
         assert!(selector_for("  ", None).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bench gemv — Phase 3 fused dequant+GEMV (decode path)
+// ---------------------------------------------------------------------------
+
+struct GemvArgs {
+    types: Vec<String>,
+    rows: Option<usize>,
+    cols: Option<usize>,
+    device: Vec<String>,
+    json: Option<PathBuf>,
+    quick: bool,
+    real: bool,
+    gguf: Option<String>,
+    layer: usize,
+    role: String,
+    expert: Option<usize>,
+    splits: Option<u32>,
+    tensor: Option<String>,
+}
+
+/// Everything a `bench gemv` JSON file contains: one run per device, because
+/// each device needs its own instance/logical device and its own numbers.
+#[derive(serde::Serialize)]
+struct GemvBundle {
+    schema_version: u32,
+    runs: Vec<breccia_kernels::GemvReport>,
+}
+
+fn bench_gemv(args: GemvArgs) -> Result<()> {
+    use breccia_kernels::{GemvBenchOptions, QuantType};
+
+    let types: Vec<QuantType> = args
+        .types
+        .iter()
+        .map(|t| t.parse::<QuantType>().map_err(|e| anyhow::anyhow!(e)))
+        .collect::<Result<_>>()?;
+
+    let shapes = match (args.rows, args.cols) {
+        (Some(r), Some(c)) => vec![breccia_kernels::Shape::new(r, c)],
+        (None, None) => Vec::new(),
+        _ => anyhow::bail!("--rows and --cols must be given together"),
+    };
+
+    let profile = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+        .ok()
+        .flatten();
+    let devices: Vec<String> = if args.device.is_empty() {
+        breccia_kernels::bench::discrete_devices()?
+    } else {
+        args.device
+            .iter()
+            .map(|spec| {
+                Ok(match selector_for(spec, profile.as_ref())? {
+                    DeviceSelector::Pci(pci) => pci,
+                    DeviceSelector::Index(i) => i.to_string(),
+                })
+            })
+            .collect::<Result<_>>()?
+    };
+
+    let mut runs = Vec::new();
+    for dev in &devices {
+        let opts = GemvBenchOptions {
+            types: types.clone(),
+            shapes: shapes.clone(),
+            devices: vec![dev.clone()],
+            quick: args.quick,
+            real: args.real,
+            real_model: args.gguf.clone(),
+            real_layer: args.layer,
+            real_role: args.role.clone(),
+            real_expert: args.expert,
+            splits: args.splits,
+            real_tensor: args.tensor.clone(),
+        };
+        let report = breccia_kernels::run_gemv_bench(&opts)
+            .with_context(|| format!("GEMV benchmark on {dev}"))?;
+        print_gemv_summary(&report);
+        runs.push(report);
+    }
+
+    if let Some(path) = &args.json {
+        let bundle = GemvBundle {
+            schema_version: breccia_kernels::bench::GEMV_SCHEMA_VERSION,
+            runs,
+        };
+        let text = serde_json::to_string_pretty(&bundle).context("serializing the GEMV report")?;
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
+        println!("\nwrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn print_gemv_summary(rep: &breccia_kernels::GemvReport) {
+    println!(
+        "\nGEMV decode benchmark ({} mode, schema v{})",
+        if rep.quick { "quick" } else { "full" },
+        rep.schema_version
+    );
+    println!(
+        "  host {} · {} · device {} ({}) {} · subgroup {}",
+        rep.environment.hostname,
+        rep.environment.timestamp,
+        rep.device.name,
+        rep.device.device_id,
+        rep.device.pci_address,
+        rep.device.subgroup_size
+    );
+    if rep.environment.vulkan_validation {
+        println!("  validation layer: enabled");
+    }
+    for w in &rep.warnings {
+        println!("  warning: {w}");
+    }
+
+    if !rep.real.is_empty() {
+        for c in &rep.real {
+            println!(
+                "\n  {} ({} {}) as {}x{} — {} MiB of packed weights{}",
+                c.tensor,
+                c.ty,
+                c.shape,
+                c.shape.rows,
+                c.shape.cols,
+                c.weight_bytes >> 20,
+                c.expert
+                    .map(|e| format!(", expert {e} of {}", c.experts))
+                    .unwrap_or_else(|| format!(", all {} experts", c.experts))
+            );
+            println!(
+                "    {:8.3} ms/token-equivalent · {:7.1} GB/s{} · {:.0} tok/s if this were \
+                 the whole token",
+                c.seconds_per_iter * 1e3,
+                c.gbps,
+                c.reference_gbps
+                    .map(|bw| format!(" ({:.0}% of {bw:.0} GB/s)", 100.0 * c.gbps / bw))
+                    .unwrap_or_default(),
+                c.tokens_per_s_equivalent
+            );
+            println!(
+                "    upload {:.2} s (one-off) · {} iters · timestamps {}",
+                c.upload_seconds,
+                c.iters,
+                if c.used_timestamps {
+                    "yes"
+                } else {
+                    "no (wall clock)"
+                }
+            );
+            if let Some(rel) = c.conformance_max_rel {
+                println!(
+                    "    conformance vs CPU reference ({} rows): max relative error {:.2e}",
+                    c.conformance_rows, rel
+                );
+            }
+        }
+        return;
+    }
+
+    println!(
+        "\n  {:<8} {:>12} {:>6} {:>10} {:>11} {:>9} {:>9}",
+        "type", "shape", "bpw", "MiB read", "ms/GEMV", "GB/s", "of DRAM"
+    );
+    for c in &rep.synthetic {
+        println!(
+            "  {:<8} {:>12} {:>6.2} {:>10.2} {:>11.3} {:>9.1} {:>8} {:>5}",
+            c.ty,
+            format!("{}x{}", c.shape.rows, c.shape.cols),
+            c.bits_per_value,
+            c.weight_bytes as f64 / (1 << 20) as f64,
+            c.seconds_per_iter * 1e3,
+            c.gbps,
+            c.percent_of_reference
+                .map(|p| format!("{p:.0}%"))
+                .unwrap_or_else(|| "-".to_string()),
+            c.splits
+        );
     }
 }

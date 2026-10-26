@@ -1,0 +1,41 @@
+// Split-K reduction for the fused dequant+GEMV kernels.
+//
+// `gemv_*.comp` writes `splits` partial dot products per output row at
+// `P[sid * rows + row]`; this kernel sums them into `O[row]`.
+//
+// Written by Breccia (no external origin): the shape is a coalesced per-row
+// strided sum, dispatched by `breccia_kernels::Gemv::run_split`.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Partials { float P[]; };
+layout(std430, binding = 1) writeonly buffer OutVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;   // unused (same 16-byte layout as the GEMV kernels)
+    uint bpr;    // unused
+    uint splits;
+} pc;
+
+// grid.x is capped at the guaranteed 65535 workgroups (see gemv_body.glsl), so
+// the row groups wrap over grid.y.
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint row = wg * 256u + gl_LocalInvocationID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint n = max(pc.splits, 1u);
+    float acc = 0.0;
+    for (uint s = 0u; s < n; ++s) {
+        acc += P[s * pc.rows + row];
+    }
+    O[row] = acc;
+}
