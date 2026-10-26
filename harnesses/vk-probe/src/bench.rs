@@ -746,6 +746,7 @@ pub fn run_device(dev: &Dev, gpu: &Gpu, quick: bool) -> DeviceReport {
                     gpu.index, s.size_mb, s.h2d_gbps, s.d2h_gbps
                 );
             }
+            rep.pcie = Some(p.report.clone());
             Some(p)
         }
         Err(e) => {

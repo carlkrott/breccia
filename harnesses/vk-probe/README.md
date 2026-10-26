@@ -69,6 +69,7 @@ Human summary on stdout; `--json PATH` writes:
       "properties": { "memory_heaps": [...], "queue_families": [...],
                       "subgroup": {...}, "extensions": {...}, "features": {...} },
       "vram_bandwidth_gbps": { "copy_gbps": ..., "read_gbps": ..., "write_gbps": ... },
+      "vram_bandwidth_cache_gbps": { "copy_gbps": ... },
       "compute_gflops":     { "fp32_gflops": ..., "fp16_gflops": ... },
       "pcie":               { "sizes": [ { "size_mb": 16, "h2d_gbps": ..., "d2h_gbps": ... } ] },
       "overlap":            { "compute_seconds": ..., "transfer_seconds": ...,

@@ -1,0 +1,451 @@
+{
+  "schema_version": 1,
+  "environment": {
+    "timestamp": "2026-10-25T23:16:02+00:00",
+    "hostname": "<host>",
+    "command": "--json results/vulkan-raw-probe.json",
+    "instance_api_version": "1.4.363",
+    "quick_mode": false,
+    "all_devices": false,
+    "competing_gpu_processes": [
+      "1467366 npm exec comfyui-mcp",
+      "1467436 npm exec comfyui-mcp",
+      "1467602 node /home/korphaus/.npm/_npx/8af3af54f44861ce/node_modules/.bin/comfyui-mcp",
+      "1467633 node /home/korphaus/.npm/_npx/8af3af54f44861ce/node_modules/.bin/comfyui-mcp"
+    ]
+  },
+  "results": [
+    {
+      "device": {
+        "index": 1,
+        "name": "AMD Radeon RX 6950 XT (RADV NAVI21)",
+        "vendor_id": "0x1002",
+        "device_id": "0x73a5",
+        "device_type": "DISCRETE_GPU",
+        "api_version": "1.4.354",
+        "driver_version": "26.2.4",
+        "driver_name": "radv",
+        "driver_info": "Mesa 26.2.4-arch3.1"
+      },
+      "properties": {
+        "memory_heaps": [
+          {
+            "index": 0,
+            "size_bytes": 31369768960,
+            "device_local": false
+          },
+          {
+            "index": 1,
+            "size_bytes": 17163091968,
+            "device_local": true
+          }
+        ],
+        "queue_families": [
+          {
+            "index": 0,
+            "flags": [
+              "GRAPHICS",
+              "COMPUTE",
+              "TRANSFER",
+              "SPARSE_BINDING"
+            ],
+            "queue_count": 1,
+            "timestamp_valid_bits": 64,
+            "supports_compute": true,
+            "supports_transfer": true,
+            "supports_graphics": true
+          },
+          {
+            "index": 1,
+            "flags": [
+              "COMPUTE",
+              "TRANSFER",
+              "SPARSE_BINDING"
+            ],
+            "queue_count": 4,
+            "timestamp_valid_bits": 64,
+            "supports_compute": true,
+            "supports_transfer": true,
+            "supports_graphics": false
+          },
+          {
+            "index": 2,
+            "flags": [],
+            "queue_count": 1,
+            "timestamp_valid_bits": 0,
+            "supports_compute": false,
+            "supports_transfer": false,
+            "supports_graphics": false
+          },
+          {
+            "index": 3,
+            "flags": [],
+            "queue_count": 1,
+            "timestamp_valid_bits": 64,
+            "supports_compute": false,
+            "supports_transfer": false,
+            "supports_graphics": false
+          },
+          {
+            "index": 4,
+            "flags": [
+              "SPARSE_BINDING"
+            ],
+            "queue_count": 1,
+            "timestamp_valid_bits": 0,
+            "supports_compute": false,
+            "supports_transfer": false,
+            "supports_graphics": false
+          }
+        ],
+        "subgroup": {
+          "subgroup_size": 64,
+          "supported_stages": [
+            "VERTEX",
+            "TESS_CONTROL",
+            "TESS_EVAL",
+            "GEOMETRY",
+            "FRAGMENT",
+            "COMPUTE"
+          ],
+          "supported_operations": [
+            "BASIC",
+            "VOTE",
+            "ARITHMETIC",
+            "BALLOT",
+            "SHUFFLE",
+            "SHUFFLE_RELATIVE",
+            "CLUSTERED",
+            "QUAD"
+          ],
+          "quad_operations_in_all_stages": true,
+          "min_subgroup_size": 32,
+          "max_subgroup_size": 64,
+          "max_compute_workgroup_subgroups": 4294967295
+        },
+        "extensions": {
+          "khr_timeline_semaphore": true,
+          "ext_external_memory_host": true,
+          "khr_cooperative_matrix": false,
+          "ext_subgroup_size_control": true,
+          "khr_shader_atomic_int64": true,
+          "total_device_extensions": 245
+        },
+        "features": {
+          "shader_float16": true,
+          "shader_int8": true,
+          "shader_atomic_int64_buffer": true,
+          "shader_atomic_int64_shared": true,
+          "timeline_semaphore": true,
+          "subgroup_size_control": true,
+          "compute_full_subgroups": true,
+          "cooperative_matrix": false
+        },
+        "timestamp_period_ns": 10.0
+      },
+      "vram_bandwidth_gbps": {
+        "buffer_bytes": 536870912,
+        "iterations": 91,
+        "seconds": 0.21139836,
+        "wall_seconds": 0.211481386,
+        "read_gbps": 231.10516558406604,
+        "write_gbps": 231.10516558406604,
+        "copy_gbps": 462.2103311681321,
+        "notes": [
+          "kernel: strided vec4 read(src)+write(dst), 2 x 512 MiB device-local, timed by queue timestamps (TYPE_64 ticks @ 10 ns/tick)"
+        ]
+      },
+      "vram_bandwidth_cache_gbps": {
+        "buffer_bytes": 33554432,
+        "iterations": 1297,
+        "seconds": 0.04805536,
+        "wall_seconds": 0.048106191,
+        "read_gbps": 905.6242280569744,
+        "write_gbps": 905.6242280569744,
+        "copy_gbps": 1811.2484561139488,
+        "notes": [
+          "kernel: strided vec4 read(src)+write(dst), 2 x 32 MiB device-local, timed by queue timestamps (TYPE_64 ticks @ 10 ns/tick)"
+        ]
+      },
+      "compute_gflops": {
+        "fp32_gflops": 26704.050104292943,
+        "fp16_gflops": 42565.85084726933,
+        "fp16_supported": true,
+        "threads": 1048576,
+        "fma_chains": 8,
+        "fma_rounds_per_dispatch": 4096,
+        "seconds_per_dispatch": 0.0025733728205128204,
+        "notes": [
+          "fp32: 1048576 threads x 4096 rounds x 8 independent fma() chains (fma counted as 2 flops); queue timestamps",
+          "fp16: shaderFloat16 enabled, 1048576 threads x 4096 rounds x 8 chains; packed/pair math means reported GFLOPS counts binary16 ops as issued (see report caveats)"
+        ]
+      },
+      "pcie": {
+        "queue_family": 1,
+        "queue_index": 0,
+        "distinct_from_compute_queue": true,
+        "staging_memory": "HOST_VISIBLE|HOST_COHERENT",
+        "device_memory": "DEVICE_LOCAL",
+        "sizes": [
+          {
+            "size_mb": 16,
+            "h2d_gbps": 26.20186829093438,
+            "d2h_gbps": 27.330545199556354,
+            "h2d_seconds_per_copy": 0.0006403060962566845,
+            "d2h_seconds_per_copy": 0.0006138632024169184
+          },
+          {
+            "size_mb": 64,
+            "h2d_gbps": 28.663015142021763,
+            "d2h_gbps": 21.968487731598216,
+            "h2d_seconds_per_copy": 0.00234130511627907,
+            "d2h_seconds_per_copy": 0.0030547785
+          },
+          {
+            "size_mb": 256,
+            "h2d_gbps": 23.300763533045455,
+            "d2h_gbps": 27.997723764466357,
+            "h2d_seconds_per_copy": 0.0115204575,
+            "d2h_seconds_per_copy": 0.00958776
+          },
+          {
+            "size_mb": 1024,
+            "h2d_gbps": 27.340444508723802,
+            "d2h_gbps": 28.06397294616764,
+            "h2d_seconds_per_copy": 0.03927302,
+            "d2h_seconds_per_copy": 0.038260506666666666
+          }
+        ],
+        "notes": [
+          "staging buffer is vkAllocateMemory'd host memory; the driver pins (page-locks) it while it is device-visible, which is the Vulkan equivalent of a CUDA host registration, not malloc'd pageable RAM",
+          "copies submitted on queue family 1 index 0 (distinct_transfer_queue_family)"
+        ]
+      },
+      "overlap": {
+        "compute_queue_family": 0,
+        "transfer_queue_family": 1,
+        "queue_mode": "distinct_transfer_queue_family",
+        "compute_seconds": 1.060319881,
+        "transfer_seconds": 0.883934177,
+        "both_seconds": 1.040384966,
+        "efficiency_percent": 102.25524880909771,
+        "formula": "eff = 1 - (T_both - max(T_compute, T_transfer)) / min(T_compute, T_transfer)",
+        "compute_work_seconds": 1.0,
+        "transfer_work_bytes": 24964497408,
+        "notes": [
+          "compute leg: 1 dispatch of 1591686 FMA rounds (~1.0s of work); transfer leg: 186 x 64 MiB H2D + D2H (24964497408 bytes total)",
+          "queue setup: compute on family 0 index 0, transfer on family 1 index 0 (distinct_transfer_queue_family)"
+        ]
+      },
+      "notes": [],
+      "error": null
+    },
+    {
+      "device": {
+        "index": 2,
+        "name": "AMD Radeon VII (RADV VEGA20)",
+        "vendor_id": "0x1002",
+        "device_id": "0x66af",
+        "device_type": "DISCRETE_GPU",
+        "api_version": "1.4.354",
+        "driver_version": "26.2.4",
+        "driver_name": "radv",
+        "driver_info": "Mesa 26.2.4-arch3.1"
+      },
+      "properties": {
+        "memory_heaps": [
+          {
+            "index": 0,
+            "size_bytes": 31369768960,
+            "device_local": false
+          },
+          {
+            "index": 1,
+            "size_bytes": 17163091968,
+            "device_local": true
+          }
+        ],
+        "queue_families": [
+          {
+            "index": 0,
+            "flags": [
+              "GRAPHICS",
+              "COMPUTE",
+              "TRANSFER",
+              "SPARSE_BINDING"
+            ],
+            "queue_count": 1,
+            "timestamp_valid_bits": 64,
+            "supports_compute": true,
+            "supports_transfer": true,
+            "supports_graphics": true
+          },
+          {
+            "index": 1,
+            "flags": [
+              "COMPUTE",
+              "TRANSFER",
+              "SPARSE_BINDING"
+            ],
+            "queue_count": 4,
+            "timestamp_valid_bits": 64,
+            "supports_compute": true,
+            "supports_transfer": true,
+            "supports_graphics": false
+          },
+          {
+            "index": 2,
+            "flags": [
+              "SPARSE_BINDING"
+            ],
+            "queue_count": 1,
+            "timestamp_valid_bits": 0,
+            "supports_compute": false,
+            "supports_transfer": false,
+            "supports_graphics": false
+          }
+        ],
+        "subgroup": {
+          "subgroup_size": 64,
+          "supported_stages": [
+            "VERTEX",
+            "TESS_CONTROL",
+            "TESS_EVAL",
+            "GEOMETRY",
+            "FRAGMENT",
+            "COMPUTE"
+          ],
+          "supported_operations": [
+            "BASIC",
+            "VOTE",
+            "ARITHMETIC",
+            "BALLOT",
+            "SHUFFLE",
+            "SHUFFLE_RELATIVE",
+            "CLUSTERED",
+            "QUAD"
+          ],
+          "quad_operations_in_all_stages": true,
+          "min_subgroup_size": 64,
+          "max_subgroup_size": 64,
+          "max_compute_workgroup_subgroups": 4294967295
+        },
+        "extensions": {
+          "khr_timeline_semaphore": true,
+          "ext_external_memory_host": true,
+          "khr_cooperative_matrix": false,
+          "ext_subgroup_size_control": true,
+          "khr_shader_atomic_int64": true,
+          "total_device_extensions": 218
+        },
+        "features": {
+          "shader_float16": true,
+          "shader_int8": true,
+          "shader_atomic_int64_buffer": true,
+          "shader_atomic_int64_shared": true,
+          "timeline_semaphore": true,
+          "subgroup_size_control": true,
+          "compute_full_subgroups": true,
+          "cooperative_matrix": false
+        },
+        "timestamp_period_ns": 40.0
+      },
+      "vram_bandwidth_gbps": {
+        "buffer_bytes": 536870912,
+        "iterations": 158,
+        "seconds": 0.2053688,
+        "wall_seconds": 0.205416906,
+        "read_gbps": 413.04036492398063,
+        "write_gbps": 413.04036492398063,
+        "copy_gbps": 826.0807298479613,
+        "notes": [
+          "kernel: strided vec4 read(src)+write(dst), 2 x 512 MiB device-local, timed by queue timestamps (TYPE_64 ticks @ 40 ns/tick)"
+        ]
+      },
+      "vram_bandwidth_cache_gbps": {
+        "buffer_bytes": 33554432,
+        "iterations": 2116,
+        "seconds": 0.1791872,
+        "wall_seconds": 0.179244312,
+        "read_gbps": 396.2402343024502,
+        "write_gbps": 396.2402343024502,
+        "copy_gbps": 792.4804686049004,
+        "notes": [
+          "kernel: strided vec4 read(src)+write(dst), 2 x 32 MiB device-local, timed by queue timestamps (TYPE_64 ticks @ 40 ns/tick)"
+        ]
+      },
+      "compute_gflops": {
+        "fp32_gflops": 6783.962394922809,
+        "fp16_gflops": 10766.201005500645,
+        "fp16_supported": true,
+        "threads": 1048576,
+        "fma_chains": 8,
+        "fma_rounds_per_dispatch": 4096,
+        "seconds_per_dispatch": 0.010129696,
+        "notes": [
+          "fp32: 1048576 threads x 4096 rounds x 8 independent fma() chains (fma counted as 2 flops); queue timestamps",
+          "fp16: shaderFloat16 enabled, 1048576 threads x 4096 rounds x 8 chains; packed/pair math means reported GFLOPS counts binary16 ops as issued (see report caveats)"
+        ]
+      },
+      "pcie": {
+        "queue_family": 1,
+        "queue_index": 0,
+        "distinct_from_compute_queue": true,
+        "staging_memory": "HOST_VISIBLE|HOST_COHERENT",
+        "device_memory": "DEVICE_LOCAL",
+        "sizes": [
+          {
+            "size_mb": 16,
+            "h2d_gbps": 2.7213417732752103,
+            "d2h_gbps": 2.932533642087028,
+            "h2d_seconds_per_copy": 0.0061650529032258065,
+            "d2h_seconds_per_copy": 0.005721065142857143
+          },
+          {
+            "size_mb": 64,
+            "h2d_gbps": 2.795016337510079,
+            "d2h_gbps": 2.8786602914598154,
+            "h2d_seconds_per_copy": 0.02401018666666667,
+            "d2h_seconds_per_copy": 0.023312533333333333
+          },
+          {
+            "size_mb": 256,
+            "h2d_gbps": 2.8479902040945664,
+            "d2h_gbps": 2.8678233688328576,
+            "h2d_seconds_per_copy": 0.09425434666666667,
+            "d2h_seconds_per_copy": 0.09360250666666665
+          },
+          {
+            "size_mb": 1024,
+            "h2d_gbps": 2.86029715883421,
+            "d2h_gbps": 2.90251075106278,
+            "h2d_seconds_per_copy": 0.3753952,
+            "d2h_seconds_per_copy": 0.36993552
+          }
+        ],
+        "notes": [
+          "staging buffer is vkAllocateMemory'd host memory; the driver pins (page-locks) it while it is device-visible, which is the Vulkan equivalent of a CUDA host registration, not malloc'd pageable RAM",
+          "copies submitted on queue family 1 index 0 (distinct_transfer_queue_family)"
+        ]
+      },
+      "overlap": {
+        "compute_queue_family": 0,
+        "transfer_queue_family": 1,
+        "queue_mode": "distinct_transfer_queue_family",
+        "compute_seconds": 0.998678024,
+        "transfer_seconds": 1.04102389,
+        "both_seconds": 2.031485836,
+        "efficiency_percent": 0.8226953835523743,
+        "formula": "eff = 1 - (T_both - max(T_compute, T_transfer)) / min(T_compute, T_transfer)",
+        "compute_work_seconds": 1.0,
+        "transfer_work_bytes": 2952790016,
+        "notes": [
+          "compute leg: 1 dispatch of 404356 FMA rounds (~1.0s of work); transfer leg: 22 x 64 MiB H2D + D2H (2952790016 bytes total)",
+          "queue setup: compute on family 0 index 0, transfer on family 1 index 0 (distinct_transfer_queue_family)"
+        ]
+      },
+      "notes": [],
+      "error": null
+    }
+  ]
+}
