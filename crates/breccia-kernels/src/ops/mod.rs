@@ -1532,6 +1532,9 @@ pub struct HcWorkspace {
     pub inject: Buf,
     map_down: Buf,
     map_up: Buf,
+    /// `[hc_lr, splits]` partial products for the split-K `down` GEMV
+    /// (`T = 1`, see [`HcMixer::down_splits`]).
+    down_partials: Buf,
 }
 
 impl HcWorkspace {
@@ -1546,6 +1549,7 @@ impl HcWorkspace {
             &self.inject,
             &self.map_down,
             &self.map_up,
+            &self.down_partials,
         ]
         .iter()
         .map(|b| b.size)
@@ -1595,6 +1599,11 @@ pub struct HcMixer<'g> {
     gated: HcGatedMean<'g>,
     write: HcWrite<'g>,
     down: crate::GemvBatch<'g>,
+    /// The same `down` shape as a **single-expert** GEMV, which is the only one
+    /// that can split K: `hc_lr` rows is 40 workgroups on a 60-CU card, i.e.
+    /// 0.7 per CU, and the projection is the HC_READ chain's most expensive
+    /// dispatch (`docs/phase-4/01-forward-pass.md` §8l). Used for `T = 1`.
+    down_split: crate::Gemv<'g>,
     up: crate::GemvBatch<'g>,
     /// `true` when the `inject` projection is folded into the gated-mean pass.
     fused_inject: bool,
@@ -1638,6 +1647,7 @@ impl<'g> HcMixer<'g> {
         };
         let write = HcWrite::new(gpu, n_embd, hc)?;
         let down = crate::GemvBatch::new(gpu, ty, hc_lr, hc * n_embd)?;
+        let down_split = crate::Gemv::new(gpu, ty, hc_lr, hc * n_embd)?;
         let up = crate::GemvBatch::new(gpu, ty, hc * n_embd, hc_lr)?;
         let no_weight = empty_buf(gpu, "hc inject weight")?;
         Ok(HcMixer {
@@ -1649,6 +1659,7 @@ impl<'g> HcMixer<'g> {
             gated,
             write,
             down,
+            down_split,
             up,
             fused_inject: with_inject,
             no_weight,
@@ -1671,6 +1682,10 @@ impl<'g> HcMixer<'g> {
     }
     pub fn has_inject(&self) -> bool {
         self.fused_inject
+    }
+    /// Splits the `T = 1` `down` GEMV uses (1 = no split).
+    pub fn down_splits(&self) -> u32 {
+        self.down_split.recommended_splits()
     }
     /// Partial sums per (token, stream) the folded `inject` writes.
     pub fn inject_chunks(&self) -> usize {
@@ -1708,6 +1723,7 @@ impl<'g> HcMixer<'g> {
         let hc_dim = self.hc * self.n_embd;
         let blobs = vec![0u32; tokens];
         let chunks = self.inject_chunks();
+        let splits = self.down_splits();
         let maps = [
             self.down.map_for_blobs(&blobs, crate::XLayout::PerExpert),
             self.up.map_for_blobs(&blobs, crate::XLayout::PerExpert),
@@ -1716,14 +1732,15 @@ impl<'g> HcMixer<'g> {
         // Six activation buffers + three maps, in one flat list so a failure at
         // any point frees exactly what was allocated.
         let sizes = [
-            hc_dim * tokens,      // xn
-            self.hc_lr * tokens,  // lo_raw
-            self.hc_lr * tokens,  // lo
-            hc_dim * tokens,      // gate
-            self.n_embd * tokens, // mixed
-            inject_vals,          // inject partials [T, hc, chunks]
-            maps[0].len(),        // map_down
-            maps[1].len(),        // map_up
+            hc_dim * tokens,              // xn
+            self.hc_lr * tokens,          // lo_raw
+            self.hc_lr * tokens,          // lo
+            hc_dim * tokens,              // gate
+            self.n_embd * tokens,         // mixed
+            inject_vals,                  // inject partials [T, hc, chunks]
+            maps[0].len(),                // map_down
+            maps[1].len(),                // map_up
+            self.hc_lr * splits as usize, // down_partials
         ];
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         let cleanup = |bufs: &[Buf]| {
@@ -1761,6 +1778,7 @@ impl<'g> HcMixer<'g> {
             inject: take(),
             map_down: take(),
             map_up: take(),
+            down_partials: take(),
         })
     }
 
@@ -1775,6 +1793,7 @@ impl<'g> HcMixer<'g> {
             &ws.inject,
             &ws.map_down,
             &ws.map_up,
+            &ws.down_partials,
         ] {
             gpu.destroy_buf(b);
         }
@@ -1805,7 +1824,7 @@ impl<'g> HcMixer<'g> {
     pub fn read(&self, ws: &HcWorkspace, r: &Buf, w: &HcWeights<'_>) -> Result<()> {
         let t = ws.tokens;
         self.norm.run(r, Some(w.norm), &ws.xn, self.hc * t)?;
-        self.down.run(w.down, &ws.xn, &ws.lo_raw, &ws.map_down, t)?;
+        self.run_down(ws, w)?;
         self.act
             .run(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32)?;
         self.up.run(w.up, &ws.lo, &ws.gate, &ws.map_up, t)?;
@@ -1831,9 +1850,19 @@ impl<'g> HcMixer<'g> {
         let norm = self
             .norm
             .run_timed(r, Some(w.norm), &ws.xn, self.hc * t, target_s)?;
-        let down = self
-            .down
-            .run_timed(w.down, &ws.xn, &ws.lo_raw, &ws.map_down, t, target_s)?;
+        let down = if t == 1 && self.down_splits() > 1 {
+            self.down_split.run_split_timed(
+                w.down,
+                &ws.xn,
+                &ws.down_partials,
+                &ws.lo_raw,
+                self.down_splits(),
+                target_s,
+            )?
+        } else {
+            self.down
+                .run_timed(w.down, &ws.xn, &ws.lo_raw, &ws.map_down, t, target_s)?
+        };
         let act =
             self.act
                 .run_timed(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32, target_s)?;
@@ -1849,6 +1878,23 @@ impl<'g> HcMixer<'g> {
 
     /// Names of [`HcMixer::stage_timings`]'s stages, in order.
     pub const STAGES: [&'static str; 5] = ["norm", "down", "act", "up", "gated"];
+
+    /// The `down` projection: split-K for a single token (where `hc_lr` rows is
+    /// 40 workgroups), the batched GEMV otherwise.
+    fn run_down(&self, ws: &HcWorkspace, w: &HcWeights<'_>) -> Result<()> {
+        let splits = self.down_splits();
+        if ws.tokens == 1 && splits > 1 {
+            return self.down_split.run_split(
+                w.down,
+                &ws.xn,
+                &ws.down_partials,
+                &ws.lo_raw,
+                splits,
+            );
+        }
+        self.down
+            .run(w.down, &ws.xn, &ws.lo_raw, &ws.map_down, ws.tokens)
+    }
 
     /// HC_WRITE: `out[c] = r[c] + block * 2*sigmoid(inject[c]/hc)` for
     /// `ws.tokens` tokens. Reads `ws.inject` from the last [`HcMixer::read`].
