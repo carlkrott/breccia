@@ -3,8 +3,10 @@ name = "breccia-format"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "Zero-copy GGUF v3 / strata pack / MTP reader with split-residency classification"
 
 [dependencies]
+memmap2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow.workspace = true
