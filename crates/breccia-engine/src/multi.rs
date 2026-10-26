@@ -62,6 +62,9 @@ pub struct MultiGeneration {
     pub decode_seconds: f64,
     /// Tokens **per stream** produced in that window.
     pub steps: usize,
+    /// Wall seconds of each decode step: every stream produces one token in it,
+    /// so this is the per-token latency each agent felt.
+    pub steps_s: Vec<f64>,
 }
 
 impl MultiGeneration {
@@ -241,6 +244,7 @@ impl<'m> Multi<'m> {
         let mut pos = prompt.len();
         let t0 = std::time::Instant::now();
         let mut steps = 0usize;
+        let mut steps_s: Vec<f64> = Vec::with_capacity(n);
         #[allow(clippy::explicit_counter_loop)]
         for i in 0..n {
             let next: Vec<u32> = (0..ns)
@@ -252,7 +256,9 @@ impl<'m> Multi<'m> {
             if i + 1 == n {
                 break;
             }
+            let t_step = std::time::Instant::now();
             logits = self.token_all(&next, pos)?;
+            steps_s.push(t_step.elapsed().as_secs_f64());
             pos += 1;
             steps += 1;
         }
@@ -269,6 +275,7 @@ impl<'m> Multi<'m> {
             streams,
             decode_seconds,
             steps,
+            steps_s,
         })
     }
 }

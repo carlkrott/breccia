@@ -88,6 +88,10 @@ const HANDOFF: usize = 13;
 const FINAL_HC: usize = 14;
 const HEAD: usize = 15;
 
+/// Live sessions on this process, so the last one to drop can release the shared
+/// dispatch ring's pools.
+static LIVE_SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Batches the `BRECCIA_GPU_TIME` probe holds before reading the pool out and
 /// starting again (256 batches = ~5 tokens of a two-stream run).
 const GPU_PROBE_BATCHES: usize = 256;
@@ -554,6 +558,7 @@ impl<'m> Session<'m> {
             )?),
             None => None,
         };
+        LIVE_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Session {
             model,
             venues,
@@ -1782,6 +1787,14 @@ impl Drop for Session<'_> {
     /// `VUID-vkDestroyDevice-device-05137` at teardown.
     fn drop(&mut self) {
         let m = self.model;
+        // Every submission must be finished before anything it references is
+        // freed, and the ring's descriptor pools are shared by every session on
+        // this thread — the last session to drop frees them.
+        let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
+        let _ = breccia_kernels::batch_cmd::wait_all(&gpus);
+        if LIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            let _ = breccia_kernels::batch_cmd::shutdown();
+        }
         for (i, v) in self.venues.iter_mut().enumerate() {
             let gpu = m.devices[i].gpu();
             v.block_out.release(gpu);

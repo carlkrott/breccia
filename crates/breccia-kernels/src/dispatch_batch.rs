@@ -75,6 +75,9 @@ thread_local! {
     static FENCES: RefCell<Vec<vk::Fence>> = const { RefCell::new(Vec::new()) };
     /// Per-slot device handle that owns the slot's fence.
     static DEVICES: RefCell<Vec<ash::vk::Device>> = const { RefCell::new(Vec::new()) };
+    /// Per-slot `ash::Device` clone, so [`shutdown`] can free the slot's pool even
+    /// when the caller no longer has that device's `Gpu`.
+    static SLOT_DEV: RefCell<Vec<Option<ash::Device>>> = const { RefCell::new(Vec::new()) };
     /// Cumulative host seconds spent inside `record` (set allocation, descriptor
     /// write, bind, push constants, dispatch, barrier) — the cost a pre-recorded
     /// command buffer would remove.
@@ -140,6 +143,47 @@ fn ensure_slots() {
             d.extend(std::iter::repeat_n(vk::Device::null(), RING));
         }
     });
+    SLOT_DEV.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.is_empty() {
+            d.extend(std::iter::repeat_n(None, RING));
+        }
+    });
+}
+
+/// Release every ring slot's descriptor pool and fence.
+///
+/// The pools outlive individual batches (they are reset, not recreated, which is
+/// what removed the per-batch create/destroy), so they are freed once — by the
+/// **last** session to drop, before the logical devices go away.
+pub fn shutdown() -> Result<()> {
+    // An unsubmitted recording is simply dropped: its command buffer and pool are
+    // about to be freed with the device.
+    OPEN.with(|o| o.borrow_mut().clear());
+    ensure_slots();
+    let mut freed = 0usize;
+    for slot in 0..RING {
+        let dev = SLOT_DEV.with(|d| d.borrow()[slot].clone());
+        let Some(dev) = dev else { continue };
+        let fence = FENCES.with(|f| f.borrow()[slot]);
+        if fence != vk::Fence::null() {
+            unsafe {
+                let _ = dev.wait_for_fences(&[fence], true, u64::MAX);
+            }
+            FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
+        }
+        let pool = POOLS.with(|p| p.borrow()[slot]);
+        if pool != vk::DescriptorPool::null() {
+            unsafe { dev.destroy_descriptor_pool(pool, None) };
+            POOLS.with(|p| p.borrow_mut()[slot] = vk::DescriptorPool::null());
+            freed += 1;
+        }
+        SLOT_DEV.with(|d| d.borrow_mut()[slot] = None);
+    }
+    if std::env::var_os("BRECCIA_TRACE_BATCH").is_some() {
+        eprintln!("batch ring: freed {freed} descriptor pool(s) at shutdown");
+    }
+    Ok(())
 }
 
 /// Is a batch open on this thread (on any device)?
@@ -208,10 +252,18 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
     // what keeps the pipeline deep), and only if every slot is busy do we wait on
     // one of our own. (Taking an own-but-in-flight slot first would make every
     // block wait for the previous block's submission and serialise the stream.)
+    //
+    // Slots are **device-affine**: a slot's descriptor pool is a device object
+    // (it is reset per batch, not recreated), so a slot may only ever serve one
+    // device. Sharing a slot across devices corrupts the recorded sets.
     let open_slots: Vec<usize> = OPEN.with(|o| o.borrow().iter().map(|x| x.slot).collect());
     let mut slot = usize::MAX;
     for i in 0..RING {
         if open_slots.contains(&i) {
+            continue;
+        }
+        let owner = DEVICES.with(|d| d.borrow()[i]);
+        if owner != vk::Device::null() && owner != dev {
             continue;
         }
         if FENCES.with(|f| f.borrow()[i]) == vk::Fence::null() {
@@ -250,11 +302,33 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
         WAIT_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
         FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
     }
-    let old_pool = POOLS.with(|p| p.borrow()[slot]);
-    if old_pool != vk::DescriptorPool::null() {
-        unsafe { gpu.device.destroy_descriptor_pool(old_pool, None) };
-        POOLS.with(|p| p.borrow_mut()[slot] = vk::DescriptorPool::null());
+    // The slot keeps its descriptor pool across batches: `vkResetDescriptorPool`
+    // is ~free against a create/destroy pair per batch, and a two-stream pair runs
+    // ~96 batches per token (§8q).
+    let pool = POOLS.with(|p| p.borrow()[slot]);
+    if pool != vk::DescriptorPool::null() {
+        unsafe {
+            let _ = gpu
+                .device
+                .reset_descriptor_pool(pool, vk::DescriptorPoolResetFlags::empty());
+        }
+    } else {
+        let sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(MAX_SETS * MAX_BINDINGS)];
+        let pool = unsafe {
+            gpu.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(MAX_SETS)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }
+        .map_err(|e| anyhow!("creating the batch descriptor pool: {e}"))?;
+        POOLS.with(|p| p.borrow_mut()[slot] = pool);
     }
+    SLOT_DEV.with(|d| d.borrow_mut()[slot] = Some(gpu.device.clone()));
+    DEVICES.with(|d| d.borrow_mut()[slot] = dev);
     let cmd = gpu.cmds_c[1 + slot];
     unsafe {
         gpu.device
@@ -263,20 +337,6 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
         gpu.device
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
             .map_err(|e| anyhow!("beginning the batch command buffer: {e}"))?;
-
-        let sizes = [vk::DescriptorPoolSize::default()
-            .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(MAX_SETS * MAX_BINDINGS)];
-        let pool = gpu
-            .device
-            .create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .max_sets(MAX_SETS)
-                    .pool_sizes(&sizes),
-                None,
-            )
-            .map_err(|e| anyhow!("creating the batch descriptor pool: {e}"))?;
-        POOLS.with(|p| p.borrow_mut()[slot] = pool);
     }
     OPEN.with(|o| {
         o.borrow_mut().push(Open {
@@ -360,11 +420,6 @@ pub fn wait(gpus: &[&Gpu], seg: Segment) -> Result<f64> {
     gpu.wait_fence(fence)
         .map_err(|e| anyhow!("waiting for segment {slot}: {e}"))?;
     FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
-    let pool = POOLS.with(|p| p.borrow()[slot]);
-    if pool != vk::DescriptorPool::null() {
-        unsafe { gpu.device.destroy_descriptor_pool(pool, None) };
-        POOLS.with(|p| p.borrow_mut()[slot] = vk::DescriptorPool::null());
-    }
     let secs = t0.elapsed().as_secs_f64();
     WAIT_NS.with(|c| c.set(c.get() + (secs * 1e9) as u64));
     Ok(secs)
@@ -419,11 +474,6 @@ pub fn wait_all(gpus: &[&Gpu]) -> Result<f64> {
             gpu.wait_fence(fence)
                 .map_err(|e| anyhow!("waiting for ring slot {slot}: {e}"))?;
             FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
-            let pool = POOLS.with(|p| p.borrow()[slot]);
-            if pool != vk::DescriptorPool::null() {
-                unsafe { gpu.device.destroy_descriptor_pool(pool, None) };
-                POOLS.with(|p| p.borrow_mut()[slot] = vk::DescriptorPool::null());
-            }
         }
     }
     let secs = t0.elapsed().as_secs_f64();

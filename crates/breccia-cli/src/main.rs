@@ -200,6 +200,44 @@ enum BenchKind {
         #[arg(long)]
         quick: bool,
     },
+    /// Phase 4: N concurrent agent-style streams (different prompts, long
+    /// prefixes) — aggregate/per-agent rate, token latency p50/p95, per-card and
+    /// host-lane utilisation
+    Agents {
+        /// Concurrent agents (one sequence each; they cycle over `--devices`)
+        #[arg(long, default_value_t = 4)]
+        streams: usize,
+        /// Tokens to generate per agent (greedy)
+        #[arg(long, default_value_t = 32)]
+        gen: usize,
+        /// Prompt length for the synthetic agent prefixes
+        #[arg(long, default_value_t = 300)]
+        prefix: usize,
+        /// Device plan, comma-separated PCI addresses
+        #[arg(
+            long,
+            value_name = "PCI[,PCI]",
+            default_value = "0000:03:00.0,0000:0e:00.0"
+        )]
+        devices: String,
+        /// Host expert-lane threads (shared by every agent)
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Write the JSON report here
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
+        /// Record a block's readback inside the block's own batch
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        inbatch_read: bool,
+        /// Blocks whose routed experts live in VRAM, per stream (`;`-separated)
+        #[arg(long, value_name = "N[,N]")]
+        gpu_experts: Option<String>,
+        /// Give every agent the reference prompt: the parity run (all agents must
+        /// produce the server's tokens bit-identically) instead of the mixed
+        /// workload table.
+        #[arg(long)]
+        same_prompt: bool,
+    },
     /// Phase 4: the forward-pass graph — one token, then greedy generation
     Token {
         /// Tokens to generate after the prompt (greedy, temperature 0)
@@ -402,6 +440,30 @@ fn run(cli: Cli) -> Result<()> {
         }),
         Command::Bench {
             kind:
+                Some(BenchKind::Agents {
+                    streams,
+                    gen,
+                    prefix,
+                    devices,
+                    threads,
+                    json,
+                    inbatch_read,
+                    gpu_experts,
+                    same_prompt,
+                }),
+        } => bench_agents(AgentArgs {
+            streams,
+            gen,
+            prefix,
+            devices,
+            threads,
+            json,
+            inbatch_read,
+            gpu_experts,
+            same_prompt,
+        }),
+        Command::Bench {
+            kind:
                 Some(BenchKind::Token {
                     gen,
                     prompt_ids,
@@ -445,6 +507,18 @@ fn run(cli: Cli) -> Result<()> {
             inbatch_read,
         }),
     }
+}
+
+struct AgentArgs {
+    streams: usize,
+    gen: usize,
+    prefix: usize,
+    devices: String,
+    threads: Option<usize>,
+    json: Option<PathBuf>,
+    inbatch_read: bool,
+    gpu_experts: Option<String>,
+    same_prompt: bool,
 }
 
 struct ProfileArgs {
@@ -1746,6 +1820,368 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         println!("wrote {}", path.display());
     }
     Ok(())
+}
+
+/// A deterministic synthetic prompt for an agent stream.
+///
+/// Two thirds of the ids come from a seeded LCG over the vocabulary and one third
+/// cycle through the reference prompt's ids, so the expert routing varies between
+/// agents the way different work would. No tokenizer is available offline, so the
+/// *content* is synthetic — but the workload (positions, QSA indexer growth, MoE
+/// routing over 512 experts, 300-token history) is exactly the real one.
+fn synthetic_prefix(reference: &[u32], n: usize, seed: u32, vocab: u32) -> Vec<u32> {
+    let mut out = Vec::with_capacity(n);
+    let mut x = seed | 1;
+    for i in 0..n {
+        x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        if i % 3 == 0 && !reference.is_empty() {
+            out.push(reference[(i / 3) % reference.len()]);
+        } else {
+            out.push(x % vocab.max(1));
+        }
+    }
+    out
+}
+
+/// `breccia bench agents`: N agent-style streams, long prefixes, greedy decode.
+fn bench_agents(a: AgentArgs) -> Result<()> {
+    let devs: Vec<String> = a
+        .devices
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if devs.is_empty() {
+        anyhow::bail!("--devices needs at least one PCI address");
+    }
+    let n = a.streams.max(1);
+    let reference = parse_reference_prompt();
+    let glob = DEFAULT_MODEL_GLOB.to_string();
+    println!(
+        "breccia bench agents: {n} stream(s) over {:?}, {} prefixes (agent 0 = the parity \
+         reference prompt of {} ids), {} greedy tokens each",
+        devs,
+        a.prefix,
+        reference.len(),
+        a.gen
+    );
+    let groups: Vec<Vec<usize>> = {
+        let g: Vec<Vec<usize>> = a
+            .gpu_experts
+            .as_ref()
+            .map(|s| {
+                s.split(';')
+                    .map(|x| {
+                        x.split(',')
+                            .filter_map(|t| t.trim().parse::<usize>().ok())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (0..n)
+            .map(|i| {
+                if g.is_empty() {
+                    if n == 2 && devs.len() >= 2 {
+                        vec![0, 1, 2, 4, 8, 18, 20, 22, 23]
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    g.get(i).or_else(|| g.last()).cloned().unwrap_or_default()
+                }
+            })
+            .collect()
+    };
+    let mut models = Vec::with_capacity(n);
+    for s in 0..n {
+        let dev = devs[s % devs.len()].clone();
+        let model = breccia_engine::Model::load(
+            &glob,
+            &breccia_engine::LoadOptions {
+                devices: vec![dev.clone()],
+                ctx_capacity: 512,
+                blocks: None,
+                gpu_experts: groups[s].clone(),
+                verbose: s == 0,
+            },
+        )
+        .with_context(|| format!("loading agent {s}'s model on {dev}"))?;
+        if s == 0 {
+            print!("{}", model.stats.banner(&model.cfg));
+        }
+        breccia_engine::graph::assert_head(&model)?;
+        models.push(model);
+    }
+    let vocab = models[0].cfg.vocab as u32;
+    let refs: Vec<&breccia_engine::Model> = models.iter().collect();
+    let cfg = breccia_engine::SessionCfg {
+        ctx_capacity: 512,
+        threads: a.threads.unwrap_or(0),
+        timers: true,
+        batching: true,
+        inbatch_read: a.inbatch_read,
+        probe: true,
+        pool: None,
+    };
+    let mut multi =
+        breccia_engine::Multi::new(&refs, &cfg).context("building the agent streams")?;
+    for s in multi.streams.iter_mut() {
+        s.sampling = breccia_engine::Sampling {
+            temperature: 0.0,
+            top_k: 0,
+            seed: 0x9e37_79b9_7f4a_7c15,
+        };
+    }
+    let prompts: Vec<Vec<u32>> = (0..n)
+        .map(|s| {
+            if s == 0 || a.same_prompt {
+                reference.clone()
+            } else {
+                synthetic_prefix(
+                    &reference,
+                    a.prefix,
+                    0x9e37_79b9 ^ ((s as u32) * 8191),
+                    vocab,
+                )
+            }
+        })
+        .collect();
+    let names: Vec<(String, String)> = multi
+        .streams
+        .iter()
+        .map(|s| s.device_names().into_iter().next().unwrap_or_default())
+        .collect();
+    println!(
+        "session  {} streams · {} shared expert threads ({}) · prompts {:?} ids",
+        multi.len(),
+        multi.streams[0].threads(),
+        breccia_kernels::cpu::path().name(),
+        prompts.iter().map(|p| p.len()).collect::<Vec<_>>()
+    );
+
+    // ---- warm pass (page cache + pipelines; discarded) --------------------
+    multi
+        .generate(&prompts[0], a.gen.min(8))
+        .context("the warm pass")?;
+    for s in multi.streams.iter_mut() {
+        s.reset_counters()?;
+    }
+    breccia_kernels::batch_cmd::reset_record_seconds();
+    multi.t_finish = 0.0;
+    multi.t_submit = 0.0;
+
+    // ---- the measured run: one generate() per agent is not possible (they must
+    // interleave), so drive token_all directly over all agents' prompts --------
+    let mut logits: Vec<Vec<f32>> = Vec::with_capacity(n);
+    for sess in multi.streams.iter_mut() {
+        sess.reset()?;
+    }
+    // All agents advance in lockstep, so a shorter prefix is extended by
+    // repeating its last id (a real scheduler holding shorter work would do the
+    // same: the streams must be at the same position to interleave).
+    let common = if a.same_prompt {
+        reference.len()
+    } else {
+        prompts.iter().map(|p| p.len()).max().unwrap_or(0)
+    };
+    let padded: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| {
+            let mut v = p.clone();
+            if let Some(&last) = p.last() {
+                v.resize(common, last);
+            }
+            v
+        })
+        .collect();
+    for pos in 0..common {
+        let toks: Vec<u32> = padded.iter().map(|p| p[pos]).collect();
+        logits = multi.token_all(&toks, pos)?;
+    }
+    // The prompt is not part of the decode measurement (counters, probe, timers).
+    for s in multi.streams.iter_mut() {
+        s.reset_counters()?;
+    }
+    breccia_kernels::batch_cmd::reset_record_seconds();
+    multi.t_finish = 0.0;
+    multi.t_submit = 0.0;
+    let mut tokens: Vec<Vec<u32>> = vec![Vec::with_capacity(a.gen); n];
+    let mut steps_s: Vec<f64> = Vec::with_capacity(a.gen);
+    let t0 = std::time::Instant::now();
+    let mut pos = prompts.iter().map(|p| p.len()).max().unwrap_or(0);
+    #[allow(clippy::explicit_counter_loop)]
+    for i in 0..a.gen {
+        let next: Vec<u32> = (0..n)
+            .map(|s| multi.streams[s].sample(&logits[s]).unwrap_or(0))
+            .collect();
+        for (s, &t) in next.iter().enumerate() {
+            tokens[s].push(t);
+        }
+        if i + 1 == a.gen {
+            break;
+        }
+        let t_step = std::time::Instant::now();
+        logits = multi.token_all(&next, pos)?;
+        steps_s.push(t_step.elapsed().as_secs_f64());
+        pos += 1;
+    }
+    let decode_seconds = t0.elapsed().as_secs_f64();
+    let steps = steps_s.len();
+
+    // ---- report ----------------------------------------------------------
+    let mut sorted = steps_s.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |q: f64| -> f64 {
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        let i = ((sorted.len() - 1) as f64 * q).round() as usize;
+        sorted[i] * 1e3
+    };
+    let agg = if decode_seconds > 0.0 {
+        steps as f64 * n as f64 / decode_seconds
+    } else {
+        0.0
+    };
+    let per = if decode_seconds > 0.0 {
+        steps as f64 / decode_seconds
+    } else {
+        0.0
+    };
+    let lane_total: f64 = multi.streams.iter().map(|s| s.lane_s).sum();
+    let lane_covered: f64 = multi.streams.iter().map(|s| s.lane_covered_s).sum();
+    let mut per_card: Vec<(String, Vec<usize>, f64)> = Vec::new();
+    let mut busy_total = 0.0;
+    for (i, sess) in multi.streams.iter_mut().enumerate() {
+        let b = sess.gpu_busy_s()?.first().copied().unwrap_or(0.0);
+        busy_total += b;
+        let pci = names[i].1.clone();
+        match per_card.iter_mut().find(|c| c.0 == pci) {
+            Some(c) => {
+                c.1.push(i);
+                c.2 += b;
+            }
+            None => per_card.push((pci, vec![i], b)),
+        }
+    }
+    println!(
+        "\nagents   {n} concurrent · {steps} measured steps · {:.2} s of decode",
+        decode_seconds
+    );
+    println!(
+        "decode   {agg:.2} tok/s aggregate · {per:.2} tok/s per agent · {:.1} ms per step \
+         (p50 {:.1} / p95 {:.1} / max {:.1} ms)",
+        decode_seconds * 1e3 / steps.max(1) as f64,
+        pct(0.50),
+        pct(0.95),
+        sorted.last().map(|x| x * 1e3).unwrap_or(0.0)
+    );
+    println!(
+        "host     expert lane {:.1} ms/step ({:.0}% of the step, {:.0}% of it under another \
+         agent's GPU work) · {:.1} ms/step of ring waits",
+        lane_total * 1e3 / steps.max(1) as f64,
+        lane_total * 1e3 / (decode_seconds * 1e3).max(1e-9) * 100.0,
+        if lane_total > 0.0 {
+            lane_covered / lane_total * 100.0
+        } else {
+            0.0
+        },
+        breccia_kernels::batch_cmd::wait_seconds() * 1e3 / steps.max(1) as f64
+    );
+    for (pci, streams_on_it, b) in &per_card {
+        let name = names
+            .iter()
+            .find(|x| &x.1 == pci)
+            .map(|x| x.0.clone())
+            .unwrap_or_default();
+        println!(
+            "card     {name:<40} agents {streams_on_it:?}  GPU {:.0}% utilised",
+            b / decode_seconds.max(1e-9) * 100.0
+        );
+    }
+    println!(
+        "         aggregate GPU busy {:.1} ms/step over {} card(s)",
+        busy_total * 1e3 / steps.max(1) as f64,
+        per_card.len()
+    );
+    let parity = if a.same_prompt {
+        format!(
+            "all agents got the reference prompt; agent 0 vs the server: {}",
+            reference_parity(&tokens[0])
+        )
+    } else {
+        "mixed prompts (run with --same-prompt for server parity)".to_string()
+    };
+    println!("parity   {parity}");
+    let dup = (1..n)
+        .map(|s| (s, tokens[s].iter().take(8).copied().collect::<Vec<_>>()))
+        .collect::<Vec<_>>();
+    for (s, t) in dup {
+        println!("         agent {s} first tokens {t:?}");
+    }
+
+    if let Some(path) = &a.json {
+        let value = serde_json::json!({
+            "agents": n,
+            "steps": steps,
+            "decode_seconds": decode_seconds,
+            "aggregate_tokens_per_s": agg,
+            "per_agent_tokens_per_s": per,
+            "latency_ms": {"p50": pct(0.50), "p95": pct(0.95), "max": sorted.last().map(|x| x * 1e3)},
+            "lane_ms_per_step": lane_total * 1e3 / steps.max(1) as f64,
+            "lane_covered_fraction": if lane_total > 0.0 { lane_covered / lane_total } else { 0.0 },
+            "ring_wait_ms_per_step": breccia_kernels::batch_cmd::wait_seconds() * 1e3 / steps.max(1) as f64,
+            "prompt_lengths": prompts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            "tokens": tokens,
+            "cards": per_card.iter().map(|(pci, s, b)| serde_json::json!({
+                "pci": pci, "agents": s, "gpu_utilisation": b / decode_seconds.max(1e-9),
+            })).collect::<Vec<_>>(),
+            "reference_parity": if a.same_prompt { reference_parity(&tokens[0]) } else { "n/a (mixed prompts)".to_string() },
+        });
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&value)? + "\n")
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
+/// The reference prompt's ids (the ones `parity.py` captured), or a fallback.
+fn parse_reference_prompt() -> Vec<u32> {
+    let path = "/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids";
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|t| {
+            t.split(|c: char| c == ',' || c.is_whitespace())
+                .filter_map(|x| x.trim().parse::<u32>().ok())
+                .collect()
+        })
+        .filter(|v: &Vec<u32>| !v.is_empty())
+        .unwrap_or_else(|| vec![760, 13017, 1433, 364, 279, 5447])
+}
+
+/// `n/n` of agent 0's generated ids against the server's recorded sequence.
+fn reference_parity(ours: &[u32]) -> String {
+    let path = "/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json";
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return "no reference file".to_string();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return "unreadable reference".to_string();
+    };
+    let Some(ref_ids) = v.get("generated").and_then(|g| g.as_array()) else {
+        return "no `generated` in the reference".to_string();
+    };
+    let ref_ids: Vec<u32> = ref_ids
+        .iter()
+        .filter_map(|x| x.as_u64().map(|y| y as u32))
+        .collect();
+    let n = ours.len().min(ref_ids.len());
+    let ok = (0..n).filter(|&i| ours[i] == ref_ids[i]).count();
+    format!("{ok}/{n}")
 }
 
 fn bench_token(a: TokenArgs) -> Result<()> {

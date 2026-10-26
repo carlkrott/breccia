@@ -1215,6 +1215,138 @@ Artifacts: `$D/s-{base,inbatch,exp4,exp9,exp11}-*.{json,log}` (the A/B sweeps),
 `$D/g-{2,4}.json` (the gen-32 cells), `$D/g-4e.json` (4 streams with experts),
 `$D/p-two.json` (utilisation + parity with the device-side MoE), `$D/sweep.sh`.
 
+## 8q. Multi-stream third pass: descriptor-pool reuse (+9 %), the agent table, and two measured "no"s
+
+Four items were scoped from §8p's conclusion (host work per block and the two cards
+jointly bind). One landed with a real win, one exposed a **correctness bug** that is
+now fixed, and two are answered with measurements instead of code.
+
+| item | outcome |
+|---|---|
+| share the placed-expert arena across streams | **not needed**: measured no VRAM cliff (§below) |
+| AVX-512 expert decode | **not attempted** (budget); no claim either way |
+| trim per-step host work | **descriptor-pool reuse: 18.68/18.17 → 20.28/19.98 tok/s (+9 %)**, 107 → 99 ms latency; found and fixed a cross-device slot bug |
+| agent-workload bench + table | landed: `breccia bench agents` |
+
+### 1. Descriptor pools: create/destroy per block → reset per block
+
+Every block's `begin` used to create a `VkDescriptorPool` and its `wait` destroy it
+— 96 create/destroy pairs per token pair. The slots now keep their pool and
+`vkResetDescriptorPool` it (a reset is ~free). Two-stream, alternating cells in one
+window:
+
+| cell | aggregate | per stream | latency |
+|---|---:|---:|---:|
+| create/destroy per block | 18.68 / 18.17 | 9.34 / 9.09 | 107.1 / 110.1 ms |
+| **reset per block** | **20.28 / 19.98** | 10.14 / 9.99 | 98.6 / 100.1 ms |
+
+**+9 % aggregate, −9 ms of latency**, and the pools are freed once, by the last
+session to drop (`batch_cmd::shutdown`).
+
+**The bug it exposed, which is the more important result.** Once a pool outlives a
+batch, a ring slot can no longer be reused by *another device*: a pool is a device
+object. Slots are now **device-affine**. Before the fix, four agents on two cards
+produced *silently wrong tokens* on the MI50 streams (2 of 4 agents diverged from
+the server at token 0, ~50 % of runs) while the RX streams were correct — the
+parity check in `bench agents --same-prompt` caught it, which is why the parity test
+is part of the agent harness and not an afterthought:
+
+| after `--streams 4 --same-prompt` | result |
+|---|---|
+| before the slot fix | agents 0,2 (MI50) wrong, agents 1,3 (RX) right |
+| after the slot fix | **all four agents 24/24 vs the server, bit-identical** |
+
+### 2. Sharing the placed-expert arena: measured, not needed
+
+The §8p 4-stream regression was attributed to "two models/card double the device
+MoE". If that were a *VRAM* problem, sharing the arenas (they are immutable model
+data) would fix it. It is not: at 4 streams, two blocks per stream per card
+(9.1 GiB/card) and four blocks (14.5 GiB/card) measure the same, so there is no
+resident-set cliff to remove:
+
+| 4 streams, one window | aggregate |
+|---|---:|
+| no device experts | 22.75 / 24.71 |
+| 2 blocks/stream (9.1 GiB/card) | 23.15 / 25.12 |
+| 4 blocks/stream (14.5 GiB/card) | 23.80 / 24.58 |
+
+The cost is the **duplicated device-MoE compute** (fence wait 14 → 23 ms/step when
+experts are on at 4 streams), which sharing weights cannot remove. So the arenas
+stay per model: an `Arc`-shared arena would need a shared *logical device* across
+streams (each stream currently opens its own), i.e. a real refactor for zero
+measured gain. It becomes worth doing only if a card ever has to run two streams
+with nine blocks each — which is exactly what §8p's 2-stream case does, one stream
+per card, where nothing is duplicated.
+
+### 3. AVX-512 expert decode: not attempted
+
+The lane is decode-bound (§8c) and is 67–71 % of an agent-length step, so a
+10–25 % AVX-512 gain would be worth 2–4 tok/s aggregate. It needs three new decode
+kernels (IQ4_NL down, Q2_0 down, IQ3_S gate/up) with `is_x86_feature_detected!`
+gating and a second conformance path; this pass spent its budget on the
+descriptor-pool win, the slot-bug fix and the agent harness instead. **No claim is
+made either way** — it is the top of the queue.
+
+### 4. `breccia bench agents`: what 4–6 agents actually feel like
+
+`breccia bench agents --streams N --prefix 300 --gen 16` runs N agent-style
+streams in lockstep with a warm pass: agent 0 gets the 27-id reference prompt,
+agents 1..N−1 get deterministic 300-id prefixes (two thirds LCG ids, one third
+reference ids, so the routing differs), greedy decode, per-step latency, per-card
+GPU utilisation and the host lane's share of the step.
+
+| agents | prefixes | aggregate | per agent | latency p50 / p95 | lane share | GPU MI50 / RX |
+|---:|---|---:|---:|---|---:|---|
+| 4 | 27 (reference, `--same-prompt`) | **20.19** | 5.05 | 194 / 255 ms | 67 % | 47 / 52 % |
+| **4** | **300** | **11.14** | 2.78 | 336 / 444 ms | **71 %** | 33 / 53 % |
+| **6** | **300** | **12.92** | 2.15 | 462 / 525 ms | **71 %** | 38 / 54 % |
+| 2 (§8p, `--prefix` 27) | 27 | 18.58 | 9.29 | — | 36 % | 44 / 64 % |
+
+Two things stand out:
+
+* **Long prefixes cost about half the aggregate** (18.6 → 11.1 at 4 agents): QSA's
+  attention and indexer grow with position, so a step goes 162 → 336 ms while
+  neither card's GPU utilisation rises — the extra time is the *host lane*, which
+  is 71 % of the step at 300 tokens against 36–67 % at 27.
+* **Six agents are only 16 % faster than four** (12.92 vs 11.14): the two cards are
+  already carrying three streams each, so the aggregate is pinned by the lane.
+
+### The third-GPU projection, restated
+
+§8p projected "3 cards ≈ 37 tok/s at 6 streams". That number assumed the 16-token,
+27-prefix workload, where the GPU was 48 % of the limit. **With agent-length
+prefixes it is wrong**: the lane is 71 % of the step, so a third card can only
+raise the GPU side. Bound: if the third card made the GPU infinitely fast, the step
+would fall from 336 ms to the lane's 240 ms, i.e. 4 agents → **15.6 tok/s** (1.4×)
+and 6 agents → ~18 tok/s. Stated with its assumption: *the lane's 32-thread
+throughput (33 GB/s) unchanged*.
+
+What actually raises the agent table, in order:
+
+1. **AVX-512 (or any) lane throughput**: 71 % of the step, so +20 % lane = +14 %
+   aggregate at 4 agents with no extra VRAM.
+2. **Fewer expert bytes per token**: at agent lengths the resident-expert mapping
+   does not fit per stream (2 models/card × 9 blocks × 0.9 GiB), so the lane reads
+   the full 799 MiB/token per agent.
+3. **A third card**: 1.4× at 4–6 agents (bounded by the lane, above), 2× at short
+   prefixes.
+
+Commands:
+
+```bash
+D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+# the agent table (mixed prompts) and the parity run (all agents = the reference)
+timeout 1800 ./target/release/breccia bench agents --streams 4 --gen 16 --prefix 300 \
+  --devices 0000:0e:00.0,0000:03:00.0 --threads 32 --json $D/ag4.json
+timeout 1200 ./target/release/breccia bench agents --streams 4 --gen 24 --same-prompt \
+  --devices 0000:0e:00.0,0000:03:00.0 --threads 32 --json $D/agents4p.json
+# the two-stream gate after the pool change
+$D/sweep.sh 2 "pool:"
+```
+
+Artifacts: `$D/ag{4,6}.json` (the agent table), `$D/agents4p.json` (parity),
+`$D/s-pool-*.{json,log}` (the pool A/B).
+
 ## 9. Exact commands
 
 
@@ -1269,21 +1401,20 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 
 ## 10. What to do next, in order
 
-1. **The two-stream gate is 18.58 tok/s at `--streams 2 --threads 32`** (9
-   GPU-resident expert blocks per stream, in-batch reads), 9.29 tok/s per stream,
-   parity 64/64 (§8p). The 4-6 stream plateau is ~25 tok/s.
-2. **Raise the plateau with a third card, not with more host tricks.** At 4
-   streams the lane (98 ms/step, 33 GB/s) and the two cards (fence wait down to
-   14 ms) bind together; a third discrete GPU takes 6 streams to ~37 tok/s while
-   the lane still has ~40 % headroom. Try a third device before optimising further.
-3. **Per-block host work still pays at 2 streams** (GPU at 44/64 % utilisation):
-   `finish_block` is 88 ms/step against ~50 ms of GPU per card. Next candidates are
-   the ffn-write record (11 ms/step) and the readback copies themselves (0.13
-   ms/block even in-batch).
-4. **GDN's delta rule** (43 us on the RX for 9 MiB of state = 217 GB/s, 2.6x off
-   the ceiling) is the largest single kernel left: the 128-float column in LDS.
-   It is GPU work, so it only pays once the cards, not the lane, are the limit —
-   i.e. at 4+ streams.
-5. **Keep the VRAM budget in view**: 9 expert blocks/stream fits at 2 streams
-   (44/64 % utilisation), 11 does not (15.6 tok/s, worse than none), and at 4
-   streams even four blocks per stream is a net loss.
+1. **AVX-512 expert decode** is now the top lever and the only un-attempted item:
+   the lane is 67-71 % of an agent-length step, so +20 % lane throughput is +14 %
+   aggregate at 4 agents with no VRAM cost. Three kernels (IQ4_NL down, Q2_0 down,
+   IQ3_S gate/up), `is_x86_feature_detected!` gated, AVX2 retained.
+2. **Keep the parity harness in every multi-stream run.** §8q's device-affine slot
+   bug produced *silently wrong tokens* on half the agents for ~50 % of runs and
+   was caught only by `bench agents --same-prompt` (24/24 before → 0/24 → 24/24
+   after). Anything that changes slot, pool or session bookkeeping needs it.
+3. **The two-stream gate is 20.0-20.3 tok/s** (9 GPU-resident expert blocks per
+   stream, in-batch reads, reset-per-batch pools) at 9.9-10.1 tok/s per stream,
+   parity 64/64; 4 agents at 27-token prefixes 20.19 aggregate, at 300-token
+   prefixes 11.14 (the realistic product number).
+4. **A third card buys 1.4x at agent lengths** (bounded by the lane), 2x at short
+   prefixes. Do the lane work first.
+5. **GDN's delta rule** (43 us for 9 MiB of state = 217 GB/s, 2.6x off the ceiling)
+   is the largest single kernel left, and it is GPU work — only pays once the cards
+   bind.
