@@ -93,6 +93,12 @@ Every flag in the production line is modelled. Field names are the JSON keys of
 `--backend` is a **Breccia extension**, not llama.cpp: the production line omits
 it and therefore gets `vulkan`. `-be` is a short form added for convenience.
 
+Note on `-D`: `qwen-dual-serve.sh` itself contains no `-D` flag — the binary
+path arrives as `argv[0]` (`exec $D/llama-server …`) and `parse_llama_server_args`
+records a leading token that looks like a program path into `binary`
+automatically. `-D`/`--binary` is the explicit on-line spelling, used to
+override the path and by tests to model `argv[0]` inside a flag string.
+
 Value forms accepted for every entry: `-c 200000` (space-separated; the value
 token is taken verbatim, so `-ngl -1` works), `-c=200000` / `--port=8160`
 (inline), and for booleans a bare flag plus an optional `--jinja=false`.
@@ -277,13 +283,13 @@ running  1 test  ... test result: ok.  1 passed; 0 failed   (doctest, lib.rs)
 7. **`parse_str` is not a shell.** No `$VAR`, backticks, `~` expansion, or
    backslash escapes other than line continuation. The service line's quotes are
    handled; anything more should pass a real argv.
-8. **Foreign files in `src/`.** `crates/breccia-flags/src/ot.rs` and
-   `crates/breccia-flags/src/tests.rs` appeared at 09:27–09:29 during this
-   implementation and belong to a *different* API design (`split_ot_list`,
-   `GpuLayers`, `ValidateError`). They are **not declared** in `lib.rs`, so they
-   are not compiled and do not affect the build or tests; they were left
-   untouched rather than deleted. Whoever owns that attempt should reconcile or
-   remove them — adding `mod ot; mod tests;` to `lib.rs` will not compile against
-   the current API.
+8. ~~**Foreign files in `src/`.`**~~ **Resolved 2026-10-26.** `src/ot.rs` and
+   `src/tests.rs` appeared at 09:27–09:29 during this implementation — remnants
+   of a superseded parallel attempt at the same crate (`split_ot_list`,
+   `GpuLayers`, `ValidateError` API), never declared in `lib.rs` and therefore
+   never compiled. Their owner removed them after this report was written;
+   `cargo build`/`cargo test`/`cargo clippy`/`cargo fmt` were re-run afterwards
+   and remain clean (41 + 10 + 1 tests, no warnings), confirming they were not
+   load-bearing.
 9. No benchmark runs and no service restarts were performed; this crate is pure
    parsing and the verification above is the complete evidence.
