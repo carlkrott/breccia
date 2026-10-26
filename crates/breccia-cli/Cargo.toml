@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 breccia-flags = { path = "../breccia-flags" }
 breccia-profile = { path = "../breccia-profile" }
+breccia-vk = { path = "../breccia-vk" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

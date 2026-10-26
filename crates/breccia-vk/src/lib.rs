@@ -1,10 +1,15 @@
-//! `breccia-vk` — Vulkan device discovery + raw micro-benchmarks.
+//! `breccia-vk` — Vulkan device discovery, raw micro-benchmarks, and the Phase-2
+//! asynchronous transfer layer.
 //!
 //! This crate is the reusable port of `harnesses/vk-probe/` (the Phase-0.2 probe
 //! that produced `docs/phase-0/02-vulkan-raw-probe.md`). It provides:
 //!
 //! * [`run_probe`] — enumerate devices, then (optionally) measure VRAM bandwidth,
 //!   FMA compute (fp32/fp16), PCIe H2D/D2H and compute/transfer overlap;
+//! * [`transfer::TransferRing`] — the engine-facing DMA ring: [`transfer`] is the
+//!   timeline-semaphore ring / pinned staging / compute-transfer overlap primitive
+//!   that M3 (expert streaming) and M5 (KV paging) drive, and [`transfer_bench`] is
+//!   the M1b benchmark that proves it (`breccia bench transfer`);
 //! * [`ctx::Host`] — instance/device plumbing (headless, no surface);
 //! * [`report`] — serde types for the measurement results;
 //! * [`pci`] — stable PCIe topology strings for the hardware fingerprint.
@@ -21,10 +26,18 @@ pub mod ctx;
 pub mod pci;
 pub mod probe;
 pub mod report;
+pub mod transfer;
+pub mod transfer_bench;
 
 pub use ctx::{api_version_string, driver_version_string, Dev, Host};
 pub use probe::{run_discovery, run_probe, ProbeOptions, ProbeOutcome};
 pub use report::*;
+pub use transfer::{RingConfig, RingStats, TransferRing};
+pub use transfer_bench::{
+    run_transfer_bench, Churn, DeviceSelector, DeviceTransfer, RingSizeStat, RingThroughput,
+    TransferBenchOptions, TransferCaps, TransferEnvironment, TransferQueue, TransferReport,
+    TRANSFER_SCHEMA_VERSION,
+};
 
 #[cfg(test)]
 mod tests {

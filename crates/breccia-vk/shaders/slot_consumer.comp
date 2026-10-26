@@ -1,0 +1,49 @@
+// Expert-slot consumer (Phase 2 / M1b churn simulation).
+//
+// Models the M3 work shape over a ring slot: a GEMV-like strided read of the whole
+// slot (memory bound, same access pattern as a dequant+GEMV weight sweep) followed
+// by `iters` dependent FMA chains so the compute leg can be sized against the DMA
+// leg of the same blob. Nothing here is an expert kernel; it is a consumer that
+// reads the slot exactly once and then burns a calibrated amount of math.
+//
+// Buffer values are small integers written by the host (1..=8) so no denormals,
+// NaN or overflow occur for any iteration count reached in the benchmark:
+// x = fma(x, 1+1e-7, 5e-7) grows by e^(iters*1e-7) and drifts by 5e-7*iters.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Slot { vec4 slot_data[]; };
+layout(set = 0, binding = 1) writeonly buffer Acc { float acc[]; };
+
+layout(push_constant) uniform Push {
+    uint count;      // vec4 elements to read from the slot (blob_bytes / 16)
+    uint stride;     // global thread count
+    uint iters;      // FMA rounds per chain (0 = read only)
+    uint acc_elems;  // == stride: one output element per thread, no races
+} pc;
+
+void main() {
+    uint tid = gl_GlobalInvocationID.x;
+
+    vec4 s = vec4(0.0);
+    for (uint i = tid; i < pc.count; i += pc.stride) {
+        s += slot_data[i];
+    }
+
+    float x0 = s.x;
+    float x1 = s.y;
+    float x2 = s.z;
+    float x3 = s.w;
+    const float a = 1.0000001;
+    const float b = 0.0000005;
+
+    for (uint k = 0; k < pc.iters; ++k) {
+        x0 = fma(x0, a, b);
+        x1 = fma(x1, a, b);
+        x2 = fma(x2, a, b);
+        x3 = fma(x3, a, b);
+    }
+
+    acc[tid % pc.acc_elems] = ((x0 + x1) + (x2 + x3));
+}

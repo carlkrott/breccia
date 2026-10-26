@@ -15,6 +15,29 @@ pub fn address_from_bus_info(bus: u32, device: u32, function: u32) -> String {
     format!("0000:{bus:02x}:{device:02x}.{function}")
 }
 
+/// Normalise a user-supplied PCI address to the sysfs / `VK_EXT_pci_bus_info`
+/// spelling `dddd:bb:dd.f`, so `3:0.0`, `03:00.0` and `0000:03:00.0` are one key.
+///
+/// Vulkan ordinals are not stable on this host (RADV intermittently omits the iGPU
+/// and reorders enumeration), so PCI identity is the only safe device selector.
+pub fn normalize_address(address: &str) -> String {
+    fn pad_dev(s: &str) -> String {
+        match s.split_once('.') {
+            Some((d, f)) => format!("{d:0>2}.{f}"),
+            None => format!("{s:0>2}"),
+        }
+    }
+    let t = address.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return t;
+    }
+    match t.split(':').collect::<Vec<_>>().as_slice() {
+        [domain, bus, dev] => format!("{domain:0>4}:{bus:0>2}:{}", pad_dev(dev)),
+        [bus, dev] => format!("0000:{bus:0>2}:{}", pad_dev(dev)),
+        _ => t,
+    }
+}
+
 /// Fallback discovery: scan sysfs for a device with this vendor:device id pair.
 /// Returns the lexicographically first match (deterministic across runs).
 pub fn find_address_by_ids(vendor_id: u32, device_id: u32) -> Option<String> {
@@ -73,6 +96,24 @@ mod tests {
     fn bus_info_address_format() {
         assert_eq!(address_from_bus_info(3, 0, 0), "0000:03:00.0");
         assert_eq!(address_from_bus_info(0x41, 0x1f, 3), "0000:41:1f.3");
+    }
+
+    #[test]
+    fn address_normalisation_is_stable() {
+        for (input, want) in [
+            ("0000:03:00.0", "0000:03:00.0"),
+            ("03:00.0", "0000:03:00.0"),
+            ("3:0.0", "0000:03:00.0"),
+            (" 0000:0E:00.0 ", "0000:0e:00.0"),
+            ("0000:05:00.0", "0000:05:00.0"),
+        ] {
+            assert_eq!(normalize_address(input), want, "input {input:?}");
+        }
+        // round-trips what address_from_bus_info produces
+        assert_eq!(
+            normalize_address(&address_from_bus_info(0x41, 0x1f, 3)),
+            "0000:41:1f.3"
+        );
     }
 
     #[test]

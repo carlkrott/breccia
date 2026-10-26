@@ -335,6 +335,11 @@ pub struct Timing {
 pub struct Gpu {
     pub index: u32,
     pub device: ash::Device,
+    /// Handle copy of the owning instance (extension function-pointer loading).
+    /// The [`Host`] still owns instance destruction.
+    pub instance: ash::Instance,
+    /// `VK_EXT_external_memory_host` was advertised **and** enabled on this device.
+    pub external_memory_host: bool,
     pub mem: vk::PhysicalDeviceMemoryProperties,
     pub timestamp_period_ns: f64,
     pub feats: Feats,
@@ -356,7 +361,8 @@ pub struct Gpu {
     pub ts_ok_x: bool,
 }
 
-fn find_mem_type(
+/// Pick the first memory type in `bits` that satisfies `req`, preferring `pref`.
+pub fn find_mem_type(
     mem: &vk::PhysicalDeviceMemoryProperties,
     bits: u32,
     req: vk::MemoryPropertyFlags,
@@ -450,6 +456,11 @@ impl Gpu {
         if dev.feats.cooperative_matrix && dev.has_ext("VK_KHR_cooperative_matrix") {
             enabled_exts.push("VK_KHR_cooperative_matrix".to_string());
         }
+        // Phase 2: needed by the zero-copy pinned-host probe in `transfer`.
+        let external_memory_host = dev.has_ext("VK_EXT_external_memory_host");
+        if external_memory_host {
+            enabled_exts.push("VK_EXT_external_memory_host".to_string());
+        }
 
         // NOTE: Vulkan12Features already carries shaderFloat16/shaderInt8/atomic64/
         // timeline/hostQueryReset — validation forbids also chaining the promoted
@@ -533,6 +544,8 @@ impl Gpu {
         Ok(Gpu {
             index,
             device,
+            instance: instance.clone(),
+            external_memory_host,
             mem: dev.mem,
             timestamp_period_ns: dev.timestamp_period_ns as f64,
             feats: dev.feats,
@@ -569,11 +582,35 @@ impl Gpu {
         req: vk::MemoryPropertyFlags,
         pref: vk::MemoryPropertyFlags,
     ) -> R<Buf> {
+        self.buf_with(size, usage, req, pref, None)
+    }
+
+    /// [`Gpu::buf`] with an explicit set of queue families.
+    ///
+    /// `families = Some(&[..])` creates a `VK_SHARING_MODE_CONCURRENT` buffer, which
+    /// is what the Phase-2 transfer ring needs: slot buffers are written by the
+    /// transfer queue family and read by the compute family, and concurrent sharing
+    /// avoids queue-family ownership transfers on every reuse. A single (or empty)
+    /// family degrades to the exclusive path.
+    pub fn buf_with(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        req: vk::MemoryPropertyFlags,
+        pref: vk::MemoryPropertyFlags,
+        families: Option<&[u32]>,
+    ) -> R<Buf> {
         unsafe {
-            let bci = vk::BufferCreateInfo::default()
-                .size(size)
-                .usage(usage)
-                .sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let mut fams: Vec<u32> = families.map(|f| f.to_vec()).unwrap_or_default();
+            fams.sort_unstable();
+            fams.dedup();
+            let mut bci = vk::BufferCreateInfo::default().size(size).usage(usage);
+            bci = if fams.len() > 1 {
+                bci.sharing_mode(vk::SharingMode::CONCURRENT)
+                    .queue_family_indices(&fams)
+            } else {
+                bci.sharing_mode(vk::SharingMode::EXCLUSIVE)
+            };
             let buffer = vk(self.device.create_buffer(&bci, None), "vkCreateBuffer")?;
             let reqs = self.device.get_buffer_memory_requirements(buffer);
             let idx = match find_mem_type(&self.mem, reqs.memory_type_bits, req, pref) {
@@ -623,6 +660,21 @@ impl Gpu {
                 "vkMapMemory",
             )? as *mut u8;
             std::slice::from_raw_parts_mut(ptr, data.len()).copy_from_slice(data);
+            self.device.unmap_memory(b.mem);
+        }
+        Ok(())
+    }
+
+    /// Read bytes back from a host-visible buffer (map -> copy -> unmap).
+    pub fn read_host(&self, b: &Buf, out: &mut [u8]) -> R<()> {
+        assert!(out.len() as u64 <= b.size, "read_host overflow");
+        unsafe {
+            let ptr = vk(
+                self.device
+                    .map_memory(b.mem, 0, out.len() as u64, vk::MemoryMapFlags::empty()),
+                "vkMapMemory",
+            )? as *const u8;
+            std::ptr::copy_nonoverlapping(ptr, out.as_mut_ptr(), out.len());
             self.device.unmap_memory(b.mem);
         }
         Ok(())

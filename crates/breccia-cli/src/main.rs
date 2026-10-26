@@ -1,16 +1,18 @@
 //! `breccia` CLI entry (`breccia profile|serve|bench`).
 //!
 //! Phase 1 wires `breccia profile` (hardware discovery + calibration →
-//! `hw_profile.json`) on top of `breccia-vk` + `breccia-profile`. The
-//! llama.cpp/HIP-compatible launch surface (`breccia-flags`) and the server
-//! arrive with Phase 2, which is where `serve`/`bench` become real.
+//! `hw_profile.json`) on top of `breccia-vk` + `breccia-profile`. Phase 2 adds
+//! `breccia bench transfer` (the M1b asynchronous transfer harness: DMA ring
+//! throughput, timeline-semaphore usage, host-memory capability, and the M3-shaped
+//! expert-slot churn that decides whether DMA hides under compute).
 //!
 //! ```text
 //! breccia profile [--reprofile] [--quick] [--json PATH] [--dry-run-plan] [--print-fingerprint]
+//! breccia bench transfer [--device <profile-index|pci>]... [--json PATH] [--quick]
 //! ```
 //!
 //! Behaviour: with a cached profile whose fingerprint matches (and whose
-//! benchmark window is at least as long as requested) it prints the cached
+//! benchmark window is at least as long as requested) `profile` prints the cached
 //! summary and exits 0 without touching the GPU; otherwise it calibrates and
 //! writes. `--dry-run-plan` prints the role table + IQ3_XXS placement sketch and
 //! writes nothing.
@@ -18,6 +20,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+use breccia_vk::DeviceSelector;
 
 #[derive(Parser)]
 #[command(
@@ -62,10 +66,27 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Phase 2: benchmark harness (not implemented yet)
+    /// Benchmark harnesses
     Bench {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        _args: Vec<String>,
+        #[command(subcommand)]
+        kind: Option<BenchKind>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BenchKind {
+    /// M1b: async transfer ring — H2D throughput, overlap, host-memory caps
+    Transfer {
+        /// Device by cached-profile index or PCI address (repeatable);
+        /// default = every discrete GPU
+        #[arg(long = "device", value_name = "PROFILE_INDEX|PCI")]
+        device: Vec<String>,
+        /// Write the full JSON report here
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
+        /// Short benchmark windows (CI-speed, noisier numbers)
+        #[arg(long)]
+        quick: bool,
     },
 }
 
@@ -93,10 +114,21 @@ fn run(cli: Cli) -> Result<()> {
             print_fingerprint,
         }),
         Command::Serve { dry_run_plan, args } => serve(dry_run_plan, args),
-        Command::Bench { .. } => {
-            println!("bench: phase-2");
+        Command::Bench { kind: None } => {
+            println!(
+                "bench: available harnesses\n  \
+                 breccia bench transfer [--device <idx|pci>]... [--json PATH] [--quick]"
+            );
             Ok(())
         }
+        Command::Bench {
+            kind:
+                Some(BenchKind::Transfer {
+                    device,
+                    json,
+                    quick,
+                }),
+        } => bench_transfer(device, json, quick),
     }
 }
 
@@ -205,6 +237,186 @@ fn hip_pci_buses() -> Option<Vec<String>> {
     }
     buses.sort_by_key(|(i, _)| *i);
     Some(buses.into_iter().map(|(_, b)| b).collect())
+}
+
+// ---------------------------------------------------------------------------
+// bench transfer — M1b asynchronous transfer harness
+// ---------------------------------------------------------------------------
+
+fn bench_transfer(specs: Vec<String>, json: Option<PathBuf>, quick: bool) -> Result<()> {
+    let profile = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+        .ok()
+        .flatten();
+    let mut devices = Vec::new();
+    for spec in &specs {
+        devices.push(selector_for(spec, profile.as_ref())?);
+    }
+
+    let report =
+        breccia_vk::run_transfer_bench(&breccia_vk::TransferBenchOptions { quick, devices })
+            .context("transfer benchmark failed")?;
+
+    if let Some(path) = &json {
+        let text = serde_json::to_string_pretty(&report).context("serializing transfer report")?;
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
+    }
+
+    print_transfer_summary(&report);
+    if let Some(path) = &json {
+        println!("\nwrote {}", path.display());
+    }
+    Ok(())
+}
+
+/// Turn one `--device` argument into a selector that survives enumeration-order
+/// changes: a cached-profile index is mapped to its PCI address first.
+fn selector_for(
+    spec: &str,
+    profile: Option<&breccia_profile::schema::HwProfile>,
+) -> Result<DeviceSelector> {
+    let t = spec.trim();
+    if t.is_empty() {
+        anyhow::bail!("--device needs a profile index or a PCI address");
+    }
+    if t.contains(':') {
+        return Ok(DeviceSelector::Pci(breccia_vk::pci::normalize_address(t)));
+    }
+    let idx: u32 = t.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "--device {t:?} is neither a profile index nor a PCI address (dddd:bb:dd.f)"
+        )
+    })?;
+    if let Some(p) = profile {
+        if let Some(entry) = p.devices.iter().find(|d| d.identity.index == idx) {
+            if !entry.identity.pci_address.is_empty() {
+                println!(
+                    "device {idx} -> {} [pci {}] (resolved through the cached profile; Vulkan \
+                     ordinals are not stable on this host)",
+                    entry.identity.name, entry.identity.pci_address
+                );
+                return Ok(DeviceSelector::Pci(entry.identity.pci_address.clone()));
+            }
+        } else {
+            println!(
+                "note: --device {idx} is not in the cached profile ({} device(s)); using the \
+                 runtime Vulkan index",
+                p.devices.len()
+            );
+        }
+    }
+    Ok(DeviceSelector::Index(idx))
+}
+
+fn print_transfer_summary(rep: &breccia_vk::TransferReport) {
+    println!(
+        "\ntransfer harness ({} mode, schema v{}), {} device(s)",
+        if rep.environment.quick {
+            "quick"
+        } else {
+            "full"
+        },
+        rep.schema_version,
+        rep.devices.len()
+    );
+    println!(
+        "  host {} · instance API {} · {}",
+        rep.environment.hostname, rep.environment.instance_api_version, rep.environment.timestamp
+    );
+    if !rep.environment.instance_layers.is_empty() {
+        println!("  instance layers: {:?}", rep.environment.instance_layers);
+    }
+    for w in &rep.warnings {
+        println!("  warning: {w}");
+    }
+
+    for d in &rep.devices {
+        println!("\n[{}] {}", d.device.index, d.device.name);
+        println!(
+            "  pci {} · {} {} · {}",
+            if d.device.pci_address.is_empty() {
+                "?"
+            } else {
+                &d.device.pci_address
+            },
+            d.device.driver_name,
+            d.device.driver_version,
+            d.device.device_type
+        );
+        println!(
+            "  queues: compute family {} ({}q) · transfer family {} ({}q, index {}) · {}",
+            d.queue.compute_family,
+            d.queue.compute_family_queue_count,
+            d.queue.transfer_family,
+            d.queue.transfer_family_queue_count,
+            d.queue.transfer_queue_index,
+            d.queue.mode
+        );
+        println!(
+            "  timeline semaphores: supported={} used={}",
+            d.capabilities.timeline_semaphore_supported, d.capabilities.timeline_semaphore_used
+        );
+        let hm = &d.capabilities.host_memory;
+        println!(
+            "  external memory host: listed={} enabled={} align={} B import={}{}{}",
+            hm.extension_listed,
+            hm.extension_enabled,
+            hm.min_imported_host_pointer_alignment,
+            if hm.import_ok { "ok" } else { "unavailable" },
+            if hm.import_verified {
+                " (verified)"
+            } else {
+                ""
+            },
+            hm.h2d_gbps
+                .map(|v| format!(" · {v:.1} GB/s zero-copy H2D"))
+                .unwrap_or_default()
+        );
+        if let Some(r) = &d.ring {
+            for s in &r.sizes {
+                println!(
+                    "  ring {:>3} MiB x{} slots: {:6.2} GB/s DMA, {:6.2} GB/s with host staging \
+                     ({} rounds, {} slot stalls, {:.3} s blocked)",
+                    s.size_mb,
+                    s.slots,
+                    s.dma_gbps,
+                    s.staged_gbps,
+                    s.rounds,
+                    s.stall_count,
+                    s.stall_seconds
+                );
+            }
+        }
+        if let Some(c) = &d.churn {
+            println!(
+                "  churn ({} rounds, {} MiB, depth {}): stream {:.3} s · compute-only {:.3} s · \
+                 transfer-only {:.3} s",
+                c.rounds,
+                c.bytes_total >> 20,
+                c.pipeline_depth,
+                c.stream_seconds,
+                c.compute_only_seconds,
+                c.transfer_only_seconds
+            );
+            println!(
+                "  overlap {:.1}% · consumer stall {:.2} ms/MB ({:.3} s total) · effective H2D \
+                 {:.2} GB/s (full rate {:.2} GB/s)",
+                c.overlap_efficiency_percent,
+                c.consumer_stall_ms_per_mb,
+                c.consumer_stall_seconds,
+                c.stream_h2d_gbps,
+                c.full_rate_h2d_gbps
+            );
+        }
+        for n in &d.notes {
+            println!("  note: {n}");
+        }
+        if let Some(e) = &d.error {
+            println!("  ERROR: {e}");
+        }
+    }
 }
 
 fn serve(dry_run: bool, args: Vec<String>) -> Result<()> {
@@ -365,4 +577,37 @@ fn serve(dry_run: bool, args: Vec<String>) -> Result<()> {
         }
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pci_spec_is_normalised() {
+        assert_eq!(
+            selector_for("03:00.0", None).expect("pci spec"),
+            DeviceSelector::Pci("0000:03:00.0".into())
+        );
+        assert_eq!(
+            selector_for(" 0000:0E:00.0 ", None).expect("full pci spec"),
+            DeviceSelector::Pci("0000:0e:00.0".into())
+        );
+    }
+
+    #[test]
+    fn numeric_spec_falls_back_to_runtime_index() {
+        // Without a cached profile the index is used verbatim (with a printed note
+        // when a profile exists but does not carry that index).
+        assert_eq!(
+            selector_for("1", None).expect("index"),
+            DeviceSelector::Index(1)
+        );
+    }
+
+    #[test]
+    fn garbage_spec_is_rejected() {
+        assert!(selector_for("rx6950", None).is_err());
+        assert!(selector_for("  ", None).is_err());
+    }
 }
