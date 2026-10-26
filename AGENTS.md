@@ -86,7 +86,7 @@ Small changes are measured in **seconds, not tens of minutes**. Every sweep is t
 | Date | Process | Card | Symptom | Cause / fix |
 |---|---|---|---|---|
 | 2026-10-25 22:09 | `conformance` (`non_finite_scal`) | RX | illegal opcode + coredump, machine hung | zero-slack allocation + unbounded table index → TAIL_PAD + masked accessors |
-| 2026-10-26 23:44 | `gemm_many` (`multi_user_gemm`) | **MI50 (display)** | ring gfx timeout → BACO reset → **machine rebooted** | four new multi-user GEMM shaders (IQ4_XS/Q4_K/Q5_K/Q6_K) crashed on the display card. 447 fault lines. WIP preserved on branch `wip/four-gemms-crash-20261026`. |
+| 2026-10-26 23:44 | `gemm_many` (`multi_user_gemm`) | **MI50 (display)** | ring gfx timeout → BACO reset → **machine rebooted** | **not a kernel defect**: all four new GEMMs later validated bit-identical on both cards, one type per invocation. The reset correlated with the *sweep shape* — up to **24 fresh dispatch shapes in one process** (a cap raised from 6) on the display card. New rule: ≤4 fresh shapes per test process, `BRECCIA_GEMM_TYPE` honoured, and pipeline pre-warm before sweeps. WIP preserved on `wip/four-gemms-crash-20261026`. |
 
 Lesson recorded: the display GPU is the MI50, so "test on MI50 first" was the wrong order; test on the RX, and treat any reset as a stop-the-line event.
 
