@@ -34,7 +34,7 @@ A from-scratch Rust inference engine (`breccia`) plus its Phase-0 measurement ha
 Per-invocation rules, mandatory once a test touches GPU memory:
 
 1. **Wrap every GPU run in `timeout 90`** — a driver hang must not outlive the command.
-2. **Risky/new kernel paths run on the Radeon VII (MI50) first** — it drives no display, so a fault there does not freeze the desktop. Resolve devices by PCI identity (`0000:0e:00.0`), never by enumeration ordinal. Only run on the RX 6950 XT (`0000:03:00.0`, the display card) after MI50 passes.
+2. **Risky/new kernel paths run on the RX 6950 XT FIRST — it is the HEADLESS card.** The **Radeon VII/MI50 (`0000:0e:00.0`) drives the displays** (DP-0, DP-1, HDMI-A-0 per Xorg) — a GPU reset there froze the box on 2026-10-26 (see incident log below). Resolve devices by PCI identity, never by enumeration ordinal. Only run risky code on the MI50 after the RX passes, and never with an unvalidated dispatch shape.
 3. **One GPU process at a time.** No parallel benches, no benches during agent work on the same card.
 4. Enable `VK_LAYER_KHRONOS_validation` for first runs of new shader code and record any VU messages; RADV page faults on illegal command streams are otherwise silent until the box freezes.
 5. Conformance: run **one quant type per invocation** so a fault is attributable; never sweep all types in one go after touching shader includes. GPU tests are opt-in by explicit device: `cargo test` skips them unless `BRECCIA_KERNEL_DEVICE` is set. Safe first run:
@@ -80,6 +80,15 @@ Small changes are measured in **seconds, not tens of minutes**. Every sweep is t
 - **A/B/A inside one pass** (baseline → change → baseline in the same short window) instead of repeated full sweeps; page-cache drift is handled by alternation.
 - **Kill and conclude**: if a sweep shows the same sign after ~2 minutes of data, stop it and act. A negative result already visible does not need more cells.
 - New bench modes must offer short forms and print a per-phase summary so a run can be abandoned early with usable data.
+
+## Incident log — GPU crashes
+
+| Date | Process | Card | Symptom | Cause / fix |
+|---|---|---|---|---|
+| 2026-10-25 22:09 | `conformance` (`non_finite_scal`) | RX | illegal opcode + coredump, machine hung | zero-slack allocation + unbounded table index → TAIL_PAD + masked accessors |
+| 2026-10-26 23:44 | `gemm_many` (`multi_user_gemm`) | **MI50 (display)** | ring gfx timeout → BACO reset → **machine rebooted** | four new multi-user GEMM shaders (IQ4_XS/Q4_K/Q5_K/Q6_K) crashed on the display card. 447 fault lines. WIP preserved on branch `wip/four-gemms-crash-20261026`. |
+
+Lesson recorded: the display GPU is the MI50, so "test on MI50 first" was the wrong order; test on the RX, and treat any reset as a stop-the-line event.
 
 ## Git
 
