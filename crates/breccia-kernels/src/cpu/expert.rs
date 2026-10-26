@@ -495,7 +495,7 @@ impl ExpertPool {
                 r1,
                 x: Arc::clone(&x),
                 x_off: 0,
-                users: Arc::new(Vec::new()),
+                users: no_users(),
             })
             .collect();
         let done1 = self.run_phase(tasks1)?;
@@ -529,7 +529,7 @@ impl ExpertPool {
                 r1,
                 x: Arc::clone(&act),
                 x_off: j * n_ff,
-                users: Arc::new(Vec::new()),
+                users: no_users(),
             })
             .collect();
         let done2 = self.run_phase(tasks2)?;
@@ -544,6 +544,13 @@ impl ExpertPool {
         }
         Ok(plan.expert_kernel_bytes() * k)
     }
+}
+
+/// The shared empty user list: the single-token path must not allocate per shard
+/// (that cost ~40 % of the decode lane's time when it did).
+fn no_users() -> Arc<Vec<(usize, usize, f32)>> {
+    static EMPTY: std::sync::OnceLock<Arc<Vec<(usize, usize, f32)>>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(Vec::new())))
 }
 
 /// `(expert, row range, users)` for one grouped phase task: the shard's row range
@@ -585,6 +592,35 @@ fn run_shard(set: &ShardSet, path: Path, shard: &Shard) -> Option<Vec<f32>> {
     // cache reuse is the whole point of grouping a chunk (§8r/§8s).
     let m = shard.users.len();
     let mut values = vec![0f32; rows * m];
+    // The `down` role is the biggest byte consumer, and its users share the same
+    // expert rows: dequantise once and dot every user (bit-identical per user,
+    // §8t). Below 2 users there is nothing to amortise.
+    if m > 1 && shard.kind == ShardKind::Down && crate::cpu::many_supported(path, plan.down.ty) {
+        let act = &shard.x;
+        let xs: Vec<&[f32]> = shard
+            .users
+            .iter()
+            .map(|&(_, x_off, _)| &act[x_off..x_off + plan.n_ff])
+            .collect();
+        let rb = crate::cpu::row_bytes(plan.down.ty, plan.down.cols);
+        let dv = slices.down.get(shard.r0 * rb..)?;
+        let bytes = rows * rb;
+        if dv.len() < bytes {
+            return None;
+        }
+        // SAFETY: the slice holds `rows` whole rows and every activation has
+        // `plan.down.cols` values (checked by the caller's chunk layout).
+        crate::cpu::gemv_into_many(
+            path,
+            plan.down.ty,
+            &dv[..bytes],
+            rows,
+            plan.down.cols,
+            &xs,
+            &mut values,
+        );
+        return Some(values);
+    }
     for (u, &(_, x_off, _)) in shard.users.iter().enumerate() {
         let ok = one_user(
             &slices,

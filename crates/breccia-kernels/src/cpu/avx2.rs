@@ -587,6 +587,105 @@ unsafe fn iq4_xs(row: &[u8], x: &[f32]) -> f32 {
     }
 }
 
+/// Users the dequant-once kernels unroll (a chunk's expert is used by `m` tokens;
+/// `m` above this is processed in groups).
+pub const MANY_MAX: usize = 8;
+
+/// **Dequantise once, dot many**: `IQ4_NL` rows against `m` activation rows.
+///
+/// `xs` are the users' activation pointers (all at the same column offset) and
+/// `out` receives `m` dots. Per block the nibble table lookup, the int→float
+/// conversion and the scale multiply happen **once**, and each user then costs one
+/// FMA per 8 values. The per-user operation order is `mul` then `fmadd`, block
+/// major, exactly as [`iq4_nl`] does it, so each dot is bit-identical to the
+/// single-user kernel (§8t).
+///
+/// # Safety
+/// `row` must be whole 18-byte blocks, every `x` must have `32 * blocks` values,
+/// and `out` must hold `m` floats.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn iq4_nl_many(row: &[u8], xs: &[*const f32], out: *mut f32) {
+    // SAFETY: callers pass whole blocks and in-range activation pointers.
+    unsafe {
+        let m = xs.len().min(MANY_MAX);
+        let mut acc = [_mm256_setzero_ps(); MANY_MAX];
+        let table = _mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i);
+        let mask = _mm_set1_epi8(0x0f);
+        let mut i = 0usize;
+        for blk in row.chunks_exact(18) {
+            let d = _mm256_set1_ps(f16_to_f32(u16le(blk, 0)));
+            let qs = _mm_loadu_si128(blk[2..18].as_ptr() as *const __m128i);
+            let lo = _mm_shuffle_epi8(table, _mm_and_si128(qs, mask));
+            let hi = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(qs, 4), mask));
+            // Four dequantised f32x8 vectors, computed once for every user.
+            let v = [
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(lo)), d),
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(lo, 8))),
+                    d,
+                ),
+                _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(hi)), d),
+                _mm256_mul_ps(
+                    _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(hi, 8))),
+                    d,
+                ),
+            ];
+            for (u, xp) in xs.iter().take(m).enumerate() {
+                let p = xp.add(i);
+                let mut a = acc[u];
+                a = _mm256_fmadd_ps(v[0], _mm256_loadu_ps(p), a);
+                a = _mm256_fmadd_ps(v[1], _mm256_loadu_ps(p.add(8)), a);
+                a = _mm256_fmadd_ps(v[2], _mm256_loadu_ps(p.add(16)), a);
+                a = _mm256_fmadd_ps(v[3], _mm256_loadu_ps(p.add(24)), a);
+                acc[u] = a;
+            }
+            i += 32;
+        }
+        for (u, a) in acc.iter().take(m).enumerate() {
+            *out.add(u) = finish(*a, _mm256_setzero_ps());
+        }
+    }
+}
+
+/// [`iq4_nl_many`] for `Q2_0` (64 values in an 18-byte block, two alternating
+/// accumulators exactly like [`q2_0`]).
+///
+/// # Safety
+/// As [`iq4_nl_many`], with 64 values per block.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn q2_0_many(row: &[u8], xs: &[*const f32], out: *mut f32) {
+    // SAFETY: callers pass whole blocks and in-range activation pointers.
+    unsafe {
+        let m = xs.len().min(MANY_MAX);
+        let mut a0 = [_mm256_setzero_ps(); MANY_MAX];
+        let mut a1 = [_mm256_setzero_ps(); MANY_MAX];
+        let shifts = _mm256_setr_epi32(0, 2, 4, 6, 8, 10, 12, 14);
+        let three = _mm256_set1_epi32(3);
+        let mut i = 0usize;
+        for blk in row.chunks_exact(18) {
+            let dv = _mm256_set1_ps(f16_to_f32(u16le(blk, 0)));
+            for u in 0..8usize {
+                let wv = _mm256_set1_epi32(u16le(blk, 2 + 2 * u) as i32);
+                let q = _mm256_and_si256(_mm256_srlv_epi32(wv, shifts), three);
+                let v = _mm256_sub_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(q), dv), dv);
+                if u & 1 == 0 {
+                    for (j, xp) in xs.iter().take(m).enumerate() {
+                        a0[j] = v_fma(a0[j], v, xp.add(i));
+                    }
+                } else {
+                    for (j, xp) in xs.iter().take(m).enumerate() {
+                        a1[j] = v_fma(a1[j], v, xp.add(i));
+                    }
+                }
+                i += 8;
+            }
+        }
+        for (u, (x, y)) in a0.iter().zip(a1.iter()).take(m).enumerate() {
+            *out.add(u) = finish(*x, *y);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Q4_K / Q5_K
 // ---------------------------------------------------------------------------

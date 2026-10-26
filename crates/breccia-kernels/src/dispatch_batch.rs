@@ -116,9 +116,9 @@ fn bump_open(gpu: &Gpu) {
 /// Sets a batch budgets for.
 ///
 /// A decode block records ~30 dispatches, but a **prefill chunk** records ~30 per
-/// token in one submission (§8s): 8 192 sets covers a 256-token chunk with room
-/// to spare, and the pool is reset (not recreated) per batch.
-pub const MAX_SETS: u32 = 8192;
+/// token in one submission (§8s): 4 096 sets covers a 128-token chunk, and the
+/// pool is reset (not recreated) per batch. A bigger chunk needs a bigger pool.
+pub const MAX_SETS: u32 = 4096;
 /// Storage bindings per set (the widest kernel in this crate declares 5).
 const MAX_BINDINGS: u32 = 8;
 

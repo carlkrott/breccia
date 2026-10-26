@@ -57,6 +57,72 @@ pub use expert::{
     expert_ffn, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch, LayerPlan, RolePlan,
 };
 
+/// `gemv_into` for **m users at once**: row `r`'s weight block is dequantised once
+/// and dotted with every user's activation, so the decode cost is amortised over
+/// the users while each user's dot keeps the single-user operation order (§8t).
+///
+/// `out` is `[user][row]` (user-major). Types without a dequant-once kernel fall
+/// back to one fused pass per user — the caller is told which by
+/// [`many_supported`].
+pub fn gemv_into_many(
+    path: Path,
+    ty: QuantType,
+    packed: &[u8],
+    rows: usize,
+    cols: usize,
+    xs: &[&[f32]],
+    out: &mut [f32],
+) -> usize {
+    let m = xs.len();
+    debug_assert!(out.len() >= m * rows);
+    if m <= 1 {
+        if let Some(x) = xs.first() {
+            gemv_into(path, ty, packed, rows, cols, x, out);
+        }
+        return rows;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if many_supported(path, ty) {
+        let row_bytes = crate::cpu::row_bytes(ty, cols);
+        let ptrs: Vec<*const f32> = xs.iter().map(|x| x.as_ptr()).collect();
+        let mut tmp = vec![0f32; m];
+        for r in 0..rows {
+            let row = &packed[r * row_bytes..(r + 1) * row_bytes];
+            // SAFETY: `row` is one whole row, every activation has `cols` values
+            // (padded to whole blocks by the caller, as `gemv_into` requires) and
+            // `tmp` holds `m`.
+            unsafe {
+                match ty {
+                    QuantType::Iq4Nl => avx2::iq4_nl_many(row, &ptrs, tmp.as_mut_ptr()),
+                    QuantType::Q2_0 => avx2::q2_0_many(row, &ptrs, tmp.as_mut_ptr()),
+                    _ => unreachable!(),
+                }
+            }
+            for (u, v) in tmp.iter().enumerate() {
+                out[u * rows + r] = *v;
+            }
+        }
+        return rows;
+    }
+    for (u, x) in xs.iter().enumerate() {
+        gemv_into(
+            path,
+            ty,
+            packed,
+            rows,
+            cols,
+            x,
+            &mut out[u * rows..(u + 1) * rows],
+        );
+    }
+    rows
+}
+
+/// Does [`gemv_into_many`] amortise the decode for `ty` on this machine?
+pub fn many_supported(path: Path, ty: QuantType) -> bool {
+    path == Path::Avx2 && matches!(ty, QuantType::Iq4Nl | QuantType::Q2_0)
+}
+
 /// Which code path a dot product takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
