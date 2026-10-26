@@ -1347,6 +1347,88 @@ $D/sweep.sh 2 "pool:"
 Artifacts: `$D/ag{4,6}.json` (the agent table), `$D/agents4p.json` (parity),
 `$D/s-pool-*.{json,log}` (the pool A/B).
 
+## 8r. Prefill: measured, and why it needs expert grouping before anything else
+
+An agent arrives with a 300-token prefix. The engine feeds it **token by token
+through the decode graph**, so prompt processing runs at decode speed. Measured
+with the agent harness (`breccia bench agents`, dual, `--threads 32`):
+
+| agents | prefix | prompt tokens | prompt seconds | **prefill tok/s per agent** |
+|---:|---:|---:|---:|---:|
+| 1 | 27 | 27 | 2.6 | 10.5 |
+| 2 | 300 | 600 | 47.7 | 6.3 |
+| **4** | **300** | **1200** | **95.6** | **3.1** |
+
+llama.cpp prefills this model at ~112 tok/s. The gap is **11–36×**, and it is
+bigger than everything else in this report: four agents spending 96 s ingesting
+their prompts against 4.2 s producing 44 tokens is the wrong way round. **No code
+from this section landed** — what follows is the measurement, the arithmetic that
+pins the design, and the reason it is not a one-pass change.
+
+### Why it is slow, in bytes
+
+Per token the forward pass reads the dense set *plus* the token's ten experts from
+the host lane: **799 MiB/token**, i.e. 38 ms of lane at the 32-thread rate. A
+300-token prefix therefore streams 234 GiB through the lane no matter how the
+prompt is fed. Chunking the graph alone cannot fix that: it amortises the *dense*
+GEMVs (measured in `bench ops`: GDN `qkv` goes 30 → 78 GB/s from T = 1 to T = 8)
+but the experts are still fetched per token.
+
+The lever is that **within a chunk the same expert serves several tokens**. With
+`n_expert = 512`, top-10, the number of *distinct* experts a chunk touches is the
+occupancy of 10·T draws into 512 bins:
+
+| chunk T | expert slots used | expected distinct (of 512) | expert bytes vs token-by-token |
+|---:|---:|---:|---:|
+| 64 | 640 | 365 | **× 0.57** |
+| 128 | 1280 | 470 | **× 0.37** |
+| 256 | 2560 | 508 | **× 0.20** |
+
+(Occupancy assumes roughly uniform routing — the router is trained, so treat these
+as the best case; they are the number to beat, not a promise.)
+
+### The design, and what it costs to build
+
+1. **Group the host lane over a chunk**: collect `(token, expert)` pairs for all T
+   tokens of a block, bucket by expert, dequantise each expert's weights **once**
+   and dot them against the `m` token activations that use it. Per-row accumulation
+   order is unchanged, so the result is bit-identical to the per-token lane — this
+   is the only piece that *must* be right, and it is also the piece the existing
+   `ExpertPool` does not have (it takes one token's `ids`/`x`).
+2. **Chunk the dense chain** (T-batched HC read/write, mixer, router, shared
+   expert): the kernels already take T (`Gdn::forward(.., pos0)`,
+   `Qsa::forward(.., pos0)` and their workspaces are `T`-shaped and were validated
+   at T = 8), but every *per-row* GEMV in the graph is a `Gemv` and needs a
+   `GemvBatch` form: the PLE key/value projections, `shexp_gate` (1 row), and the
+   head (which only needs the chunk's last row). The QSA causal mask over a chunk
+   and the PLE host block (per token today) both need a T form.
+3. **Pipelining**: the T tokens of one block are independent (each has its own
+   residual; the KV is appended at its position), so the dense chain can run for all
+   T tokens, then the grouped MoE for all T, then the next block — one submission
+   per stage per chunk instead of one per token per block.
+
+Projected, from the measured per-block costs (dense 0.6 ms/token, lane 0.79
+ms/token at 32 threads): grouping alone → lane 0.16 ms at T = 256 → **~27 tok/s
+prefill**; grouping + a T-batched dense chain (0.23 ms) → **~52 tok/s**. Both are
+per *agent* on one card, so four agents prefilling together would be bounded by
+the shared lane — which is why the lane work (below) is the co-requirement.
+
+### Why it is not landed in this pass
+
+It is not one edit: it is a new CPU lane entry point (grouped MoE), a batched form
+of three per-row GEMVs, a chunked PLE, a T-shaped residual/mailbox/staging, and a
+chunk-level QSA/GDN verification — and the last pass showed that this engine can
+produce *silently wrong* tokens from a bookkeeping mistake (§8q). Half of it would
+be worse than none, so it is left whole for the next pass with the numbers above as
+its target.
+
+### AVX-512: still not attempted, and now the *second* lever
+
+The lane is 67–75 % of a decode step, so a 10–25 % AVX-512 gain is 2–4 tok/s of
+decode aggregate — real, but an order of magnitude smaller than the 11–36× prefill
+gap on the workload agents actually produce. Order: prefill grouping first, then
+AVX-512.
+
 ## 9. Exact commands
 
 
@@ -1401,20 +1483,21 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 
 ## 10. What to do next, in order
 
-1. **AVX-512 expert decode** is now the top lever and the only un-attempted item:
-   the lane is 67-71 % of an agent-length step, so +20 % lane throughput is +14 %
-   aggregate at 4 agents with no VRAM cost. Three kernels (IQ4_NL down, Q2_0 down,
-   IQ3_S gate/up), `is_x86_feature_detected!` gated, AVX2 retained.
-2. **Keep the parity harness in every multi-stream run.** §8q's device-affine slot
-   bug produced *silently wrong tokens* on half the agents for ~50 % of runs and
-   was caught only by `bench agents --same-prompt` (24/24 before → 0/24 → 24/24
-   after). Anything that changes slot, pool or session bookkeeping needs it.
-3. **The two-stream gate is 20.0-20.3 tok/s** (9 GPU-resident expert blocks per
-   stream, in-batch reads, reset-per-batch pools) at 9.9-10.1 tok/s per stream,
-   parity 64/64; 4 agents at 27-token prefixes 20.19 aggregate, at 300-token
-   prefixes 11.14 (the realistic product number).
-4. **A third card buys 1.4x at agent lengths** (bounded by the lane), 2x at short
-   prefixes. Do the lane work first.
-5. **GDN's delta rule** (43 us for 9 MiB of state = 217 GB/s, 2.6x off the ceiling)
-   is the largest single kernel left, and it is GPU work — only pays once the cards
-   bind.
+1. **Prefill, in this order**: (a) a grouped host-lane entry point (bucket a
+   chunk's `(token, expert)` pairs by expert, dequantise once, dot the `m` users)
+   — expected to cut expert bytes/token to × 0.20 at T = 256 and lift prefill from
+   3.1 to ~27 tok/s per agent; (b) the T-batched dense chain (three per-row GEMVs
+   need a batch form, chunked PLE, chunk-level QSA mask) → ~52 tok/s. Measured
+   baseline to beat: **3.1 tok/s/agent (4 × 300 tokens), 10.5 single-agent**.
+2. **AVX-512 on the lane** (second lever): 10–25 % on 67–75 % of a decode step.
+   Three kernels (IQ4_NL down, Q2_0 down, IQ3_S gate/up), runtime-detected, AVX2
+   kept.
+3. **Keep the parity gate strict in every multi-stream run.** §8q's device-affine
+   slot bug produced silently wrong tokens on half the agents for ~50 % of runs;
+   only `bench agents --same-prompt` (24/24) caught it.
+4. **Current gates**: 2 streams 20.0–20.3 tok/s (9 resident expert blocks each,
+   in-batch reads, reset-per-batch pools, parity 64/64); 4 agents × 27-prefix
+   20.19 aggregate; 4 agents × 300-prefix 11.14 decode with **3.14 tok/s prefill**.
+5. **A third card** buys 1.4× at agent lengths (lane-bound), 2× at short prefixes;
+   **GDN's delta rule** (217 GB/s, 2.6× off the ceiling) is the largest single
+   kernel left and only pays once the cards bind.

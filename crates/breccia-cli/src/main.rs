@@ -1995,10 +1995,13 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
             v
         })
         .collect();
+    let t_prompt = std::time::Instant::now();
     for pos in 0..common {
         let toks: Vec<u32> = padded.iter().map(|p| p[pos]).collect();
         logits = multi.token_all(&toks, pos)?;
     }
+    let prompt_seconds = t_prompt.elapsed().as_secs_f64();
+    let prompt_tokens = common * n;
     // The prompt is not part of the decode measurement (counters, probe, timers).
     for s in multi.streams.iter_mut() {
         s.reset_counters()?;
@@ -2066,7 +2069,12 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         }
     }
     println!(
-        "\nagents   {n} concurrent · {steps} measured steps · {:.2} s of decode",
+        "\nprefill  {prompt_tokens} prompt tokens ({common} x {n}) in {prompt_seconds:.2} s = \
+         {:.2} tok/s per agent (token-by-token; batched prefill is not implemented)",
+        prompt_tokens as f64 / prompt_seconds.max(1e-9) / n as f64
+    );
+    println!(
+        "agents   {n} concurrent · {steps} measured steps · {:.2} s of decode",
         decode_seconds
     );
     println!(
@@ -2126,6 +2134,8 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
             "agents": n,
             "steps": steps,
             "decode_seconds": decode_seconds,
+            "prefill_tokens_per_s_per_agent": prompt_tokens as f64 / prompt_seconds.max(1e-9) / n as f64,
+            "prefill_seconds": prompt_seconds,
             "aggregate_tokens_per_s": agg,
             "per_agent_tokens_per_s": per,
             "latency_ms": {"p50": pct(0.50), "p95": pct(0.95), "max": sorted.last().map(|x| x * 1e3)},
