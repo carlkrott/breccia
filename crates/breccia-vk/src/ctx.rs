@@ -332,6 +332,85 @@ pub struct Timing {
     pub used_timestamps: bool,
 }
 
+/// Command buffers the compute pool owns: index 0 is the **synchronous one-shot**
+/// buffer (`Gpu::cmd_c`, used by `record`/`wall_run`), the rest are the
+/// pipelining ring that `breccia_kernels::dispatch_batch` records a block's
+/// segments into.
+///
+/// They must be separate objects: a buffer that is pending execution cannot be
+/// reset, and the whole point of the ring is to have one segment in flight while
+/// the next is being recorded.
+pub const BATCH_CMDS: usize = 3;
+
+/// A timeline semaphore, used as a **mid-batch sync point**: a submission can
+/// signal a value part-way through a block's work and the host can wait for it
+/// while the rest of that work is still executing.
+///
+/// This is what lets the host expert lane overlap the GPU: a block is submitted
+/// as two submissions — everything up to the router (which signals) and the
+/// shared expert (submitted behind it) — so the host learns the router's ids one
+/// shared-expert-worth of GPU time before the block ends instead of after a
+/// fence (`docs/phase-4/01-forward-pass.md` §8m/§8n).
+///
+/// The wait is **bounded**: [`Timeline::wait_host`] takes a timeout and the
+/// caller falls back to the fence. Nothing here can hang the box.
+pub struct Timeline {
+    pub sem: vk::Semaphore,
+    /// Highest value handed to a submission, so a caller cannot signal
+    /// backwards (VUID-VkSubmitInfo-pSignalSemaphores-03242 is a validation
+    /// error *and* a hard `vkQueueSubmit` failure).
+    value: std::cell::Cell<u64>,
+}
+
+/// Outcome of [`Timeline::wait_host`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Signalled {
+    /// The GPU reached the marker before the timeout.
+    Yes,
+    /// The timeout expired; the caller must fall back to the fence.
+    Timeout,
+}
+
+impl Timeline {
+    /// The next value a submission should signal (strictly increasing).
+    pub fn next(&self) -> u64 {
+        self.value.get() + 1
+    }
+
+    /// Record that `value` was handed to a submission (call after the submit
+    /// returned `Ok`).
+    pub fn advanced(&self, value: u64) {
+        self.value.set(value);
+    }
+
+    /// Wait (host side, no fence for the submission) until the GPU signals at
+    /// least `value`. `timeout_ns` bounds it.
+    pub fn wait_host(&self, gpu: &Gpu, value: u64, timeout_ns: u64) -> R<Signalled> {
+        let sems = [self.sem];
+        let vals = [value];
+        let info = vk::SemaphoreWaitInfo::default()
+            .semaphores(&sems)
+            .values(&vals);
+        match unsafe { gpu.device.wait_semaphores(&info, timeout_ns) } {
+            Ok(()) => Ok(Signalled::Yes),
+            Err(vk::Result::TIMEOUT) => Ok(Signalled::Timeout),
+            Err(e) => Err(format!("vkWaitSemaphores({value}): {e}")),
+        }
+    }
+
+    /// The counter the GPU has actually reached.
+    pub fn counter(&self, gpu: &Gpu) -> R<u64> {
+        vk(
+            unsafe { gpu.device.get_semaphore_counter_value(self.sem) },
+            "vkGetSemaphoreCounterValue",
+        )
+    }
+
+    pub fn release(&self, gpu: &Gpu) {
+        unsafe { gpu.device.destroy_semaphore(self.sem, None) };
+    }
+}
+
 pub struct Gpu {
     pub index: u32,
     pub device: ash::Device,
@@ -353,13 +432,32 @@ pub struct Gpu {
 
     pub pool_c: vk::CommandPool,
     pub cmd_c: vk::CommandBuffer,
+    /// `[cmd_c, ring[0], ring[1], …]` — see [`BATCH_CMDS`]. Allocated from
+    /// `pool_c`, so destroying the pool frees them.
+    pub cmds_c: Vec<vk::CommandBuffer>,
     pub pool_x: vk::CommandPool,
     pub cmd_x: vk::CommandBuffer,
     pub timer_c: vk::QueryPool,
     pub timer_x: vk::QueryPool,
     pub ts_ok_c: bool,
     pub ts_ok_x: bool,
+    /// `vkQueueSubmit2` (VK_KHR_synchronization2, core in Vulkan 1.3): the only
+    /// submit path that can carry a timeline-semaphore value.
+    ///
+    /// Loaded by its **core** name: ash 0.38's `synchronization2` wrapper loads
+    /// `vkQueueSubmit2KHR`, which RADV does not export (it advertises sync2 only
+    /// through the promoted 1.3 entry point), so the wrapper panics at submit.
+    pub queue_submit2: Option<QueueSubmit2Fn>,
 }
+
+/// `vkQueueSubmit2` with the lifetime erased (it is an ABI-level function
+/// pointer; the structs it points at are borrowed only for the call).
+pub type QueueSubmit2Fn = unsafe extern "system" fn(
+    queue: vk::Queue,
+    submit_count: u32,
+    submits: *const vk::SubmitInfo2<'static>,
+    fence: vk::Fence,
+) -> vk::Result;
 
 /// Pick the first memory type in `bits` that satisfies `req`, preferring `pref`.
 pub fn find_mem_type(
@@ -481,6 +579,9 @@ impl Gpu {
         let mut en_f13 = vk::PhysicalDeviceVulkan13Features {
             subgroup_size_control: dev.feats.subgroup_size_control as u32,
             compute_full_subgroups: dev.feats.compute_full_subgroups as u32,
+            // vkQueueSubmit2 is how a submission carries a timeline-semaphore
+            // value (the mid-batch marker); the feature gates the command.
+            synchronization2: 1,
             ..Default::default()
         };
         let mut en_coop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR {
@@ -525,7 +626,8 @@ impl Gpu {
         // Always separate command buffers (and pools) per queue: the overlap test
         // submits both at once, and they must not alias when the "transfer" queue
         // happens to be the same queue object as the compute queue.
-        let (pool_c, cmd_c) = make_cmd_pool(&device, fam_c)?;
+        let (pool_c, cmds_c) = make_cmd_pool_n(&device, fam_c, 1 + BATCH_CMDS)?;
+        let cmd_c = cmds_c[0];
         let (pool_x, cmd_x) = make_cmd_pool(&device, family_x)?;
         let timer_c = make_timer(&device)?;
         let timer_x = make_timer(&device)?;
@@ -541,6 +643,18 @@ impl Gpu {
             enabled_exts.join(", ")
         );
 
+        // Load vkQueueSubmit2 by its core name (see the field's docs).
+        let queue_submit2: Option<QueueSubmit2Fn> = {
+            let name = c"vkQueueSubmit2";
+            let fp = unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) };
+            if fp.is_none() {
+                None
+            } else {
+                // SAFETY: the loader returned a non-null pointer for the core
+                // 1.3 name of vkQueueSubmit2; the signature is Vulkan's own.
+                Some(unsafe { std::mem::transmute::<vk::PFN_vkVoidFunction, QueueSubmit2Fn>(fp) })
+            }
+        };
         Ok(Gpu {
             index,
             device,
@@ -557,12 +671,14 @@ impl Gpu {
             xfer_mode,
             pool_c,
             cmd_c,
+            cmds_c,
             pool_x,
             cmd_x,
             timer_c,
             timer_x,
             ts_ok_c: fam_c_props.timestamp_valid_bits > 0,
             ts_ok_x: fam_x_props.timestamp_valid_bits > 0,
+            queue_submit2,
         })
     }
 
@@ -879,21 +995,105 @@ impl Gpu {
 
     /// Submit the queue's recorded command buffer; returns a fence to wait on.
     pub fn submit(&self, q: Qc) -> R<vk::Fence> {
-        let (queue, cmd, _, _) = self.parts(q);
+        let (_, cmd, _, _) = self.parts(q);
+        self.submit_cmd(q, cmd, None)
+    }
+
+    /// Submit `cmd` (which need not be the queue's own one-shot buffer), with an
+    /// optional timeline-semaphore signal that is raised when **this
+    /// submission** completes. Returns the fence for the submission.
+    ///
+    /// A signal attached to a submission is the mid-batch sync point: submit the
+    /// work up to the marker with the signal, submit the rest immediately behind
+    /// it on the same queue, and the host can wait for just the marker
+    /// ([`Timeline::wait_host`]) while the second submission still runs.
+    pub fn submit_cmd(
+        &self,
+        q: Qc,
+        cmd: vk::CommandBuffer,
+        signal: Option<(&Timeline, u64)>,
+    ) -> R<vk::Fence> {
+        let (queue, _, _, _) = self.parts(q);
         unsafe {
             let fence = vk(
                 self.device
                     .create_fence(&vk::FenceCreateInfo::default(), None),
                 "vkCreateFence",
             )?;
-            let cmds = [cmd];
-            let si = vk::SubmitInfo::default().command_buffers(&cmds);
-            if let Err(e) = self.device.queue_submit(queue, &[si], fence) {
+            let r = match signal {
+                None => {
+                    let cmds = [cmd];
+                    let si = vk::SubmitInfo::default().command_buffers(&cmds);
+                    self.device.queue_submit(queue, &[si], fence)
+                }
+                // A timeline value can only ride a submission through
+                // VkSubmitInfo2 (VUID-VkSubmitInfo-pSignalSemaphores-03242):
+                // VkSubmitInfo has no `pSignalSemaphoreValues`.
+                Some((tl, value)) => {
+                    let sig = [vk::SemaphoreSubmitInfo::default()
+                        .semaphore(tl.sem)
+                        .value(value)
+                        .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+                    let cbs = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+                    let si = vk::SubmitInfo2::default()
+                        .command_buffer_infos(&cbs)
+                        .signal_semaphore_infos(&sig);
+                    match self.queue_submit2 {
+                        None => Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT),
+                        Some(f) => {
+                            let r = (f)(
+                                queue,
+                                1,
+                                &si as *const vk::SubmitInfo2<'_> as *const _,
+                                fence,
+                            );
+                            if r == vk::Result::SUCCESS {
+                                Ok(())
+                            } else {
+                                Err(r)
+                            }
+                        }
+                    }
+                }
+            };
+            if let Err(e) = r {
                 self.device.destroy_fence(fence, None);
                 return Err(format!("vkQueueSubmit: {e}"));
             }
+            if let Some((tl, value)) = signal {
+                tl.advanced(value);
+            }
             Ok(fence)
         }
+    }
+
+    /// A timeline semaphore at `initial`, for [`submit_cmd`]'s signal and
+    /// [`Timeline::wait_host`].
+    pub fn timeline(&self, initial: u64) -> R<Timeline> {
+        if !self.feats.timeline_semaphore {
+            return Err(format!(
+                "device {} does not support VK_KHR_timeline_semaphore, which the \
+                 mid-batch sync needs",
+                self.index
+            ));
+        }
+        let sem = vk(
+            unsafe {
+                self.device.create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(
+                        &mut vk::SemaphoreTypeCreateInfo::default()
+                            .semaphore_type(vk::SemaphoreType::TIMELINE)
+                            .initial_value(initial),
+                    ),
+                    None,
+                )
+            },
+            "vkCreateSemaphore(TIMELINE)",
+        )?;
+        Ok(Timeline {
+            sem,
+            value: std::cell::Cell::new(initial),
+        })
     }
 
     pub fn wait_fence(&self, fence: vk::Fence) -> R<()> {
@@ -1002,6 +1202,50 @@ impl Gpu {
         unsafe { vk(self.device.device_wait_idle(), "vkDeviceWaitIdle") }
     }
 
+    /// A `TIMESTAMP` query pool with `n` queries, for measuring a submission's
+    /// own GPU span (as opposed to its fence wait, which also contains the host
+    /// and driver's submission latency).
+    pub fn query_pool(&self, n: u32) -> R<vk::QueryPool> {
+        let qpci = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(n);
+        vk(
+            unsafe { self.device.create_query_pool(&qpci, None) },
+            "vkCreateQueryPool(TIMESTAMP)",
+        )
+    }
+
+    pub fn destroy_query_pool(&self, pool: vk::QueryPool) {
+        unsafe { self.device.destroy_query_pool(pool, None) };
+    }
+
+    /// `2n` timestamps in **nanoseconds**: `[start_0, end_0, start_1, end_1, …]`.
+    /// The caller must have waited for the submissions that wrote them.
+    pub fn timestamps(&self, pool: vk::QueryPool, n: u32) -> R<Vec<f64>> {
+        let mut ticks = vec![0u64; (2 * n) as usize];
+        unsafe {
+            vk(
+                self.device.get_query_pool_results(
+                    pool,
+                    0,
+                    &mut ticks,
+                    vk::QueryResultFlags::TYPE_64,
+                ),
+                "vkGetQueryPoolResults",
+            )?;
+        }
+        Ok(ticks
+            .into_iter()
+            .map(|t| t as f64 * self.timestamp_period_ns)
+            .collect())
+    }
+
+    /// Reset the first `n` queries of `pool` (needs `hostQueryReset`, enabled on
+    /// every device here).
+    pub fn reset_queries(&self, pool: vk::QueryPool, n: u32) {
+        unsafe { self.device.reset_query_pool(pool, 0, n) };
+    }
+
     pub fn destroy(self) {
         unsafe {
             let _ = self.device.device_wait_idle();
@@ -1015,6 +1259,16 @@ impl Gpu {
 }
 
 fn make_cmd_pool(device: &ash::Device, family: u32) -> R<(vk::CommandPool, vk::CommandBuffer)> {
+    let (pool, cmds) = make_cmd_pool_n(device, family, 1)?;
+    Ok((pool, cmds[0]))
+}
+
+/// A pool plus `n` primary command buffers allocated from it.
+fn make_cmd_pool_n(
+    device: &ash::Device,
+    family: u32,
+    n: usize,
+) -> R<(vk::CommandPool, Vec<vk::CommandBuffer>)> {
     unsafe {
         let pci = vk::CommandPoolCreateInfo::default()
             .queue_family_index(family)
@@ -1026,15 +1280,14 @@ fn make_cmd_pool(device: &ash::Device, family: u32) -> R<(vk::CommandPool, vk::C
         let ai = vk::CommandBufferAllocateInfo::default()
             .command_pool(pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let cmd = match device.allocate_command_buffers(&ai) {
-            Ok(c) => c[0],
+            .command_buffer_count(n as u32);
+        match device.allocate_command_buffers(&ai) {
+            Ok(c) => Ok((pool, c)),
             Err(e) => {
                 device.destroy_command_pool(pool, None);
-                return Err(format!("vkAllocateCommandBuffers: {e}"));
+                Err(format!("vkAllocateCommandBuffers: {e}"))
             }
-        };
-        Ok((pool, cmd))
+        }
     }
 }
 

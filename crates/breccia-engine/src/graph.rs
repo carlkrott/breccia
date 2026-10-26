@@ -86,6 +86,9 @@ const HANDOFF: usize = 12;
 const FINAL_HC: usize = 13;
 const HEAD: usize = 14;
 
+/// Batches the `BRECCIA_GPU_TIME` probe stamps (one token's worth).
+const GPU_PROBE_BATCHES: usize = 56;
+
 /// Wall-clock accounting: host-side deltas around synchronous dispatch groups.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Timers {
@@ -278,6 +281,10 @@ pub struct Session<'m> {
     pub dispatches: u64,
     /// See [`SessionCfg::batching`].
     pub batching: bool,
+    /// GPU-time probe (`BRECCIA_GPU_TIME=1`): one timestamp pool per device and
+    /// the number of batches stamped so far (`None` = done or disabled).
+    probe_pools: Vec<ash::vk::QueryPool>,
+    probe_batches: Option<u32>,
     /// Per device: fence-wait seconds and host↔device bytes, so a dual run can
     /// say what *each* card did instead of only a total.
     pub dev_wait_s: Vec<f64>,
@@ -493,6 +500,26 @@ impl<'m> Session<'m> {
             submits: 0,
             dispatches: 0,
             batching: cfg.batching,
+            probe_pools: {
+                let on = std::env::var_os("BRECCIA_GPU_TIME").is_some();
+                let mut v = Vec::with_capacity(model.devices.len());
+                for i in 0..model.devices.len() {
+                    v.push(if on {
+                        model.devices[i]
+                            .gpu()
+                            .query_pool(2 * GPU_PROBE_BATCHES as u32)
+                            .map_err(|e| anyhow!("allocating the GPU-time probe: {e}"))?
+                    } else {
+                        ash::vk::QueryPool::null()
+                    });
+                }
+                v
+            },
+            probe_batches: if std::env::var_os("BRECCIA_GPU_TIME").is_some() {
+                Some(0)
+            } else {
+                None
+            },
             dev_wait_s: vec![0.0; model.devices.len()],
             dev_down: vec![0; model.devices.len()],
             dev_up: vec![0; model.devices.len()],
@@ -514,7 +541,9 @@ impl<'m> Session<'m> {
             let rec = batch_cmd::recorded();
             let stage = self.timers.stage;
             self.timers.count_dispatches(stage, rec);
-            let wait = batch_cmd::end(self.model.devices[d].gpu())
+            let gpu = self.model.devices[d].gpu();
+            self.probe_stamp(d, true)?;
+            let wait = batch_cmd::end(gpu)
                 .map_err(|e| anyhow!("closing the dispatch batch on device {d}: {e}"))?;
             self.dev_wait_s[d] += wait;
             self.submits += 1;
@@ -546,6 +575,71 @@ impl<'m> Session<'m> {
         batch_cmd::begin(self.model.devices[dev].gpu())
             .map_err(|e| anyhow!("opening a dispatch batch on device {dev}: {e}"))?;
         self.pending_batch = Some(dev);
+        self.probe_stamp(dev, false)?;
+        Ok(())
+    }
+
+    /// `BRECCIA_GPU_TIME=1`: bracket the first [`GPU_PROBE_BATCHES`] batches with
+    /// GPU timestamps and print their durations at the end of the token.
+    ///
+    /// The fence wait a batch costs includes the host and driver's submission
+    /// latency; these say how much of it the GPU was actually busy — the number
+    /// that decides whether a bottleneck is arithmetic (fusions help) or
+    /// submission (pipelining helps).
+    fn probe_stamp(&mut self, dev: usize, end: bool) -> Result<()> {
+        let Some(k) = self.probe_batches else {
+            return Ok(());
+        };
+        if k as usize >= GPU_PROBE_BATCHES {
+            return Ok(());
+        }
+        let pool = self.probe_pools[dev];
+        let query = 2 * k + u32::from(end);
+        batch_cmd::record_timestamp(self.model.devices[dev].gpu(), pool, query)?;
+        if end {
+            self.probe_batches = Some(k + 1);
+        }
+        Ok(())
+    }
+
+    /// Print and disable the GPU-time probe (called once a token).
+    fn probe_report(&mut self) -> Result<()> {
+        let Some(k) = self.probe_batches else {
+            return Ok(());
+        };
+        if k == 0 {
+            return Ok(());
+        }
+        let mut lines = Vec::new();
+        for (i, pool) in self.probe_pools.iter().enumerate() {
+            if *pool == ash::vk::QueryPool::null() {
+                continue;
+            }
+            let gpu = self.model.devices[i].gpu();
+            let ts = gpu
+                .timestamps(*pool, k)
+                .map_err(|e| anyhow!("reading the GPU-time probe: {e}"))?;
+            let mut spans = Vec::new();
+            for c in ts.chunks_exact(2) {
+                spans.push(c[1] - c[0]);
+            }
+            if spans.is_empty() {
+                continue;
+            }
+            let sum: f64 = spans.iter().sum();
+            let max = spans.iter().cloned().fold(0.0f64, f64::max);
+            lines.push(format!(
+                "device {i}: {} batches, GPU busy {:.2} ms/token, mean {:.0} us, max {:.0} us",
+                spans.len(),
+                sum / 1e6,
+                sum / spans.len() as f64 / 1e3,
+                max / 1e3
+            ));
+        }
+        for l in lines {
+            eprintln!("gpu-time {l}");
+        }
+        self.probe_batches = None;
         Ok(())
     }
 
@@ -707,6 +801,7 @@ impl<'m> Session<'m> {
         let raw = self.stagings[last]
             .read_batch(m.devices[last].gpu(), &[(logits_buf, 0, mc.vocab * 4)])?;
         self.timers.stop();
+        self.probe_report()?;
         self.forwards += 1;
         let values = f32_from_bytes(&raw[0]);
         if values.len() != mc.vocab {
