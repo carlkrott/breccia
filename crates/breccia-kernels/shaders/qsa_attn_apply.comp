@@ -1,0 +1,100 @@
+#version 450
+//
+// QSA attention output: `o[head][token][d] = sigmoid(gate) * sum_slot p[slot] * v(cell)[d]`
+//
+// (`docs/specs/qwen4exp-architecture.md` §4.3 steps 5-7: dense attention over the
+// selected cells, `A = A * sigmoid(gate)` **before** `attn_output`, where `gate`
+// is the second half of the `attn_q` projection; `LC/src/models/qwen4exp.cpp:1003-1009`.)
+//
+// Consumption of the score matrix is row-major over the same `slots` layout
+// `qsa_attn_scores.comp` wrote and `ops_softmax` normalised, so probabilities
+// arrive already masked to exact zeros (exp(-1e30 - max) == 0 in f32).
+//
+// # Layout
+//
+// One invocation per (token, head, d) — `T * 24 * 256` invocations, `d` fastest —
+// so consecutive lanes read consecutive f16 values of a cell (coalesced) and the
+// same probability (broadcast). The gate is read straight out of the `attn_q`
+// projection output at its interleaved offset (`head*512 + 256 + d`), so the
+// 24x256xT gate values are never copied.
+//
+// `out` is `[T, n_head, head_dim]` head-major, which is exactly the `attn_output`
+// GEMV's (`[6144 -> 2560]`) activation layout.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Probs { float P[]; }; // [n_head*T, slots]
+layout(std430, binding = 1) readonly buffer VPool { uint VP[]; }; // paged f16 pairs
+layout(std430, binding = 2) readonly buffer PageTable { uint PT[]; };
+layout(std430, binding = 3) readonly buffer Ids { uint IDS[]; }; // [T, max_blocks]
+layout(std430, binding = 4) readonly buffer Counts { uint CNT[]; }; // [T]
+layout(std430, binding = 5) readonly buffer QFull { float QF[]; }; // [T, n_head*512]
+layout(std430, binding = 6) writeonly buffer Out { float O[]; }; // [T, n_head, head_dim]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_head;
+    uint head_dim;
+    uint slots;
+    uint id_stride;
+    int pos0;
+    uint page_cells;
+    uint n_kv_head;
+} pc;
+
+#define WG_X_MAX 65535u
+
+#include "f16_storage.glsl"
+#include "ops_math.glsl"
+
+// One f16 element of the paged cache (`elem` is the element index inside a row).
+float load_half(uint elem) {
+    return breccia_load_f16(VP[elem >> 1], elem);
+}
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint unit = wg * 256u + gl_LocalInvocationID.x;
+    uint total = pc.tokens * pc.n_head * pc.head_dim;
+    if (unit >= total) {
+        return;
+    }
+    uint d = unit % pc.head_dim;
+    uint rest = unit / pc.head_dim;
+    uint h = rest % pc.n_head;
+    uint t = rest / pc.n_head;
+
+    uint count = CNT[t];
+    int pos = pc.pos0 + int(t);
+    uint kvh = h * pc.n_kv_head / pc.n_head;
+    uint row = t * pc.n_head + h;
+
+    float acc = 0.0;
+    for (uint r = 0u; r < count; ++r) {
+        uint block = IDS[t * pc.id_stride + r];
+        for (uint k = 0u; k < 4u; ++k) {
+            uint p_slot = r * 4u + k;
+            if (p_slot >= pc.slots) {
+                break;
+            }
+            float p = P[row * pc.slots + p_slot];
+            if (p == 0.0) {
+                continue;
+            }
+            int cell = int(block) * 4 + int(k);
+            if (cell > pos) {
+                continue;
+            }
+            uint page = PT[uint(cell) / pc.page_cells];
+            uint in_page = uint(cell) % pc.page_cells;
+            uint base = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
+                        in_page * pc.head_dim;
+            acc += p * load_half(base + d);
+        }
+    }
+
+    // sigmoid of the head's gate half, read in place from the projection output.
+    uint gate_at = t * (pc.n_head * 2u * pc.head_dim) + h * (2u * pc.head_dim) +
+                   pc.head_dim + d;
+    O[unit] = acc * breccia_sigmoid(QF[gate_at]);
+}

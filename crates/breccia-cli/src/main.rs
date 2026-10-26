@@ -202,7 +202,7 @@ fn run(cli: Cli) -> Result<()> {
                  breccia bench gemv [--type IQ3_S]... [--rows N --cols N] [--device <idx|pci>]... \\\n                 \
                  [--json PATH] [--quick] [--real [--layer N] [--role gate|up|down] [--expert E]]\n                 \
                  [--experts 1,2,4,8,10,16] [--accum f32|f16]\n  \
-                 breccia bench ops --op rmsnorm|rope|swiglu|softmax|router|emb_gather|hc|add \\\n                 \
+                 breccia bench ops --op rmsnorm|rope|swiglu|softmax|router|emb_gather|hc|add|gdn|qsa \\\n                 \
                  [--tokens 1,256] [--device <idx|pci>] [--json PATH] [--quick]"
             );
             Ok(())

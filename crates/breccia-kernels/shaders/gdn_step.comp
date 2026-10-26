@@ -1,0 +1,100 @@
+#version 450
+//
+// The gated delta-rule recurrence, one invocation per state column.
+//
+//   dec   = exp(gate[h])                                    scalar per v-head
+//   sk[j] = sum_i S[i][h][j] * dec * k[h % h_k][i]
+//   d[j]  = (v[h][j] - sk[j]) * beta[h]
+//   S[i][h][j] = S[i][h][j] * dec + k[h % h_k][i] * d[j]
+//   o[h][j]    = sum_i S[i][h][j] * q[h % h_k][i]
+//
+// (`docs/specs/qwen4exp-architecture.md` §5.2; `delta-net-base.cpp:349-366`;
+//  `ST/include/strata/kernels/gdn.hpp:12-57`.)
+//
+// # State layout (spec open question Q3 — this is the choice)
+//
+// **`(S, h_v, S)` = `(i, h, j)` with `j` fastest**: flat index
+// `(i * h_v + h) * S + j`. That is strata's layout (`gdn.hpp:13-18`), picked over
+// llama.cpp's `(S, S, H_v)` because for a fixed `i` a warp walking consecutive
+// `j` reads contiguous memory — and `j` is the axis the output and the state
+// update both stream along. A mismatch between the two layouts is silent (same
+// three numbers), so the CPU reference in `src/gdn/cpu.rs` indexes the same
+// formula and the conformance test pins it.
+//
+// # Why this is parallel at all
+//
+// Every line above touches only the (j, h) column: the decay is one scalar per
+// head, `sk` is a dot over `i` for fixed `j`, and the rank-1 update writes the
+// same column. Nothing couples one column to another, so one invocation owns a
+// column for the whole step and **no barrier appears anywhere in the kernel**.
+//
+// # T > 1
+//
+// The invocation walks the T tokens of the call in order, carrying the state in
+// place, so a prefill chunk is "the decode kernel applied T times" — the same
+// equality `ST/include/strata/core/verify.hpp:3-11` asserts between strata's
+// chunked and single-token GDN paths. Cost is linear in T (the state is
+// re-read per token); the chunked/UT-transform formulation that makes prefill
+// sublinear in T is `docs/phase-3/06-attention-gdn.md` §open items.
+//
+// `q` arrives ALREADY L2-normalised and scaled by 1/S (`gdn_qk_l2.comp`), `v`
+// is raw, and `gate` is the pre-exp value.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer State { float ST[]; }; // [(i*h_v + h)*S + j]
+layout(std430, binding = 1) readonly buffer Qkv { float QKV[]; }; // [T, C]
+layout(std430, binding = 2) readonly buffer GateVec { float GATE[]; }; // [T, h_v]
+layout(std430, binding = 3) readonly buffer BetaVec { float BETA[]; }; // [T, h_v]
+layout(std430, binding = 4) writeonly buffer OVec { float O[]; }; // [T, h_v*S]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint h_k;      // 16
+    uint h_v;      // 48
+    uint S;        // 128
+    uint channels; // C = 2*h_k*S + h_v*S
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+#define WG_X_MAX 65535u
+
+void main() {
+    // unit = (h, j): one state column.
+    uint unit = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint per_wg = 128u;
+    uint col = unit * per_wg + gl_LocalInvocationID.x;
+    if (col >= pc.h_v * pc.S) {
+        return;
+    }
+    uint h = col / pc.S;
+    uint j = col - h * pc.S;
+    uint gh = h % pc.h_k; // MODULO pairing (§5.2, spec Q2)
+
+    uint q_base = gh * pc.S;
+    uint k_base = pc.h_k * pc.S + gh * pc.S;
+    uint v_base = 2u * pc.h_k * pc.S + h * pc.S;
+
+    for (uint t = 0u; t < pc.tokens; ++t) {
+        uint at = t * pc.channels;
+        float dec = exp(GATE[t * pc.h_v + h]);
+        float beta = BETA[t * pc.h_v + h];
+
+        float sk = 0.0;
+        for (uint i = 0u; i < pc.S; ++i) {
+            sk += ST[(i * pc.h_v + h) * pc.S + j] * QKV[at + k_base + i];
+        }
+        float d = (QKV[at + v_base + j] - sk * dec) * beta;
+
+        float acc = 0.0;
+        for (uint i = 0u; i < pc.S; ++i) {
+            uint idx = (i * pc.h_v + h) * pc.S + j;
+            float st = ST[idx] * dec + QKV[at + k_base + i] * d;
+            ST[idx] = st;
+            acc += st * QKV[at + q_base + i];
+        }
+        O[t * (pc.h_v * pc.S) + h * pc.S + j] = acc;
+    }
+}

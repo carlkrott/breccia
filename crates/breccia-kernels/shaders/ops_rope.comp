@@ -46,6 +46,11 @@ layout(std430, binding = 0) readonly buffer XVec { float X[]; };
 layout(std430, binding = 1) readonly buffer Table { vec2 CS[]; };
 /// One int32 rotary position per row (a device array, not a host scalar: a
 /// captured graph must not replay the first token's position forever).
+///
+/// With `pos_base`/`pos_div` the caller can pass one **identity** table for the
+/// whole context (`POS[i] = i`) and address token `t`'s position as
+/// `POS[pos_base + row/pos_div]` — that is what the QSA layer does, so a decode
+/// step never re-uploads a positions array.
 layout(std430, binding = 2) readonly buffer Positions { int POS[]; };
 layout(std430, binding = 3) writeonly buffer OVec { float O[]; };
 
@@ -54,6 +59,8 @@ layout(push_constant) uniform Params {
     uint head_dim; // elements per row
     uint n_rot;    // rotated dims (must be even)
     uint max_pos;  // positions in the table
+    int  pos_base; // first position of this call (an identity table + a base)
+    uint pos_div;  // rows per token (heads per token; 1 = one position per row)
 } pc;
 
 #define WG_X_MAX 65535u
@@ -73,7 +80,7 @@ void main() {
     if (j < hrot) {
         float a = X[base + j];
         float b = X[base + j + hrot];
-        int p = POS[row];
+        int p = POS[pc.pos_base + int(row / pc.pos_div)];
         // Clamp defensively: an out-of-range position must not become an
         // out-of-bounds table read (a fault, not a wrong number).
         uint pi = p < 0 ? 0u : (uint(p) < pc.max_pos ? uint(p) : pc.max_pos - 1u);

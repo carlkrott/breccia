@@ -105,7 +105,7 @@ pub fn u32_to_bytes(v: &[u32]) -> Vec<u8> {
 /// `(grid.x, grid.y)` for `units` invocations at `per_wg` invocations per
 /// workgroup, wrapped over `grid.y` so `grid.x <= 65535` (the only value every
 /// Vulkan device guarantees).
-fn grid_for(units: usize, per_wg: usize) -> (u32, u32) {
+pub(crate) fn grid_for(units: usize, per_wg: usize) -> (u32, u32) {
     let groups = units.div_ceil(per_wg.max(1)).max(1) as u64;
     let gx = groups.min(u64::from(WG_X_MAX)) as u32;
     let gy = groups
@@ -116,20 +116,20 @@ fn grid_for(units: usize, per_wg: usize) -> (u32, u32) {
 
 /// A 32-byte push-constant block builder (every op uses four words or fewer).
 #[derive(Clone, Copy)]
-struct Pc {
+pub(crate) struct Pc {
     bytes: [u8; 32],
     len: usize,
 }
 
 impl Pc {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Pc {
             bytes: [0u8; 32],
             len: 0,
         }
     }
 
-    fn u(mut self, v: u32) -> Self {
+    pub(crate) fn u(mut self, v: u32) -> Self {
         let at = self.len;
         if at + 4 <= 32 {
             self.bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
@@ -138,31 +138,47 @@ impl Pc {
         self
     }
 
-    fn f(self, v: f32) -> Self {
+    pub(crate) fn f(self, v: f32) -> Self {
         self.u(v.to_bits())
     }
 
-    fn as_bytes(&self) -> &[u8] {
+    /// A signed 32-bit word (sequence positions in the QSA kernels).
+    pub(crate) fn i(self, v: i32) -> Self {
+        self.u(v as u32)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 }
 
 /// One compiled pipeline plus the device that owns it.
-struct Pipe<'g> {
+pub(crate) struct Pipe<'g> {
     gpu: &'g Gpu,
     kernel: Kernel,
     what: &'static str,
 }
 
 impl<'g> Pipe<'g> {
-    fn new(gpu: &'g Gpu, spv: &'static [u8], n_buffers: u32, what: &'static str) -> Result<Self> {
+    /// The device that owns this pipeline (pipeline `Drop` frees the kernel, so
+    /// an owning struct can free its own buffers in the same order).
+    pub(crate) fn gpu(&self) -> &'g Gpu {
+        self.gpu
+    }
+
+    pub(crate) fn new(
+        gpu: &'g Gpu,
+        spv: &'static [u8],
+        n_buffers: u32,
+        what: &'static str,
+    ) -> Result<Self> {
         let kernel = gpu
             .kernel(spv, n_buffers)
             .map_err(|e| anyhow!("creating the {what} pipeline: {e}"))?;
         Ok(Pipe { gpu, kernel, what })
     }
 
-    fn bind(&self, bufs: &[&Buf]) -> Result<()> {
+    pub(crate) fn bind(&self, bufs: &[&Buf]) -> Result<()> {
         let handles: Vec<vk::Buffer> = bufs.iter().map(|b| b.buf).collect();
         self.gpu
             .bind_kernel(&self.kernel, &handles)
@@ -170,7 +186,7 @@ impl<'g> Pipe<'g> {
     }
 
     /// One dispatch, synchronously.
-    fn run(&self, bufs: &[&Buf], pc: &Pc, grid: (u32, u32, u32)) -> Result<()> {
+    pub(crate) fn run(&self, bufs: &[&Buf], pc: &Pc, grid: (u32, u32, u32)) -> Result<()> {
         self.bind(bufs)?;
         self.gpu
             .wall_run(Qc::C, |d, cmd| {
@@ -183,7 +199,7 @@ impl<'g> Pipe<'g> {
     /// One dispatch repeated for `target_s`, GPU-timestamped. A full barrier
     /// between dispatches keeps the reported number a latency, not a pipelined
     /// average (same protocol as `Gemv::run_timed`).
-    fn run_timed(
+    pub(crate) fn run_timed(
         &self,
         bufs: &[&Buf],
         pc: &Pc,
@@ -209,7 +225,13 @@ impl<'g> Pipe<'g> {
     }
 }
 
-fn record(d: &ash::Device, cmd: vk::CommandBuffer, k: &Kernel, pc: &[u8], grid: (u32, u32, u32)) {
+pub(crate) fn record(
+    d: &ash::Device,
+    cmd: vk::CommandBuffer,
+    k: &Kernel,
+    pc: &[u8],
+    grid: (u32, u32, u32),
+) {
     unsafe {
         d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipe);
         d.cmd_bind_descriptor_sets(
@@ -232,7 +254,7 @@ impl Drop for Pipe<'_> {
 }
 
 /// 4-element device buffer bound where a shader declares an optional input.
-fn empty_buf(gpu: &Gpu, what: &str) -> Result<Buf> {
+pub(crate) fn empty_buf(gpu: &Gpu, what: &str) -> Result<Buf> {
     upload(gpu, &[0u8; 16]).with_context(|| format!("allocating the unused {what} binding"))
 }
 
@@ -524,12 +546,28 @@ impl<'g> Rope<'g> {
         out: &'a Buf,
         rows: usize,
     ) -> (Vec<&'a Buf>, Pc, (u32, u32, u32)) {
+        self.launch_at(x, table, positions, out, rows, 0, 1)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_at<'a>(
+        &'a self,
+        x: &'a Buf,
+        table: &'a Buf,
+        positions: &'a Buf,
+        out: &'a Buf,
+        rows: usize,
+        pos_base: i32,
+        pos_div: usize,
+    ) -> (Vec<&'a Buf>, Pc, (u32, u32, u32)) {
         let bufs = vec![x, table, positions, out];
         let pc = Pc::new()
             .u(rows as u32)
             .u(self.head_dim as u32)
             .u(self.n_rot as u32)
-            .u(self.max_pos as u32);
+            .u(self.max_pos as u32)
+            .i(pos_base)
+            .u(pos_div.max(1) as u32);
         let units = rows * (self.head_dim / 2);
         let (gx, gy) = grid_for(units, 64);
         (bufs, pc, (gx, gy, 1))
@@ -537,11 +575,53 @@ impl<'g> Rope<'g> {
 
     /// Rotate `rows` rows. `positions` holds `rows` int32 values (device array).
     pub fn run(&self, x: &Buf, table: &Buf, positions: &Buf, out: &Buf, rows: usize) -> Result<()> {
+        self.run_at(x, table, positions, out, rows, 0, 1)
+    }
+
+    /// Rotate `rows` rows reading the position of row `r` from
+    /// `positions[pos_base + r/pos_div]`.
+    ///
+    /// `pos_div = heads_per_token` lets a caller pass one identity position
+    /// table for the whole context — `positions[i] = i` — and address a token
+    /// batch by its base position, so a decode step never re-uploads a
+    /// positions array (and a captured graph cannot freeze one). `run` is this
+    /// with `(0, 1)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_at(
+        &self,
+        x: &Buf,
+        table: &Buf,
+        positions: &Buf,
+        out: &Buf,
+        rows: usize,
+        pos_base: i32,
+        pos_div: usize,
+    ) -> Result<()> {
         if rows == 0 {
             return Ok(());
         }
-        let (bufs, pc, grid) = self.launch(x, table, positions, out, rows);
+        let (bufs, pc, grid) = self.launch_at(x, table, positions, out, rows, pos_base, pos_div);
         self.pipe.run(&bufs, &pc, grid)
+    }
+
+    /// Timed variant of [`Rope::run_at`] (the `pos_base`/`pos_div` form).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_at_timed(
+        &self,
+        x: &Buf,
+        table: &Buf,
+        positions: &Buf,
+        out: &Buf,
+        rows: usize,
+        pos_base: i32,
+        pos_div: usize,
+        target_s: f64,
+    ) -> Result<GemvTiming> {
+        if rows == 0 {
+            return Err(anyhow!("rope rows must be non-zero"));
+        }
+        let (bufs, pc, grid) = self.launch_at(x, table, positions, out, rows, pos_base, pos_div);
+        self.pipe.run_timed(&bufs, &pc, grid, target_s)
     }
 
     /// Timed variant of [`Rope::run`].
@@ -1138,30 +1218,101 @@ impl<'g> Act<'g> {
     }
 }
 
-/// HC_READ tail: `mixed[d] = (1/hc) * sum_c xn[c][d] * sigmoid(gate[c][d])`.
+/// HC_READ tail: `mixed[d] = (1/hc) * sum_c xn[c][d] * sigmoid(gate[c][d])`,
+/// **and** the four `inject` dot products, folded in.
 ///
 /// Layouts (`GGML ne` order, see the shader):
-/// `xn`, `gate` are `[n_embd, hc, T]`; `mixed` is `[n_embd, T]`.
+/// `xn`, `gate` are `[n_embd, hc, T]`; `mixed` is `[n_embd, T]`;
+/// `w_inject` is `[hc, n_embd]`; `part` is `[T, hc, chunks]` with
+/// `chunks = n_embd/256` partial sums per (token, stream).
+///
+/// # Why `inject` is here (`docs/phase-3/04` §7.2 item 1)
+///
+/// `inject = xn @ w_inject.T` is a 4 x 10240 projection: 82 KiB of BF16 read by
+/// one 8-row workgroup, measured at **21.85 us** on the RX 6950 XT — pure dispatch
+/// latency, 36 % of the whole HC_READ chain (2.1 ms/token across the model's 96
+/// HC_READs). This kernel already walks every `xn` value for `mixed`, so the four
+/// dot products ride along in the same registers.
+///
+/// The dot products span all `n_embd` values while the grid gives one workgroup
+/// per 256-element chunk, so each workgroup writes its **partial** sums to
+/// `part[t][c][k]`; [`HcWrite`] — which reads the four gates once per token anyway —
+/// sums the `chunks` of them. One dispatch removed per HC_READ, no atomics, and a
+/// summation order that is fixed by the chunk index rather than by race.
 pub struct HcGatedMean<'g> {
     pipe: Pipe<'g>,
     n_embd: usize,
     hc: usize,
+    /// Partial columns per token (`n_embd / 256`); 0 disables the fold.
+    chunks: usize,
+    /// 0 = the inject weight is BF16, 1 = F32.
+    dt: u32,
 }
 
 impl<'g> HcGatedMean<'g> {
+    /// The strided mean on its own (no `inject`).
     pub fn new(gpu: &'g Gpu, n_embd: usize, hc: usize) -> Result<Self> {
+        Self::with_inject(gpu, n_embd, hc, None)
+    }
+
+    /// `inject = Some((ty, chunks))` folds the 4 x `n_embd` projection in; `ty`
+    /// must be BF16 (the artifact's `hc_*` type, §14) or F32 (tests), and
+    /// `chunks` must be `n_embd / 256` so that a workgroup is never split across
+    /// a token boundary.
+    pub fn with_inject(
+        gpu: &'g Gpu,
+        n_embd: usize,
+        hc: usize,
+        inject: Option<(QuantType, usize)>,
+    ) -> Result<Self> {
         if n_embd == 0 || hc == 0 {
             return Err(anyhow!("hc gated mean needs n_embd > 0 and hc > 0"));
         }
+        if hc > 8 {
+            return Err(anyhow!(
+                "hc gated mean caches {hc} stream partials in shared memory (max 8)"
+            ));
+        }
+        let (dt, chunks) = match inject {
+            None => (0u32, 0usize),
+            Some((ty, chunks)) => {
+                if !n_embd.is_multiple_of(256) {
+                    return Err(anyhow!(
+                        "the fused inject needs n_embd % 256 == 0 (got {n_embd}): one \
+                         workgroup per token chunk is what makes the partial sums \
+                         unambiguous"
+                    ));
+                }
+                if chunks != n_embd / 256 {
+                    return Err(anyhow!(
+                        "fused inject chunks must be n_embd/256 = {}, got {chunks}",
+                        n_embd / 256
+                    ));
+                }
+                match ty {
+                    QuantType::Bf16 => (0u32, chunks),
+                    QuantType::F32 => (1u32, chunks),
+                    other => {
+                        return Err(anyhow!(
+                            "the fused hc inject reads BF16 or F32 weights (the artifact \
+                             ships BF16); got {}",
+                            other.name()
+                        ))
+                    }
+                }
+            }
+        };
         Ok(HcGatedMean {
             pipe: Pipe::new(
                 gpu,
                 include_bytes!(concat!(env!("OUT_DIR"), "/ops_hc_gated_mean.spv")),
-                3,
+                5,
                 "hc gated mean",
             )?,
             n_embd,
             hc,
+            chunks,
+            dt,
         })
     }
 
@@ -1171,45 +1322,72 @@ impl<'g> HcGatedMean<'g> {
     pub fn hc(&self) -> usize {
         self.hc
     }
+    /// Partial sums per (token, stream); 0 when `inject` is not folded in.
+    pub fn chunks(&self) -> usize {
+        self.chunks
+    }
+    /// Values the partial buffer holds for `tokens` tokens (`tokens*hc*chunks`).
+    pub fn part_values(&self, tokens: usize) -> usize {
+        tokens * self.hc * self.chunks
+    }
 
     fn launch<'a>(
         &'a self,
         xn: &'a Buf,
         gate: &'a Buf,
         out: &'a Buf,
+        w: &'a Buf,
+        part: &'a Buf,
         tokens: usize,
     ) -> (Vec<&'a Buf>, Pc, (u32, u32, u32)) {
         let (gx, gy) = grid_for(self.n_embd * tokens, 256);
         (
-            vec![xn, gate, out],
+            vec![xn, gate, out, w, part],
             Pc::new()
                 .u(self.n_embd as u32)
                 .u(self.hc as u32)
-                .u(tokens as u32),
+                .u(tokens as u32)
+                .u(self.dt)
+                .u(self.chunks as u32),
             (gx, gy, 1),
         )
     }
 
-    pub fn run(&self, xn: &Buf, gate: &Buf, out: &Buf, tokens: usize) -> Result<()> {
+    /// `mixed` for `tokens` tokens; when the fold is enabled, `w` is
+    /// `hc_*_inject.weight` and `part` receives `tokens*hc*chunks` partials.
+    /// `w`/`part` must be real buffers even when unused (every declared binding
+    /// is bound).
+    pub fn run(
+        &self,
+        xn: &Buf,
+        gate: &Buf,
+        out: &Buf,
+        w: &Buf,
+        part: &Buf,
+        tokens: usize,
+    ) -> Result<()> {
         if tokens == 0 {
             return Ok(());
         }
-        let (bufs, pc, grid) = self.launch(xn, gate, out, tokens);
+        let (bufs, pc, grid) = self.launch(xn, gate, out, w, part, tokens);
         self.pipe.run(&bufs, &pc, grid)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_timed(
         &self,
         xn: &Buf,
         gate: &Buf,
         out: &Buf,
+        w: &Buf,
+        part: &Buf,
         tokens: usize,
         target_s: f64,
     ) -> Result<GemvTiming> {
         if tokens == 0 {
             return Err(anyhow!("hc gated mean tokens must be non-zero"));
         }
-        let (bufs, pc, grid) = self.launch(xn, gate, out, tokens);
+        let (bufs, pc, grid) = self.launch(xn, gate, out, w, part, tokens);
         self.pipe.run_timed(&bufs, &pc, grid, target_s)
     }
 }
@@ -1261,6 +1439,7 @@ impl<'g> HcWrite<'g> {
         inject: &'a Buf,
         out: &'a Buf,
         tokens: usize,
+        chunks: usize,
     ) -> (Vec<&'a Buf>, Pc, (u32, u32, u32)) {
         let gx = self.n_embd.div_ceil(256).max(1) as u32;
         (
@@ -1268,16 +1447,27 @@ impl<'g> HcWrite<'g> {
             Pc::new()
                 .u(self.n_embd as u32)
                 .u(self.hc as u32)
-                .u(tokens as u32),
+                .u(tokens as u32)
+                .u(chunks as u32),
             (gx, tokens.max(1) as u32, 1),
         )
     }
 
-    pub fn run(&self, r: &Buf, block: &Buf, inject: &Buf, out: &Buf, tokens: usize) -> Result<()> {
+    /// `chunks = 0` reads `inject` as `[T, hc]` final values; `chunks > 0` sums the
+    /// `[T, hc, chunks]` partials that [`HcGatedMean`] wrote.
+    pub fn run(
+        &self,
+        r: &Buf,
+        block: &Buf,
+        inject: &Buf,
+        out: &Buf,
+        tokens: usize,
+        chunks: usize,
+    ) -> Result<()> {
         if tokens == 0 {
             return Ok(());
         }
-        let (bufs, pc, grid) = self.launch(r, block, inject, out, tokens);
+        let (bufs, pc, grid) = self.launch(r, block, inject, out, tokens, chunks);
         self.pipe.run(&bufs, &pc, grid)
     }
 
@@ -1289,12 +1479,13 @@ impl<'g> HcWrite<'g> {
         inject: &Buf,
         out: &Buf,
         tokens: usize,
+        chunks: usize,
         target_s: f64,
     ) -> Result<GemvTiming> {
         if tokens == 0 {
             return Err(anyhow!("hc write tokens must be non-zero"));
         }
-        let (bufs, pc, grid) = self.launch(r, block, inject, out, tokens);
+        let (bufs, pc, grid) = self.launch(r, block, inject, out, tokens, chunks);
         self.pipe.run_timed(&bufs, &pc, grid, target_s)
     }
 }
@@ -1326,11 +1517,12 @@ pub struct HcWorkspace {
     pub gate: Buf,
     /// `[n_embd, T]` the mixer output the sublayer consumes.
     pub mixed: Buf,
-    /// `[hc, T]` the per-stream inject scalars.
+    /// `[T, hc, chunks]` partial `inject` dot products (`chunks = n_embd/256`,
+    /// 1 when the mixer has no inject). [`HcWrite`] sums each token's `chunks`;
+    /// [`HcMixer::inject_values`] does the same on the host for tests.
     pub inject: Buf,
     map_down: Buf,
     map_up: Buf,
-    map_inject: Buf,
 }
 
 impl HcWorkspace {
@@ -1345,7 +1537,6 @@ impl HcWorkspace {
             &self.inject,
             &self.map_down,
             &self.map_up,
-            &self.map_inject,
         ]
         .iter()
         .map(|b| b.size)
@@ -1396,12 +1587,22 @@ pub struct HcMixer<'g> {
     write: HcWrite<'g>,
     down: crate::GemvBatch<'g>,
     up: crate::GemvBatch<'g>,
-    inject_proj: Option<crate::GemvBatch<'g>>,
+    /// `true` when the `inject` projection is folded into the gated-mean pass.
+    fused_inject: bool,
+    /// Bound as the gated-mean's inject weight when the mixer has no `inject`
+    /// (every declared binding must be bound).
+    no_weight: Buf,
 }
 
 impl<'g> HcMixer<'g> {
-    /// Compile the six pipelines of one mixer. `ty` is the projection type
+    /// Compile the pipelines of one mixer. `ty` is the projection type
     /// (`BF16` in the artifact: the `hc_*` weights are BF16, §14).
+    ///
+    /// With `with_inject` the fourth projection is **folded** into the gated-mean
+    /// dispatch instead of being a 4-row GEMV: one dispatch fewer per HC_READ, and
+    /// the 82 KiB of `w_inject` is read once and coalesced alongside `xn` instead
+    /// of by a single under-filled workgroup (measured 21.85 us -> ~1 us on the RX,
+    /// `docs/phase-3/06` §HC). Requires `n_embd % 256 == 0` and a BF16/F32 weight.
     pub fn new(
         gpu: &'g Gpu,
         ty: QuantType,
@@ -1420,15 +1621,16 @@ impl<'g> HcMixer<'g> {
         }
         let norm = RmsNorm::new(gpu, n_embd, hc)?;
         let act = Act::new(gpu, ActMode::SiluDiv)?;
-        let gated = HcGatedMean::new(gpu, n_embd, hc)?;
+        let gated = if with_inject {
+            let chunks = n_embd / 256;
+            HcGatedMean::with_inject(gpu, n_embd, hc, Some((ty, chunks)))?
+        } else {
+            HcGatedMean::new(gpu, n_embd, hc)?
+        };
         let write = HcWrite::new(gpu, n_embd, hc)?;
         let down = crate::GemvBatch::new(gpu, ty, hc_lr, hc * n_embd)?;
         let up = crate::GemvBatch::new(gpu, ty, hc * n_embd, hc_lr)?;
-        let inject_proj = if with_inject {
-            Some(crate::GemvBatch::new(gpu, ty, hc, hc * n_embd)?)
-        } else {
-            None
-        };
+        let no_weight = empty_buf(gpu, "hc inject weight")?;
         Ok(HcMixer {
             n_embd,
             hc,
@@ -1439,7 +1641,8 @@ impl<'g> HcMixer<'g> {
             write,
             down,
             up,
-            inject_proj,
+            fused_inject: with_inject,
+            no_weight,
         })
     }
 
@@ -1458,7 +1661,11 @@ impl<'g> HcMixer<'g> {
         self.hc_lr
     }
     pub fn has_inject(&self) -> bool {
-        self.inject_proj.is_some()
+        self.fused_inject
+    }
+    /// Partial sums per (token, stream) the folded `inject` writes.
+    pub fn inject_chunks(&self) -> usize {
+        self.gated.chunks()
     }
     /// The grouped norm stage (exposed for the bench's stage split).
     pub fn norm(&self) -> &RmsNorm<'g> {
@@ -1477,26 +1684,26 @@ impl<'g> HcMixer<'g> {
         &self.write
     }
 
-    /// Allocate the scratch for `tokens` tokens, including the three row maps.
+    /// Allocate the scratch for `tokens` tokens, including the two row maps.
     ///
     /// The maps are constant for a given `(weights, tokens)`: all "experts" in a
     /// batched projection share the same weight blob (base 0) and differ only in
     /// their per-token activation base, so the map is built once here and not
-    /// per token.
+    /// per token. The `inject` half keeps its two buffers (a 4-element weight
+    /// placeholder for the disabled case and `tokens*hc*chunks` partials) so the
+    /// gated-mean dispatch always has all five bindings.
     pub fn workspace(&self, gpu: &Gpu, tokens: usize) -> Result<HcWorkspace> {
         if tokens == 0 {
             return Err(anyhow!("hc workspace needs tokens >= 1"));
         }
         let hc_dim = self.hc * self.n_embd;
         let blobs = vec![0u32; tokens];
+        let chunks = self.inject_chunks();
         let maps = [
             self.down.map_for_blobs(&blobs, crate::XLayout::PerExpert),
             self.up.map_for_blobs(&blobs, crate::XLayout::PerExpert),
-            match &self.inject_proj {
-                Some(p) => p.map_for_blobs(&blobs, crate::XLayout::PerExpert),
-                None => Vec::new(),
-            },
         ];
+        let inject_vals = (tokens * self.hc * chunks.max(1)).max(4);
         // Six activation buffers + three maps, in one flat list so a failure at
         // any point frees exactly what was allocated.
         let sizes = [
@@ -1505,10 +1712,9 @@ impl<'g> HcMixer<'g> {
             self.hc_lr * tokens,  // lo
             hc_dim * tokens,      // gate
             self.n_embd * tokens, // mixed
-            self.hc * tokens,     // inject
+            inject_vals,          // inject partials [T, hc, chunks]
             maps[0].len(),        // map_down
             maps[1].len(),        // map_up
-            maps[2].len(),        // map_inject
         ];
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         let cleanup = |bufs: &[Buf]| {
@@ -1525,7 +1731,7 @@ impl<'g> HcMixer<'g> {
                 }
             }
         }
-        for (buf, map) in bufs[6..9].iter().zip(maps.iter()) {
+        for (buf, map) in bufs[6..8].iter().zip(maps.iter()) {
             if map.is_empty() {
                 continue;
             }
@@ -1535,7 +1741,7 @@ impl<'g> HcMixer<'g> {
             }
         }
         let mut it = bufs.into_iter();
-        let mut take = || it.next().expect("nine hc buffers were allocated");
+        let mut take = || it.next().expect("eight hc buffers were allocated");
         Ok(HcWorkspace {
             tokens,
             xn: take(),
@@ -1546,7 +1752,6 @@ impl<'g> HcMixer<'g> {
             inject: take(),
             map_down: take(),
             map_up: take(),
-            map_inject: take(),
         })
     }
 
@@ -1561,14 +1766,33 @@ impl<'g> HcMixer<'g> {
             &ws.inject,
             &ws.map_down,
             &ws.map_up,
-            &ws.map_inject,
         ] {
             gpu.destroy_buf(b);
         }
     }
 
+    /// The `inject` scalars for each token, summed across the partials the
+    /// gated-mean dispatch wrote (`[T, hc]`). The device sums them inside
+    /// [`HcWrite`]; this is the same arithmetic on the host, for tests and for a
+    /// debug dump.
+    pub fn inject_values(&self, gpu: &Gpu, ws: &HcWorkspace) -> Result<Vec<f32>> {
+        let chunks = self.inject_chunks().max(1);
+        let raw = download_f32(gpu, &ws.inject, ws.tokens * self.hc * chunks)?;
+        let mut out = vec![0.0f32; ws.tokens * self.hc];
+        for t in 0..ws.tokens {
+            for c in 0..self.hc {
+                let base = (t * self.hc + c) * chunks;
+                out[t * self.hc + c] = raw[base..base + chunks].iter().sum();
+            }
+        }
+        Ok(out)
+    }
+
     /// HC_READ for `ws.tokens` tokens: fills `ws.xn`, `ws.mixed` and (when the
     /// mixer has one) `ws.inject`. `r` is `[n_embd, hc, T]`.
+    ///
+    /// Five dispatches with the fold (norm, down, act, up, gated+inject) instead
+    /// of six: the projection that used to be a 4-row GEMV is inside the last one.
     pub fn read(&self, ws: &HcWorkspace, r: &Buf, w: &HcWeights<'_>) -> Result<()> {
         let t = ws.tokens;
         self.norm.run(r, Some(w.norm), &ws.xn, self.hc * t)?;
@@ -1576,26 +1800,24 @@ impl<'g> HcMixer<'g> {
         self.act
             .run(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32)?;
         self.up.run(w.up, &ws.lo, &ws.gate, &ws.map_up, t)?;
-        self.gated.run(&ws.xn, &ws.gate, &ws.mixed, t)?;
-        if let (Some(proj), Some(winj)) = (&self.inject_proj, w.inject) {
-            proj.run(winj, &ws.xn, &ws.inject, &ws.map_inject, t)?;
-        }
+        let winj = w.inject.unwrap_or(&self.no_weight);
+        self.gated
+            .run(&ws.xn, &ws.gate, &ws.mixed, winj, &ws.inject, t)?;
         Ok(())
     }
 
-    /// Time each HC_READ stage on its own: `[norm, down, act, up, gated, inject]`.
+    /// Time each HC_READ stage on its own: `[norm, down, act, up, gated+inject]`.
     ///
     /// The chain total says how much a layer's mixer costs; this says *which*
-    /// stage it is. On the RX at T=1 the two small GEMVs dominate and every
-    /// stage is dispatch-latency-bound, which is a different fix (fuse the six
-    /// into one kernel) from a bandwidth problem — see `docs/phase-3/04`.
+    /// stage it is. With the fold there is no separate `inject` stage any more —
+    /// its cost is inside `gated` (`docs/phase-3/06` §HC).
     pub fn stage_timings(
         &self,
         ws: &HcWorkspace,
         r: &Buf,
         w: &HcWeights<'_>,
         target_s: f64,
-    ) -> Result<[GemvTiming; 6]> {
+    ) -> Result<[GemvTiming; 5]> {
         let t = ws.tokens;
         let norm = self
             .norm
@@ -1609,25 +1831,21 @@ impl<'g> HcMixer<'g> {
         let up = self
             .up
             .run_timed(w.up, &ws.lo, &ws.gate, &ws.map_up, t, target_s)?;
+        let winj = w.inject.unwrap_or(&self.no_weight);
         let gated = self
             .gated
-            .run_timed(&ws.xn, &ws.gate, &ws.mixed, t, target_s)?;
-        let inject = match (&self.inject_proj, w.inject) {
-            (Some(proj), Some(winj)) => {
-                proj.run_timed(winj, &ws.xn, &ws.inject, &ws.map_inject, t, target_s)?
-            }
-            _ => GemvTiming::default(),
-        };
-        Ok([norm, down, act, up, gated, inject])
+            .run_timed(&ws.xn, &ws.gate, &ws.mixed, winj, &ws.inject, t, target_s)?;
+        Ok([norm, down, act, up, gated])
     }
 
     /// Names of [`HcMixer::stage_timings`]'s stages, in order.
-    pub const STAGES: [&'static str; 6] = ["norm", "down", "act", "up", "gated", "inject"];
+    pub const STAGES: [&'static str; 5] = ["norm", "down", "act", "up", "gated"];
 
     /// HC_WRITE: `out[c] = r[c] + block * 2*sigmoid(inject[c]/hc)` for
     /// `ws.tokens` tokens. Reads `ws.inject` from the last [`HcMixer::read`].
     pub fn write(&self, ws: &HcWorkspace, r: &Buf, block: &Buf, out: &Buf) -> Result<()> {
-        self.write.run(r, block, &ws.inject, out, ws.tokens)
+        self.write
+            .run(r, block, &ws.inject, out, ws.tokens, self.inject_chunks())
     }
 
     /// Time a whole HC_READ (`ws.tokens` tokens) as one back-to-back sequence:
@@ -1652,10 +1870,10 @@ impl<'g> HcMixer<'g> {
         self.down.bind(w.down, &ws.xn, &ws.lo_raw, &ws.map_down)?;
         self.act.pipe.bind(&[&ws.lo_raw, &ws.lo])?;
         self.up.bind(w.up, &ws.lo, &ws.gate, &ws.map_up)?;
-        self.gated.pipe.bind(&[&ws.xn, &ws.gate, &ws.mixed])?;
-        if let (Some(proj), Some(winj)) = (&self.inject_proj, w.inject) {
-            proj.bind(winj, &ws.xn, &ws.inject, &ws.map_inject)?;
-        }
+        let winj = w.inject.unwrap_or(&self.no_weight);
+        self.gated
+            .pipe
+            .bind(&[&ws.xn, &ws.gate, &ws.mixed, winj, &ws.inject])?;
 
         let norm_pc = Pc::new()
             .u((self.hc * t) as u32)
@@ -1669,7 +1887,9 @@ impl<'g> HcMixer<'g> {
         let gated_pc = Pc::new()
             .u(self.n_embd as u32)
             .u(self.hc as u32)
-            .u(t as u32);
+            .u(t as u32)
+            .u(self.gated.dt)
+            .u(self.inject_chunks() as u32);
         let (ggx, ggy) = grid_for(self.n_embd * t, 256);
         let (agx, agy) = grid_for(self.hc_lr * t, 256);
 
@@ -1704,10 +1924,6 @@ impl<'g> HcMixer<'g> {
                         (ggx, ggy, 1),
                     );
                     unsafe { Gpu::barrier_all(d, cmd) };
-                    if let Some(proj) = &self.inject_proj {
-                        proj.dispatch(d, cmd, proj.rows(t));
-                        unsafe { Gpu::barrier_all(d, cmd) };
-                    }
                 }
             })
             .map_err(|e| anyhow!("hc read chain: {e}"))?;
@@ -1717,6 +1933,14 @@ impl<'g> HcMixer<'g> {
             total_s: timing.total_s,
             used_timestamps: timing.used_timestamps,
         })
+    }
+}
+
+impl Drop for HcMixer<'_> {
+    fn drop(&mut self) {
+        // The pipelines free their own kernels through `Pipe::drop`; this is the
+        // only buffer the mixer owns.
+        self.norm.pipe.gpu.destroy_buf(&self.no_weight);
     }
 }
 

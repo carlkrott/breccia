@@ -1,0 +1,72 @@
+#version 450
+//
+// QSA query preparation: split the interleaved `attn_q` projection and RMSNorm
+// the query half.
+//
+// `attn_q.weight` is `[2560, 12288]` = 24 heads x **512**, and each head's block
+// is `q (256) | gate (256)` (`LC/src/models/qwen4exp.cpp:944-970`, spec §4.3
+// steps 1-2). This kernel reads the q half of every head's block (stride 512),
+// normalises it per head with `attn_q_norm`, and writes the queries **contiguous**
+// (`[T, 24, 256]`) so the IMRoPE op and the attention kernels can treat them as
+// plain 256-wide rows.
+//
+// The gate half is deliberately NOT copied: `qsa_attn_apply.comp` reads it in
+// place with the same stride so the 24 x 256 x T values are never materialised
+// twice. (The output gate is `sigmoid(gate)` applied to the attention output
+// per head, BEFORE `attn_output`, `qwen4exp.cpp:1003-1009`.)
+//
+// `y[i] = x[i] * rsqrt(mean(x^2) + eps) * gamma[i]` — the model's 1e-6 eps
+// (`attention.layer_norm_rms_epsilon`), one workgroup of 256 threads per
+// (token, head).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QFull { float QF[]; }; // [T, 24*512]
+layout(std430, binding = 1) readonly buffer GVec { float GAMMA[]; }; // [256]
+layout(std430, binding = 2) writeonly buffer QOut { float Q[]; }; // [T, 24*256]
+
+layout(push_constant) uniform Params {
+    uint rows;     // tokens * n_head
+    uint head_dim; // 256
+    uint gate_dim; // 256 (the second half of each head block)
+    float eps;
+    uint n_head; // 24 (stride = n_head * (head_dim + gate_dim))
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+#define WG_X_MAX 65535u
+
+shared float red[256];
+
+void main() {
+    uint row = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint t = row / pc.n_head;
+    uint h = row - t * pc.n_head;
+    uint stride = pc.n_head * (pc.head_dim + pc.gate_dim);
+    uint base = t * stride + h * (pc.head_dim + pc.gate_dim);
+    uint obase = row * pc.head_dim;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.head_dim; i += 256u) {
+        float v = QF[base + i];
+        ss += v * v;
+    }
+    red[tid] = ss;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            red[tid] += red[tid + off];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(pc.head_dim) + pc.eps);
+    for (uint i = tid; i < pc.head_dim; i += 256u) {
+        Q[obase + i] = QF[base + i] * inv * GAMMA[i];
+    }
+}

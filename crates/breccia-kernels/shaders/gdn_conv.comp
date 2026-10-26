@@ -1,0 +1,76 @@
+#version 450
+//
+// GDN depthwise causal conv1d (kernel 4) + SiLU + carried state.
+//
+//   inp       = [conv_state (3 rows, OLDEST FIRST) | x (T rows)]     per channel
+//   out[t][c] = silu( sum_{k<4} inp[t + k][c] * w[c][k] )
+//   conv_state is then shifted so its last row is the newest input
+//
+// (`docs/specs/qwen4exp-architecture.md` §4.2 step "conv_input = concat(conv_state[3,10240], qkv)";
+//  `ST/include/strata/kernels/gdn.hpp:60-70`; `LC/src/models/qwen4exp.cpp:1074-1078`.)
+//
+// Two details that are easy to get wrong and are pinned here:
+//
+//  * The weight layout is GGML-native `ne = [4, 10240]`, i.e. `w[c*4 + k]` is tap
+//    k of channel c (NOT row-major `[4, 10240]`).
+//  * SiLU is applied to the whole 10240-wide conv output **before** the q/k/v
+//    split (`qwen4exp.cpp:1074-1078`), which is why one kernel owns all channels
+//    and no per-slice variant exists.
+//
+// One invocation per channel, walking the T tokens of this call in order: the
+// convolution is a recurrence over t (token t's window contains token t-1), and
+// conversely every channel is independent, so 10240 invocations each keep their
+// own 3-element history in registers. That is exactly the reference's semantics
+// for a chunked prefill: the per-token kernel applied T times, which
+// `ST/include/strata/core/verify.hpp:3-11` asserts bit-equal to the fused path.
+//
+// In place: `x` and `out` may be the same buffer. Token t's inputs are read
+// before token t's output is written, and later tokens only read `x[t']` with
+// t' >= t.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer ConvState { float STATE[]; }; // [3, channels]
+layout(std430, binding = 1) readonly buffer XVec { float X[]; }; // [T, channels]
+layout(std430, binding = 2) readonly buffer WVec { float W[]; }; // [channels, 4]
+layout(std430, binding = 3) writeonly buffer OVec { float O[]; }; // [T, channels]
+
+layout(push_constant) uniform Params {
+    uint channels;
+    uint tokens;
+    uint d_conv; // 4
+    uint pad0;
+} pc;
+
+#include "ops_math.glsl"
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint c = wg * 128u + gl_LocalInvocationID.x;
+    if (c >= pc.channels) {
+        return;
+    }
+    // Oldest first: state[0] is the input three steps back.
+    float h0 = STATE[0u * pc.channels + c];
+    float h1 = STATE[1u * pc.channels + c];
+    float h2 = STATE[2u * pc.channels + c];
+    float w0 = W[c * pc.d_conv + 0u];
+    float w1 = W[c * pc.d_conv + 1u];
+    float w2 = W[c * pc.d_conv + 2u];
+    float w3 = W[c * pc.d_conv + 3u];
+
+    for (uint t = 0u; t < pc.tokens; ++t) {
+        uint at = t * pc.channels + c;
+        float xn = X[at];
+        float y = h0 * w0 + h1 * w1 + h2 * w2 + xn * w3;
+        O[at] = breccia_silu(y);
+        h0 = h1;
+        h1 = h2;
+        h2 = xn;
+    }
+    STATE[0u * pc.channels + c] = h0;
+    STATE[1u * pc.channels + c] = h1;
+    STATE[2u * pc.channels + c] = h2;
+}

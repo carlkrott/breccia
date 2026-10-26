@@ -1,0 +1,68 @@
+#version 450
+//
+// GDN output tail: `rmsnorm_128(y, ssm_norm) * sigmoid(z)`.
+//
+//   out[h][j] = y[h][j] * rsqrt(mean_j(y[h][j]^2) + eps) * ssm_norm[j] * sigmoid(z[h][j])
+//
+// (`docs/specs/qwen4exp-architecture.md` §4.2 last two lines; `build_norm_gated`
+//  in `LC/src/models/qwen4exp.cpp:634-644`: "the one numerical difference from
+//  Qwen3.5's GDN: sigmoid output gate, not silu".)
+//
+// The norm is per v-head row of 128 values (48 rows per token) and the gate is
+// elementwise with the raw `attn_gate` projection output `z` — the same flat
+// `[T, h_v*S]` layout gdn_step writes, so both buffers line up index for index.
+//
+// This is `ops_rmsnorm`'s math with the sigmoid multiply fused in: fusing here
+// removes one round trip over 6144*T floats and one dispatch from every GDN
+// layer. One workgroup (128 threads) per row, tree reduction in shared memory.
+//
+// Like the rest of the GDN tail the output is consumed by `ssm_out`
+// (`[6144 -> 2560]`): `out` is `[T, 6144]` head-major, which is exactly the GEMV's
+// activation layout.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer YVec { float Y[]; }; // [T, h_v*S]
+layout(std430, binding = 1) readonly buffer GVec { float GAMMA[]; }; // [S]
+layout(std430, binding = 2) readonly buffer ZVec { float Z[]; }; // [T, h_v*S]
+layout(std430, binding = 3) writeonly buffer OVec { float O[]; }; // [T, h_v*S]
+
+layout(push_constant) uniform Params {
+    uint rows; // tokens * h_v
+    float eps; // 1e-6
+    uint S;    // 128
+    uint pad0;
+} pc;
+
+#include "ops_math.glsl"
+
+#define WG_X_MAX 65535u
+
+shared float red[128];
+
+void main() {
+    uint row = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.S;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.S; i += 128u) {
+        float v = Y[base + i];
+        ss += v * v;
+    }
+    red[tid] = ss;
+    barrier();
+    for (uint off = 64u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            red[tid] += red[tid + off];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(pc.S) + pc.eps);
+    for (uint i = tid; i < pc.S; i += 128u) {
+        O[base + i] = Y[base + i] * inv * GAMMA[i] * breccia_sigmoid(Z[base + i]);
+    }
+}

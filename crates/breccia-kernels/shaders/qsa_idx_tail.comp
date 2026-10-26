@@ -1,0 +1,52 @@
+#version 450
+//
+// QSA indexer key cache — the RAW tail.
+//
+// The indexer keeps one **pooled** key per 4-cell block (`qsa_idx_pool.comp`) and
+// only the three raw keys of the block currently being filled, because the cell
+// that completes a block arrives in registers on the completion step
+// (`ST/include/strata/kernels/qsa.hpp:197-237`, `qsa.cu:169-220`). Raw keys are
+// never normed and never rotated (`qwen4exp.cpp:756-792`).
+//
+//   tail[slot][d] = raw key of the cell at `cell % idx_block == slot`, slot < 3,
+//                   for the **last, incomplete** block of the call
+//
+// Only the cells of the final partial block are written, which is both correct
+// and the only race-free choice: the block before it is already pooled and the
+// block after it has not started, so those are the only keys the next call can
+// still need. (Writing every cell of the call would be a data race whenever a
+// chunk spans more than one block, with two invocations targeting the same slot
+// and no ordering between them.) The completion trigger (`slot == idx_block-1`)
+// is never stored: that key arrives in registers on the pooling step.
+//
+// One invocation per (token, dim).
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer RawVec { float RAW[]; }; // [T, idx_dim]
+layout(std430, binding = 1) buffer TailVec { float TAIL[]; }; // [idx_block-1, idx_dim]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    int pos0;
+    uint idx_dim;
+    uint idx_block;
+} pc;
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint i = wg * 128u + gl_LocalInvocationID.x;
+    if (i >= pc.tokens * pc.idx_dim) {
+        return;
+    }
+    uint d = i % pc.idx_dim;
+    uint t = i / pc.idx_dim;
+    uint cell = uint(int(pc.pos0) + int(t));
+    uint last_cell = uint(int(pc.pos0) + int(pc.tokens) - 1);
+    uint slot = cell % pc.idx_block;
+    if (cell / pc.idx_block == last_cell / pc.idx_block && slot + 1u < pc.idx_block) {
+        TAIL[slot * pc.idx_dim + d] = RAW[i];
+    }
+}

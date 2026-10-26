@@ -560,11 +560,14 @@ fn hc_mixer_matches_the_cpu_reference() {
             );
             let mut inject_rel = 0.0;
             if with_inject {
-                let got_inject = ops::download_f32(gpu, &ws.inject, hc * tokens).expect("inject");
+                // The `inject` projection is folded into the gated-mean dispatch,
+                // so the workspace holds one partial per 256-wide chunk; the host
+                // helper sums them exactly as `HcWrite` does on the device.
+                let got_inject = mixer.inject_values(gpu, &ws).expect("inject");
                 inject_rel = max_rel(&got_inject, &as_f64(&want_inject));
                 assert!(
                     inject_rel <= 1e-5,
-                    "hc read (T={tokens}): inject max rel {inject_rel:e}"
+                    "hc read (T={tokens}): inject max rel {inject_rel:e} got {got_inject:?} want {want_inject:?}"
                 );
             }
 

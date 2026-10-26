@@ -1,9 +1,14 @@
 #version 450
 //
-// HC_READ tail: the gated mean over the hyper-connection streams.
+// HC_READ tail: the gated mean over the hyper-connection streams, **and** the
+// four `inject` dot products folded into the same pass.
 //
 //   gated[c][d] = xn[c][d] * sigmoid(gate[c][d])
-//   mixed[d]    = (1/hc) * sum_c gated[c][d]        -> [n_embd]
+//   mixed[d]    = (1/hc) * sum_c gated[c][d]                    -> [n_embd]
+//   inject[c]   = sum_{c',d} xn[c'][d] * w_inject[c][c',d]       -> [hc]
+//                 (a dot over the WHOLE [hc_dim] stack: the tensor is
+//                  `[10240, 4]` in ne order, so row `c` is 10240 wide and mixes
+//                  all four streams — `docs/phase-3/04` §7.1 item 5)
 //
 // (`docs/specs/qwen4exp-architecture.md` §4.1, `LC/src/models/qwen4exp.cpp:313-397`,
 // `ST/include/strata/kernels/gr.hpp:77-124`.)
@@ -13,9 +18,27 @@
 // from the `w_up` projection and `xn` from the grouped RMSNorm, both already
 // `[n_embd, hc, T]`, and nothing else reads `xn * sigmoid(gate)`.
 //
+// # Why `inject` lives here (`docs/phase-3/04` §7.2 item 1)
+//
+// `inject = xn @ w_inject.T` is a 4 x 10240 projection: 82 KiB of BF16 read by a
+// single 8-row workgroup, measured at **21.85 us** on the RX 6950 XT — dispatch
+// latency, not bandwidth, and 36 % of the whole HC_READ chain (2.1 ms/token over
+// the model's 96 HC_READs). `xn` is already being walked here stream by stream
+// for `mixed`, so the same registers produce the four dot products for free.
+//
+// The dot products span all `n_embd` values, but the grid gives one workgroup
+// per 256-element chunk (10 workgroups per token at n_embd = 2560), so each
+// workgroup can only produce a **partial** sum. Rather than add a second
+// dispatch or a float atomic (non-deterministic summation order), the partials
+// are written to `part[t][c][k]` (k = chunk) and `ops_hc_write.comp` — which
+// already reads the four gates once per token — sums the `CHUNKS` partials.
+// Total = one dispatch saved per HC_READ, no ordering assumptions.
+//
 // Layout (GGML `ne` order, fastest axis first):
 //   xn, gate :: [n_embd, hc, T]  -> index = (c + hc*t) * n_embd + d
 //   mixed    :: [n_embd, T]      -> index =  t * n_embd + d
+//   w_inject :: [hc, n_embd]     -> index =  c * n_embd + d   (Bf16 or F32)
+//   part     :: [T, hc, chunks]  -> index = (t * hc + c) * chunks + k
 // One invocation per (token, d), so `n_embd * T` units, wrapped over grid.y.
 //
 // `mean`, not `sum`: §4.1 writes `mean_over_streams(gated)`, which is a divide
@@ -27,17 +50,34 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer XnVec { float XN[]; };
 layout(std430, binding = 1) readonly buffer GateVec { float G[]; };
 layout(std430, binding = 2) writeonly buffer OVec { float O[]; };
+layout(std430, binding = 3) readonly buffer WVec { uint W[]; };
+layout(std430, binding = 4) writeonly buffer PartVec { float P[]; };
 
 layout(push_constant) uniform Params {
-    uint n_embd; // elements per stream
-    uint hc;     // streams to collapse (mean over these)
-    uint tokens; // T
+    uint n_embd;  // elements per stream
+    uint hc;      // streams to collapse (mean over these)
+    uint tokens;  // T
+    uint dt;      // 0 = the inject weight is Bf16 packed (u16 pairs), 1 = F32
+    uint chunks;  // workgroups per token (= n_embd / 256); 0 = no inject
     uint pad0;
+    uint pad1;
+    uint pad2;
 } pc;
 
 #include "ops_math.glsl"
 
 #define WG_X_MAX 65535u
+// The most streams a workgroup caches partials for (hc is 4 in the artifact).
+#define MAX_HC 8u
+
+shared float s_part[MAX_HC][256];
+
+// Bf16 (top 16 bits of an f32) at element index `i` of a packed u16 array.
+float load_bf16(uint i) {
+    uint word = W[i >> 1];
+    uint h = (i & 1u) == 0u ? (word & 0xffffu) : (word >> 16);
+    return uintBitsToFloat(h << 16);
+}
 
 void main() {
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
@@ -47,11 +87,45 @@ void main() {
     }
     uint t = gid / pc.n_embd;
     uint d = gid - t * pc.n_embd;
+    uint tid = gl_LocalInvocationID.x;
 
     float acc = 0.0;
-    for (uint c = 0u; c < pc.hc; ++c) {
+    float xn[MAX_HC];
+    for (uint c = 0u; c < pc.hc && c < MAX_HC; ++c) {
         uint idx = (c + pc.hc * t) * pc.n_embd + d;
-        acc += XN[idx] * breccia_sigmoid(G[idx]);
+        xn[c] = XN[idx];
+        acc += xn[c] * breccia_sigmoid(G[idx]);
     }
     O[t * pc.n_embd + d] = acc / float(pc.hc);
+
+    if (pc.chunks == 0u) {
+        return;
+    }
+    // inject[c_out] mixes every stream: the weight row is `hc_dim` wide.
+    uint hc_dim = pc.hc * pc.n_embd;
+    for (uint c_out = 0u; c_out < pc.hc && c_out < MAX_HC; ++c_out) {
+        float s = 0.0;
+        for (uint c_src = 0u; c_src < pc.hc && c_src < MAX_HC; ++c_src) {
+            uint at = c_out * hc_dim + c_src * pc.n_embd + d;
+            float w = pc.dt == 0u ? load_bf16(at) : uintBitsToFloat(W[at]);
+            s += xn[c_src] * w;
+        }
+        s_part[c_out][tid] = s;
+    }
+    // Reduction over this workgroup's 256 d values, one tree per stream.
+    // `chunks` workgroups per token each write their own partial row, so the
+    // tree only ever spans one chunk (deterministic, no atomics).
+    uint k = wg - t * pc.chunks;
+    barrier();
+    for (uint c = 0u; c < pc.hc && c < MAX_HC; ++c) {
+        for (uint off = 128u; off > 0u; off >>= 1u) {
+            if (tid < off) {
+                s_part[c][tid] += s_part[c][tid + off];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            P[(t * pc.hc + c) * pc.chunks + k] = s_part[c][0];
+        }
+    }
 }

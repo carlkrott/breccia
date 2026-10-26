@@ -1,0 +1,79 @@
+#version 450
+//
+// QSA attention KV cache append: f32 K/V of this call -> paged **f16** cache.
+//
+// # The layout this defines (spec §7 / §12.1, docs/phase-3/05 §7)
+//
+//   k_pool, v_pool :: u32 words, two f16 per word
+//     logical element index = ((page * n_kv_head + kv_head) * PAGE_CELLS + cell_in_page) * head_dim + d
+//     word index            = element index / 2
+//   page_table :: u32 per logical page: logical page -> physical page (identity today,
+//                 a real table as soon as M5 evicts; nothing else assumes identity)
+//
+// so one **16-cell page** of one layer holds `n_kv_head * 16 * 256 * 2 B` for K and
+// the same for V: 16 KiB + 16 KiB = exactly the 2048 B/cell the budget in
+// `docs/phase-3/05` §3 assumes (2 heads x 256 x 2 types x 2 B).
+//
+// `PAGE_CELLS = 16` (not strata's 4) on purpose: it is the granule a paged
+// allocator can move without touching a 4-cell indexer block, it makes the
+// per-page byte count a whole 16 KiB per type, and 16 cells is the smallest
+// granule at which a deferred/streamed fetch is worth starting on the MI50's
+// ~4 MB L2. The indexer's 4-cell blocks are a *score* granule, not a storage one,
+// so the two do not have to agree.
+//
+// f16 arithmetic note: the pool is storage only. Both the store here and the
+// load in `qsa_attn_apply.comp` round-trip through IEEE binary16
+// (`packHalf2x16`/`unpackHalf2x16`), which is the spec's baseline precision
+// (§12.1, spec open question Q8); quantised bodies are an M5 change behind the
+// same page geometry.
+//
+// One invocation per (token, kv_head, d-pair) so each writes exactly one word.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer KPool { uint KP[]; };
+layout(std430, binding = 1) buffer VPool { uint VP[]; };
+layout(std430, binding = 2) readonly buffer PageTable { uint PT[]; };
+layout(std430, binding = 3) readonly buffer KCur { float KC[]; }; // [T, n_kv_head*head_dim]
+layout(std430, binding = 4) readonly buffer VCur { float VC[]; };
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    int pos0;       // sequence position of token 0 of this call
+    uint n_kv_head; // 2
+    uint head_dim;  // 256
+    uint page_cells; // 16
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+#include "f16_storage.glsl"
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint unit = wg * 128u + gl_LocalInvocationID.x;
+    uint pairs = pc.head_dim / 2u;
+    uint total = pc.tokens * pc.n_kv_head * pairs;
+    if (unit >= total) {
+        return;
+    }
+    uint pair = unit % pairs;
+    uint rest = unit / pairs;
+    uint kvh = rest % pc.n_kv_head;
+    uint t = rest / pc.n_kv_head;
+
+    uint cell = uint(int(pc.pos0) + int(t));
+    uint page = PT[cell / pc.page_cells];
+    uint in_page = cell % pc.page_cells;
+    uint word = ((page * pc.n_kv_head + kvh) * pc.page_cells + in_page) * pairs + pair;
+
+    uint src = t * (pc.n_kv_head * pc.head_dim) + kvh * pc.head_dim + pair * 2u;
+    // The engine's own round-to-nearest-even encoding, not `packHalf2x16` (see
+    // f16_storage.glsl: this device's packer truncates, which would bias every
+    // cached |K| and |V| toward zero by up to 1 ulp).
+    KP[word] = breccia_pack_f16x2(KC[src], KC[src + 1u]);
+    VP[word] = breccia_pack_f16x2(VC[src], VC[src + 1u]);
+}

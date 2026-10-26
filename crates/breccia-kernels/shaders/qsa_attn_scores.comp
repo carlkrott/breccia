@@ -1,0 +1,112 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+//
+// QSA attention scores: `s[head][token][slot] = kq_scale * q . k(selected cell)`,
+// with the selection + causal masks applied as `-1e30` (softmax turns that into
+// exactly zero weight, which is the contract in spec §10.4).
+//
+// # What "selected" means here (and why the sparse path is bounded)
+//
+// `qsa_topk.comp` writes, per token, a list of **4-cell indexer block ids** in
+// descending indexer score, plus the incomplete tail block (always selected).
+// Slot `r*4 + k` of that list names cell `ids[r]*4 + k`, so one query touches at
+// most `idx_top_k + idx_block - 1 = 2051` cells (spec §10.4, `qsa.hpp:127-136`)
+// no matter how long the cache is. That is the budget the indexer exists for, and
+// the reason no dense 262144-cell path was built (spec Q5).
+//
+// A slot is dead and gets `-1e30` when
+//   * `r >= count[token]` — the list is shorter than this call's budget, or
+//   * `cell > pos[token]` — causal: a selected block may contain future cells.
+//
+// # Layout
+//
+// `rows = n_head * T` with `row = t*n_head + h`, `cols = slots = 4 * max_blocks`
+// for the call, i.e. a plain row-major matrix the `Softmax` op consumes unchanged.
+//
+// One **subgroup** per (token, head), walking every slot of that row: the query
+// stays in registers for the whole walk, and the 256-wide dot is reduced with
+// `subgroupShuffleXor` — no barriers, and correct on Wave32 (RX, gfx1030) and
+// Wave64 (MI50, gfx906) alike.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QVec { float Q[]; }; // [T, n_head, head_dim]
+layout(std430, binding = 1) readonly buffer KPool { uint KP[]; }; // paged f16 pairs
+layout(std430, binding = 2) readonly buffer PageTable { uint PT[]; };
+layout(std430, binding = 3) readonly buffer Ids { uint IDS[]; }; // [T, max_blocks]
+layout(std430, binding = 4) readonly buffer Counts { uint CNT[]; }; // [T]
+layout(std430, binding = 5) writeonly buffer Scores { float SC[]; }; // [n_head*T, slots]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_head;
+    uint head_dim;
+    uint slots;      // 4 * max_blocks for this call
+    uint id_stride;  // max_blocks (per-token id row length)
+    int pos0;        // sequence position of token 0
+    uint page_cells; // 16
+    uint n_kv_head;  // 2
+} pc;
+
+#define WG_X_MAX 65535u
+#define MASK_DEAD (-1.0e30)
+#define KQ_SCALE 0.0625 // 1/sqrt(256), spec §5.3
+
+#include "f16_storage.glsl"
+
+// One f16 element of the paged cache (`elem` is the element index inside a row).
+float load_half(uint elem) {
+    return breccia_load_f16(KP[elem >> 1], elem);
+}
+
+void main() {
+    uint sg_size = gl_SubgroupSize;
+    uint sg_id = gl_SubgroupID;
+    uint sgs = 256u / sg_size;
+    uint lane = gl_SubgroupInvocationID;
+
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint unit = wg * sgs + sg_id; // one (token, head)
+    uint rows = pc.tokens * pc.n_head;
+    if (unit >= rows) {
+        return;
+    }
+    uint t = unit / pc.n_head;
+    uint h = unit - t * pc.n_head;
+
+    uint count = CNT[t];
+    int pos = pc.pos0 + int(t);
+    uint kvh = h * pc.n_kv_head / pc.n_head;
+    uint q_base = unit * pc.head_dim;
+
+    // The query slice, `head_dim / sg_size` values per lane.
+    uint n_local = pc.head_dim / sg_size;
+    for (uint slot = 0u; slot < pc.slots; ++slot) {
+        uint r = slot / 4u;
+        uint k = slot % 4u;
+        float acc = 0.0;
+        int cell = -1;
+        if (r < count) {
+            cell = int(IDS[t * pc.id_stride + r]) * 4 + int(k);
+            if (cell > pos) {
+                cell = -1;
+            }
+        }
+        if (cell >= 0) {
+            uint page = PT[uint(cell) / pc.page_cells];
+            uint in_page = uint(cell) % pc.page_cells;
+            uint base = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
+                        in_page * pc.head_dim;
+            for (uint m = 0u; m < n_local; ++m) {
+                uint d = lane + m * sg_size;
+                acc += Q[q_base + d] * load_half(base + d);
+            }
+        }
+        for (uint off = sg_size >> 1; off > 0u; off >>= 1u) {
+            acc += subgroupShuffleXor(acc, off);
+        }
+        if (lane == 0u) {
+            SC[unit * pc.slots + slot] = cell >= 0 ? acc * KQ_SCALE : MASK_DEAD;
+        }
+    }
+}

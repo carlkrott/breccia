@@ -52,10 +52,12 @@ pub enum OpKind {
     EmbGather,
     Hc,
     Add,
+    Gdn,
+    Qsa,
 }
 
 impl OpKind {
-    pub const ALL: [OpKind; 8] = [
+    pub const ALL: [OpKind; 10] = [
         OpKind::RmsNorm,
         OpKind::Rope,
         OpKind::SwiGlu,
@@ -64,6 +66,8 @@ impl OpKind {
         OpKind::EmbGather,
         OpKind::Hc,
         OpKind::Add,
+        OpKind::Gdn,
+        OpKind::Qsa,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -76,6 +80,8 @@ impl OpKind {
             OpKind::EmbGather => "emb_gather",
             OpKind::Hc => "hc",
             OpKind::Add => "add",
+            OpKind::Gdn => "gdn",
+            OpKind::Qsa => "qsa",
         }
     }
 
@@ -244,6 +250,8 @@ pub fn run_ops_bench(opts: &OpsBenchOptions) -> Result<OpsReport> {
             OpKind::EmbGather => emb_gather_cells(&dev, &tokens, window, repeats)?,
             OpKind::Hc => hc_cells(&dev, &tokens, window, repeats)?,
             OpKind::Add => add_cells(&dev, &tokens, window, repeats)?,
+            OpKind::Gdn => crate::gdn::bench::gdn_cells(&dev, &tokens, window, repeats)?,
+            OpKind::Qsa => crate::qsa::bench::qsa_cells(&dev, &tokens, window, repeats)?,
         };
         report.cells.append(&mut cells);
     }
@@ -255,21 +263,21 @@ fn best(v: &[f64]) -> f64 {
 }
 
 /// Fold one measured cell's windows into a report row.
-struct Measured {
-    windows: Vec<f64>,
-    iters: u32,
-    used_timestamps: bool,
+pub(crate) struct Measured {
+    pub(crate) windows: Vec<f64>,
+    pub(crate) iters: u32,
+    pub(crate) used_timestamps: bool,
 }
 
 impl Measured {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Measured {
             windows: Vec::new(),
             iters: 0,
             used_timestamps: true,
         }
     }
-    fn push(&mut self, t: crate::gemv::GemvTiming) {
+    pub(crate) fn push(&mut self, t: crate::gemv::GemvTiming) {
         self.windows.push(t.per_iter_s);
         self.iters = t.iters;
         self.used_timestamps &= t.used_timestamps;
@@ -277,7 +285,7 @@ impl Measured {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cell(
+pub(crate) fn cell(
     op: OpKind,
     case: &str,
     tokens: usize,
@@ -601,7 +609,7 @@ fn emb_gather_cells(
 }
 
 /// BF16 bytes for `n` ones (`0x3F80`), the artifact's `hc_*` type.
-fn bf16_ones(n: usize) -> Vec<u8> {
+pub(crate) fn bf16_ones(n: usize) -> Vec<u8> {
     let mut v = Vec::with_capacity(n * 2);
     for _ in 0..n {
         v.extend_from_slice(&0x3f80u16.to_le_bytes());
@@ -667,10 +675,16 @@ fn hc_cells(dev: &Device, tokens: &[usize], window: f64, repeats: usize) -> Resu
                 .run_timed(&r, Some(&norm_w), &ws.xn, MODEL_HC * t, window)?;
             let b = mixer
                 .gated_mean()
-                .run_timed(&ws.xn, &ws.gate, &ws.mixed, t, window)?;
-            let c = mixer
-                .combine()
-                .run_timed(&r, &block, &ws.inject, &out, t, window)?;
+                .run_timed(&ws.xn, &ws.gate, &ws.mixed, &inj_w, &ws.inject, t, window)?;
+            let c = mixer.combine().run_timed(
+                &r,
+                &block,
+                &ws.inject,
+                &out,
+                t,
+                mixer.inject_chunks(),
+                window,
+            )?;
             m.windows.push(a.per_iter_s + b.per_iter_s + c.per_iter_s);
             m.iters = a.iters.min(b.iters).min(c.iters);
             m.used_timestamps = a.used_timestamps && b.used_timestamps && c.used_timestamps;
@@ -687,7 +701,7 @@ fn hc_cells(dev: &Device, tokens: &[usize], window: f64, repeats: usize) -> Resu
         ));
 
         // (c) per-stage breakdown, so the chain total is attributable
-        let mut stage_windows: Vec<Vec<f64>> = vec![Vec::new(); 6];
+        let mut stage_windows: Vec<Vec<f64>> = vec![Vec::new(); HcMixer::STAGES.len()];
         for _ in 0..repeats {
             for (i, t_stage) in mixer
                 .stage_timings(&ws, &r, &weights, window)?
@@ -704,18 +718,19 @@ fn hc_cells(dev: &Device, tokens: &[usize], window: f64, repeats: usize) -> Resu
             (MODEL_HC_LR as u64 * hc_dim as u64 * 2) * t as u64 + (hc_dim * 4) as u64 * t as u64,
             (MODEL_HC_LR * 12) as u64 * t as u64, // act
             (hc_dim as u64 * MODEL_HC_LR as u64 * 2) * t as u64 + (hc_dim * 4) as u64 * t as u64,
-            (hc_dim * 8 + N_EMBD * 4) as u64 * t as u64, // gated
-            (MODEL_HC as u64 * hc_dim as u64 * 2) * t as u64,
+            // gated mean **and** the folded inject projection: `xn` + `gate`
+            // read, `mixed` written, 4 x hc_dim BF16 weight values read once.
+            (hc_dim * 8 + N_EMBD * 4) as u64 * t as u64
+                + (MODEL_HC as u64 * hc_dim as u64 * 2) * t as u64,
         ];
         let stage_macs = [
             (hc_dim) as u64 * t as u64,
             (MODEL_HC_LR as u64 * hc_dim as u64) * t as u64,
             (MODEL_HC_LR) as u64 * t as u64,
             (hc_dim as u64 * MODEL_HC_LR as u64) * t as u64,
-            (hc_dim) as u64 * t as u64,
-            (MODEL_HC as u64 * hc_dim as u64) * t as u64,
+            (hc_dim) as u64 * t as u64 + (MODEL_HC as u64 * hc_dim as u64) * t as u64,
         ];
-        for i in 0..6 {
+        for i in 0..HcMixer::STAGES.len() {
             let m = Measured {
                 windows: stage_windows[i].clone(),
                 iters: 0,

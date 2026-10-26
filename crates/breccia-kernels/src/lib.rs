@@ -17,6 +17,9 @@
 //! | [`dequant_to_f32`] | standalone block dequantiser (same decode path, used by conformance tests and by anything that needs f32 weights) |
 //! | [`GemvBatch`] | one dispatch over N routed experts' blobs (row indirection + per-expert `x`), the MoE decode shape |
 //! | [`ops`] | the elementwise/utility ops the graph needs around the GEMVs: RMSNorm, IMRoPE, SwiGLU, softmax, router top-k, quantised gather, HC mixer, residual add |
+//! | [`gdn`] | the GDN/SSM sublayer (36 layers): conv+SiLU, q/k L2 norm, beta/gate, delta-rule recurrence with in-place state, norm+gate |
+//! | [`qsa`] | the QSA sublayer (12 layers): per-head q norm, paged f16 KV, lightning indexer, top-k selection, masked attention with the output gate |
+//! | [`proj`] | one projection, two dispatch shapes (decode `Gemv` / batched prefill `GemvBatch`) |
 //! | [`reference`] | scalar CPU port of `ggml-quants.c` (decode + dot) used as the conformance oracle |
 //! | [`bench`] | `breccia bench gemv`: throughput vs bytes-read, plus a real-model mode that runs the kernel on an expert tensor straight out of the GGUF mapping |
 //!
@@ -41,8 +44,11 @@
 pub mod batch;
 pub mod bench;
 pub mod device;
+pub mod gdn;
 pub mod gemv;
 pub mod ops;
+pub mod proj;
+pub mod qsa;
 pub mod quant;
 pub mod real;
 pub mod reference;
@@ -51,9 +57,12 @@ pub(crate) mod tables;
 pub use batch::{GemvBatch, XLayout};
 pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
+pub use gdn::{Gdn, GdnProjections, GdnState, GdnWeights, GdnWorkspace};
 pub use gemv::{dequant_to_f32, Accum, Gemv, GemvTiming};
 pub use ops::bench::{run_ops_bench, OpKind, OpsBenchOptions, OpsReport};
 pub use ops::{HcMixer, HcWeights, HcWorkspace, RmsNorm, Rope, RopeTable, Router};
+pub use proj::Proj;
+pub use qsa::{Qsa, QsaProjections, QsaState, QsaWeights, QsaWorkspace};
 pub use quant::QuantType;
 
 #[cfg(test)]

@@ -1,0 +1,60 @@
+#version 450
+//
+// GDN per-v-head scalars: the write strength `beta` and the decay gate.
+//
+//   beta[h] = sigmoid(ssm_beta @ x)                                [h_v]
+//   gate[h] = softplus(ssm_alpha @ x + ssm_dt) * ssm_a             [h_v]
+//   dec[h]  = exp(gate[h])                                         (in gdn_step)
+//
+// (`docs/specs/qwen4exp-architecture.md` §4.2; `LC/src/models/qwen4exp.cpp:1038-1056`;
+//  `delta-net-base.cpp:349` applies `ggml_exp` in the recurrence.)
+//
+// `ssm_a` is the stored `-exp(A_log)` and is NEGATIVE for all 48 heads (verified
+// in the artifact, §14), so `gate < 0` and the decay `exp(gate)` is in (0, 1) —
+// which is why the kernel does not clamp.
+//
+// `softplus` is ggml's: `x > 20 ? x : log1p(exp(x))` (`ggml_softplus_f32`), which
+// keeps `exp` from overflowing at the artifact's `ssm_dt` ceiling (+2.53) and at
+// large alpha. Written as `log(1+exp(x))` for x > 20 is exactly x in f32, so the
+// branch is only about not producing +inf on the way there.
+//
+// Layout: all four vectors are per (token, v-head), `[T, h_v]`, token-major.
+// One invocation per (token, head) producing both outputs.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer AlphaVec { float ALPHA[]; }; // [T,h_v]
+layout(std430, binding = 1) readonly buffer BetaVec { float BETA_IN[]; }; // [T,h_v]
+layout(std430, binding = 2) readonly buffer DtVec { float DT[]; }; // [h_v]
+layout(std430, binding = 3) readonly buffer AVec { float A[]; }; // [h_v]
+layout(std430, binding = 4) writeonly buffer BetaOut { float BETA[]; }; // [T,h_v]
+layout(std430, binding = 5) writeonly buffer GateOut { float GATE[]; }; // [T,h_v]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint h_v;
+    uint pad0;
+    uint pad1;
+} pc;
+
+#include "ops_math.glsl"
+
+#define WG_X_MAX 65535u
+
+float breccia_softplus(float x) {
+    if (x > 20.0) {
+        return x;
+    }
+    return log(1.0 + exp(x));
+}
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint i = wg * 128u + gl_LocalInvocationID.x;
+    if (i >= pc.tokens * pc.h_v) {
+        return;
+    }
+    uint h = i % pc.h_v;
+    BETA[i] = breccia_sigmoid(BETA_IN[i]);
+    GATE[i] = breccia_softplus(ALPHA[i] + DT[h]) * A[h];
+}

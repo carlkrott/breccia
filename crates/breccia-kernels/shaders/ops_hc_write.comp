@@ -16,13 +16,22 @@
 // Layout:
 //   r, out :: [n_embd, hc, T]  -> index = (c + hc*t) * n_embd + d
 //   block  :: [n_embd, T]      -> index =  t * n_embd + d
-//   inject :: [hc, T]          -> index =  t * hc + c
+//   inject :: [T, hc, chunks]  -> index = (t*hc + c)*chunks + k   (`chunks` per-token
+//                                   partial sums from ops_hc_gated_mean.comp)
+//             or [hc, T]       -> index =  t*hc + c              (`chunks == 0`, plain)
 //
 // One workgroup per (token, 256-element chunk) so the `hc` gate values are
 // computed once per token in shared memory instead of once per element.
 //
 // `r` and `out` may be the same buffer (in-place residual update): every element
 // is read and written by exactly one invocation.
+//
+// The `chunks > 0` form consumes the partial dot products that
+// `ops_hc_gated_mean.comp` produced while it was already walking `xn` — that is
+// the fold described in `docs/phase-3/06-attention-gdn.md` (it removes one
+// latency-bound 4x10240 GEMV from every HC_READ). Each of the token's `chunks`
+// workgroups re-sums the same handful of floats, which is cheaper than a
+// dispatch and keeps the sum deterministic and order-fixed.
 
 layout(local_size_x = 256) in;
 
@@ -35,7 +44,7 @@ layout(push_constant) uniform Params {
     uint n_embd;
     uint hc;      // streams (<= 32: the gate cache below is per workgroup)
     uint tokens;
-    uint pad0;
+    uint chunks;  // per-token partials of `inject` (0 = INJ already holds the sums)
 } pc;
 
 #include "ops_math.glsl"
@@ -49,7 +58,16 @@ void main() {
         return;
     }
     if (tid < pc.hc && tid < 32u) {
-        s_w[tid] = 2.0 * breccia_sigmoid(INJ[t * pc.hc + tid] / float(pc.hc));
+        float inj;
+        if (pc.chunks == 0u) {
+            inj = INJ[t * pc.hc + tid];
+        } else {
+            inj = 0.0;
+            for (uint k = 0u; k < pc.chunks; ++k) {
+                inj += INJ[(t * pc.hc + tid) * pc.chunks + k];
+            }
+        }
+        s_w[tid] = 2.0 * breccia_sigmoid(inj / float(pc.hc));
     }
     barrier();
 

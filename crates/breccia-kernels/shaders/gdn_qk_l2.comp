@@ -1,0 +1,80 @@
+#version 450
+//
+// GDN L2 normalisation of the convolved q and k (NOT v), with the two scales the
+// reference folds in.
+//
+//   q[h][:] = x / sqrt(sum_i x[i]^2 + eps) * (1/S)          (delta-rule scale)
+//   k[h][:] = x / sqrt(sum_i x[i]^2 + eps) * (1/sqrt(S))
+//
+// Sources:
+//
+//  * `build_gdn_l2_norm` (`LC/src/models/models.h:14-18`) = `rms_norm(x, eps/n)` then
+//    `* 1/sqrt(n)`, which algebraically is `x / sqrt(sum(x^2) + eps)` — the `+eps`
+//    is an absolute floor on the SQUARED NORM, not on the mean
+//    (`ST/include/strata/kernels/gdn.hpp:70-79`). Using `mean` instead would be a
+//    11.3x error at S = 128.
+//  * the delta rule scales q by `1/sqrt(S_k)` (`delta-net-base.cpp:316-318`,
+//    `ST/include/strata/kernels/gdn.hpp:44-48`), so q carries BOTH factors and k
+//    only the L2 one.
+//
+// v is deliberately not normalised (§4.2: "l2_normalize(h_q), l2_normalize(h_k)
+// // v is NOT normalised").
+//
+// Layout: `qkv` is the concatenated projection output `[T, C]` with
+// C = 2*h_k*S + h_v*S and, per token, `q (h_k*S) | k (h_k*S) | v (h_v*S)`.
+// One workgroup (S threads) per (token, q-or-k head); `S = 128` in the artifact
+// so one wave covers a row. In place.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer Qkv { float QKV[]; };
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint h_k;      // 16 key/query heads
+    uint S;        // 128, the head width
+    float eps;     // 1e-6, added to the raw sum of squares
+    uint channels; // C = 2*h_k*S + h_v*S
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+#define WG_X_MAX 65535u
+
+shared float red[128];
+
+void main() {
+    // unit = (token, half, head): half 0 = q, half 1 = k
+    uint unit = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint per_token = pc.h_k * 2u;
+    uint t = unit / per_token;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint r = unit - t * per_token;
+    uint base = t * pc.channels + r * pc.S;
+    uint tid = gl_LocalInvocationID.x;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.S; i += 128u) {
+        float v = QKV[base + i];
+        ss += v * v;
+    }
+    // 128-wide tree reduction in shared memory (deterministic).
+    red[tid] = ss;
+    barrier();
+    for (uint off = 64u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            red[tid] += red[tid + off];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(red[0] + pc.eps);
+    // q additionally carries the delta-rule 1/sqrt(S); S is the head width, so
+    // the two factors together are 1/S.
+    float scale = r < pc.h_k ? inv / float(pc.S) : inv * inversesqrt(float(pc.S));
+    for (uint i = tid; i < pc.S; i += 128u) {
+        QKV[base + i] *= scale;
+    }
+}

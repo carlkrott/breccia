@@ -88,6 +88,21 @@ const SHADERS: &[&str] = &[
     "ops_gather_f16",
     "ops_gather_bf16",
     "ops_gather_f32",
+    // GDN / SSM step (`src/gdn`, docs/phase-3/06-attention-gdn.md).
+    "gdn_conv",
+    "gdn_qk_l2",
+    "gdn_gate",
+    "gdn_step",
+    "gdn_norm_gate",
+    // QSA attention + lightning indexer (`src/qsa`, docs/phase-3/06).
+    "qsa_q_norm",
+    "qsa_kv_append",
+    "qsa_idx_tail",
+    "qsa_idx_pool",
+    "qsa_idx_score",
+    "qsa_topk",
+    "qsa_attn_scores",
+    "qsa_attn_apply",
 ];
 
 fn main() {

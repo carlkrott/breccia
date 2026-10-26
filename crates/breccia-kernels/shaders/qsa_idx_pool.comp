@@ -1,0 +1,107 @@
+#version 450
+//
+// QSA indexer key cache — block pooling, one workgroup per completed block.
+//
+//   pooled[b] = imrope( rmsnorm( mean(raw[4b .. 4b+3]), indexer.k_norm ), pos = 4b )
+//
+// (`ST/include/strata/kernels/qsa.hpp:202-233`, `qsa.cu:158-245`,
+//  `LC/src/models/qwen4exp.cpp:756-792`.)
+//
+// Three details pinned by the references and reproduced here:
+//
+//  * the mean is taken over the RAW keys, **before** the norm and the rotation;
+//  * the rotation position is the block's **first** cell (`4b`), not its last —
+//    `ref/qsa.py` PROPERTY 4, and rotating at the last cell keeps every shape and
+//    every magnitude, so it fails silently;
+//  * a block's four cells may straddle the call boundary (the first completing
+//    block of a prefill chunk usually does), so each cell is sourced either from
+//    the raw tail (`cell < pos0`, slot = cell % 4 < 3 by construction) or from
+//    this call's raw rows (`cell >= pos0`). The host asserts the tail-source
+//    case never asks for slot 3, which cannot hold a key.
+//
+// The rotation is the same NEOX pairing as `ops_rope.comp` (`(j, j + n_rot/2)`),
+// applied here rather than by a second `Rope` dispatch because only *some* rows
+// of `pooled` are written per call: running the op over the whole buffer would
+// re-rotate the rows written by earlier calls. A unit test holds this pairing to
+// `ops::cpu::rope_apply` on the same inputs.
+//
+// Workgroup = 128 threads = one per indexer dim; the 4-cell mean and the
+// 128-wide sum of squares are shared-memory reductions.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer RawVec { float RAW[]; }; // [T, idx_dim]
+layout(std430, binding = 1) readonly buffer TailVec { float TAIL[]; }; // [idx_block-1, idx_dim]
+layout(std430, binding = 2) readonly buffer GammaVec { float GAMMA[]; }; // [idx_dim]
+layout(std430, binding = 3) readonly buffer RopeVec { float CS[]; }; // [max_pos, n_rot/2, 2]
+layout(std430, binding = 4) buffer PooledVec { float POOLED[]; }; // [max_blocks+1, idx_dim]
+
+layout(push_constant) uniform Params {
+    uint n_new;    // blocks completed by this call
+    uint b0;       // first completed block index
+    int pos0;      // position of this call's first token
+    uint tokens;
+    uint idx_block; // 4
+    uint idx_dim;   // 128
+    uint n_rot;     // 64 rotated dims of the 128
+    float eps;      // 1e-6, the model's RMSNorm epsilon
+} pc;
+
+#define WG_X_MAX 65535u
+shared float s_val[128];
+
+shared float s_sum[128];
+
+void main() {
+    uint b = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (b >= pc.n_new) {
+        return;
+    }
+    uint block = pc.b0 + b;
+    uint tid = gl_LocalInvocationID.x;
+    float mean = 0.0;
+    for (uint k = 0u; k < pc.idx_block; ++k) {
+        int cell = int(block * pc.idx_block + k);
+        int slot = cell - pc.pos0;
+        float v = 0.0;
+        if (slot >= 0 && uint(slot) < pc.tokens) {
+            v = RAW[uint(slot) * pc.idx_dim + tid];
+        } else {
+            uint tail_slot = uint(cell) % pc.idx_block;
+            if (tail_slot + 1u < pc.idx_block) {
+                v = TAIL[tail_slot * pc.idx_dim + tid];
+            }
+        }
+        mean += v;
+    }
+    mean /= float(pc.idx_block);
+
+    s_sum[tid] = mean * mean;
+    barrier();
+    for (uint off = 64u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_sum[tid] += s_sum[tid + off];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(s_sum[0] / float(pc.idx_dim) + pc.eps);
+    s_val[tid] = mean * inv * GAMMA[tid];
+    barrier();
+
+    // NEOX pairs (j, j + n_rot/2), rotation at the block's first cell.
+    uint pairs = pc.n_rot / 2u;
+    if (tid < pairs) {
+        uint tpos = pc.idx_block * block;
+        float c = CS[(tpos * pairs + tid) * 2u];
+        float s = CS[(tpos * pairs + tid) * 2u + 1u];
+        float a = s_val[tid];
+        float bb = s_val[tid + pairs];
+        uint at = block * pc.idx_dim;
+        POOLED[at + tid] = a * c - bb * s;
+        POOLED[at + tid + pairs] = a * s + bb * c;
+    }
+    barrier();
+    if (tid >= pc.n_rot && tid < pc.idx_dim) {
+        POOLED[block * pc.idx_dim + tid] = s_val[tid];
+    }
+}

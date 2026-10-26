@@ -1,0 +1,91 @@
+#version 450
+//
+// QSA lightning indexer — block scores.
+//
+//   score[t][b] = (1/sqrt(idx_dim)) * sum_{h<idx_n_head} relu( q[h] . pooled[b] )
+//
+// (`docs/specs/qwen4exp-architecture.md` §10.3; `qsa.cu:276-289`;
+//  `LC/src/models/qwen4exp.cpp:794-811` + `ggml_lightning_indexer`.)
+//
+// The per-head weight is the constant `1/sqrt(idx_dim)` that llama.cpp fills the
+// weights tensor with (`qwen4exp.cpp:802-805`) rather than a learned vector —
+// i.e. the general lightning indexer with every head weight set to that scale.
+// strata sums the raw dots and adds `+1e9` to the incomplete tail instead
+// (spec open question Q4). The two rank identically (a constant positive factor
+// cannot reorder, and both pin the tail), so this is a documented choice, not an
+// ambiguity that can change the selection.
+//
+// A block whose first cell is beyond the query's position is dead (`-1e30`): the
+// block set is shared by every token of the call, but a token may not see a block
+// that only holds future cells.
+//
+// One workgroup (128 threads = one per indexer dim) per (token, block):
+// `idx_n_head = 4` independent 128-dots, reduced in shared memory, then summed
+// with the ReLU.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer QVec { float Q[]; }; // [T, idx_n_head, idx_dim]
+layout(std430, binding = 1) readonly buffer PooledVec { float POOLED[]; }; // [blocks, idx_dim]
+layout(std430, binding = 2) writeonly buffer Scores { float SC[]; }; // [T, n_blocks]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_blocks;
+    uint idx_n_head; // 4
+    uint idx_dim;    // 128
+    int pos0;
+    uint idx_block;  // 4
+    float scale;     // 1/sqrt(idx_dim)
+    uint pad0;
+} pc;
+
+#define WG_X_MAX 65535u
+#define MAX_IDX_HEAD 8u
+#define MASK_DEAD (-1.0e30)
+
+shared float s_acc[MAX_IDX_HEAD][128];
+
+void main() {
+    uint unit = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint total = pc.tokens * pc.n_blocks;
+    if (unit >= total) {
+        return;
+    }
+    uint t = unit / pc.n_blocks;
+    uint b = unit - t * pc.n_blocks;
+    uint tid = gl_LocalInvocationID.x;
+    int pos = pc.pos0 + int(t);
+
+    if (int(b * pc.idx_block) > pos) {
+        if (tid == 0u) {
+            SC[t * pc.n_blocks + b] = MASK_DEAD;
+        }
+        return;
+    }
+
+    for (uint h = 0u; h < pc.idx_n_head && h < MAX_IDX_HEAD; ++h) {
+        s_acc[h][tid] = Q[(t * pc.idx_n_head + h) * pc.idx_dim + tid] *
+                        POOLED[b * pc.idx_dim + tid];
+    }
+    barrier();
+    for (uint h = 0u; h < pc.idx_n_head && h < MAX_IDX_HEAD; ++h) {
+        for (uint off = 64u; off > 0u; off >>= 1u) {
+            if (tid < off) {
+                s_acc[h][tid] += s_acc[h][tid + off];
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            s_acc[h][0] = max(s_acc[h][0], 0.0);
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        float sum = 0.0;
+        for (uint h = 0u; h < pc.idx_n_head && h < MAX_IDX_HEAD; ++h) {
+            sum += s_acc[h][0];
+        }
+        SC[t * pc.n_blocks + b] = sum * pc.scale;
+    }
+}

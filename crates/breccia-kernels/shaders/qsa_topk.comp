@@ -1,0 +1,126 @@
+#version 450
+//
+// QSA lightning indexer — top-k block selection, one workgroup per token.
+//
+// Produces the selection list the attention kernel walks:
+//
+//   ids[0 .. count-1] = the `min(n_blocks, idx_top_k / idx_block)` highest-scoring
+//                       4-cell blocks that are visible to this query, in
+//                       DESCENDING score, plus the query's **own** block
+//                       (`pos / idx_block`) if the selection did not already
+//                       contain it.
+//
+// # Budget
+//
+// `idx_top_k = 2048` cells of whole blocks (`2048/4 = 512` blocks) + up to 3 cells
+// of the query's own, still-filling block = the spec's 2051-cell width
+// (`qsa.hpp:127-136`: `width = min(n_kv, idx_top_k + idx_block - 1)`). Below 2051
+// cells every block is selected, so the layer degenerates to dense causal
+// attention — the identity behaviour the spec requires (§10.4).
+//
+// The own-block rule is per **token**, not per call: in a prefill chunk the tokens
+// sit in different blocks, and for a token early in the chunk its block may not
+// even be complete. Two consequences pinned by the conformance test:
+//   * the block containing the query is always in the list, so a query can always
+//     attend to itself (that is what the spec's `+ idx_block - 1` cells are for);
+//   * it is appended only if the score selection did not already pick it, so no
+//     cell is ever counted twice (a duplicated block would double-weight its four
+//     cells in the softmax).
+//
+// # Tie-break (documented, and the reason this is a selection loop)
+//
+// Equal scores resolve to the **lower block index**, i.e. descending-score with
+// ascending-index ties — the same rule `ops_router.comp` uses for the MoE top-10
+// and the one strata's numpy-style argsort gives (`qsa.cu:293-400`). Selection is
+// strict-greater so a tie can never displace an earlier block, and the emitted
+// order is therefore deterministic and reproducible cell-for-cell against the
+// CPU reference in `src/qsa/cpu.rs`.
+//
+// The loop is `k` block-wide argmax passes over the row (k <= 512): O(k*n_blocks)
+// compares with no atomics and no reordering. `docs/phase-3/06` §open items lists
+// the radix-select replacement, needed only once n_blocks reaches the 65536 of a
+// full 262144-token cache.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) buffer Scores { float SC[]; }; // [T, n_blocks], destroyed
+layout(std430, binding = 1) buffer Ids { uint IDS[]; }; // [T, max_ids]
+layout(std430, binding = 2) writeonly buffer Counts { uint CNT[]; }; // [T]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_blocks;
+    uint topk_blocks; // 512
+    uint max_ids;     // per-token id row length (>= topk_blocks + 1)
+    int pos0;         // sequence position of token 0 of this call
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+#define WG_X_MAX 65535u
+#define MASK_DEAD (-1.0e30)
+#define NONE 0xffffffffu
+
+shared float s_s[256];
+shared uint s_i[256];
+
+void main() {
+    uint t = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = t * pc.n_blocks;
+    uint want = min(pc.n_blocks, pc.topk_blocks);
+    uint count = 0u;
+
+    for (uint r = 0u; r < want; ++r) {
+        float bs = MASK_DEAD;
+        uint bi = NONE;
+        for (uint b = tid; b < pc.n_blocks; b += 256u) {
+            float s = SC[base + b];
+            if (s > bs || (s == bs && b < bi)) {
+                bs = s;
+                bi = b;
+            }
+        }
+        s_s[tid] = bs;
+        s_i[tid] = bi;
+        barrier();
+        for (uint off = 128u; off > 0u; off >>= 1u) {
+            if (tid < off) {
+                float os = s_s[tid + off];
+                uint oi = s_i[tid + off];
+                if (os > s_s[tid] || (os == s_s[tid] && oi < s_i[tid])) {
+                    s_s[tid] = os;
+                    s_i[tid] = oi;
+                }
+            }
+            barrier();
+        }
+        if (s_s[0] <= -1.0e29) {
+            break; // nothing visible left
+        }
+        if (tid == 0u) {
+            IDS[t * pc.max_ids + count] = s_i[0];
+            SC[base + s_i[0]] = MASK_DEAD;
+        }
+        count += 1u;
+        barrier();
+    }
+
+    // The query's own block, appended only when the selection missed it.
+    if (tid == 0u) {
+        uint own = uint(pc.pos0 + int(t)) / 4u;
+        bool present = false;
+        for (uint i = 0u; i < count; ++i) {
+            present = present || (IDS[t * pc.max_ids + i] == own);
+        }
+        if (!present && count < pc.max_ids) {
+            IDS[t * pc.max_ids + count] = own;
+            count += 1u;
+        }
+        CNT[t] = count;
+    }
+}
