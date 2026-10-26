@@ -71,6 +71,16 @@ Each implementation/test round should carry **several independent improvements**
 - Every grouped item still needs: its own before/after number, the parity gate (bit-identical where applicable), and a revert path (flag or patch) if it does not pay.
 - Research findings from the paired research subagent are folded into the same round where they are independent, so a round typically lands: 1 big item + 2–3 small independent items + 1 research-driven experiment.
 
+## Fast iteration (benchmark hygiene, 2026-10-26)
+
+Small changes are measured in **seconds, not tens of minutes**. Every sweep is timeboxed.
+
+- **Default measurement = short form**: prefill throughput from a **64-token prefix** (the first minute of work is representative); decode from **8–16 generated steps**; per-kernel numbers from unit benches (µs/ms), never end-to-end.
+- **Long runs are reserved for**: real long-context prefill validation (4K–32K tokens) and final gate evidence. Nothing else needs a multi-minute workload.
+- **A/B/A inside one pass** (baseline → change → baseline in the same short window) instead of repeated full sweeps; page-cache drift is handled by alternation.
+- **Kill and conclude**: if a sweep shows the same sign after ~2 minutes of data, stop it and act. A negative result already visible does not need more cells.
+- New bench modes must offer short forms and print a per-phase summary so a run can be abandoned early with usable data.
+
 ## Git
 
 See `docs/GIT-WORKFLOW.md`. Remote exists and is **public** (`origin` = github.com/carlkrott/breccia); push to `main` after `scripts/verify.sh` passes. Making the repo public was explicitly approved on 2026-10-26; publishing anything else (releases, packages, other remotes) still needs a fresh gate.
