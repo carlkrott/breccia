@@ -63,7 +63,8 @@ fn multi_user_gemm_matches_the_single_user_gemv() {
     };
     let layout = set.layout().expect("layout");
     // Every (block, role) whose type has a multi-user kernel: the delivered set
-    // covers `down` (IQ4_NL, Q2_0) and `gate`/`up` (IQ2_*, IQ3_*).
+    // covers `down` (IQ4_NL, Q2_0) and `gate`/`up` (IQ2_*, IQ3_*, and since §8aa
+    // also IQ4_XS, Q4_K, Q5_K, Q6_K — the shared expert's types).
     let mut cells: Vec<(usize, ExpertRole, QuantType)> = Vec::new();
     for block in layout.blocks() {
         let plan = LayerPlan::from_block(&set, block).expect("plan");
@@ -78,12 +79,16 @@ fn multi_user_gemm_matches_the_single_user_gemv() {
                     | QuantType::Iq2S
                     | QuantType::Iq3Xxs
                     | QuantType::Iq3S
+                    | QuantType::Iq4Xs
+                    | QuantType::Q4K
+                    | QuantType::Q5K
+                    | QuantType::Q6K
             ) && !cells.iter().any(|c| c.1 == role && c.2 == ty)
             {
                 cells.push((plan.block, role, ty));
             }
         }
-        if cells.len() >= 6 {
+        if cells.len() >= 24 {
             break;
         }
     }

@@ -2271,6 +2271,48 @@ alone, failed in the suite. Both now take a `HOST_LOCK` mutex around the
   against 67-84 resident; ring depth to be derived from the measured record/step
   ratio).
 
+## 8aa. The four extra multi-user GEMMs compile; barrier pruning is parked; the shared-expert pass is not wired
+
+A short round with one partial delivery, one park and one honest gap. **Parity at
+the end of the round is unchanged**: chunk 128 + merged 32/32, top-1 13.170561.
+
+### 1. Four more multi-user GEMMs (`IQ4_XS`, `Q4_K`, `Q5_K`, `Q6_K`)
+
+`shaders/gemm_{iq4_xs,q4_k,q5_k,q6_k}.comp` are the 14-line form the pattern asks
+for (`QK 256`, `BLOCK_WORDS 68/72/88/105`, `DEQUANT_UNIT
+dequant_{iq4_xs,q4_k,q5_k,q6_k}_unit` over the unchanged `gemm_body.glsl`), wired
+into `build.rs` and `GemmMany::new`, so `PipelineSet::gemm` now caches **eleven**
+types instead of seven. **They are not validated yet**, and the reason matters: the
+`gemm_many` test walks *routed-expert* plans, and this artifact's routed experts are
+only `IQ2_*/IQ3_*/IQ4_NL/Q2_0` — the four new types appear on the **shared** expert
+(`ffn_{gate,up,down}_shexp`), which has no `LayerPlan`. So the kernels compile,
+dispatch and pass validation, but there is **no bit-identity claim** until a test
+builds them from a dense tensor (next round's first job, its own `GemmMany` vs
+`Gemv` comparison).
+
+### 2. The shared-expert T-batch: not wired
+
+It needs a chunk-level shape that does not exist yet: `mixed` for all `T` tokens in
+one buffer (the merged pass builds it, the plain chunk path does not), `gate`/`up`
+outputs as `[T, n_ff]`, one fused SwiGLU, `down` as a second GEMM, and the ffn
+`HC_WRITE` consuming `[T, n_embd]`. That is a restructure of `record_dense_prelude`
+for **every** block, not just the merged ones, so it is queued rather than rushed —
+the stage table that ranks it is §8z (`shared-exp` 20.9-55.3 ms/token chunked
+against 15.4 token-by-token).
+
+### 3. Barrier pruning: parked, and nothing unsafe is reachable
+
+`batch_cmd::skip_next_barrier` is now a **documented no-op** (the call sites remain
+as a map of the independent pairs). Re-arming it requires per-dispatch dependency
+bookkeeping; a call-site annotation cannot express it, and the ceiling (0.98 ms RX /
+4.32 ms MI50 of the GPU half) does not justify that work ahead of the shared expert.
+
+### 4. Not landed
+
+Token-major PLE read (`--ple-threads`) and async expert prefetch `e+1`: unchanged.
+The PLE design is §8z's (4320 contiguous bytes per token, 8-16 gather threads, host
+RAM, persistent maps).
+
 ## 9. Exact commands
 
 

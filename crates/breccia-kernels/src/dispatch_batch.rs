@@ -212,17 +212,17 @@ pub fn shutdown() -> Result<()> {
 /// in-place), which is why pruning is declared per call site
 /// (`docs/phase-4/01-forward-pass.md` §8z).
 pub fn skip_next_barrier() {
-    // **Opt-in only.** This is measured and *not* shippable yet: with it on, the
-    // parity gate reads 20/32 at chunk 0 and a wrong top-1 logit at chunk 128, so
-    // at least one of the three "independent" pairs is not one — a call that
-    // records several dispatches (the split-K forms) consumes the flag on its
-    // *first* dispatch and drops a fence the reduction needs. Recorded in §8z as a
-    // negative result; `BRECCIA_BARRIER_PRUNE=1` re-arms it for whoever fixes the
-    // bookkeeping (a per-dispatch dependency graph, not a call-site annotation).
-    if std::env::var_os("BRECCIA_BARRIER_PRUNE").is_none() {
-        return;
-    }
-    SKIP_BARRIER.with(|c| c.set(true));
+    // PARKED (§8z/§8aa). Measured, and it failed its own parity gate: with the
+    // flag armed the gate read 20/32 at chunk 0 and a wrong top-1 logit at chunk
+    // 128, because a *call site* is not a *dispatch* — the split-K forms record
+    // several dispatches per `run`, so the flag is consumed by the first of them
+    // and the reduction loses its fence. Re-arming it needs per-dispatch
+    // dependency bookkeeping (each kernel declaring its reads and writes), not a
+    // call-site annotation. The measured ceiling is small anyway: 0.98 ms (RX) /
+    // 4.32 ms (MI50) of the GPU half for ~1 100 pruned barriers, which sits under
+    // this box's CPU-contention noise. Kept as a no-op so the call sites document
+    // where the independent pairs are, and so nothing unsafe is reachable.
+    let _ = SKIP_BARRIER.with(|c| c.replace(false));
 }
 
 /// Is a batch open on this thread (on any device)?
