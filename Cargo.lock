@@ -110,6 +110,7 @@ name = "breccia-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "breccia-flags",
  "breccia-profile",
  "clap",
  "serde",
