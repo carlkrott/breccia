@@ -77,6 +77,10 @@ layout(push_constant) uniform Params {
     uint cols;   // row length in elements
     uint bpr;    // blocks per row = ceil(cols / QK)
     uint splits; // split-K factor (1 = single pass, result written directly)
+    // 5th word, multi-user GEMM only (§8v): the expert's blob offset inside the
+    // resident arena, in 16-bit words. The GEMV dispatches push 16 bytes and never
+    // read it; the multi-user GEMM pushes 20.
+    uint base;
 } pc;
 #endif
 

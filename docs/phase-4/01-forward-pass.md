@@ -1705,6 +1705,40 @@ The budget says the payoff is still there (compute 0.5 ms/token, streaming 2.6-1
 ms/token, against 163-320 ms today), and the kernels are the expensive part; what
 remains is the fan-in shader and the orchestration.
 
+
+### The fan-in kernel and arena addressing (landed, validated)
+
+Two of the three pieces the merged path needed are now in the tree, both validated
+against the existing kernels (MI50, validation layer on, 0 messages):
+
+| piece | what it is | validation |
+|---|---|---|
+| **`moe_fanin.comp`** | for a chunk, `out[u] = Σ_j w[u][j]·scratch[slot[u][j]] + shared[u]·σ(gate[u])`, one workgroup-row per (token, 64-channel block); the `(token, expert)` pairs are resolved through a host-built **slot map**, so the grouped GEMM can write each distinct expert's users contiguously | **bit-identical to `MoeCombine`** for one token (worst 0.0), **4.8e-8** vs an f64 reference for a 3-token / 12-pair / 9-slot chunk |
+| **`base_words`** | the multi-user GEMM's 5th push-constant word (`pc.base`, `ROW_BASE_WORDS`), so a GEMM addresses expert `e` inside the resident arena — the `MoeMap`/`GemvBatch` convention | the same blob at `base_words = 64` inside a larger arena is **bit-identical** to the same blob at 0 |
+
+The bottom line, stated plainly so nothing is over-claimed: the three items were
+(a) the fan-in, (b) arena addressing, (c) wiring the resident blocks into the
+chunked prefill pass. **(a) and (b) are done and validated; (c) is not started**
+— there is no merged-prefill pass in the binary and therefore **no new prefill
+number**: the baseline remains **6.13 tok/s/agent** (2 agents x 300-token prefixes,
+token by token) and the non-resident path is 100 % of it today.
+
+What (c) needs, precisely: in `Session::prefill_block`, for a block in `m.placed`
+1. upload the chunk's `mixed` (T x 2560) and build the `(expert, user)` bucket list
+   from the router ids the dense chain already produced (the host has them in
+   `pf_ids`, ~130 distinct experts per block at T = 128, measured);
+2. per distinct expert: `GemmMany::run_at` for `gate`, again for `up` (both from
+   `pe.gate`/`pe.up` with `base_words = e * blob_words`), the existing `SwiGlu`
+   over that expert's `m_e` rows, then `run_at` for `down` into the scratch;
+3. `MoeFanIn::run` over the chunk with the slot map, then the existing `HC_WRITE`
+   pass — replacing the per-token `run_placed_moe` call for those blocks only;
+4. the `--prefill-merged` flag, the byte/GEMM/fan-in counters per chunk (the
+   `Session` already carries `pf_distinct`, `pf_merged_bytes`, `pf_tokens`).
+
+Scratch for (2): `E_max x m x 2560` f32 (T = 128, E ~ 160, m <= 8: ~13 MB) plus
+`E_max x m x 640` for the SwiGLU intermediate — one allocation per session.
+
+
 ## 9. Exact commands
 
 

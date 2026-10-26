@@ -114,3 +114,53 @@ impl<'g> MoeCombine<'g> {
             .run(&[down, weights, shared, gate_logit, out], &pc, (gx, gy, 1))
     }
 }
+
+/// Chunked-prefill fan-in: `out[u] = Σ_j w[u][j]·scratch[slot[u][j]] + shared[u]·σ(gate[u])`
+/// for every token of a chunk (§8v).
+///
+/// The grouped GEMM writes each distinct expert's users contiguously, so the
+/// `(token, expert)` pairs are resolved through a host-built `slots` map — the same
+/// algebra [`MoeCombine`] does for one token, with the pair list made explicit.
+pub struct MoeFanIn<'g> {
+    pipe: Pipe<'g>,
+}
+
+impl<'g> MoeFanIn<'g> {
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Ok(MoeFanIn {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/moe_fanin.spv")),
+                6,
+                "moe fan-in",
+            )?,
+        })
+    }
+
+    /// `scratch` is `[slots, cols]`, `slots`/`weights` are `[tokens, k]`, `shared`
+    /// `[tokens, cols]`, `gate` `[tokens]`, `out` `[tokens, cols]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        scratch: &Buf,
+        slots: &Buf,
+        weights: &Buf,
+        shared: &Buf,
+        gate: &Buf,
+        out: &Buf,
+        tokens: usize,
+        k: usize,
+        cols: usize,
+    ) -> Result<()> {
+        if tokens == 0 || k == 0 || cols == 0 {
+            return Err(anyhow!("moe fan-in needs tokens, k and cols > 0"));
+        }
+        let pc = Pc::new().u(cols as u32).u(k as u32).u(tokens as u32);
+        let gx = cols.div_ceil(64).max(1) as u32;
+        self.pipe.run(
+            &[scratch, slots, weights, shared, gate, out],
+            &pc,
+            (gx, tokens as u32, 1),
+        )
+    }
+}

@@ -1,0 +1,44 @@
+#version 450
+//
+// Chunked-prefill MoE fan-in (§8v): for every token of a chunk, gather its own
+// top-k expert outputs out of the grouped GEMM scratch and accumulate
+//   out[u][c] = sum_j w[u][j] * scratch[slot[u][j]][c] + shared[u][c] * sigmoid(gate[u])
+// — the same algebra `moe_combine.comp` does for one token, with the (token, expert)
+// pairs resolved through a slot map so the merged GEMM can write each distinct
+// expert's users contiguously.
+//
+// Bindings: 0 scratch (slots x cols f32, user-major inside each slot), 1 slots
+// (tokens x k u32), 2 weights (tokens x k f32), 3 shared (tokens x cols f32),
+// 4 gate (tokens f32), 5 out (tokens x cols f32).
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Scratch { float S[]; };
+layout(std430, binding = 1) readonly buffer Slots { uint SL[]; };
+layout(std430, binding = 2) readonly buffer Weights { float Wt[]; };
+layout(std430, binding = 3) readonly buffer Shared { float Sh[]; };
+layout(std430, binding = 4) readonly buffer GateIn { float G[]; };
+layout(std430, binding = 5) writeonly buffer OutV { float O[]; };
+
+layout(push_constant) uniform PC {
+    uint cols;   // channels per row
+    uint k;      // experts per token
+    uint tokens; // tokens in the chunk
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;      // channel / column
+    uint t = gl_GlobalInvocationID.y;      // token
+    if (c >= pc.cols || t >= pc.tokens) {
+        return;
+    }
+    uint k = pc.k;
+    float acc = 0.0;
+    // Router order, so the sum matches the single-token combine exactly.
+    for (uint j = 0u; j < k; ++j) {
+        uint slot = SL[t * k + j];
+        acc += Wt[t * k + j] * S[slot * pc.cols + c];
+    }
+    float gate = G[t];
+    float sig = 1.0 / (1.0 + exp(-gate));
+    O[t * pc.cols + c] = acc + Sh[t * pc.cols + c] * sig;
+}

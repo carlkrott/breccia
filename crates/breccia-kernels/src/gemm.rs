@@ -80,12 +80,13 @@ impl<'g> GemmMany<'g> {
         self.blocks_per_row(cols) * self.ty.block_elems()
     }
 
-    fn pc(rows: usize, cols: usize, bpr: usize, users: usize) -> [u8; 16] {
-        let mut pc = [0u8; 16];
+    fn pc(rows: usize, cols: usize, bpr: usize, users: usize, base_words: u32) -> [u8; 20] {
+        let mut pc = [0u8; 20];
         pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
         pc[4..8].copy_from_slice(&(cols as u32).to_le_bytes());
         pc[8..12].copy_from_slice(&(bpr as u32).to_le_bytes());
         pc[12..16].copy_from_slice(&(users as u32).to_le_bytes());
+        pc[16..20].copy_from_slice(&base_words.to_le_bytes());
         pc
     }
 
@@ -99,10 +100,26 @@ impl<'g> GemmMany<'g> {
         cols: usize,
         users: usize,
     ) -> Result<()> {
+        self.run_at(w, x, out, rows, cols, users, 0)
+    }
+
+    /// [`GemmMany::run`] with the expert's blob at `base_words` (u16 words) inside
+    /// `w` — the resident arena's addressing (`MoeMap`'s convention, §8v).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_at(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        base_words: u32,
+    ) -> Result<()> {
         if users == 0 || users > USERS_MAX {
             return Err(anyhow!("users must be 1..={USERS_MAX}, got {users}"));
         }
-        let pc = Self::pc(rows, cols, self.blocks_per_row(cols), users);
+        let pc = Self::pc(rows, cols, self.blocks_per_row(cols), users, base_words);
         self.gpu
             .bind_kernel(&self.kernel, &[w.buf, x.buf, out.buf, self.tables.buf])
             .map_err(|e| anyhow!("{e}"))?;
@@ -140,7 +157,7 @@ impl<'g> GemmMany<'g> {
         users: usize,
         target_s: f64,
     ) -> Result<GemvTiming> {
-        let pc = Self::pc(rows, cols, self.blocks_per_row(cols), users);
+        let pc = Self::pc(rows, cols, self.blocks_per_row(cols), users, 0);
         self.gpu
             .bind_kernel(&self.kernel, &[w.buf, x.buf, out.buf, self.tables.buf])
             .map_err(|e| anyhow!("{e}"))?;

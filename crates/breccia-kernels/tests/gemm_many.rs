@@ -182,3 +182,103 @@ fn multi_user_gemm_matches_the_single_user_gemv() {
     drop(guard);
     let _ = vk::WHOLE_SIZE;
 }
+
+/// The chunked-prefill fan-in against `MoeCombine` (single token, must match) and
+/// against a CPU reference for a multi-token chunk.
+#[test]
+fn fan_in_matches_moe_combine_and_the_cpu_reference() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("fan_in: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else {
+        eprintln!("fan_in: no device for {selector}");
+        return;
+    };
+    let gpu = &dev.gpu;
+    let fan = breccia_kernels::MoeFanIn::new(gpu).expect("fan-in pipeline");
+    let combine = breccia_kernels::MoeCombine::new(gpu).expect("combine pipeline");
+    let (k, cols) = (4usize, 256usize);
+
+    let mut seed = 0x2468_ace0u32;
+    let mut rnd = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+            })
+            .collect()
+    };
+
+    // ---- one token: the fan-in must equal MoeCombine ----
+    let down = rnd(k * cols); // [k, cols], the same layout MoeCombine takes
+    let wts = rnd(k);
+    let shared = rnd(cols);
+    let gate = rnd(1);
+    let slots: Vec<u32> = (0..k as u32).collect();
+    let down_b = breccia_kernels::ops::upload_f32(gpu, &down).unwrap();
+    let w_b = breccia_kernels::ops::upload_f32(gpu, &wts).unwrap();
+    let sh_b = breccia_kernels::ops::upload_f32(gpu, &shared).unwrap();
+    let g_b = breccia_kernels::ops::upload_f32(gpu, &gate).unwrap();
+    let s_b =
+        breccia_kernels::gemv::upload(gpu, &breccia_kernels::ops::u32_to_bytes(&slots)).unwrap();
+    let out_fan = breccia_kernels::gemv::alloc(gpu, (cols * 4) as u64).unwrap();
+    let out_cmb = breccia_kernels::gemv::alloc(gpu, (cols * 4) as u64).unwrap();
+    fan.run(&down_b, &s_b, &w_b, &sh_b, &g_b, &out_fan, 1, k, cols)
+        .expect("fan-in");
+    combine
+        .run(&down_b, &w_b, &sh_b, &g_b, &out_cmb, k, cols)
+        .expect("combine");
+    let a = breccia_kernels::ops::download_f32(gpu, &out_fan, cols).unwrap();
+    let b = breccia_kernels::ops::download_f32(gpu, &out_cmb, cols).unwrap();
+    let mut worst = 0f64;
+    let mut same = true;
+    for i in 0..cols {
+        if a[i].to_bits() != b[i].to_bits() {
+            same = false;
+        }
+        worst = worst.max(((a[i] - b[i]).abs() as f64) / (b[i].abs() as f64).max(1.0));
+    }
+    println!("fan-in vs MoeCombine (1 token): worst {worst:.3e}, bit-identical {same}");
+
+    // ---- a 3-token chunk with overlapping slots: CPU reference ----
+    let tokens = 3usize;
+    let slots_t: Vec<u32> = vec![0, 2, 5, 7, 1, 3, 4, 6, 2, 3, 5, 8];
+    let n_slots = 9usize;
+    let scratch = rnd(n_slots * cols);
+    let wts_t = rnd(tokens * k);
+    let shared_t = rnd(tokens * cols);
+    let gate_t = rnd(tokens);
+    let sc_b = breccia_kernels::ops::upload_f32(gpu, &scratch).unwrap();
+    let sl_b =
+        breccia_kernels::gemv::upload(gpu, &breccia_kernels::ops::u32_to_bytes(&slots_t)).unwrap();
+    let wt_b = breccia_kernels::ops::upload_f32(gpu, &wts_t).unwrap();
+    let sht_b = breccia_kernels::ops::upload_f32(gpu, &shared_t).unwrap();
+    let gt_b = breccia_kernels::ops::upload_f32(gpu, &gate_t).unwrap();
+    let out_t = breccia_kernels::gemv::alloc(gpu, (tokens * cols * 4) as u64).unwrap();
+    fan.run(&sc_b, &sl_b, &wt_b, &sht_b, &gt_b, &out_t, tokens, k, cols)
+        .expect("fan-in chunk");
+    let got = breccia_kernels::ops::download_f32(gpu, &out_t, tokens * cols).unwrap();
+    let mut worst_t = 0f64;
+    for t in 0..tokens {
+        for c in 0..cols {
+            let mut want = 0f64;
+            for j in 0..k {
+                let slot = slots_t[t * k + j] as usize;
+                want += f64::from(wts_t[t * k + j]) * f64::from(scratch[slot * cols + c]);
+            }
+            let sig = 1.0 / (1.0 + (-f64::from(gate_t[t])).exp());
+            want += f64::from(shared_t[t * cols + c]) * sig;
+            let gotv = f64::from(got[t * cols + c]);
+            worst_t = worst_t.max((gotv - want).abs() / want.abs().max(1.0));
+        }
+    }
+    println!("fan-in vs f64 reference (3 tokens, 12 pairs, 9 slots): worst {worst_t:.3e}");
+    assert!(
+        worst <= 1e-6,
+        "fan-in differs from MoeCombine by {worst:.3e}"
+    );
+    assert!(worst_t <= 1e-5, "fan-in differs from f64 by {worst_t:.3e}");
+    drop(guard);
+}

@@ -30,6 +30,11 @@ layout(local_size_x = 256) in;
 // from `blocks.glsl`; the **user count rides in `pc.splits`** because a GEMM
 // dispatch never splits K.
 #define pc_users pc.splits
+// `pc.base` (the 5th push-constant word, declared in blocks.glsl) is the arena
+// offset of this expert's blob in 16-bit words: the resident arena holds all 512
+// experts, so a GEMM addresses one of them exactly as the `MoeMap`/`GemvBatch` path
+// does. The single-expert callers push 0.
+#define ROW_BASE_WORDS pc.base
 
 #define LANES 32u
 #define ROWS_PER_WG 8u
@@ -52,7 +57,7 @@ void main() {
     const uint b_off = UNITS >= LANES ? 0u : (lane / UNITS);
     const uint bpr = pc.bpr;
     const uint full = pc.cols / QK;
-    const uint row_base = row * bpr * BLOCK_WORDS;
+    const uint row_base = ROW_BASE_WORDS + row * bpr * BLOCK_WORDS;
 
     float acc0[USERS_MAX];
     float acc1[USERS_MAX];
