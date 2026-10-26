@@ -631,7 +631,94 @@ compute the *complement* of that subset (its current entry point takes the full
 the only real work: `ExpertPool::moe_topk` needs an "experts `ids[a..]` only"
 form, ~40 lines mirroring its phase 1/2 dispatch.
 
+## 8k. Overlap of the host lane with GPU work: measured conclusion, not attempted
+
+The scoped design was: split each block's top-10, run the GPU subset on the
+block's device and the CPU complement on the host **concurrently**, combine.
+
+The complement needs no new pool entry — `ExpertPool::moe_topk(plan, ids, weights,
+x, out)` takes arbitrary slices, so `&ids[k_gpu..]` *is* the complement, and
+`MoeMap::run(..., experts = k_gpu, ...)` already reads exactly `IDS[0..k_gpu]`, so
+the GPU subset is the first `k_gpu` ids with no kernel change.
+
+**It cannot pay for itself, by arithmetic:**
+
+* overlap requires the GPU subset to be *submitted* before the host starts, i.e.
+  one extra `vkQueueSubmit` + fence per block. The measured cost of a round trip
+  on this graph is **~0.8 ms/block** (the alternating sweep: 4 round trips → 2
+  gave −47 ms over 48 blocks, §8e);
+* the work it hides is the host lane's share of `k_gpu` experts: the whole lane is
+  0.76 ms/block for 10 experts, so `k_gpu = 4` moves **0.30 ms**, and the GPU's own
+  share of that work is ~0.1 ms at the measured 640-row rates;
+* so the best case is −0.3 ms of critical path for +0.8 ms of submission — and
+  `k_gpu = 2/6` move 0.15/0.45 ms. Every setting loses by 0.35–0.65 ms/block, i.e.
+  **−17 to −31 ms/token**.
+
+There is a way it *could* win, and it is the same primitive the replay discussion
+needs: a mid-batch sync so the host learns the router's ids **without** fencing the
+phase — a timeline semaphore signalled by the router dispatch, waited on the host
+while the GPU continues into the expert GEMV. That is a `breccia-vk` change
+(`Gpu` owns the command buffer and the fence), outside this work order's
+ownership, and it would also unlock K > 2. Recorded here as the prerequisite.
+
+The device-expert path itself stays **correct but off** (§8d): 32/32 parity,
++22 ms serial.
+
+## 8l. Where the ~1 500 dispatches and the 70.8 ms of GPU time go
+
+Dispatch counts are deterministic from the call graph; the times are the measured
+phase-3 kernel numbers (`docs/phase-3/01`, `03/04`, `06`) for the *slower* of the
+two cards, because the split's slowest link sets the block's cost:
+
+| op family | dispatches/block | × blocks | dispatches/token | GPU cost/block | ms/token |
+|---|---:|---:|---:|---:|---:|
+| **HC read** (norm, down 320×10240, act, up 10240×320, gated+inject) | 5 × 2 | 48 | **480** | 2 × 119 µs = 238 µs | **11.4** |
+| **GDN** (qkv, z, beta, alpha, conv, qk-l2, gate, delta-step, norm+gate, ssm_out) | 10 | 36 | **360** | 357 µs | **12.9** |
+| **QSA** (6 proj, q/k/idx norms, 3 rope, kv-append, idx tail/pool/score, top-k, scores, softmax, apply, out-proj) | 20 | 12 | **240** | 310–859 µs (4 → 310, full budget → 859) | **3.7–10.3** |
+| **shared expert** (gate, up, SwiGLU, down, scalar gate) | 5 | 48 | **240** | ~120 µs | **5.8** |
+| **router** (GEMV + softmax/top-k) | 2 | 48 | **96** | 21 µs | **1.0** |
+| **HC write** (combine) | 2 | 48 | **96** | 2 × 25 µs | **2.4** |
+| head (248 320 × 2560 Q5_K) + final HC read | 6 | 1 | **6** | 4.5 + 0.6 ms | **5.1** |
+| embed (staged gather) | 1 | 1 | **1** | 12 µs | **0.01** |
+| **total** | | | **≈1 519** (measured 1 509) | | **≈42–49** |
+
+Ranked by time: **GDN 12.9 (26 %), HC read 11.4 (23 %), QSA 3.7–10.3 (7–21 %),
+shared expert 5.8 (12 %), head 5.1 (10 %)**; by dispatches: **HC read 480,
+GDN 360, QSA 240 and shared expert 240, router + HC write 192**.
+
+Memory-bound vs latency-bound, against the phase-3 rates:
+
+* **GDN's three big GEMVs are bandwidth-bound** and run at 1 650 GB/s on the RX
+  (above the 561 GB/s DRAM ceiling → Infinity-Cache resident, §6.1/§6.3 there);
+  the **delta rule is latency/stride-bound** (43 µs RX for 9 MiB of state = 217
+  GB/s, 2.6× off the ceiling) and is 28 % of a layer.
+* **HC read is latency-bound at T = 1**: 60→44 µs for 13.1 MB of BF16, half the
+  596 GB/s a plain 640-row GEMV reaches, and the 4-row `inject` alone was 21.85 µs
+  before it was folded (`docs/phase-3/04` §5.1).
+* **the shared expert is latency-bound** (640-row shapes, 81–161 GB/s).
+* the **head is DRAM-bound** (437 MB, 252 GB/s measured for Q5_K).
+
+### The three highest-value fusions, with estimates
+
+1. **Fuse the HC_READ chain's `norm` + `gated` into their neighbours** (5
+   dispatches → 3): `norm` (6.3 µs) and `gated` (7.4 µs) are already single
+   workgroup-per-256-element passes over data the adjacent GEMVs touch. Removing
+   192 dispatches and two 6–7 µs passes per read: **≈ 2.5 ms/token**, and it needs
+   one shader edit in a path that already has a conformance suite.
+2. **A split-K `down` for the HC bottleneck** (320 rows × 10 240 today = 40
+   workgroups on 60 CUs): `Gemv::run_split` already exists but the mixer uses
+   `GemvBatch`, which has no split-K. A split-4 `down` is worth 22.75 → ~12 µs at
+   T = 1 × 96 reads = **≈ 1.0 ms/token**, no new shader (host-side plumbing only).
+3. **One-pass GDN**: conv + qk-l2 + gate are three passes over the same 10 240
+   channels (1.95 + 2.03 + 1.60 = 5.6 µs/layer, all latency-floor). Fusing them
+   saves the two dispatch floors (≈ 2 × 4.5 µs on the MI50) × 36 = **≈ 0.3 ms** —
+   small, and it is the riskiest of the three (three shaders' semantics in one).
+
+Item 2 is the cheap one (host-side only, `< 1 hour`) and is the recommendation for
+the next pass; item 1 is the biggest single win and is contained.
+
 ## 9. Exact commands
+
 
 
 

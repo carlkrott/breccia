@@ -91,10 +91,14 @@ const HEAD: usize = 14;
 pub struct Timers {
     pub on: bool,
     pub ns: [u64; STAGES.len()],
+    /// Dispatches recorded while each stage was the current one.
+    pub dispatches: [u32; STAGES.len()],
     #[serde(skip)]
     last: Option<std::time::Instant>,
     #[serde(skip)]
     stage: usize,
+    #[serde(skip)]
+    dispatch_mark: u32,
 }
 
 impl Timers {
@@ -115,6 +119,17 @@ impl Timers {
         }
         self.last = Some(now);
         self.stage = stage;
+        // Dispatches recorded so far belong to the stage we are leaving.
+        self.dispatch_mark = batch_cmd::recorded();
+        let _ = stage;
+    }
+
+    /// Account the dispatches recorded since the previous mark to `stage`.
+    fn count_dispatches(&mut self, stage: usize, total: u32) {
+        if !self.on {
+            return;
+        }
+        self.dispatches[stage] += total.saturating_sub(self.dispatch_mark);
     }
     fn stop(&mut self) {
         if !self.on {
@@ -126,8 +141,20 @@ impl Timers {
     }
     fn clear(&mut self) {
         self.ns = [0; STAGES.len()];
+        self.dispatches = [0; STAGES.len()];
         self.last = None;
         self.stage = 0;
+        self.dispatch_mark = 0;
+    }
+
+    /// `(stage, dispatches per token)` for the report.
+    pub fn dispatch_table(&self, tokens: usize) -> Vec<(&'static str, f64)> {
+        let n = tokens.max(1) as f64;
+        STAGES
+            .iter()
+            .zip(self.dispatches.iter())
+            .map(|(name, d)| (*name, *d as f64 / n))
+            .collect()
     }
     pub fn total_s(&self) -> f64 {
         self.ns.iter().sum::<u64>() as f64 / 1e9
@@ -484,6 +511,9 @@ impl<'m> Session<'m> {
     /// Close the open batch (submit once, wait once), if any.
     fn flush(&mut self) -> Result<()> {
         if let Some(d) = self.pending_batch.take() {
+            let rec = batch_cmd::recorded();
+            let stage = self.timers.stage;
+            self.timers.count_dispatches(stage, rec);
             let wait = batch_cmd::end(self.model.devices[d].gpu())
                 .map_err(|e| anyhow!("closing the dispatch batch on device {d}: {e}"))?;
             self.dev_wait_s[d] += wait;
