@@ -62,94 +62,123 @@ fn multi_user_gemm_matches_the_single_user_gemv() {
         }
     };
     let layout = set.layout().expect("layout");
-    // The first block whose `down` role is the delivered type.
-    let mut found = None;
+    // Every (block, role) whose type has a multi-user kernel: the delivered set
+    // covers `down` (IQ4_NL, Q2_0) and `gate`/`up` (IQ2_*, IQ3_*).
+    let mut cells: Vec<(usize, ExpertRole, QuantType)> = Vec::new();
     for block in layout.blocks() {
         let plan = LayerPlan::from_block(&set, block).expect("plan");
-        if plan.role(ExpertRole::Down.name()).ty == QuantType::Iq4Nl {
-            found = Some(plan);
+        for role in [ExpertRole::Down, ExpertRole::Gate] {
+            let ty = plan.role(role.name()).ty;
+            if matches!(
+                ty,
+                QuantType::Iq4Nl
+                    | QuantType::Q2_0
+                    | QuantType::Iq2Xxs
+                    | QuantType::Iq2Xs
+                    | QuantType::Iq2S
+                    | QuantType::Iq3Xxs
+                    | QuantType::Iq3S
+            ) && !cells.iter().any(|c| c.1 == role && c.2 == ty)
+            {
+                cells.push((plan.block, role, ty));
+            }
+        }
+        if cells.len() >= 6 {
             break;
         }
     }
-    let Some(plan) = found else {
-        eprintln!("gemm_many: no IQ4_NL down role in this artifact");
+    if cells.is_empty() {
+        eprintln!("gemm_many: no supported role/type in this artifact");
         return;
-    };
-    let (rows, cols) = (plan.n_embd, plan.n_ff);
+    }
     let gpu = &dev.gpu;
-    let gemm = GemmMany::new(gpu, QuantType::Iq4Nl).expect("gemm pipeline");
-    let gemv = Gemv::new(gpu, QuantType::Iq4Nl, rows, cols).expect("gemv pipeline");
-
-    // One expert's down blob, straight out of the mmap.
-    let expert = 7usize;
-    let slices = plan.slices(&set, expert).expect("slices");
-    let down = slices.down;
-    let pad = gemm.padded_cols(cols);
-    let w = breccia_kernels::gemv::upload(gpu, down).expect("upload weights");
-    let mut seed = 0x1234_5678u32;
-    let mut xs: Vec<f32> = Vec::with_capacity(USERS_MAX * pad);
-    for _ in 0..USERS_MAX * pad {
-        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        xs.push(((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5);
-    }
-    let x = breccia_kernels::ops::upload_f32(gpu, &xs).expect("upload x");
-    let out_gemm = alloc(gpu, (USERS_MAX * rows * 4) as u64).expect("out buffer");
-    let out_ref = alloc(gpu, (rows * 4) as u64).expect("ref buffer");
-
-    let mut worst: f64 = 0.0;
-    let mut same_bits_all = true;
-    for m in [1usize, 2, 4, 8] {
-        gemm.run(&w, &x, &out_gemm, rows, cols, m).expect("gemm");
-        let got = breccia_kernels::ops::download_f32(gpu, &out_gemm, m * rows).expect("download");
-        for u in 0..m {
-            // The single-user kernel reads its activation at the *start* of its x
-            // buffer, so give each user its own view by re-uploading the slice.
-            let xu = breccia_kernels::ops::upload_f32(gpu, &xs[u * pad..(u + 1) * pad])
-                .expect("upload x_u");
-            gemv.run(&w, &xu, &out_ref).expect("gemv");
-            let want = breccia_kernels::ops::download_f32(gpu, &out_ref, rows).expect("download");
-            for r in 0..rows {
-                let a = got[u * rows + r];
-                let b = want[r];
-                if a.to_bits() != b.to_bits() {
-                    same_bits_all = false;
-                }
-                worst = worst.max(((a - b).abs() as f64) / (b.abs() as f64).max(1.0));
-            }
-            gpu.destroy_buf(&xu);
+    for (block_no, role, ty) in cells {
+        let plan =
+            LayerPlan::from_block(&set, layout.block(block_no).expect("block")).expect("plan");
+        let (rows, cols) = if role == ExpertRole::Down {
+            (plan.n_embd, plan.n_ff)
+        } else {
+            (plan.n_ff, plan.n_embd)
+        };
+        let gemm = GemmMany::new(gpu, ty).expect("gemm pipeline");
+        let gemv = Gemv::new(gpu, ty, rows, cols).expect("gemv pipeline");
+        let expert = 7usize;
+        let slices = plan.slices(&set, expert).expect("slices");
+        let down = match role {
+            ExpertRole::Down => slices.down,
+            ExpertRole::Gate => slices.gate,
+            ExpertRole::Up => slices.up,
+        };
+        let pad = gemm.padded_cols(cols);
+        let w = breccia_kernels::gemv::upload(gpu, down).expect("upload weights");
+        let mut seed = 0x1234_5678u32;
+        let mut xs: Vec<f32> = Vec::with_capacity(USERS_MAX * pad);
+        for _ in 0..USERS_MAX * pad {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            xs.push(((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5);
         }
-        // Throughput: weights read once, m*rows*cols MACs.
-        let t = gemm
-            .run_timed(&w, &x, &out_gemm, rows, cols, m, 0.2)
-            .expect("timed");
-        let bytes = gemm.weight_bytes(rows, cols) as f64;
-        let flops = 2.0 * m as f64 * rows as f64 * cols as f64;
+        let x = breccia_kernels::ops::upload_f32(gpu, &xs).expect("upload x");
+        let out_gemm = alloc(gpu, (USERS_MAX * rows * 4) as u64).expect("out buffer");
+        let out_ref = alloc(gpu, (rows * 4) as u64).expect("ref buffer");
+
+        let mut worst: f64 = 0.0;
+        let mut same_bits_all = true;
+        for m in [1usize, 2, 4, 8] {
+            gemm.run(&w, &x, &out_gemm, rows, cols, m).expect("gemm");
+            let got =
+                breccia_kernels::ops::download_f32(gpu, &out_gemm, m * rows).expect("download");
+            for u in 0..m {
+                let xu = breccia_kernels::ops::upload_f32(gpu, &xs[u * pad..(u + 1) * pad])
+                    .expect("upload x_u");
+                gemv.run(&w, &xu, &out_ref).expect("gemv");
+                let want =
+                    breccia_kernels::ops::download_f32(gpu, &out_ref, rows).expect("download");
+                for r in 0..rows {
+                    let a = got[u * rows + r];
+                    let b = want[r];
+                    if a.to_bits() != b.to_bits() {
+                        same_bits_all = false;
+                    }
+                    worst = worst.max(((a - b).abs() as f64) / (b.abs() as f64).max(1.0));
+                }
+                gpu.destroy_buf(&xu);
+            }
+            let t = gemm
+                .run_timed(&w, &x, &out_gemm, rows, cols, m, 0.2)
+                .expect("timed");
+            let bytes = gemm.weight_bytes(rows, cols) as f64;
+            let flops = 2.0 * m as f64 * rows as f64 * cols as f64;
+            println!(
+                "{} {} m = {m}: {:.3} ms/dispatch, weights {:.1} GB/s, {:.0} GFLOP/s",
+                ty.name(),
+                role.name(),
+                t.per_iter_s * 1e3,
+                bytes / t.per_iter_s / 1e9,
+                flops / t.per_iter_s / 1e9,
+            );
+        }
         println!(
-            "m = {m}: {:.3} ms/dispatch, weights {:.2} GB/s, {:.1} GFLOP/s \
-             ({:.1} GFLOP/s normalized per weight byte)",
-            t.per_iter_s * 1e3,
-            bytes / t.per_iter_s / 1e9,
-            flops / t.per_iter_s / 1e9,
-            flops / t.per_iter_s / 1e9 / (bytes / 1e9),
+            "{} {}: worst relative {worst:.3e}, bit-identical for every m: {same_bits_all}",
+            ty.name(),
+            role.name()
         );
+        assert!(
+            worst <= 1e-6,
+            "{} {}: multi-user GEMM differs by {worst:.3e}",
+            ty.name(),
+            role.name()
+        );
+        assert!(
+            same_bits_all,
+            "{} {}: m = 1 must be bit-identical",
+            ty.name(),
+            role.name()
+        );
+        gpu.destroy_buf(&out_ref);
+        gpu.destroy_buf(&out_gemm);
+        gpu.destroy_buf(&x);
+        gpu.destroy_buf(&w);
     }
-    println!(
-        "multi-user GEMM vs single-user GEMV: worst relative {worst:.3e}, \
-         bit-identical for every m: {same_bits_all}"
-    );
-    assert!(
-        worst <= 1e-6,
-        "multi-user GEMM differs from the single-user GEMV by {worst:.3e}"
-    );
-    // m = 1 must be exact: same decodes, same accumulation order, same reduction.
-    assert!(
-        same_bits_all,
-        "m > 1 need not be bit-identical, but m = 1 must be (see the module docs)"
-    );
-    gpu.destroy_buf(&out_ref);
-    gpu.destroy_buf(&out_gemm);
-    gpu.destroy_buf(&x);
-    gpu.destroy_buf(&w);
     drop(guard);
     let _ = vk::WHOLE_SIZE;
 }

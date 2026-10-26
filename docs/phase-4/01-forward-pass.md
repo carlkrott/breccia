@@ -1657,6 +1657,54 @@ number in the table above.
   The budget no longer argues against any of it: measured, the compute is 0.5 ms and
   the streaming 2.6-11 ms per token against 163-320 ms today.
 
+## 8v. Multi-user GEMM: all seven expert types, bit-identical; the fan-in is the blocker
+
+`GemmMany` (§8u) now covers the whole expert type set, and every user's dot is
+**bit-identical** to the single-user kernel for every `m` - not just `m = 1` - so the
+parity gate keeps working unchanged. MI50, validation layer on, one GPU process,
+`tests/gemm_many.rs` (`BRECCIA_KERNEL_DEVICE=0000:0e:00.0`), 0 validation messages:
+
+| role / type | m = 1 | m = 2 | m = 4 | m = 8 | GFLOP/s 1 -> 8 | per-user | worst rel. | bit-identical |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| `down` IQ4_NL | 0.014 ms | 0.017 | 0.022 | 0.033 | 231 -> 797 | **3.4x** | 0.0 | yes (all m) |
+| `down` Q2_0 | 0.009 | 0.012 | 0.017 | 0.027 | 356 -> 955 | **2.7x** | 0.0 | yes |
+| `gate`/`up` IQ2_XS | 0.016 | 0.021 | 0.032 | 0.053 | 202 -> 498 | 2.5x | 0.0 | yes |
+| `gate`/`up` IQ2_XXS | 0.016 | 0.021 | 0.032 | 0.053 | 201 -> 499 | 2.5x | 0.0 | yes |
+| `gate`/`up` IQ2_S | 0.016 | 0.021 | 0.032 | 0.053 | 205 -> 493 | 2.4x | 0.0 | yes |
+| `gate`/`up` IQ3_S | 0.016 | 0.021 | 0.032 | 0.053 | 202 -> 498 | 2.5x | 0.0 | yes |
+
+`gate` and `up` are served as **two multi-user GEMMs plus the existing SwiGLU
+pass**, not one fused dispatch: `blocks.glsl`'s decode units read the weight buffer
+from binding 0 by name, so a second tensor in the same dispatch needs either a
+duplicated decode unit per type or a concatenated `gate||up` arena. Two passes are
+arithmetically identical (`silu` is elementwise) and cost one extra dispatch; the
+fusion is deferred rather than faked.
+
+### What this pass did **not** reach, and why
+
+The end-to-end merged prefill (routing a chunk, running the GEMMs for the distinct
+experts of the resident blocks, and an m-user fan-in) is **not wired**, so there is
+**no new prefill number**: the baseline is still **6.13 tok/s/agent** (2 agents x 300,
+token by token). The blockers, in order:
+
+1. **The fan-in needs a new kernel.** The routed set is per *token* (10 experts each,
+   weighted), while the GEMM output is per *(distinct expert, user)*. `MoeCombine`
+   sums one token's `k` rows from a `[k, cols]` buffer; a chunk needs the weighted sum
+   over each token's own top-10 out of an `[E_distinct, users, cols]` scratch, i.e. a
+   gather over a per-token expert list. That is a new shader (or an atomics path the
+   device does not have for f32 storage buffers, §8c).
+2. **Arena offset views.** The resident arena holds all 512 experts in one buffer and
+   a GEMM needs expert `e`'s blob: `Buf` has no offset field, so the kernel needs a
+   `base_words` push constant (the `moe_map`/`GemvBatch` path already does exactly
+   this) - a small, contained change to the new GEMM kernels.
+3. **Chunk orchestration**: per block, upload the chunk's `mixed` (m x 2560), run
+   one dispatch per distinct expert (~130 per block at T = 128, measured), then the
+   fan-in; ~130 x 48 = 6 240 dispatches per chunk, 0.22 ms/token at 4.5 us.
+
+The budget says the payoff is still there (compute 0.5 ms/token, streaming 2.6-11
+ms/token, against 163-320 ms today), and the kernels are the expensive part; what
+remains is the fan-in shader and the orchestration.
+
 ## 9. Exact commands
 
 

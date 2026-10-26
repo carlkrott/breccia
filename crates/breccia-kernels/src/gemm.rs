@@ -14,7 +14,7 @@ use anyhow::{anyhow, Result};
 use ash::vk;
 use breccia_vk::ctx::{Buf, Gpu, Qc};
 
-use crate::gemv::{table_bytes, upload, Accum, GemvTiming, ROWS_PER_WG, WG_X_MAX};
+use crate::gemv::{table_bytes, upload, GemvTiming, ROWS_PER_WG, WG_X_MAX};
 use crate::quant::QuantType;
 
 /// Users one dispatch can hold in registers (the shader's `USERS_MAX`).
@@ -31,14 +31,19 @@ pub struct GemmMany<'g> {
 impl<'g> GemmMany<'g> {
     /// Compile the pipeline for `ty` (only the types with a multi-user shader).
     pub fn new(gpu: &'g Gpu, ty: QuantType) -> Result<Self> {
-        let spv = match (ty, Accum::F32) {
-            (QuantType::Iq4Nl, Accum::F32) => {
-                include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq4_nl.spv")) as &[u8]
-            }
-            _ => {
+        let spv: &[u8] = match ty {
+            QuantType::Iq4Nl => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq4_nl.spv")),
+            QuantType::Q2_0 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_q2_0.spv")),
+            QuantType::Iq2Xxs => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq2_xxs.spv")),
+            QuantType::Iq2Xs => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq2_xs.spv")),
+            QuantType::Iq2S => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq2_s.spv")),
+            QuantType::Iq3Xxs => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq3_xxs.spv")),
+            QuantType::Iq3S => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq3_s.spv")),
+            other => {
                 return Err(anyhow!(
-                    "no multi-user GEMM shader for {} yet: the delivered set is IQ4_NL",
-                    ty.name()
+                    "no multi-user GEMM shader for {}: the delivered set is \
+                     IQ4_NL, Q2_0, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S",
+                    other.name()
                 ))
             }
         };
