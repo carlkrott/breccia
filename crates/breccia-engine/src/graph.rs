@@ -96,6 +96,13 @@ static LIVE_SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 /// starting again (256 batches = ~5 tokens of a two-stream run).
 const GPU_PROBE_BATCHES: usize = 256;
 
+/// Dispatches after which a prefill chunk's batch is closed and the next one
+/// opened. The batch's descriptor pool holds `MAX_SETS = 8 192` sets, and a
+/// 256-token chunk records ~30 dispatches per token in pass 1 alone, so the cap
+/// keeps a chunk (and its merged expert pass) inside the pool without making the
+/// batches so short that the submissions dominate.
+const MERGED_BATCH_CAP: u32 = 6000;
+
 /// Wall-clock accounting: host-side deltas around synchronous dispatch groups.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Timers {
@@ -180,6 +187,85 @@ impl Timers {
     }
 }
 
+/// The merged prefill pass's per-session chunk scratch (§8v).
+///
+/// Every buffer is allocated once for the configured `prefill_chunk`, because the
+/// pass runs once per block per chunk (48 × 2 per prompt, at chunk 128) and a
+/// per-call allocation would be the whole cost of the thing it is trying to
+/// delete.
+pub struct PfChunk {
+    /// The chunk's per-token MoE inputs, gathered inside pass 1's submission:
+    /// `[T, k]` router ids (host-readable — the bucket list needs them),
+    /// `[T, k]` router weights, `[T, n_embd]` ffn-mixed activation,
+    /// `[T, n_embd]` shared-expert out and `[T]` its gate logit.
+    ids: Mailbox,
+    w: Buf,
+    mixed: Buf,
+    shared: Buf,
+    gate: Buf,
+    /// The host-built `(token, expert) → slot` map the fan-in reads.
+    slots: Mailbox,
+    /// `[T*k, n_embd]`: each distinct expert group's users, written contiguously.
+    scratch: Buf,
+    /// One expert group's GEMM scratch: `[8, n_embd]` activation gather,
+    /// `[8, n_ff]` gate, `[8, n_ff]` up, `[8, n_ff]` SwiGLU, `[8, n_embd]` down.
+    x: Buf,
+    gg: Buf,
+    uu: Buf,
+    act: Buf,
+    down: Buf,
+    /// `[T, n_embd]`, the fan-in's output.
+    out: Buf,
+}
+
+impl PfChunk {
+    fn bytes(&self) -> u64 {
+        [
+            &self.ids.buf,
+            &self.w,
+            &self.mixed,
+            &self.shared,
+            &self.gate,
+            &self.slots.buf,
+        ]
+        .iter()
+        .map(|b| b.size)
+        .sum::<u64>()
+            + [
+                &self.scratch,
+                &self.x,
+                &self.gg,
+                &self.uu,
+                &self.act,
+                &self.down,
+                &self.out,
+            ]
+            .iter()
+            .map(|b| b.size)
+            .sum::<u64>()
+    }
+
+    fn release(&self, gpu: &breccia_vk::ctx::Gpu) {
+        self.ids.release(gpu);
+        self.slots.release(gpu);
+        for b in [
+            &self.w,
+            &self.mixed,
+            &self.shared,
+            &self.gate,
+            &self.scratch,
+            &self.x,
+            &self.gg,
+            &self.uu,
+            &self.act,
+            &self.down,
+            &self.out,
+        ] {
+            gpu.destroy_buf(b);
+        }
+    }
+}
+
 /// Everything one device owns during a session.
 pub struct Venue<'m> {
     pub pipes: PipelineSet<'m>,
@@ -224,6 +310,11 @@ pub struct Venue<'m> {
     pub moe_map_down: Buf,
     pub moe_map: breccia_kernels::MoeMap<'m>,
     pub moe_combine: breccia_kernels::MoeCombine<'m>,
+    /// The chunk's weighted expert fan-in (§8v), used by the merged prefill pass.
+    pub moe_fanin: breccia_kernels::MoeFanIn<'m>,
+    /// The merged prefill pass's chunk scratch (`Some` only when
+    /// `--prefill-merged` is on and the placement is single-device).
+    pub pf: Option<PfChunk>,
     /// Chunked-prefill scratch: the chunk's gathered residual, one residual slice
     /// per token (the dense chain runs per token, unchanged) and one host-visible
     /// MoE mailbox per token (`docs/phase-4` §8s).
@@ -262,6 +353,12 @@ pub struct SessionCfg {
     /// over the chunk (§8s). `0` = token by token. Requires a single-device
     /// placement (which is what a multi-stream session is).
     pub prefill_chunk: usize,
+    /// **Merged** prefill (§8v): for a chunk of `t` tokens, route the whole chunk
+    /// once, bucket the `(token, expert)` pairs by distinct expert, and run one
+    /// multi-user `GemmMany` per expert role over the resident arena
+    /// (`--gpu-experts` blocks) instead of one GEMV per token. Off by default.
+    /// Blocks whose experts are not resident keep the per-token host path.
+    pub prefill_merged: bool,
     /// Enable the GPU-time probe (`BRECCIA_GPU_TIME=1` also turns it on).
     /// It stamps every batch, so a two-stream run can report per-card
     /// utilisation instead of only fence waits.
@@ -365,12 +462,24 @@ pub struct Session<'m> {
     /// the venue; the dense chain runs **per token** (unchanged) and only the
     /// expert lane is grouped (§8s).
     pub prefill_chunk: usize,
+    /// See [`SessionCfg::prefill_merged`].
+    pub prefill_merged: bool,
     /// Host-side per-token routing for the chunk's grouped lane, and the chunk's
     /// token ids (the PLE hash needs them).
     pf_ids: Vec<Vec<usize>>,
     pf_weights: Vec<Vec<f32>>,
     pf_mixed: Vec<f32>,
     pf_toks: Vec<u32>,
+    /// The merged pass's own counters (reset per measured window with the rest):
+    /// host wall seconds of the expert GEMMs and of the fan-in, the dispatches
+    /// they recorded, the distinct experts they touched and the expert bytes they
+    /// read out of the arena (§8v).
+    pf_gemm_s: f64,
+    pf_fanin_s: f64,
+    pf_merged_dispatches: u64,
+    pf_merged_experts: usize,
+    pf_merged_slots: usize,
+    pf_merged_chunks: usize,
     /// Distinct experts the chunk's grouped lane touched, and the expert bytes a
     /// **merged** (device-side, once-per-expert) pass would move for it — the
     /// measured budget of §8u.
@@ -520,6 +629,32 @@ impl<'m> Session<'m> {
             };
             let moe_map = breccia_kernels::MoeMap::new(gpu)?;
             let moe_combine = breccia_kernels::MoeCombine::new(gpu)?;
+            let moe_fanin = breccia_kernels::MoeFanIn::new(gpu)?;
+            // The merged prefill pass's chunk scratch (§8v): only when the flag is
+            // on, so a session that does not use it pays nothing.
+            let pf = if chunk > 0 && cfg.prefill_merged && !model.placed.is_empty() {
+                let k = mc.n_expert_used;
+                let nb = mc.n_embd as u64 * 4;
+                let nfb = mc.n_ff as u64 * 4;
+                let users = breccia_kernels::gemm::USERS_MAX as u64;
+                Some(PfChunk {
+                    ids: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
+                    w: alloc(chunk as u64 * k as u64 * 4, "prefill router weights")?,
+                    mixed: alloc(chunk as u64 * nb, "prefill chunk mixed")?,
+                    shared: alloc(chunk as u64 * nb, "prefill chunk shared")?,
+                    gate: alloc(chunk as u64 * 4, "prefill chunk shared gate")?,
+                    slots: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
+                    scratch: alloc(chunk as u64 * k as u64 * nb, "prefill merged scratch")?,
+                    x: alloc(users * nb, "prefill expert gather")?,
+                    gg: alloc(users * nfb, "prefill expert gate")?,
+                    uu: alloc(users * nfb, "prefill expert up")?,
+                    act: alloc(users * nfb, "prefill expert act")?,
+                    down: alloc(users * nb, "prefill expert down")?,
+                    out: alloc(chunk as u64 * nb, "prefill merged out")?,
+                })
+            } else {
+                None
+            };
             venues.push(Venue {
                 pipes,
                 hc,
@@ -555,6 +690,8 @@ impl<'m> Session<'m> {
                 moe_map_down,
                 moe_map,
                 moe_combine,
+                moe_fanin,
+                pf,
                 r_chunk,
                 r_slots,
                 inject_slots,
@@ -658,10 +795,21 @@ impl<'m> Session<'m> {
             } else {
                 0
             },
+            prefill_merged: if model.devices.len() == 1 {
+                cfg.prefill_merged
+            } else {
+                false
+            },
             pf_ids: Vec::new(),
             pf_weights: Vec::new(),
             pf_mixed: Vec::new(),
             pf_toks: Vec::new(),
+            pf_gemm_s: 0.0,
+            pf_fanin_s: 0.0,
+            pf_merged_dispatches: 0,
+            pf_merged_experts: 0,
+            pf_merged_slots: 0,
+            pf_merged_chunks: 0,
             pf_distinct: 0,
             pf_merged_bytes: 0,
             pf_tokens: 0,
@@ -871,6 +1019,12 @@ impl<'m> Session<'m> {
         self.pf_distinct = 0;
         self.pf_merged_bytes = 0;
         self.pf_tokens = 0;
+        self.pf_gemm_s = 0.0;
+        self.pf_fanin_s = 0.0;
+        self.pf_merged_dispatches = 0;
+        self.pf_merged_experts = 0;
+        self.pf_merged_slots = 0;
+        self.pf_merged_chunks = 0;
         self.forwards = 0;
         self.expert_bytes = 0;
         self.lane_s = 0.0;
@@ -984,6 +1138,9 @@ impl<'m> Session<'m> {
     pub fn session_bytes(&self) -> u64 {
         let mut total = 0u64;
         for v in &self.venues {
+            if let Some(pf) = &v.pf {
+                total += pf.bytes();
+            }
             for b in [
                 &v.r,
                 &v.sh,
@@ -1315,6 +1472,9 @@ impl<'m> Session<'m> {
                 mc.n_ctx_max
             );
         }
+        if !self.batching {
+            bail!("chunked prefill records into a dispatch batch: it needs --batching");
+        }
         let dev = 0;
         let gpu = m.devices[dev].gpu();
         let hc_dim = mc.hc_dim();
@@ -1395,6 +1555,24 @@ impl<'m> Session<'m> {
             }
         }
 
+        // ---- merged expert pass (§8v): resident blocks only ------------------
+        // `--prefill-merged` routes the chunk once per block, buckets the
+        // `(token, expert)` pairs and runs one multi-user GEMM per distinct expert
+        // instead of one GEMV per token. A block whose role type has no multi-user
+        // GEMM, or a session without the chunk scratch, keeps the path below.
+        if self.prefill_merged {
+            if let Some(pe) = m.placed.get(&b) {
+                let pipes = &self.venues[dev].pipes;
+                let ready = self.venues[dev].pf.is_some()
+                    && [pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty]
+                        .iter()
+                        .all(|ty| pipes.gemm(*ty).is_some());
+                if ready {
+                    return self.prefill_block_merged(b, t, pos0, pe);
+                }
+            }
+        }
+
         // ---- pass 1: the whole chunk's dense chain, one submission -----------
         self.ensure_batch(dev)?;
         for i in 0..t {
@@ -1421,6 +1599,13 @@ impl<'m> Session<'m> {
                 )?;
             }
             self.swap_r_in(dev, i);
+            // A chunk of 256 tokens records ~30 dispatches per token, which would
+            // overrun the batch's descriptor pool (8 192 sets): close it and open
+            // the next one. Tokens are independent, so this changes nothing.
+            if batch_cmd::recorded() >= MERGED_BATCH_CAP {
+                self.flush()?;
+                self.ensure_batch(dev)?;
+            }
         }
         self.submit_batch()?;
         self.flush()?;
@@ -1518,6 +1703,285 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// One block of a chunk with the **merged** expert pass (§8v).
+    ///
+    /// Pass 1 is the same dense chain per token, but a block whose experts are
+    /// resident no longer runs one GEMV per token: it keeps the chunk's router ids,
+    /// weights, `mixed`, shared-expert output and gate logit in chunk buffers. The
+    /// host then builds the `(token, expert)` bucket list, and per distinct expert
+    /// **three multi-user GEMMs** (`gate`, `up`, `down`) read that expert's blob
+    /// **once** out of the arena and dot it with all of its users, followed by one
+    /// chunk-wide fan-in that does what `MoeCombine` does per token.
+    ///
+    /// Numerics: every user's GEMM dot is bit-identical to the single-user kernel
+    /// it replaces (§8v, measured for every `m`), the SwiGLU is elementwise, and the
+    /// fan-in is bit-identical to `MoeCombine` in router order — so the generated
+    /// tokens must match the token-by-token path exactly.
+    fn prefill_block_merged(
+        &mut self,
+        b: usize,
+        t: usize,
+        pos0: usize,
+        pe: &'m crate::model::PlacedExperts,
+    ) -> Result<()> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let dev = 0usize;
+        let n_embd = mc.n_embd;
+        let n_ff = mc.n_ff;
+        let k = mc.n_expert_used;
+        let gpu = m.devices[dev].gpu();
+        let (gate_ty, up_ty, down_ty) = (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty);
+        // Each expert's blob, in the 16-bit words the GEMM's base push constant
+        // takes (the arena holds all 512 experts back to back).
+        let words = |ty: breccia_kernels::QuantType, rows: usize, cols: usize| -> u32 {
+            let bytes = rows * cols.div_ceil(ty.block_elems()) * ty.block_bytes();
+            assert!(
+                bytes.is_multiple_of(2),
+                "an expert blob must be a whole u16 word count"
+            );
+            (bytes / 2) as u32
+        };
+        let (wgate, wup, wdown) = (
+            words(gate_ty, n_ff, n_embd),
+            words(up_ty, n_ff, n_embd),
+            words(down_ty, n_embd, n_ff),
+        );
+        let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
+        let disp_before = self.dispatches;
+
+        // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
+        self.ensure_batch(dev)?;
+        for i in 0..t {
+            self.swap_r_in(dev, i);
+            self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace)?;
+            {
+                let v = &self.venues[dev];
+                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                let kb = (k * 4) as u64;
+                let nb = (n_embd * 4) as u64;
+                batch_cmd::record_copy(gpu, &pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb)?;
+                batch_cmd::record_copy(gpu, &pf.w, i as u64 * kb, &v.router_w, 0, kb)?;
+                batch_cmd::record_copy(gpu, &pf.mixed, i as u64 * nb, &ws.mixed, 0, nb)?;
+                batch_cmd::record_copy(gpu, &pf.shared, i as u64 * nb, &v.sh, 0, nb)?;
+                batch_cmd::record_copy(gpu, &pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4)?;
+                // The ffn `HC_WRITE` moves to pass 2, so this token's inject
+                // partials have to survive the rest of the chunk (§8s).
+                batch_cmd::record_copy(
+                    gpu,
+                    &v.inject_slots[i],
+                    0,
+                    &ws.inject,
+                    0,
+                    ws.inject.size.min(160),
+                )?;
+            }
+            self.swap_r_in(dev, i);
+            if batch_cmd::recorded() >= MERGED_BATCH_CAP {
+                self.flush()?;
+                self.ensure_batch(dev)?;
+            }
+        }
+        batch_cmd::record_barrier_to_host(gpu)?;
+        self.submit_batch()?;
+        self.flush()?;
+
+        // ---- the bucket list: per distinct expert, its users -----------------
+        let mut raw = vec![0u8; t * k * 4];
+        self.venues[dev]
+            .pf
+            .as_ref()
+            .expect("the merged prefill scratch")
+            .ids
+            .read(&mut raw)?;
+        let mut pairs: Vec<(usize, usize, usize)> = Vec::with_capacity(t * k);
+        for i in 0..t {
+            for j in 0..k {
+                let o = (i * k + j) * 4;
+                let e = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
+                if e >= mc.n_expert {
+                    bail!(
+                        "router id {e} is outside the model's {} experts",
+                        mc.n_expert
+                    );
+                }
+                pairs.push((e, i, j));
+            }
+        }
+        // Router order within a token, expert order across: the slot map keeps
+        // each distinct expert's users contiguous, which is exactly the GEMM's
+        // `O[u * rows + row]` output layout.
+        pairs.sort_unstable();
+        let mut slots = vec![0u32; t * k];
+        let mut groups: Vec<(usize, u32, Vec<usize>)> = Vec::new();
+        let mut slot = 0u32;
+        let mut at = 0usize;
+        let mut distinct = 0usize;
+        while at < pairs.len() {
+            let e = pairs[at].0;
+            let end = pairs[at..]
+                .iter()
+                .position(|p| p.0 != e)
+                .map_or(pairs.len(), |d| at + d);
+            distinct += 1;
+            let mut u = at;
+            while u < end {
+                let g_end = (u + breccia_kernels::gemm::USERS_MAX).min(end);
+                let base = slot;
+                let mut users = Vec::with_capacity(g_end - u);
+                for &(_, ti, j) in &pairs[u..g_end] {
+                    slots[ti * k + j] = slot;
+                    users.push(ti);
+                    slot += 1;
+                }
+                groups.push((e, base, users));
+                u = g_end;
+            }
+            at = end;
+        }
+        let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+        self.venues[dev]
+            .pf
+            .as_ref()
+            .expect("the merged prefill scratch")
+            .slots
+            .write(&slot_bytes)?;
+
+        // ---- the expert GEMMs: three per (distinct expert, group of <= 8) -----
+        self.timers.mark(EXPERTS);
+        self.ensure_batch(dev)?;
+        let t_gemm = std::time::Instant::now();
+        for (e, base, users) in &groups {
+            let mu = users.len();
+            {
+                let v = &self.venues[dev];
+                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let pipes = &v.pipes;
+                let gate = pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
+                let up = pipes.gemm(up_ty).expect("the up multi-user GEMM");
+                let down = pipes.gemm(down_ty).expect("the down multi-user GEMM");
+                // Gather the group's activation rows (a run of consecutive tokens
+                // is one copy), then one weights read at the expert's arena base.
+                let mut a = 0usize;
+                while a < mu {
+                    let mut z = a + 1;
+                    while z < mu && users[z] == users[z - 1] + 1 {
+                        z += 1;
+                    }
+                    batch_cmd::record_copy(
+                        gpu,
+                        &pf.x,
+                        (a * n_embd * 4) as u64,
+                        &pf.mixed,
+                        (users[a] * n_embd * 4) as u64,
+                        ((z - a) * n_embd * 4) as u64,
+                    )?;
+                    a = z;
+                }
+                let wbase = |words: u32| (*e as u32) * words;
+                gate.run_at(&pe.gate.buf, &pf.x, &pf.gg, n_ff, n_embd, mu, wbase(wgate))?;
+                up.run_at(&pe.up.buf, &pf.x, &pf.uu, n_ff, n_embd, mu, wbase(wup))?;
+                v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
+                down.run_at(
+                    &pe.down.buf,
+                    &pf.act,
+                    &pf.down,
+                    n_embd,
+                    n_ff,
+                    mu,
+                    wbase(wdown),
+                )?;
+                batch_cmd::record_copy(
+                    gpu,
+                    &pf.scratch,
+                    (*base as u64) * (n_embd * 4) as u64,
+                    &pf.down,
+                    0,
+                    (mu * n_embd * 4) as u64,
+                )?;
+            }
+            if batch_cmd::recorded() >= MERGED_BATCH_CAP {
+                self.flush()?;
+                self.ensure_batch(dev)?;
+            }
+        }
+        self.submit_batch()?;
+        self.flush()?;
+        let gemm_s = t_gemm.elapsed().as_secs_f64();
+
+        // ---- the fan-in: one dispatch, then the chunk's MoE result per token --
+        self.ensure_batch(dev)?;
+        let t_fan = std::time::Instant::now();
+        {
+            let v = &self.venues[dev];
+            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            v.moe_fanin.run(
+                &pf.scratch,
+                &pf.slots.buf,
+                &pf.w,
+                &pf.shared,
+                &pf.gate,
+                &pf.out,
+                t,
+                k,
+                n_embd,
+            )?;
+            for i in 0..t {
+                batch_cmd::record_copy(
+                    gpu,
+                    &v.moe_out[i].buf,
+                    0,
+                    &pf.out,
+                    (i * n_embd * 4) as u64,
+                    (n_embd * 4) as u64,
+                )?;
+                self.dev_up[dev] += (n_embd * 4) as u64;
+            }
+        }
+        self.submit_batch()?;
+        self.flush()?;
+        let fanin_s = t_fan.elapsed().as_secs_f64();
+
+        // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
+        self.timers.mark(HC_WRITE_F);
+        self.ensure_batch(dev)?;
+        for i in 0..t {
+            self.swap_r_in(dev, i);
+            self.swap_inject_in(dev, i);
+            let v = &self.venues[dev];
+            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+            v.hc.write(ws, &v.r, &v.moe_out[i].buf, &v.r)?;
+            self.swap_inject_in(dev, i);
+            self.swap_r_in(dev, i);
+        }
+        self.submit_batch()?;
+        self.flush()?;
+
+        // ---- the counters (§8v): per chunk, per block ------------------------
+        let dispatches = self.dispatches - disp_before;
+        let expert_bytes = m.layers[b].experts.expert_bytes() as u64;
+        self.pf_gemm_s += gemm_s;
+        self.pf_fanin_s += fanin_s;
+        self.pf_merged_dispatches += dispatches;
+        self.pf_merged_experts += groups.len();
+        self.pf_merged_slots += t * k;
+        self.pf_distinct += distinct;
+        self.pf_merged_bytes += distinct as u64 * expert_bytes;
+        if std::env::var_os("BRECCIA_TRACE_MERGED").is_some() {
+            eprintln!(
+                "merged blk {b:>2} t={t} distinct={distinct} groups={} slots={} \
+                 gemm={:.2} ms fanin={:.3} ms dispatches={dispatches} arena={:.1} MiB",
+                groups.len(),
+                t * k,
+                gemm_s * 1e3,
+                fanin_s * 1e3,
+                (distinct as u64 * expert_bytes) as f64 / (1u64 << 20) as f64
+            );
+        }
+        Ok(())
+    }
+
     /// Swap token `i`'s residual slice into the venue's single-token `r` (and
     /// back), so the per-token dense chain runs verbatim on a chunk.
     fn swap_r_in(&mut self, dev: usize, i: usize) {
@@ -1585,6 +2049,20 @@ impl<'m> Session<'m> {
     /// blocks, expert bytes a once-per-expert device pass would move, tokens)`.
     pub fn merged_prefill_budget(&self) -> (usize, u64, usize) {
         (self.pf_distinct, self.pf_merged_bytes, self.pf_tokens)
+    }
+
+    /// The merged prefill pass's cost breakdown for the last measured window:
+    /// `(expert GEMM seconds, fan-in seconds, dispatches recorded, expert groups,
+    /// arena bytes read, slots)`.
+    pub fn merged_prefill_detail(&self) -> (f64, f64, u64, usize, u64, usize) {
+        (
+            self.pf_gemm_s,
+            self.pf_fanin_s,
+            self.pf_merged_dispatches,
+            self.pf_merged_experts,
+            self.pf_merged_bytes,
+            self.pf_merged_slots,
+        )
     }
 
     /// Wait for block `b`'s segment, read its MoE inputs, run the host expert
@@ -2243,6 +2721,9 @@ impl Drop for Session<'_> {
             }
             for mb in &v.moe_out {
                 mb.release(gpu);
+            }
+            if let Some(pf) = &v.pf {
+                pf.release(gpu);
             }
             if let Some(ws) = v.hc_ws.take() {
                 v.hc.release(gpu, ws);

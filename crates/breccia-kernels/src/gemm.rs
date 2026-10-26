@@ -120,12 +120,25 @@ impl<'g> GemmMany<'g> {
             return Err(anyhow!("users must be 1..={USERS_MAX}, got {users}"));
         }
         let pc = Self::pc(rows, cols, self.blocks_per_row(cols), users, base_words);
-        self.gpu
-            .bind_kernel(&self.kernel, &[w.buf, x.buf, out.buf, self.tables.buf])
-            .map_err(|e| anyhow!("{e}"))?;
         let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
         let gx = groups.min(WG_X_MAX);
         let gy = groups.div_ceil(WG_X_MAX);
+        // Inside a dispatch batch the dispatch is **recorded** (the same rule
+        // `Pipe::run`, `Gemv::run` and `GemvBatch::run` follow): a chunked prefill
+        // records ~200 expert groups per block, and one submit+wait each would be
+        // 40-60 µs of round trip per GEMM.
+        if crate::dispatch_batch::is_open() {
+            return crate::dispatch_batch::record(
+                self.gpu,
+                &self.kernel,
+                &[w, x, out, &self.tables],
+                &pc,
+                (gx, gy, 1),
+            );
+        }
+        self.gpu
+            .bind_kernel(&self.kernel, &[w.buf, x.buf, out.buf, self.tables.buf])
+            .map_err(|e| anyhow!("{e}"))?;
         let kernel = &self.kernel;
         self.gpu
             .wall_run(Qc::C, |d, cmd| unsafe {

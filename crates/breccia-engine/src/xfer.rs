@@ -338,6 +338,23 @@ impl Mailbox {
         Ok(())
     }
 
+    /// Copy the mapping out into `out`. No driver call, no submission — the
+    /// caller must have waited for the batch that wrote it (the chunked prefill
+    /// reads the chunk's router ids this way once per block, §8v).
+    pub fn read(&self, out: &mut [u8]) -> Result<()> {
+        if out.len() as u64 > self.size {
+            return Err(anyhow!(
+                "mailbox read of {} bytes from a {}-byte buffer",
+                out.len(),
+                self.size
+            ));
+        }
+        // SAFETY: bounds checked above; the mapping covers `size + TAIL_PAD` and
+        // the memory is host-coherent.
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr, out.as_mut_ptr(), out.len()) };
+        Ok(())
+    }
+
     pub fn bytes(&self) -> u64 {
         self.buf.size
     }

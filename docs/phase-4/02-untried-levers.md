@@ -462,9 +462,9 @@ Both cards expose a **16 GB BAR** (entire VRAM host-mapped), and Vulkan advertis
 | Type | Heap | Flags | Meaning |
 |---|---|---|---|
 | 3, 4 | VRAM | `0x0007` | DEVICE_LOCAL + HOST_VISIBLE + HOST_COHERENT |
-| 9 | VRAM | `0x00c7` | + HOST_CACHED + DEVICE_COHERENT/CACHED (AMD) |
+| 9 | VRAM | `0x00c7` | + DEVICE_UNCACHED + DEVICE_COHERENT + DEVICE_CACHED (AMD) — **not** HOST_CACHED: good for CPU→GPU uplink, bad for CPU readback (research 01 §A) |
 
-Today every per-block handoff goes through host-coherent system memory with explicit copies/fences (mailbox + readback path). These types allow **the handoff buffers themselves to live in VRAM, directly CPU-mapped**: the expert lane reads its input and writes its result in place — no staging copies, no extra submissions. Payloads are 10–40 KiB, so even the MI50's 2.9 GB/s BAR is irrelevant (latency-bound), and `0x00c7` is explicitly built for cached host access.
+Today every per-block handoff goes through host-coherent system memory with explicit copies/fences (mailbox + readback path). These types allow **the handoff buffers themselves to live in VRAM, directly CPU-mapped**: the expert lane reads its input and writes its result in place — no staging copies, no extra submissions. Payloads are 10–40 KiB, so even the MI50's 2.9 GB/s BAR is irrelevant (latency-bound), and `0x00c7` is device-uncached/device-coherent — good for uplink writes, poor for host readback, so readback mailboxes belong in `0x0007` (corrected by `docs/research/01-vulkan-and-mlc.md` §A).
 
 Expected: trims the mailbox/readback slice of the host-lane critical path (currently 55–71% of the step) and removes a class of fence round trips. Effort S–M; risk low (a memory-type selection plus mapping lifetime); measure with 2- and 4-stream `bench token`/`bench agents` plus the unchanged parity gate. It composes with every ranked item above, including the merged-prefill stream (item 1), where the CPU never touches the activations at all.
 

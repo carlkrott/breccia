@@ -760,6 +760,11 @@ impl Drop for Model {
 pub struct PipelineSet<'g> {
     map: std::collections::BTreeMap<PipeKey, Gemv<'g>>,
     batch: std::collections::BTreeMap<PipeKey, breccia_kernels::GemvBatch<'g>>,
+    /// The **multi-user** GEMM of the chunked-prefill merge (§8v), one per quant
+    /// type (the kernel's shape rides in the push constants, so a type needs one
+    /// pipeline however many roles use it).
+    gemm:
+        std::collections::BTreeMap<breccia_kernels::QuantType, breccia_kernels::gemm::GemmMany<'g>>,
 }
 
 impl<'g> PipelineSet<'g> {
@@ -799,7 +804,39 @@ impl<'g> PipelineSet<'g> {
                 })?,
             );
         }
-        Ok(PipelineSet { map, batch })
+        // The multi-user GEMM is only needed for the resident blocks' expert roles
+        // (the merged prefill pass, §8v). A type with no shader is left out and
+        // the caller falls back to the per-token path for those blocks.
+        let mut gemm = std::collections::BTreeMap::new();
+        for k in keys {
+            let is_expert_role =
+                (k.rows == 640 && k.cols == 2560) || (k.rows == 2560 && k.cols == 640);
+            if !is_expert_role || gemm.contains_key(&k.ty) {
+                continue;
+            }
+            match breccia_kernels::gemm::GemmMany::new(gpu, k.ty) {
+                Ok(g) => {
+                    gemm.insert(k.ty, g);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "merged prefill: no multi-user GEMM for {} ({e}); those blocks keep \
+                         the per-token path",
+                        k.ty.name()
+                    );
+                }
+            }
+        }
+        Ok(PipelineSet { map, batch, gemm })
+    }
+
+    /// The multi-user GEMM for `ty`, or `None` when the shader set has no GEMM
+    /// for it (the caller then keeps the per-token path for that block, §8v).
+    pub fn gemm(
+        &self,
+        ty: breccia_kernels::QuantType,
+    ) -> Option<&breccia_kernels::gemm::GemmMany<'g>> {
+        self.gemm.get(&ty)
     }
 
     /// The batched (multi-expert) pipeline for an expert role shape.

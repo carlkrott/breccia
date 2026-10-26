@@ -233,6 +233,11 @@ enum BenchKind {
         /// expert lane. `0` = token by token
         #[arg(long, default_value_t = 0)]
         prefill_chunk: usize,
+        /// Merged prefill (§8v): route a chunk once and run **one multi-user GEMM
+        /// per distinct expert** over the resident (`--gpu-experts`) arena instead
+        /// of one GEMV per token
+        #[arg(long, default_value_t = false)]
+        prefill_merged: bool,
         /// Blocks whose routed experts live in VRAM, per stream (`;`-separated)
         #[arg(long, value_name = "N[,N]")]
         gpu_experts: Option<String>,
@@ -320,6 +325,9 @@ enum BenchKind {
         /// expert lane (§8s). `0` = token by token
         #[arg(long, default_value_t = 0)]
         prefill_chunk: usize,
+        /// Merged prefill (§8v): one multi-user GEMM per distinct resident expert
+        #[arg(long, default_value_t = false)]
+        prefill_merged: bool,
     },
 }
 fn main() {
@@ -459,6 +467,7 @@ fn run(cli: Cli) -> Result<()> {
                     gpu_experts,
                     same_prompt,
                     prefill_chunk,
+                    prefill_merged,
                 }),
         } => bench_agents(AgentArgs {
             streams,
@@ -471,6 +480,7 @@ fn run(cli: Cli) -> Result<()> {
             gpu_experts,
             same_prompt,
             prefill_chunk,
+            prefill_merged,
         }),
         Command::Bench {
             kind:
@@ -495,6 +505,7 @@ fn run(cli: Cli) -> Result<()> {
                     streams,
                     inbatch_read,
                     prefill_chunk,
+                    prefill_merged,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -517,6 +528,7 @@ fn run(cli: Cli) -> Result<()> {
             streams,
             inbatch_read,
             prefill_chunk,
+            prefill_merged,
         }),
     }
 }
@@ -532,6 +544,7 @@ struct AgentArgs {
     gpu_experts: Option<String>,
     same_prompt: bool,
     prefill_chunk: usize,
+    prefill_merged: bool,
 }
 
 struct ProfileArgs {
@@ -1509,6 +1522,7 @@ struct TokenArgs {
     streams: usize,
     inbatch_read: bool,
     prefill_chunk: usize,
+    prefill_merged: bool,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1644,6 +1658,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         batching: a.batching,
         inbatch_read: a.inbatch_read,
         prefill_chunk: a.prefill_chunk,
+        prefill_merged: a.prefill_merged,
         probe: std::env::var_os("BRECCIA_GPU_TIME").is_some(),
         pool: None,
     };
@@ -1949,6 +1964,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         batching: true,
         inbatch_read: a.inbatch_read,
         prefill_chunk: a.prefill_chunk,
+        prefill_merged: a.prefill_merged,
         probe: true,
         pool: None,
     };
@@ -2128,6 +2144,24 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
             merged_bytes as f64 / pf_tokens as f64 / (1u64 << 20) as f64,
             799.0
         );
+    }
+    {
+        let (gemm_s, fanin_s, dispatches, groups, bytes, slots) = multi
+            .streams
+            .iter()
+            .fold((0.0, 0.0, 0u64, 0usize, 0u64, 0usize), |acc, st| {
+                let (g, f, d, gr, b, sl) = st.merged_prefill_detail();
+                (acc.0 + g, acc.1 + f, acc.2 + d, acc.3 + gr, acc.4 + b, acc.5 + sl)
+            });
+        if groups > 0 {
+            println!(
+                "merged   {groups} expert GEMM groups over {slots} slots: {:.1} ms of GEMM,                  {:.1} ms of fan-in, {dispatches} dispatches ({:.1} GiB read once per expert,                  {:.0} us/group)",
+                gemm_s * 1e3,
+                fanin_s * 1e3,
+                bytes as f64 / (1u64 << 30) as f64,
+                gemm_s * 1e6 / groups as f64
+            );
+        }
     }
     println!(
         "\nprefill  {prompt_tokens} prompt tokens ({common} x {n}) in {prompt_seconds:.2} s = \
@@ -2312,6 +2346,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         batching: a.batching,
         inbatch_read: a.inbatch_read,
         prefill_chunk: a.prefill_chunk,
+        prefill_merged: a.prefill_merged,
         probe: false,
         pool: None,
     };
