@@ -2190,6 +2190,87 @@ And the correction that matters for this section: **launch count is 1-4 % of pre
 time**, so the 20.3 -> 13.5 reconciliation was never going to be a launch story —
 it was one `usize` default.
 
+## 8z. PLE is a cold-start cost, barrier pruning fails its own parity gate, and the flaky test was a real race
+
+Three items and one negative result. The round's honest summary: the prefill item
+was smaller than the trace made it look, the launch item **does not work as
+specified**, and the suite's flake was a genuine ordering bug.
+
+### 1. PLE: batched fault-in landed; the 14.7 ms was cold pages, not the chunk path
+
+The chunk's PLE phase now hashes every token's rows up front and faults them in
+with **one** `prefetch_rows` over `t * 16` rows (8-way), then runs the per-token
+host blocks in order (`Session::ple_step_rows`, split out of `ple_step` so the
+rolling hash still advances exactly once per token). That is the IO half the
+research asked to batch.
+
+It also settled what the cost actually was. `BRECCIA_TRACE_PREFILL`, 64-token
+prompt, warm:
+
+| chunk | `ple` (ms/token) | `shared-exp` | `mixer` | `experts(host)` |
+|---:|---:|---:|---:|---:|
+| 8 | 1.39 | 55.3 | 12.6 | 51.0 |
+| 32 | 1.38 | 30.4 | 10.7 | 51.5 |
+| 64 | 1.41 | 20.9 | 7.2 | 49.2 |
+
+**PLE is 1.4 ms/token at every chunk size** — §8w's `ple 14.65` was one *cold-table*
+run (90-byte records in a 28.8 GiB file: 65 µs per cold row × 16, exactly as
+`docs/research/03` priced it), not a chunk-path regression. So batching the prefetch
+pays only on a cold table, which `--warm` removes from the measurement by
+definition. The real PLE fix is the one research round 5 measured: read a token's
+**4320 contiguous bytes** instead of 48 scattered 90-byte rows (15.6 -> 0.45 ms per
+128 tokens), with 8-16 threads (the decode lane wants 32, so a separate small pool),
+host RAM rather than a `HOST_VISIBLE|DEVICE_LOCAL` heap, and persistent mappings.
+Not implemented; that is the next PLE action.
+
+Prefill, 2 agents x 300 prefix, 8 gen, `--warm 1`: **this window was degraded**
+(baseline 4.75 tok/s/agent against 6.45 in §8x's window; the canonical gate read
+15.2 with a 73 ms/step lane). In-window pair: baseline 4.75 vs chunk 128 + merged
+**6.04** (+27 %), where §8x's window had 6.45 vs 6.07 (-6 %). Both pairs are
+recorded; **no gate claim is made** from a window whose lane time moved 73 vs 40
+ms/step.
+
+### 2. Barrier pruning: implemented, measured, and it does not survive parity (opt-in, off)
+
+`batch_cmd::skip_next_barrier()` drops the fence after a dispatch whose successor
+provably reads nothing it wrote — the three pairs are the shared expert's
+`gate`/`up`, the PLE `key`/`value` projections and the merged pass's `gate`/`up`
+GEMMs. Result:
+
+| arm | chunk 0 parity | chunk 128 + merged |
+|---|---|---|
+| fences everywhere (default) | **32/32**, top-1 13.170521 | **32/32**, top-1 **13.170561** |
+| `BRECCIA_BARRIER_PRUNE=1` | 20/32, top-1 13.069797 | 32/32 but top-1 **12.933844** |
+
+A call site is not a dispatch: the split-K forms record *several* dispatches per
+`run`, so the flag is consumed by the first of them and the reduction loses its
+fence. The fix is a per-dispatch dependency graph, not a call-site annotation — so
+the mechanism stays in the tree **off by default**, re-armed only by that env var,
+and the idea is demoted rather than shipped. The A/B/A of the canonical gate in the
+same window was inconclusive anyway (6.39 / 16.73 / 20.31 / 17.82 aggregate, lane
+39-256 ms/step): the research's 0.98 / 4.32 ms of GPU-half headroom is below this
+box's CPU-contention noise, which is itself worth knowing.
+
+### 3. The flaky suite was a real race, and is fixed
+
+`breccia-vk`'s `device_select_env_is_cleared_and_reported` sets
+`MESA_VK_DEVICE_SELECT` and expects `Host::new()` to unset and report it, while
+`enumerates_three_devices_on_this_host` also calls `Host::new()`. Both mutate the
+**process-global** environment, so under `cargo test`'s parallelism one test's
+`Host::new()` cleared the variable before the other's could observe it — passed
+alone, failed in the suite. Both now take a `HOST_LOCK` mutex around the
+`set_var` + `Host::new` pair; the reason is a doc comment on the lock.
+
+### 4. Items not landed
+
+* **The four multi-user GEMMs (`IQ4_XS`, `Q4_K`, `Q5_K`, `Q6_K`)** and the
+  T-batched shared expert behind them: unchanged. The trace above makes this the
+  largest prefill stage that has a kernel-shaped fix (`shared-exp` 20.9-55.3
+  ms/token in chunked prefill against 15.4 token-by-token).
+* **Async expert prefetch `e+1`**: unchanged (§8x: 429-530 µs per streamed group
+  against 67-84 resident; ring depth to be derived from the measured record/step
+  ratio).
+
 ## 9. Exact commands
 
 

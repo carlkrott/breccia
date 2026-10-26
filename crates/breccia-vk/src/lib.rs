@@ -43,10 +43,24 @@ pub use transfer_bench::{
 mod tests {
     use super::*;
 
+    /// `Host::new()` mutates a **process-global** env var
+    /// (`MESA_VK_DEVICE_SELECT`): it unsets it so enumeration sees every card. Two
+    /// tests doing that in parallel race — one clears the variable before the
+    /// other's `Host::new()` can observe it, and
+    /// `device_select_env_is_cleared_and_reported` then fails on the *other* test's
+    /// timing. That is why the suite flaked under `cargo test` and passed alone.
+    /// Every test that builds a `Host` takes this lock.
+    static HOST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn host_lock() -> std::sync::MutexGuard<'static, ()> {
+        HOST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Run-for-real enumeration test (this machine): without clearing
     /// `MESA_VK_DEVICE_SELECT` only the Raphael iGPU would show up.
     #[test]
     fn enumerates_three_devices_on_this_host() {
+        let _guard = host_lock();
         let host = match Host::new() {
             Ok(h) => h,
             Err(e) => panic!("libvulkan must load on this machine: {e}"),
@@ -82,6 +96,7 @@ mod tests {
     /// The environment trap itself: a set variable is cleared and reported.
     #[test]
     fn device_select_env_is_cleared_and_reported() {
+        let _guard = host_lock();
         // Safe under edition 2021; this test deliberately sets the trap first.
         std::env::set_var("MESA_VK_DEVICE_SELECT", "1002:164e!");
         let host = ctx::Host::new().expect("libvulkan loads");

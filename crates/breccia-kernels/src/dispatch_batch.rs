@@ -64,6 +64,9 @@ use breccia_vk::ctx::{Buf, Gpu, Kernel, Qc, Timeline};
 use std::cell::{Cell, RefCell};
 
 thread_local! {
+    /// Set by [`skip_next_barrier`]: the next recorded dispatch is provably
+    /// independent of the one before it, so its trailing fence can be dropped.
+    static SKIP_BARRIER: Cell<bool> = const { Cell::new(false) };
     /// Batches currently being recorded, one per device.
     static OPEN: RefCell<Vec<Open>> = const { RefCell::new(Vec::new()) };
     /// Round-robin cursor for [`begin`].
@@ -187,6 +190,39 @@ pub fn shutdown() -> Result<()> {
         eprintln!("batch ring: freed {freed} descriptor pool(s) at shutdown");
     }
     Ok(())
+}
+
+/// Drop the fence **after the dispatch that is recorded next**, for the case where
+/// the dispatch after it provably does not read anything that one wrote (one
+/// dispatch only; the flag clears itself).
+///
+/// The distinction matters: the fence a recorded dispatch emits is the one that
+/// separates it from its *successor*, so the flag has to be set before the
+/// **first** member of an independent pair. Set before the second, it skips the
+/// fence the pair still needs (§8z — that mistake measured 0/32 parity).
+///
+/// # When this is valid
+///
+/// Only when the next dispatch reads nothing the previous one wrote. The call
+/// sites here are pairs that share an *input* and write disjoint *outputs* — the
+/// shared expert's `gate`/`up` (both read `mixed`), the PLE `key`/`value`
+/// projections (both read `ple_emb`) and the merged pass's `gate`/`up` GEMMs (both
+/// read `pf.x`) — so the result is bit-identical by construction, not by luck.
+/// A buffer-overlap heuristic would prune almost nothing here (most kernels are
+/// in-place), which is why pruning is declared per call site
+/// (`docs/phase-4/01-forward-pass.md` §8z).
+pub fn skip_next_barrier() {
+    // **Opt-in only.** This is measured and *not* shippable yet: with it on, the
+    // parity gate reads 20/32 at chunk 0 and a wrong top-1 logit at chunk 128, so
+    // at least one of the three "independent" pairs is not one — a call that
+    // records several dispatches (the split-K forms) consumes the flag on its
+    // *first* dispatch and drops a fence the reduction needs. Recorded in §8z as a
+    // negative result; `BRECCIA_BARRIER_PRUNE=1` re-arms it for whoever fixes the
+    // bookkeeping (a per-dispatch dependency graph, not a call-site annotation).
+    if std::env::var_os("BRECCIA_BARRIER_PRUNE").is_none() {
+        return;
+    }
+    SKIP_BARRIER.with(|c| c.set(true));
 }
 
 /// Is a batch open on this thread (on any device)?
@@ -758,9 +794,14 @@ pub(crate) fn record(
         // The narrowest correct fence between two dispatches: `Gpu::barrier_all`
         // (ALL_COMMANDS → ALL_COMMANDS) costs 4.4 µs (MI50) / 5.2 µs (RX) of
         // forced launch serialisation per dispatch, a compute-scoped sync2
-        // barrier 2.7 / 1.1 µs, and the dispatches themselves are 4-5 µs
-        // (`docs/research/02-vulkan-followups-and-powerinfer.md` §A1).
-        gpu.barrier_compute_on(cmd);
+        // barrier 0.65 / 2.87 µs, and the dispatches themselves are 4-5 µs
+        // (`docs/research/02`/`04`). A caller that declared this dispatch
+        // independent of the last one (`skip_next_barrier`) needs none.
+        if SKIP_BARRIER.with(|c| c.replace(false)) {
+            // nothing to fence: the previous dispatch's outputs are not inputs here
+        } else {
+            gpu.barrier_compute_on(cmd);
+        }
     }
     bump_open(gpu);
     RECORD_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));

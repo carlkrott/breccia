@@ -506,6 +506,8 @@ pub struct Session<'m> {
     pf_stream_bytes: u64,
     pf_stream_fill_s: f64,
     pf_stream_wait_s: f64,
+    /// Host seconds spent faulting PLE table rows in for the whole chunk.
+    pf_ple_prefetch_s: f64,
     pf_merged_dispatches: u64,
     pf_arena_bytes: u64,
     pf_merged_experts: usize,
@@ -863,6 +865,7 @@ impl<'m> Session<'m> {
             pf_stream_bytes: 0,
             pf_stream_fill_s: 0.0,
             pf_stream_wait_s: 0.0,
+            pf_ple_prefetch_s: 0.0,
             pf_merged_dispatches: 0,
             pf_arena_bytes: 0,
             pf_merged_experts: 0,
@@ -1082,6 +1085,7 @@ impl<'m> Session<'m> {
         self.pf_stream_bytes = 0;
         self.pf_stream_fill_s = 0.0;
         self.pf_stream_wait_s = 0.0;
+        self.pf_ple_prefetch_s = 0.0;
         self.pf_merged_dispatches = 0;
         self.pf_arena_bytes = 0;
         self.pf_merged_experts = 0;
@@ -1476,6 +1480,9 @@ impl<'m> Session<'m> {
             let v = &self.venues[dev];
             let pipes = &v.pipes;
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+            // `gate` and `up` both read `ws.mixed` and write disjoint outputs, so
+            // the fence between them is dead: drop *gate's* trailing fence (§8z).
+            batch_cmd::skip_next_barrier();
             pipes
                 .get(&lw.moe.gate.key)?
                 .run(&lw.moe.gate.buf, &ws.mixed, &v.shexp_gate)?;
@@ -1626,10 +1633,34 @@ impl<'m> Session<'m> {
         // ---- PLE: per-token fallback (it needs the residual on the host) -----
         if mc.is_ple_layer(b) {
             self.timers.mark(PLE);
-            for i in 0..t {
+            // Batch the IO half: hash every token's 16 table rows up front and
+            // fault them in with **one** `prefetch_rows` over `t * 16` rows, so the
+            // 90-byte-within-a-4-KiB-page reads of a 28.8 GiB table stop serialising
+            // per token (`docs/research/03`: 65 µs per cold row, 48x extent
+            // over-read). The host blocks stay sequential — the rolling context and
+            // the conv state are per token by definition.
+            let table = self.model.ple_table()?;
+            let row_bytes = self.model.ple_row_bytes();
+            let mut per: Vec<Vec<u32>> = Vec::with_capacity(t);
+            let mut all: Vec<u32> = Vec::with_capacity(t * 16);
+            {
+                let ple = self
+                    .ple
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("no PLE host state"))?;
+                for i in 0..t {
+                    let r = ple.rows_for(self.pf_toks[i]);
+                    all.extend_from_slice(&r);
+                    per.push(r);
+                }
+            }
+            let t_prefetch = std::time::Instant::now();
+            prefetch_rows(table, &all, row_bytes);
+            self.pf_ple_prefetch_s += t_prefetch.elapsed().as_secs_f64();
+            for (i, rows) in per.iter().enumerate() {
                 self.swap_r_in(dev, i);
                 self.cur_tok = self.pf_toks[i];
-                self.ple_step(b)?;
+                self.ple_step_rows(b, rows)?;
                 self.swap_r_in(dev, i);
             }
         }
@@ -2112,6 +2143,9 @@ impl<'m> Session<'m> {
                     ),
                     None => (&pf.sf_gate, &pf.sf_up, &pf.sf_down, 0u32, 0u32, 0u32),
                 };
+                // `gate` and `up` read the same gather and write pf.gg / pf.uu:
+                // drop gate's trailing fence (§8z).
+                batch_cmd::skip_next_barrier();
                 gate.run_at(gbuf, &pf.x, &pf.gg, n_ff, n_embd, mu, gb)?;
                 up.run_at(ubuf, &pf.x, &pf.uu, n_ff, n_embd, mu, ub)?;
                 v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
@@ -2691,7 +2725,21 @@ impl<'m> Session<'m> {
 
     /// The PLE insertion: host hash → GPU projections → host block → write back.
     fn ple_step(&mut self, b: usize) -> Result<()> {
-        let tok = self.cur_tok;
+        // The host hash advances the rolling context, so it happens exactly once
+        // per token; a chunk hashes its whole prompt up front so the table rows can
+        // be faulted in **once, in parallel** (see `ple_step_rows`).
+        let rows = self
+            .ple
+            .as_mut()
+            .ok_or_else(|| anyhow!("no PLE host state"))?
+            .rows_for(self.cur_tok);
+        self.ple_step_rows(b, &rows)
+    }
+
+    /// [`Session::ple_step`] with the table rows already hashed: the GPU half and
+    /// the host block for one token.
+    fn ple_step_rows(&mut self, b: usize, rows: &[u32]) -> Result<()> {
+        let _tok = self.cur_tok;
         // PLE needs the residual on the host, so it runs outside any batch.
         self.flush()?;
         let m = self.model;
@@ -2705,13 +2753,6 @@ impl<'m> Session<'m> {
         let hc_dim = mc.hc_dim();
         let n_embd = mc.n_embd;
 
-        // 1. the host hash (§9.1): 16 table rows, head-major.
-        let rows = self
-            .ple
-            .as_mut()
-            .ok_or_else(|| anyhow!("no PLE host state"))?
-            .rows_for(tok);
-
         // 2. fault the rows in concurrently, then gather them on the GPU.
         //
         // The PLE table is 26.8 GiB of lazily-mapped IQ4_NL, and one token needs
@@ -2720,12 +2761,14 @@ impl<'m> Session<'m> {
         // expert lane streams ~800 MiB/token through the same NVMe), against
         // 0.65 ms once hot. llama.cpp prefetches the same rows for the same
         // reason (`llama_prefetch_rows`, `qwen4exp.cpp:1283-1288`).
-        prefetch_rows(table, &rows, m.ple_row_bytes());
+        prefetch_rows(table, rows, m.ple_row_bytes());
         {
             let gpu = m.devices[dev].gpu();
             let v = &self.venues[dev];
-            let staged = v.emb_ple.gather_staged(gpu, table, &rows, &v.ple_emb)?;
+            let staged = v.emb_ple.gather_staged(gpu, table, rows, &v.ple_emb)?;
             v.emb_ple.release(gpu, &staged);
+            // `key` and `value` read the same gathered rows: drop key's fence.
+            batch_cmd::skip_next_barrier();
             v.pipes
                 .get(&raw.key.key)?
                 .run(&raw.key.buf, &v.ple_emb, &v.ple_key_out)?;
@@ -3053,7 +3096,7 @@ fn prefetch_rows(table: &[u8], rows: &[u32], row_bytes: usize) {
     if rows.len() < 2 || table.is_empty() {
         return;
     }
-    let threads = rows.len().min(4);
+    let threads = rows.len().min(8);
     let per = rows.len().div_ceil(threads);
     std::thread::scope(|s| {
         for chunk in rows.chunks(per) {
