@@ -226,6 +226,14 @@ pub struct Session<'m> {
     stagings: Vec<Staging>,
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
+    /// One `QsaWorkspace` per QSA layer, allocated at `ctx_capacity` and reused
+    /// every token: the *buffers* stay fixed and only `n_blocks` / `max_ids` /
+    /// `slots` are rewritten per call, which is what the forward pass reads.
+    ///
+    /// The per-token version cost two extra flushes per QSA block (allocate
+    /// outside the batch, release after it) plus eleven allocations per layer
+    /// per token — 24 round trips a token, ~19 ms.
+    qsa_ws: Vec<Option<QsaWorkspace>>,
     pool: ExpertPool,
     ple: Option<PleHost>,
     sampler: Sampler,
@@ -405,6 +413,22 @@ impl<'m> Session<'m> {
             }
         }
 
+        // Hoist the QSA workspaces: capacity-sized once, mutated per call.
+        let mut qsa_ws: Vec<Option<QsaWorkspace>> = Vec::with_capacity(mc.n_layers);
+        for b in 0..mc.n_layers {
+            if mc.layer_kind(b) != LayerKind::Qsa {
+                qsa_ws.push(None);
+                continue;
+            }
+            let dev = model.device_of(b);
+            let gpu = model.devices[dev].gpu();
+            let qsa = venues[dev]
+                .qsa
+                .as_ref()
+                .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
+            qsa_ws.push(Some(qsa.workspace(gpu, 1, cfg.ctx_capacity)?));
+        }
+
         let threads = if cfg.threads == 0 {
             default_threads()
         } else {
@@ -427,6 +451,7 @@ impl<'m> Session<'m> {
             stagings,
             gdn_state,
             qsa_state,
+            qsa_ws,
             pool,
             ple,
             sampler: Sampler::new(Sampling::default().seed),
@@ -1020,7 +1045,6 @@ impl<'m> Session<'m> {
 
     fn run_qsa(&mut self, b: usize, dev: usize, pos: usize) -> Result<()> {
         let m = self.model;
-        let gpu = m.devices[dev].gpu();
         let n_kv_after = pos + 1;
         {
             let state = self.qsa_state[b]
@@ -1033,25 +1057,24 @@ impl<'m> Session<'m> {
                 );
             }
         }
-
-        // The workspace is allocated **outside** the batch and released **after**
-        // it: its eleven buffers are referenced by the dispatches the batch
-        // records, so freeing them before the submission completes is a
-        // use-after-free (a GPUVM fault, not a wrong number). The allocation is
-        // also the one host operation in the QSA path, and a batch may not
-        // contain a host round trip.
-        self.flush()?;
-        let ws: QsaWorkspace = {
-            let v = &self.venues[dev];
-            let qsa = v
-                .qsa
-                .as_ref()
-                .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
-            qsa.workspace(gpu, 1, n_kv_after)?
-        };
+        // The workspace is hoisted: rewrite the three shape scalars the forward
+        // pass reads (`n_blocks`, `max_ids`, `slots`) and leave the buffers
+        // alone. No allocation, no flush — the batch stays open across the block.
+        {
+            let Some(ws) = self.qsa_ws[b].as_mut() else {
+                bail!("block {b} has no hoisted QSA workspace");
+            };
+            let n_blocks = n_kv_after / 4;
+            let max_ids = n_blocks.min(2048 / 4) + 1;
+            ws.n_blocks = n_blocks;
+            ws.max_ids = max_ids;
+            ws.slots = 4 * max_ids;
+        }
         self.ensure_batch(dev)?;
-
-        let res = {
+        let ws: &QsaWorkspace = self.qsa_ws[b]
+            .as_ref()
+            .ok_or_else(|| anyhow!("block {b} has no hoisted QSA workspace"))?;
+        {
             let qw = m.layers[b]
                 .qsa
                 .as_ref()
@@ -1085,25 +1108,8 @@ impl<'m> Session<'m> {
                 w_out: &qw.out.buf,
             };
             let hc = v.hc_ws.as_ref().expect("the session's hc workspace");
-            qsa.forward(
-                state,
-                &ws,
-                &weights,
-                &proj,
-                &hc.mixed,
-                &v.block_out.buf,
-                pos,
-            )
-        };
-
-        self.flush()?;
-        {
-            let v = &self.venues[dev];
-            if let Some(qsa) = v.qsa.as_ref() {
-                qsa.release(gpu, ws);
-            }
+            qsa.forward(state, ws, &weights, &proj, &hc.mixed, &v.block_out.buf, pos)
         }
-        res
     }
 
     /// The PLE insertion: host hash → GPU projections → host block → write back.
@@ -1375,6 +1381,14 @@ impl Drop for Session<'_> {
                     &st.positions,
                 ] {
                     gpu.destroy_buf(buf);
+                }
+            }
+        }
+        for (b, ws) in self.qsa_ws.iter_mut().enumerate() {
+            if let Some(ws) = ws.take() {
+                let dev = m.device_of(b);
+                if let Some(qsa) = self.venues[dev].qsa.as_ref() {
+                    qsa.release(m.devices[dev].gpu(), ws);
                 }
             }
         }

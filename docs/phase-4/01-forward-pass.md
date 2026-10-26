@@ -586,7 +586,53 @@ second placement path) with a negative expected value. §8d already measured the
 same shape of answer from the other direction (all three roles on the device:
 +22 ms).
 
+## 8i. QSA workspace hoisting (landed): 134.9 -> 121.7 ms on dual
+
+One `QsaWorkspace` per QSA layer, allocated at `ctx_capacity` in `Session::new`,
+freed in `Drop`, and reused every token: only its three shape scalars
+(`n_blocks`, `max_ids`, `slots` — the fields `Qsa::forward` reads) are rewritten
+per call, against buffers sized once. That removes
+
+* the **two extra flushes per QSA block** (the workspace used to be allocated
+  outside the batch and released after it, so 12 QSA blocks cost 24 submit+fence
+  round trips a token), and
+* **eleven buffer allocations per QSA layer per token**.
+
+Dual, 20/28, 16 threads, 3×32, three alternating runs in one window:
+
+| run | tok/s | ms/token | vs 20.79 | parity | dispatches per submit |
+|---|---:|---:|---:|---|---:|
+| 1 (cold) | 6.40 | 156.2 | 30.8 % | 32/32 | 29 |
+| 2 | 8.09 | 123.6 | 38.9 % | 32/32 | 29 |
+| **3 (warm)** | **8.22** | **121.7** | **39.5 %** | **32/32** | 29 |
+
+The generated 32-token sequences are **bit-identical across the three runs and to
+the server** (32/32 each). `dispatches per submit` rose 21 → 29: the QSA block's
+work now rides the same submission as its neighbours, which is the expected
+signature of the removed flushes.
+
+Warm dual: **134.9 → 121.7 ms (−13.2 ms, −10 %)**, 7.42 → **8.22 tok/s (+11 %)**,
+both cards' fence wait still balanced (33.8 : 34.2 ms).
+
+## 8j. Overlap of the host expert lane with GPU work: not attempted
+
+The structural idea (split the top-10: a few experts on the block's device via the
+now-correct `MoeMap`/`MoeCombine` path, the rest on the host, with the GPU GEMV
+issued *before* the host work so the two run concurrently) is the right next move
+and it is **not** implemented: this pass spent its budget on §8i, which was the
+prerequisite — with the QSA flushes still in place, the GPU was idle for two
+submissions per QSA block and any overlap measurement would have been swamped.
+
+What the numbers say about it: the host lane is now the **largest single item**
+(~37–53 ms of 121.7), and `MoeCombine` already accepts the whole routed set, so
+the split needs (a) a per-block policy `k_gpu ∈ {2,4,6}`, (b) the CPU lane to
+compute the *complement* of that subset (its current entry point takes the full
+`ids`), and (c) one `MoeCombine` that adds CPU partials to the GPU ones. (b) is
+the only real work: `ExpertPool::moe_topk` needs an "experts `ids[a..]` only"
+form, ~40 lines mirroring its phase 1/2 dispatch.
+
 ## 9. Exact commands
+
 
 
 ```bash
