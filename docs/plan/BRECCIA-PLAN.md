@@ -13,6 +13,8 @@ Source of truth for scope. Each phase ends in a gate: the gate report lives in `
 
 **Gate A** → feasibility report: pure-Vulkan vs hybrid verdict + M2 kernel work order.
 
+**Gate A: PASSED 2026-10-26** → `docs/phase-0/gate-A-report.md`. Verdict: hybrid — HIP is the M2 reference compute backend; Vulkan viable and RX-primary (single-device full model 16.6 tok/s, best prefill measured); MI50 excluded from PCIe streaming (gen3×4 ~2.9 GB/s, ~0% overlap); expert-parallel placement by default; layer-pipeline split only after Phase-2 proof. Environment hazards codified in `docs/PROJECT-SETUP.md`.
+
 ## Phase 1 — Workspace + `breccia-profile` (M1a)
 
 Cargo workspace (`breccia-cli`, `breccia-profile`, `breccia-vk`, `breccia-kernels`, `breccia-format`, `breccia-cache`, `breccia-draft`, `breccia-server`). `breccia-profile`: device discovery (heaps, queue families, subgroup 32/64, extension probe), CPU/RAM/NVMe probe, calibration micro-benchmarks, `hw_profile.json` + BLAKE3 fingerprint, `--reprofile` / `--dry-run-plan` / `--override-role`.
