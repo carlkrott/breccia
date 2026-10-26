@@ -1264,6 +1264,7 @@ impl<'m> Session<'m> {
         self.expert_bytes = 0;
         self.timers.clear();
         // The prompt passes must not inflate the per-device figures.
+        batch_cmd::reset_record_seconds();
         self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
         self.dev_down.iter_mut().for_each(|x| *x = 0);
         self.dev_up.iter_mut().for_each(|x| *x = 0);

@@ -50,6 +50,10 @@ thread_local! {
     static COUNT: Cell<u32> = const { Cell::new(0) };
     /// This thread's descriptor pool for the open batch.
     static POOL: Cell<vk::DescriptorPool> = const { Cell::new(vk::DescriptorPool::null()) };
+    /// Cumulative host seconds spent inside `record` (set allocation, descriptor
+    /// write, bind, push constants, dispatch, barrier) — the cost a pre-recorded
+    /// command buffer would remove.
+    static RECORD_NS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Sets a batch budgets for. A batch no longer holds one block: with the experts
@@ -71,6 +75,16 @@ pub fn is_open() -> bool {
 /// Dispatches recorded into the batch that is (or was last) open.
 pub fn recorded() -> u32 {
     COUNT.with(|c| c.get())
+}
+
+/// Host seconds spent recording since the last [`reset_record_seconds`].
+pub fn record_seconds() -> f64 {
+    RECORD_NS.with(|c| c.get()) as f64 / 1e9
+}
+
+/// Clear the recording-time accumulator (the engine calls this per run).
+pub fn reset_record_seconds() {
+    RECORD_NS.with(|c| c.set(0));
 }
 
 /// Start recording on the compute queue's command buffer. Nothing is submitted.
@@ -148,6 +162,7 @@ pub(crate) fn record(
     pc: &[u8],
     grid: (u32, u32, u32),
 ) -> Result<()> {
+    let t0 = std::time::Instant::now();
     let cmd = gpu.cmd_c;
     let pool = POOL.with(|c| c.get());
     if pool == vk::DescriptorPool::null() {
@@ -203,6 +218,7 @@ pub(crate) fn record(
         Gpu::barrier_all(&gpu.device, cmd);
     }
     COUNT.with(|c| c.set(c.get() + 1));
+    RECORD_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
     Ok(())
 }
 

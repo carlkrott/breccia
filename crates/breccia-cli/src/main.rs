@@ -1742,6 +1742,12 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             / (1 << 20) as f64,
         sess.host_blocks
     );
+    println!(
+        "\nrecord   {:.2} ms/token of host recording ({} dispatches, {:.0} per submit)",
+        breccia_kernels::batch_cmd::record_seconds() * 1e3 / runs_n,
+        sess.dispatches,
+        sess.dispatches as f64 / sess.submits.max(1) as f64
+    );
     println!("\nper device (per generated token):");
     for line in sess.per_device(forwards / runs_n.max(1.0).floor() as usize) {
         println!("  {line}");

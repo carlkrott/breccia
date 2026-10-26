@@ -526,7 +526,68 @@ keeping the host lane for the gate/up roles and moving only `down` where the sha
 is 2 560 rows. The mechanism (`MoeMap`, `MoeCombine`, `PlacedExperts`, arena,
 device-side ids) is correct and is the substrate for all of those.
 
+## 8g. Where the recording budget actually is (and what that does to the replay plan)
+
+New instrument: `breccia_kernels::batch_cmd::record_seconds()` accumulates the host
+time inside `record()` — descriptor-set allocation + write, bind, push constants,
+dispatch, barrier — i.e. exactly what a pre-recorded command buffer would remove.
+The engine prints it as `record … ms/token (dispatches, per submit)`.
+
+Dual, 20/28, 16 threads, 3×32:
+
+```
+record   10.02 ms per 31-token run = 0.32 ms/token   (1 353 dispatches/token, 21 per submit)
+```
+
+**Recording is ~0.3 ms/token, not the 18.7 ms this report previously attributed to
+"mixer recording".** The stage mark around the mixer measures the *wall* time of
+issuing those dispatches, and what is in there is not `vkCmd*`:
+
+* `run_qsa` flushes **twice** per QSA block (once to allocate the workspace
+  outside the batch, once to release it after), so 12 QSA blocks cost
+  **24 extra submit+fence round trips** per token, each landing in the `mixer`
+  stage: 12 × 2 × ~0.8 ms ≈ 19 ms — the whole figure; and
+* `qsa.workspace()` allocates **eleven buffers per QSA layer per token**.
+
+### Consequences
+
+1. **Experiment B's payoff is not the recorded time.** A replayed command buffer
+   still costs one submission and one fence, so replay can only remove ~0.3 ms of
+   recording. The QSA position indirection is therefore **not** the pay-off item,
+   and it should not be started for the recording reason this report gave.
+2. **The real item is the QSA workspace lifecycle**: hoist it (one workspace per
+   QSA layer, sized to the context, allocated at session start) and mutate its
+   `n_blocks` / `max_ids` / `slots` fields per call — they are public, so the
+   live position can be written per token without a reallocation and without
+   flushing the batch. That removes up to 24 round trips (~19 ms) *and* the
+   allocation churn, with no shader change and no position indirection. It is the
+   top of the queue now.
+3. Experiment A stays ruled out by arithmetic (§8h).
+
+**Run-to-run caution this exposed:** the same dual 20/28 configuration measured
+134.9 ms and 156.4 ms in two windows of this pass, with `experts(host)` moving
+36.6 → 52.7 ms and `ple` 1.2 → 6.2 ms — page-cache state, not code. Comparisons
+across passes must be alternated within one scripted window (`bc-*`, `du-*`,
+`sp-*` were), which is why the headline numbers come from single sweeps.
+
+## 8h. Experiment A (only the `down` role on the GPUs): ruled out by arithmetic
+
+* the host lane is **0.76 ms/block** (36.6 ms / 48), and gate, up and down each
+  cost **one third** of it (`docs/phase-3/08` §2 — the roles are symmetric by
+  construction: `640·2560 = 2560·640` values);
+* moving `down` for the 13 production blocks therefore moves **≤ 2.5 ms** of a
+  135 ms token, and it cannot even keep that: gate/up still need the host, so the
+  readback stays and the `act` vector (`[10, 640]` = 25 KiB) must go **up** to the
+  device — one extra submit+fence per placed block, 11 × ~0.19 ms ≈ 2.1 ms;
+* net ≈ **+0.3 ms**, before counting the device `down` GEMV.
+
+Not implemented: ~170 lines (a partial-lane entry point in `ExpertPool` plus a
+second placement path) with a negative expected value. §8d already measured the
+same shape of answer from the other direction (all three roles on the device:
++22 ms).
+
 ## 9. Exact commands
+
 
 ```bash
 # build + the whole verification set
