@@ -188,11 +188,9 @@ pub struct SessionCfg {
     /// Collect per-stage timings.
     pub timers: bool,
     /// Record each GPU phase into one command buffer and submit it once
-    /// (`crate::graph`'s batching). **Off by default**: the mechanism is verified
-    /// bit-identical in `breccia-kernels/tests/batching.rs`, but the graph
-    /// integration still trips a command-buffer lifecycle violation
-    /// (`VUID-vkCmdBindPipeline-commandBuffer-recording`) at run time — see
-    /// `docs/phase-4/01-forward-pass.md` §batching. Off is the reference path.
+    /// (`crate::graph`'s batching). **On by default**: 0 validation messages, and
+    /// the generated tokens are bit-identical with it on and off on all three
+    /// device configurations (`docs/phase-4/01-forward-pass.md` §8).
     pub batching: bool,
 }
 
@@ -202,7 +200,7 @@ impl Default for SessionCfg {
             ctx_capacity: 256,
             threads: 0,
             timers: false,
-            batching: false,
+            batching: true,
         }
     }
 }
@@ -612,6 +610,20 @@ impl<'m> Session<'m> {
             self.ple_step(b, tok)?;
         }
 
+        // `BRECCIA_TRACE_BATCH=1` prints one line per block: kind, whether a
+        // batch is open, and the running submit/dispatch counters. It is how the
+        // QSA-workspace lifecycle bug (docs/phase-4/01-forward-pass.md §8.1) was
+        // found, so it stays.
+        let trace_batch = std::env::var_os("BRECCIA_TRACE_BATCH").is_some();
+        if trace_batch {
+            eprintln!(
+                "block {b:>2} {:?} open={} submits={} dispatches={}",
+                m.layers[b].kind,
+                batch_cmd::is_open(),
+                self.submits,
+                self.dispatches
+            );
+        }
         // Every dispatch from here to the MoE readback rides one command buffer.
         self.ensure_batch(dev)?;
 
@@ -825,50 +837,81 @@ impl<'m> Session<'m> {
 
     fn run_qsa(&mut self, b: usize, dev: usize, pos: usize) -> Result<()> {
         let m = self.model;
-        let qw = m.layers[b]
-            .qsa
-            .as_ref()
-            .ok_or_else(|| anyhow!("block {b} is QSA but has no weights"))?;
         let gpu = m.devices[dev].gpu();
-        let v = &self.venues[dev];
-        let qsa = v
-            .qsa
-            .as_ref()
-            .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
-        let state = self.qsa_state[b]
-            .as_ref()
-            .ok_or_else(|| anyhow!("block {b} has no QSA state"))?;
         let n_kv_after = pos + 1;
-        if n_kv_after > state.capacity_cells {
-            bail!(
-                "block {b}: position {pos} needs {n_kv_after} KV cells but the cache holds {}",
-                state.capacity_cells
-            );
+        {
+            let state = self.qsa_state[b]
+                .as_ref()
+                .ok_or_else(|| anyhow!("block {b} has no QSA state"))?;
+            if n_kv_after > state.capacity_cells {
+                bail!(
+                    "block {b}: position {pos} needs {n_kv_after} KV cells but the cache holds {}",
+                    state.capacity_cells
+                );
+            }
         }
-        let ws: QsaWorkspace = qsa.workspace(gpu, 1, n_kv_after)?;
-        let weights = QsaWeights {
-            q_norm: &qw.q_norm,
-            k_norm: &qw.k_norm,
-            idx_q_norm: &qw.idx_q_norm,
-            idx_k_norm: &qw.idx_k_norm,
+
+        // The workspace is allocated **outside** the batch and released **after**
+        // it: its eleven buffers are referenced by the dispatches the batch
+        // records, so freeing them before the submission completes is a
+        // use-after-free (a GPUVM fault, not a wrong number). The allocation is
+        // also the one host operation in the QSA path, and a batch may not
+        // contain a host round trip.
+        self.flush()?;
+        let ws: QsaWorkspace = {
+            let v = &self.venues[dev];
+            let qsa = v
+                .qsa
+                .as_ref()
+                .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
+            qsa.workspace(gpu, 1, n_kv_after)?
         };
-        let proj = QsaProjections {
-            q: Proj::Single(v.pipes.get(&qw.q.key)?),
-            w_q: &qw.q.buf,
-            k: Proj::Single(v.pipes.get(&qw.k.key)?),
-            w_k: &qw.k.buf,
-            v: Proj::Single(v.pipes.get(&qw.v.key)?),
-            w_v: &qw.v.buf,
-            idx_q: Proj::Single(v.pipes.get(&qw.idx_q.key)?),
-            w_idx_q: &qw.idx_q.buf,
-            idx_k: Proj::Single(v.pipes.get(&qw.idx_k.key)?),
-            w_idx_k: &qw.idx_k.buf,
-            out: Proj::Single(v.pipes.get(&qw.out.key)?),
-            w_out: &qw.out.buf,
+        self.ensure_batch(dev)?;
+
+        let res = {
+            let qw = m.layers[b]
+                .qsa
+                .as_ref()
+                .ok_or_else(|| anyhow!("block {b} is QSA but has no weights"))?;
+            let v = &self.venues[dev];
+            let qsa = v
+                .qsa
+                .as_ref()
+                .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
+            let state = self.qsa_state[b]
+                .as_ref()
+                .ok_or_else(|| anyhow!("block {b} has no QSA state"))?;
+            let weights = QsaWeights {
+                q_norm: &qw.q_norm,
+                k_norm: &qw.k_norm,
+                idx_q_norm: &qw.idx_q_norm,
+                idx_k_norm: &qw.idx_k_norm,
+            };
+            let proj = QsaProjections {
+                q: Proj::Single(v.pipes.get(&qw.q.key)?),
+                w_q: &qw.q.buf,
+                k: Proj::Single(v.pipes.get(&qw.k.key)?),
+                w_k: &qw.k.buf,
+                v: Proj::Single(v.pipes.get(&qw.v.key)?),
+                w_v: &qw.v.buf,
+                idx_q: Proj::Single(v.pipes.get(&qw.idx_q.key)?),
+                w_idx_q: &qw.idx_q.buf,
+                idx_k: Proj::Single(v.pipes.get(&qw.idx_k.key)?),
+                w_idx_k: &qw.idx_k.buf,
+                out: Proj::Single(v.pipes.get(&qw.out.key)?),
+                w_out: &qw.out.buf,
+            };
+            let hc = v.hc_ws.as_ref().expect("the session's hc workspace");
+            qsa.forward(state, &ws, &weights, &proj, &hc.mixed, &v.block_out, pos)
         };
-        let hc = v.hc_ws.as_ref().expect("the session's hc workspace");
-        let res = qsa.forward(state, &ws, &weights, &proj, &hc.mixed, &v.block_out, pos);
-        qsa.release(gpu, ws);
+
+        self.flush()?;
+        {
+            let v = &self.venues[dev];
+            if let Some(qsa) = v.qsa.as_ref() {
+                qsa.release(gpu, ws);
+            }
+        }
         res
     }
 

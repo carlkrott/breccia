@@ -15,17 +15,18 @@ reference, stopped before the benchmarks (recorded in §7).
 server is MET — 32 of 32 generated tokens identical, no divergence.** Two real
 defects were found by the per-layer digests and fixed: a never-written `mixed`
 buffer (§4.1) and a GDN q/k L2-norm scale that cost a factor of 128 (§4.2).
-Batching is implemented and verified bit-identical at the kernel level but is
-**off by default** in the graph (§8). Every number below is from a run, and the
-ones taken before each fix are labelled.
+Dispatch batching is **on by default**, 0 validation messages, and produces
+bit-identical tokens on MI50-only, RX-only and dual (§8). Every number below is
+from a run, and the ones taken before each fix are labelled.
 
 | | |
 |---|---|
 | first end-to-end token | **yes** — 248 320 finite logits, repeat bit-identical, top-1 stable |
 | greedy generation | **yes** — `Sampling::Argmax`, deterministic |
 | parity vs the production HIP server | **MET** — 32/32 greedy tokens, first divergence: none |
-| decode, MI50-only (post-fix) | **5.01 tok/s** avg / **5.71** best (199.5 / 175.2 ms/token) |
-| vs the 20.79 tok/s baseline | **24 – 27 %** |
+| decode, MI50-only, batching on, 3×32 warm | **6.74 tok/s** (148.3 ms/token) |
+| decode, MI50-only, batching on, 16 host threads | **6.55 tok/s** (152.8 ms) — see §9 |
+| vs the 20.79 tok/s baseline | **32.4 %** (24.6 % without batching) |
 | hotspot | **synchronous-dispatch overhead**, not arithmetic — 96 HC_READ calls alone cost 39–53 ms/token |
 
 ---
@@ -186,35 +187,35 @@ conformance suite then still passed **6/6** under the validation layer.
 
 ## 5. Speed — and the finding that dominates it
 
-### 5.1 Measured decode (warm page cache)
+### 5.1 Measured decode (warm page cache, 3×32, batching off vs on)
 
 Method: `--gen 32 --runs 3`, decode-only (the prompt is fed first, its time is
-excluded, the average over 3 runs is reported). A warm-up pass on the MI50 runs
-first so the expert/PLE pages are not the measurement. One GPU process at a
-time, everything under `timeout`, engine only (the parity server is stopped).
+excluded, the 3 runs are averaged). A warm-up pass runs first so the
+expert/PLE pages are not the measurement. One GPU process at a time, everything
+under `timeout`, engine only (the parity server is stopped).
 
-| config | tok/s | ms/token | vs 20.79 | logits |
-|---|---:|---:|---:|---|
-| **MI50-only, post-parity-fix** | **5.01** (best 5.71) | **199.5** (best 175.2) | 24.1 % | 32/32 parity |
-| MI50-only, pre-fix | 5.27 | 189.9 | 25.3 % | embedding-only |
-| RX-only, pre-fix | 3.91 | 255.8 | 18.8 % | embedding-only |
-| dual, pre-fix | 4.70 | 212.8 | 22.6 % | embedding-only |
+| config | batching | tok/s | ms/token | vs 20.79 | Δ vs off |
+|---|---|---:|---:|---:|---:|
+| MI50-only `0000:0e:00.0` | off | 5.12 | 195.3 | 24.6 % | |
+| MI50-only | **on** | **6.74** | **148.3** | **32.4 %** | **−47.0 ms** |
+| RX-only `0000:03:00.0` | off | 3.94 | 254.1 | 18.9 % | |
+| RX-only | **on** | **5.30** | **188.6** | **25.5 %** | **−65.6 ms** |
+| dual `0000:03:00.0,0000:0e:00.0` | off | 4.62 | 216.6 | 22.2 % | |
+| dual | **on** | **6.03** | **165.9** | **29.0 %** | **−50.6 ms** |
+| MI50-only, 16 host threads | on | 6.55 | 152.8 | 31.5 % | −42.5 |
 
-The three pre-fix rows are structurally comparable (a GEMV reads the same weight
-bytes whatever the activation holds, and the dispatch count is unchanged) but
-they ran with the §4.1/§4.2 defects, so the **post-fix MI50 row is the number to
-quote**; RX and dual have not been re-measured since the parity fix.
+Against the plan's target (−40 ms MI50 / −70 ms RX): **MI50 119 %, RX 94 %**.
 
-Per-run spread: MI50 5.19/5.18/5.43, RX 3.84/3.86/4.04, dual 4.68/4.72/4.70 —
-i.e. the ranking is outside the noise. **These runs predate the §4.1 fix**; the
-dispatch and byte mix is identical (a GEMV reads the same weight bytes whatever
-the activation vector holds), so the table stands for the *structure*, but it
-must be re-measured once 4.2 is closed.
+**Parity invariant.** All six configurations generate the *same* 32 tokens, and
+they are the server's 32 (32/32 each). Batching changes timing, not arithmetic.
 
-**The MI50 beats the RX**, which is the opposite of their compute ratio and is
-explained in §5.2: this graph is bound by per-dispatch host round trips, and the
-RX's round trip measured *higher* than the MI50's on this host (82 vs 54 µs with
-validation on, 64 vs 36 µs without — the RX is the display card).
+**The dual configuration still does not beat MI50-only** (6.03 vs 6.74 tok/s).
+Splitting 48 blocks over two cards moves half the work to the RX, whose host
+round trip is ~1.8× the MI50's (64 vs 36 µs measured) and which adds a PCIe
+hand-off of the 40 KiB residual stack per token; the RX's 2× compute does not
+pay for that in a graph this dispatch-bound. The RX advantage the plan predicted
+would need the *per-phase* dispatch count to fall further, or the larger weights
+to be the constraint (they are not: dense is 3.2 GiB).
 
 ### 5.2 Where the time goes
 
@@ -313,72 +314,88 @@ all of them; the count is 0.
 
 ---
 
-## 8. Dispatch batching: infrastructure landed, graph integration open
+## 8. Dispatch batching: fixed, measured, on by default
 
-The single change with the largest expected effect on tok/s is to stop paying a
-submit+fence per dispatch. Numbers to beat, per token:
+`breccia-kernels/src/dispatch_batch.rs`: `begin` / `end` / `record`, plus hooks in
+`Pipe::run`, `Gemv::run`, `GemvBatch::run` that record instead of submitting while
+a batch is open. A graph block is now **two submissions** (one for
+`HC_READ(attn) … shared expert`, one for the ffn `HC_WRITE`) instead of ~29, and
+`breccia-kernels/tests/batching.rs` proves six dependent dispatches across three
+pipelines plus a GEMV are **bit-identical** to the synchronous path.
 
-| item | count | cost each | total |
-|---|---:|---:|---:|
-| synchronous dispatches | ~1 512 | 36 µs (MI50) / 64 µs (RX) | **54 – 97 ms** |
-| device↔host round trips | ~100 | 161 / 193 µs | **16 – 19 ms** |
-| buffer alloc + free | ~130 (a QSA workspace per layer per token) | 15 / 13 µs | 1.7 – 2.0 ms |
+### 8.1 The three defects this cost, in order
 
-**What landed.** `breccia-kernels/src/dispatch_batch.rs`: `begin` / `end` /
-`record`, plus hooks in `Pipe::run`, `Gemv::run`, `GemvBatch::run` that record
-instead of submitting while a batch is open. Two rules came out of building it
-and both cost a fault to learn:
-
-1. **A `Kernel` owns one descriptor set, and a set may not be updated once a
-   recorded command buffer references it** — the GPU then sees the *last* write
-   for every recorded dispatch. A batch therefore allocates a fresh set per
-   dispatch from its own pool (compatible, because it is allocated from the
-   kernel's own `dsl`). The first version reused `kernel.set` and faulted
-   (`GPUVM fault`, soft-recovered) inside one token.
+1. **One descriptor set per dispatch.** A `Kernel` owns a single set, and a set
+   may not be updated once a recorded command buffer references it — the GPU then
+   sees the *last* write for every recorded dispatch (GPUVM fault within one
+   token). A batch now allocates a fresh set per dispatch from its own pool,
+   compatible because it is allocated from the kernel's own `dsl`.
 2. **The pool must outlive the submission**, not just the recording: freeing it
-   before `vkWaitForFences` shows up as `VUID-vkCmdDispatch-None-08114`
+   before `vkWaitForFences` reads as `VUID-vkCmdDispatch-None-08114`
    ("descriptors must be valid").
+3. **The QSA workspace was allocated and freed inside the batch** — and this was
+   the `VUID-vkCmdBindPipeline-commandBuffer-recording` cascade. Its eleven
+   buffers are referenced by recorded dispatches, so `Qsa::release` freed them
+   before the submit (a use-after-free) while `Qsa::workspace` did the one host
+   allocation the batch discipline forbids. `run_qsa` now flushes, allocates,
+   opens the batch, records the forward, flushes, *then* releases.
 
-`breccia-kernels/tests/batching.rs` proves the mechanism: six dependent
-dispatches across three pipelines, and a GEMV, recorded into one command buffer,
-are **bit-identical** to the synchronous path (MI50, validation on, `timeout`).
+### 8.2 Evidence
 
-**What is open.** The graph opens and closes ~4 batches per block; at run time it
-still trips `VUID-vkCmdBindPipeline-commandBuffer-recording` (the command buffer
-is not in the recording state when a later dispatch is recorded) and then faults,
-so `--batching` is **off by default** (`SessionCfg::batching`, default `false`)
-and the measured tables in §5 are the reference path. The isolated test passing
-while the graph fails narrows it to a command-buffer lifecycle mistake in the
-engine's open/close sequencing around transfers (the `Staging` readback/upload
-also resets `cmd_c`), not to the recording mechanism itself.
+* `VK_LAYER_KHRONOS_validation` on the MI50, `--batching`: **0 validation
+  messages** (it was 107 before the fix), no fault, run completes.
+* Per block: 29 recorded dispatches in 2 submits (GDN), 28 in 3 (QSA — the
+  workspace lifecycle adds one).
+* `cargo test -p breccia-kernels --test batching` on the MI50: bit-identical.
+* 32/32 server parity and bit-identical output across all six on/off ×
+  device configurations (§5.1).
 
-Expected win once it closes, from §5.2's numbers: a block's ~29 dispatches become
-one submit, and a block's ~4 round trips replace ~30, i.e. **−40 ms/token on the
-MI50 and −70 on the RX**.
+**Reading the per-stage table after batching.** The stage marks are host-clock
+deltas around synchronous dispatch groups; with batching the GPU work of a whole
+phase completes at the *fence*, so it is charged to the stage after it
+(`xfer-down`). That is why `hc-read(attn)` reads 0.2 ms and `xfer-down` 43.2 ms
+with batching on: the same work, attributed to the wait instead of to the
+dispatches. The totals are the honest number.
 
-Original plan, in order of value per unit of work:
+## 8b. Next hotspot: the host expert lane
 
-1. **One command buffer per block, one fence.** Needs `breccia-kernels` to
-   expose a *record-only* entry point next to `run` (`Pipe::record`,
-   `Gemv::record`, `GemvBatch::record`, `Proj::record`) so the graph can record
-   all ~29 dispatches of a block with `Gpu::barrier_all` between them and submit
-   once. Expected: −25 of the 29 fences per block, i.e. **−40 ms/token on the
-   MI50, −70 on the RX**. This is the one change that could put the engine in
-   the same league as the 48.1 ms baseline. It is *outside this work order's
-   ownership* (`crates/breccia-kernels/**`), so it is specified here rather than
-   done.
-2. **Hoist the QSA workspace** out of the per-token loop (one allocation for the
-   capacity, `n_kv_after` taken from a push constant) — the current per-token
-   `qsa.workspace()` costs 12 × 11 allocations. Small (≈2 ms) but free.
-3. **Free the residual stack from the round trip**: `block_out` and the router's
-   `ids`/`weights` are read once per block; making them host-visible
-   (`HOST_VISIBLE|HOST_COHERENT|DEVICE_LOCAL`) removes the copy and the submit on
-   the upload side, leaving one readback per block (−8 ms/token on the MI50).
-4. Only then look at the arithmetic (the tiled-GEMM prefill lever and the
-   attention-score parallelism already queued in `docs/phase-3/06` §8.2), which
-   at 4–5 ms/token of GPU work is not where the time is.
+Post-batching MI50 breakdown (148.3 ms): the host expert lane is the largest
+single item and the only one that does not depend on which GPU runs.
 
----
+| threads | tok/s | ms/token | `experts(host)` ms | lane GB/s (799 MiB/token) |
+|---:|---:|---:|---:|---:|
+| 8 (default) | 5.82 | 171.9 | 53.3 | 15.0 |
+| 12 | 6.30 | 158.8 | 42.9 | 18.6 |
+| 16 | **6.55** | **152.8** | **38.5** | **20.8** |
+
+* **It scales with threads, so it is compute-bound, not fault-bound.** Run-to-run
+  at 8 threads is 169.3 / 177.4 / 169.2 ms and at 16 threads 153.3 / 152.3 /
+  152.7 ms — a warm run is *not* faster than the first, i.e. the page cache is
+  already holding the sampled expert pages after the prompt (the one 414 ms
+  `experts` outlier in this log is a fresh-load first token, not the steady
+  state). Phase-3 measured the lane at 20.4 GB/s standalone with 8 threads and
+  22.5–30.5 with 16; in-graph we see 15.0 / 20.8, the difference being the
+  3.7 GiB of dense weights and the PLE table sharing the cache.
+* **12–16 threads is the free win**: +13 % tok/s for a flag, and `--threads 16`
+  is the recommended setting for this graph. The default stays at the lane's own
+  policy (physical cores / 2 = 8) so the phase-3 numbers keep their meaning.
+* **AVX-512 is not the next step, and here is why.** The lane is already at
+  20.8 GB/s at 16 threads against a 53.9 GB/s single-core DRAM stream: it is
+  *decode-bound*, and the top-3 types by bytes (`IQ4_NL` down 18 layers,
+  `Q2_0` down 30 layers, `IQ3_S` gate/up 13 layers) are the two *cheap* decoders
+  (`vpshufb` table lookup and shift/mask, 4.1× and 5.6× over scalar) and the one
+  mid-cost type. Phase-3 put the ceiling of a `vpermb`-style IQ rewrite at
+  **10–25 %**, requires a second complete set of 14 kernels behind
+  `is_x86_feature_detected!` plus per-feature gating (Rust has no
+  `#[target_feature(enable = "avx512vNNI")]` subset that is stable for all of
+  these), and would buy ~4–9 ms of a 152 ms token. The structural lever is
+  better: fewer expert bytes per token.
+* **What actually moves this**: (a) `--threads 16`, +0.8 tok/s; (b) the `-ot`
+  parity we do not implement — put *some* blocks' experts in VRAM, which removes
+  their host reads entirely (this is where the production engine's 13.6 GB
+  placement gets its speed); (c) fold the SwiGLU into the gate/up shard walk (it
+  already is, in the pool) and prefetch the next token's expert pages during the
+  GPU half of the current block. (a) is free and is in this report; (b) is M3.
 
 ## 9. Exact commands
 
@@ -439,5 +456,6 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 3. **BF16/Q8 activation emulation** (§6 items 2–3) — one rounded upload per block
    behind a flag, then measure the parity delta; that is the cheapest way to
    decide whether the deviation matters or not.
-4. **Then** the batching lever of §8 — it is worth 2–4× and it is the only
-   change that gets near the 48.1 ms baseline with this arithmetic.
+4. **The expert lane's structural lever** (§8b): `-ot`-style GPU expert blocks,
+   worth ~20 ms/token on the host side, and the page prefetch across the block
+   boundary. Together with batching that is where the remaining 100 ms lives.
