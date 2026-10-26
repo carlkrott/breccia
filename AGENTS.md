@@ -29,6 +29,17 @@ A from-scratch Rust inference engine (`breccia`) plus its Phase-0 measurement ha
 - Measurement claims must include the command line and environment (backend, device IDs, flags) in the report.
 - Never call a gate passed without the number in `docs/phase-N/`.
 
+### GPU crash safety (learned 2026-10-26: a conformance test hung the machine)
+
+Per-invocation rules, mandatory once a test touches GPU memory:
+
+1. **Wrap every GPU run in `timeout 90`** — a driver hang must not outlive the command.
+2. **Risky/new kernel paths run on the Radeon VII (MI50) first** — it drives no display, so a fault there does not freeze the desktop. Resolve devices by PCI identity (`0000:0e:00.0`), never by enumeration ordinal. Only run on the RX 6950 XT (`0000:03:00.0`, the display card) after MI50 passes.
+3. **One GPU process at a time.** No parallel benches, no benches during agent work on the same card.
+4. Enable `VK_LAYER_KHRONOS_validation` for first runs of new shader code and record any VU messages; RADV page faults on illegal command streams are otherwise silent until the box freezes.
+5. Conformance: run **one quant type per invocation** (`--exact`/env selector) so a fault is attributable; never sweep all types in one go after touching shader includes.
+6. After any GPU fault, check `journalctl -b -1` for `amdgpu ... page fault` / `Illegal opcode` and capture the process/thread names before rebooting.
+
 ## Git
 
 See `docs/GIT-WORKFLOW.md`. No `git push` until a remote exists and the user has explicitly approved publication.

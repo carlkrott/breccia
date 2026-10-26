@@ -62,6 +62,18 @@ spirv-val foo.spv
 | gpu-manager monitor runs even when its unit is inactive | Stops idle GPU services when `MemAvailable < 4 GiB` — benchmark servers get evicted mid-window | keep requests in flight while measuring; restore service state after windows |
 | GPU DPM clock states | Same run at boosted vs idle clocks differs up to ~1.6× (273 vs 174 tok/s) | warm up / pin clocks for comparable numbers |
 
+## GPU crash safety (2026-10-26 incident)
+
+A conformance test with poisoned block scales produced an **illegal command stream**
+on the RX 6950 XT (`[gfxhub] page fault … Illegal opcode in command stream` + coredump)
+and hung the machine. Rules now enforced (also in `AGENTS.md`):
+
+- `timeout 90` around every GPU run;
+- risky/new shader paths on the **MI50 first** (not the display card), selected by PCI
+  `0000:0e:00.0`;
+- one GPU process at a time; validation layer on for first runs;
+- one quant type per conformance invocation; inspect `journalctl -b -1` after any fault.
+
 ## Reference builds (baselines — do not rebuild without reason)
 
 | Build | Path | Backend |
