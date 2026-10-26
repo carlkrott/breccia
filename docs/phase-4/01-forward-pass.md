@@ -795,6 +795,189 @@ inside kernels that already have conformance suites; the pattern to keep is the
 one that made §8d correct: a unit-level byte/value diff against the host reference
 **before** the end-to-end parity run.
 
+## 8n. Mid-batch sync, overlap, and split-K: one win, two measured rejections
+
+§8m specified a timeline-semaphore marker so the host could start a block's
+MoE work before the block's GPU work finished. All of the machinery landed and is
+validated; the **overlap it enables does not pay**, and the report says so with
+numbers rather than estimates. One item out of the four attempted is a win.
+
+### What landed
+
+| piece | where | state |
+|---|---|---|
+| `Gpu::timeline(initial) -> Timeline`, bounded `Timeline::wait_host(value, timeout_ns)`, `Timeline::counter` | `breccia-vk/src/ctx.rs` | used by the probe; the segmented path that used it measured negative (§below) |
+| `Gpu::submit_cmd(q, cmd, signal)` — a submission that signals a timeline value (`vkQueueSubmit2`, loaded by its **core 1.3** name; ash 0.38 only loads `vkQueueSubmit2KHR`, which RADV does not export, and `VkSubmitInfo` cannot carry `pSignalSemaphoreValues`) | `breccia-vk/src/ctx.rs` | on |
+| a **ring of command buffers** (`Gpu::cmds_c`, 3 slots) with a per-slot fence, so a segment can be in flight while the next is recorded; `begin` waits only on the slot it reuses | `breccia-vk`, `breccia-kernels/dispatch_batch` | on (no cost, §A/B below) |
+| `record_copy` / `record_barrier_to_host` / `record_timestamp` into an open batch | `dispatch_batch` | the copy path was measured and rejected; `record_timestamp` powers the new probe |
+| `BRECCIA_GPU_TIME=1` **GPU-time probe**: `vkCmdWriteTimestamp` around the first 56 batches, printed as per-device GPU busy ms | `breccia-engine/src/graph.rs` | on (env-gated) |
+| split-K on the HC_READ `down` GEMV (`T = 1`) | `breccia-kernels/ops` (`HcMixer::down_splits`) | **on — the win** |
+
+Validation: the whole path (timeline semaphores, `vkQueueSubmit2`, the ring, the
+segmented submissions) ran on the **MI50 first with `VK_LAYER_KHRONOS_validation`**
+as AGENTS.md requires, and produced **0 validation messages**, including at
+teardown (the semaphores and the ring's pools/fences are released in `Drop`).
+
+### The new instrument: how much of a fence wait is the GPU?
+
+`BRECCIA_GPU_TIME=1` timestamps each batch; the difference from its fence wait is
+what the host and driver add. One warm token, 48 blocks, `--threads 16`:
+
+| configuration | GPU busy (ms/token) | fence wait (both devices) | per block |
+|---|---:|---:|---:|
+| dual 20/28 (RX 20 blocks) | 29.4 (RX) + 29.9 (MI50) = **59.3** | 33.0 + 33.7 = **66.8** | RX 1.47, MI50 1.07 |
+| RX only (48 blocks) | **76.6** | 85.0 | **1.60** |
+| MI50 only (48 blocks) | **43.4** | 49.7 | **0.90** |
+
+Two things fall out of that table, and both matter more than the marker did:
+
+1. **Submission latency is ~8–13 ms/token, not the 20–26 ms §8k assumed.** The
+   fence wait is GPU busy + ~4 ms per device. Pipelining across blocks (the other
+   pay-off §8m predicted for the marker) has at most ~8 ms to win, which is why it
+   is not the next thing to build.
+2. **The RX 6950 XT's GPU time for the same 48 blocks is 1.76× the MI50's**
+   (76.6 vs 43.4 ms) while the desktop compositor owns the RX. That makes *any*
+   block placed on the RX a net loss today (§placement below) — the opposite of
+   what the 20/28 split was chosen for.
+
+### 1. Two segments + marker: **rejected** (measured 17 ms slower)
+
+Segment A = everything up to the router, submitted with a timeline signal;
+segment B = the shared expert, submitted immediately behind it; the host waits for
+A's marker (bounded at 2 s; 5472/5472 markers signalled, **0 timeouts**) and runs
+the expert lane while B executes. Alternating A/B in one window, dual 20/28, 3×32
+tokens, best-of:
+
+| binary | ms/token | tok/s | tokens |
+|---|---:|---:|---|
+| single submission per block (HEAD) | **121.9** | 8.20 | reference (32/32) |
+| two segments + marker | 139.7 | 7.16 | bit-identical |
+
+Why it loses, in measured numbers: after the router there is only the **shared
+expert** left to hide — 0.24 ms of GPU per block (`shared-exp` stage, and the GPU
+probe agrees) — against 0.9 ms of host lane. The second submission costs a GPU
+pipeline bubble of ~0.2 ms per block (24 dispatches drain and re-ramp), so hiding
+0.24 costs 0.2 and the *lane itself* runs 0.17 ms/block slower from memory
+contention with the concurrent segment. §8k's arithmetic (0.15–0.45 ms of lane to
+hide for `k_gpu = 2/4/6`) is right about the size of the prize; the prize is just
+smaller than the submission it needs — and the `k_gpu` split it was scoped for
+needs experts resident in VRAM, which §8d already measured at +22 ms.
+
+### 2. Copies inside the block's own batch: **rejected** (measured 17.8 ms slower)
+
+Keeping the readback's five copies in the block's submission removes a
+submit+fence per block (~55 µs), and the host then reads the staging mapping
+directly. Same window, same protocol:
+
+| binary | ms/token | tok/s |
+|---|---:|---:|
+| HEAD (readback as its own submission) | **121.9** | 8.20 |
+| copies recorded into the compute batch | 139.7 | 7.16 |
+
+A `vkCmdCopyBuffer` in the middle of a compute stream forces a
+compute→transfer→compute transition (and a `HOST`-visibility barrier) per block:
+~0.36 ms of GPU+driver per block, seven times the round trip it removes. Copy
+count is not the problem — *placement in the stream* is. The staging-buffer block
+region and the copy helpers stay in the tree (they are what a device-side
+readback would use), unused by the graph.
+
+### 3. Split-K on the HC_READ `down`: **landed**
+
+`hc_lr` = 320 rows × 10 240 columns is 40 workgroups on a 60-CU card — under one
+per CU, and §8l measures 110 GB/s for it against 251–448 GB/s for the same weights
+as a 6400-row matrix. `Gemv::run_split` already existed; the mixer used
+`GemvBatch`, which has no split-K. `HcMixer` now keeps a single-expert `Gemv` for
+the `T = 1` case and runs it with `Gemv::recommended_splits()` (4 here: 160
+workgroups + one reduce dispatch). Alternating A/B, dual 20/28, 3×32:
+
+| binary | run 1 | run 2 | best | tok/s |
+|---|---:|---:|---:|---:|
+| HEAD | 121.82 | 121.34 | **121.34** | 8.24 |
+| split-K `down` | 118.95 | 117.76 | **117.76** | **8.49** |
+
+**−3.6 ms/token (−3.0 %)**, and it is the only change in this pass that moved the
+gate. It applies per HC_READ (96 per token) on both cards.
+
+**Numerical deviation, stated as required:** split-K sums four partial products
+instead of one running accumulator, so the `down` result differs in the last bits.
+Measured effect on the first token's distribution: top-1 logit `13.1705` →
+`13.1706`, top-2 and the whole top-10 list unchanged, gap 0.8159 both ways. The
+32 greedy tokens are **bit-identical** (§parity below).
+
+### 4. Split-K on the short-row shapes: **rejected**
+
+The same plumbing applied to the shared expert's `gate`/`up` (640×2560) and
+`down` (2560×640) plus the router (512×2560) — shapes `recommended_splits()`
+also wants to split (80 and 64 workgroups) — is **slower**:
+
+| binary | run 1 | run 2 |
+|---|---:|---:|
+| split-K `down` only | **117.27** | 123.71 |
+| + shared expert and router split | 124.06 | 125.75 |
+
+Those shapes are *bandwidth*-bound at 81–161 GB/s, not under-filled: splitting
+adds a reduce dispatch and two barriers and no bandwidth. The heuristic in
+`Gemv::recommended_splits` is right for one long reduction (320×10 240) and wrong
+for short rows; the graph therefore calls `run_split` only where it is measured
+to win.
+
+### 5. Placement: the dual optimum no longer puts blocks on the RX
+
+Same window, one 32-token generation each, `--threads 16`:
+
+| configuration | ms/token | tok/s |
+|---|---:|---:|
+| dual 20/28 (the split in §8i–§8m) | 118.7 | 8.43 |
+| dual 4/44 | 105.0 | 9.53 |
+| dual **0/48** | **101.8** | **9.82** |
+| MI50 only (diagnostic) | 100.8 | 9.92 |
+| RX only (diagnostic) | 142.7 | 7.01 |
+
+The GPU probe explains it: the same block costs 1.5–1.6 ms of GPU on the RX and
+0.9–1.1 ms on the MI50 *in this graph, on this desktop session* (§8l's phase-3
+per-kernel numbers had the RX ahead, so this is in-graph contention, not kernel
+quality — the compositor is on the RX). Blocks are serial across the residual
+stream, so the token costs the **sum** of its blocks; putting any block on the
+slower card can only add time.
+
+**Consequence for the dual-first policy:** with serial block placement, "both
+cards doing useful work" is unreachable — the measured optimum is 0 RX blocks.
+Giving the RX real work needs *concurrent* work, i.e. two sequences (or two tokens)
+in flight so one card's block stream runs while the other's expert lane does;
+that is a batch>1 decode change, not a placement change. Recorded here as the
+policy-level finding of this pass.
+
+### 6. Gate
+
+| item | value |
+|---|---|
+| dual, best measured placement (`--split-blocks 0,48`) | **98.1–104.4 ms/token over 6 cells, median 100.9**, best **98.13 ms / 10.19 tok/s** |
+| dual, the inherited 20/28 split | 116.9–119.0 ms (from 121.3–121.8 at HEAD) |
+| greedy parity vs the production server | **32/32, bit-identical** at both placements (`parity-check.py`) |
+| validation messages (MI50, validation on) | **0** |
+| `cargo test --workspace` / clippy `-D warnings` / `fmt --check` | 28 suites ok / clean / clean (`scripts/verify.sh` PASS) |
+
+Commands (one GPU process at a time; the warm pass is what makes a run comparable):
+
+```bash
+D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+# the gate: 32 greedy tokens against the server's recorded sequence, both placements
+python3 $D/parity-check.py ./target/release/breccia 0000:03:00.0,0000:0e:00.0 dual048
+# alternating A/B of two builds in one window (page-cache/thermal discipline)
+$D/compare.sh base v6 3
+# how much of a fence wait is GPU, and per-block cost per card
+timeout 400 env BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
+  --devices 0000:0e:00.0 --prompt-ids-file $D/parity-server.json.ids --gen 4 --runs 1 --threads 16
+# placement sweep (each is one 32-token generation)
+for sp in 20,28 4,44 0,48; do timeout 400 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --prompt-ids-file $D/parity-server.json.ids \
+  --gen 32 --runs 1 --threads 16 --split-blocks $sp; done
+```
+
+Artifacts: `$D/ab-{base,v2,v3,v4,v5,v6}-*.json`, `$D/x-{base,v6}-*.log`
+(the 0/48 A/B), `$D/sp-*.log` (the placement sweep), `$D/parity-dual.json`,
+`$D/parity-dual048.json`, `$D/compare.sh`, `$D/parity-check.py`, `$D/ab2.sh`.
+
 ## 9. Exact commands
 
 
@@ -849,15 +1032,24 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 
 ## 10. What to do next, in order
 
-1. **Close §4.2**: add `qkv`/`beta`/`gate`/`step`/`normed` digests to the debug
-   trace (the buffers are already there) and find the GDN input that is wrong.
-   Nothing else matters until a GDN block contributes to the residual.
-2. **Re-run parity** with `--dump-logits` against `n_probs` from the server, and
-   report the rank of our top-1 inside the server's distribution — the metric
-   that tells "close" from "unrelated" without needing an activation dump.
-3. **BF16/Q8 activation emulation** (§6 items 2–3) — one rounded upload per block
-   behind a flag, then measure the parity delta; that is the cheapest way to
-   decide whether the deviation matters or not.
-4. **The expert lane's structural lever** (§8b): `-ot`-style GPU expert blocks,
-   worth ~20 ms/token on the host side, and the page prefetch across the block
-   boundary. Together with batching that is where the remaining 100 ms lives.
+1. **Give the two cards concurrent work, or stop splitting blocks between them.**
+   §8n measured the per-block GPU cost per card in-graph (RX 1.5-1.6 ms, MI50
+   0.9-1.1 ms) and the serial residual stream means the token pays the sum: the
+   measured dual optimum is 0 RX blocks (101.8 ms) instead of 20/28 (118.7 ms).
+   The levers that would make the RX earn its keep are all concurrency, not
+   placement: two sequences (batch-2 decode) so one card's blocks overlap the
+   other's expert lane, or a parallel-K split of the *host* lane. Batch-2 decode
+   is also the only way to hide the 38 ms host lane at all (§8n item 1), and the
+   marker/semaphore primitive needed for it is in the tree.
+2. **The host expert lane is now the co-equal bottleneck** (36-38 ms of a 100 ms
+   token) and it is decode-bound at 20.8 GB/s with 16 threads (§8c). Anything that
+   cuts expert bytes per token or the number of experts per block pays 1:1.
+3. **GDN's delta rule** (43 us on the RX for 9 MiB of state = 217 GB/s, 2.6x off
+   the ceiling) is the largest single *kernel* left after split-K fixed `down`:
+   the 128-float column in LDS is the §8m design and is unchanged.
+4. **Keep the split-K discipline**: it paid 3.6 ms on a 320-row x 10 240 long
+   reduction and lost 7 ms on 640x2560 short rows. Measure per shape, never
+   globally.
+5. **Do not rebuild the two-segment marker for overlap** (139.7 vs 121.9 ms), and
+   do not move the block readback's copies into the compute stream (same
+   139.7 vs 121.9). Both are measured, not estimated (§8n items 1-2).
