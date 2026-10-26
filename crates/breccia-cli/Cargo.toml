@@ -14,6 +14,7 @@ breccia-flags = { path = "../breccia-flags" }
 breccia-profile = { path = "../breccia-profile" }
 breccia-vk = { path = "../breccia-vk" }
 breccia-kernels = { path = "../breccia-kernels" }
+breccia-engine = { path = "../breccia-engine" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

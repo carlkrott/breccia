@@ -200,6 +200,56 @@ enum BenchKind {
         #[arg(long)]
         quick: bool,
     },
+    /// Phase 4: the forward-pass graph — one token, then greedy generation
+    Token {
+        /// Tokens to generate after the prompt (greedy, temperature 0)
+        #[arg(long, default_value_t = 32)]
+        gen: usize,
+        /// Prompt token ids, comma-separated (`--prompt-ids 1,2,3`). With
+        /// `--prompt-ids-file`, the file's ids are used instead.
+        #[arg(long, value_name = "ID,ID,...")]
+        prompt_ids: Option<String>,
+        /// A file of whitespace/comma-separated prompt ids
+        #[arg(long, value_name = "PATH")]
+        prompt_ids_file: Option<PathBuf>,
+        /// Device plan: comma-separated PCI addresses (`0000:03:00.0,0000:0e:00.0`),
+        /// runtime indices, or `default` (first discrete). Repeatable; the
+        /// default is one device. **The first run of new code must be
+        /// MI50-only** (`--devices 0000:0e:00.0`, AGENTS.md).
+        #[arg(long = "devices", value_name = "PCI[,PCI]", value_delimiter = ',')]
+        devices: Vec<String>,
+        /// Measure this many independent generations (the best is reported)
+        #[arg(long, default_value_t = 3)]
+        runs: usize,
+        /// Host expert-lane threads (default: physical cores/2, capped at 16)
+        #[arg(long, value_name = "N")]
+        threads: Option<usize>,
+        /// KV cells (and positions) the session may use
+        #[arg(long, default_value_t = 256)]
+        ctx: usize,
+        /// Digests of every block's activations (for diffing runs)
+        #[arg(long)]
+        debug_layers: bool,
+        /// Sampling temperature (`0` = greedy, the parity path)
+        #[arg(long, default_value_t = 0.0)]
+        temperature: f32,
+        /// GGUF glob for the model (default: the IQ3_XXS shards)
+        #[arg(long, value_name = "GLOB")]
+        gguf: Option<String>,
+        /// Per-stage timers (host-clock deltas around synchronous dispatches)
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        timers: bool,
+        /// Write the full JSON report here
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
+        /// Write the prompt's last-token logits here (`id logit` per line, the
+        /// `--top-logits` best) — the row a parity diff is made against
+        #[arg(long, value_name = "PATH")]
+        dump_logits: Option<PathBuf>,
+        /// How many logits `--dump-logits` keeps
+        #[arg(long, default_value_t = 256)]
+        top_logits: usize,
+    },
 }
 fn main() {
     let cli = Cli::parse();
@@ -235,7 +285,9 @@ fn run(cli: Cli) -> Result<()> {
                  breccia bench ops --op rmsnorm|rope|swiglu|softmax|router|emb_gather|hc|add|gdn|qsa \\\n                 \
                  [--tokens 1,256] [--device <idx|pci>] [--json PATH] [--quick]\n  \
                  breccia bench cpu-experts [--type IQ2_XS]... [--threads N] [--topk 10] \\\n                 \
-                 [--type-experts N] [--layers N] [--reps N] [--gguf GLOB] [--json PATH] [--quick]"
+                 [--type-experts N] [--layers N] [--reps N] [--gguf GLOB] [--json PATH] [--quick]\n  \
+                 breccia bench token --gen 32 --prompt-ids \"1,2,3\" [--devices PCI[,PCI]] [--json PATH] \\\n                 \
+                 [--debug-layers] [--runs 3] [--threads N] [--ctx 256] [--temperature T]"
             );
             Ok(())
         }
@@ -322,6 +374,40 @@ fn run(cli: Cli) -> Result<()> {
             reps,
             json,
             quick,
+        }),
+        Command::Bench {
+            kind:
+                Some(BenchKind::Token {
+                    gen,
+                    prompt_ids,
+                    prompt_ids_file,
+                    devices,
+                    runs,
+                    threads,
+                    ctx,
+                    debug_layers,
+                    temperature,
+                    gguf,
+                    timers,
+                    json,
+                    dump_logits,
+                    top_logits,
+                }),
+        } => bench_token(TokenArgs {
+            gen,
+            prompt_ids,
+            prompt_ids_file,
+            devices,
+            runs,
+            threads,
+            ctx,
+            debug_layers,
+            temperature,
+            gguf,
+            timers,
+            json,
+            dump_logits,
+            top_logits,
         }),
     }
 }
@@ -1269,6 +1355,356 @@ fn bench_cpu_experts(args: CpuExpertsArgs) -> Result<()> {
         }
         std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
         println!("\nwrote {}", path.display());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// breccia bench token — Phase 4: the forward-pass graph
+// ---------------------------------------------------------------------------
+
+/// The IQ3_XXS shards, the only artifact this machine has.
+const DEFAULT_MODEL_GLOB: &str = "/srv/strata-data/models/IQ3_XXS/*-0000?-of-00002.gguf";
+
+struct TokenArgs {
+    gen: usize,
+    prompt_ids: Option<String>,
+    prompt_ids_file: Option<PathBuf>,
+    devices: Vec<String>,
+    runs: usize,
+    threads: Option<usize>,
+    ctx: usize,
+    debug_layers: bool,
+    temperature: f32,
+    gguf: Option<String>,
+    timers: bool,
+    json: Option<PathBuf>,
+    dump_logits: Option<PathBuf>,
+    top_logits: usize,
+}
+
+/// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
+fn parse_prompt_ids(a: &TokenArgs) -> Result<Vec<u32>> {
+    let text = match (&a.prompt_ids_file, &a.prompt_ids) {
+        (Some(path), _) => std::fs::read_to_string(path)
+            .with_context(|| format!("reading the prompt ids from {}", path.display()))?,
+        (None, Some(s)) => s.clone(),
+        (None, None) => anyhow::bail!(
+            "no prompt: pass --prompt-ids \"1,2,3\" (or --prompt-ids-file PATH). \
+             Tokenize real text with the production server: \
+             curl -s localhost:8164/tokenize -d '{{\"content\":\"...\"}}'"
+        ),
+    };
+    let mut out = Vec::new();
+    for tok in text.split(|c: char| c == ',' || c.is_whitespace()) {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let id: u32 = t
+            .parse()
+            .with_context(|| format!("prompt id {t:?} is not a token id"))?;
+        out.push(id);
+    }
+    if out.is_empty() {
+        anyhow::bail!("the prompt id list is empty");
+    }
+    Ok(out)
+}
+
+/// Reset and feed every prompt token; returns the last token's logits.
+fn feed_prompt(sess: &mut breccia_engine::Session<'_>, prompt: &[u32]) -> Result<Vec<f32>> {
+    sess.reset()?;
+    let mut logits = Vec::new();
+    for (pos, &t) in prompt.iter().enumerate() {
+        logits = sess.token(t, pos, None)?;
+    }
+    Ok(logits)
+}
+
+fn bench_token(a: TokenArgs) -> Result<()> {
+    let prompt = parse_prompt_ids(&a)?;
+    let glob = a
+        .gguf
+        .clone()
+        .unwrap_or_else(|| DEFAULT_MODEL_GLOB.to_string());
+    println!(
+        "breccia bench token: {} prompt ids, {} to generate, {} run(s)",
+        prompt.len(),
+        a.gen,
+        a.runs
+    );
+
+    // ---- load -------------------------------------------------------------
+    let model = breccia_engine::Model::load(
+        &glob,
+        &breccia_engine::LoadOptions {
+            devices: a.devices.clone(),
+            ctx_capacity: a.ctx,
+            verbose: true,
+        },
+    )
+    .context("loading the model")?;
+    print!("{}", model.stats.banner(&model.cfg));
+    breccia_engine::graph::assert_head(&model)?;
+
+    let cfg = breccia_engine::SessionCfg {
+        ctx_capacity: a.ctx,
+        threads: a.threads.unwrap_or(0),
+        timers: a.timers,
+    };
+    let mut sess = breccia_engine::Session::new(&model, &cfg).context("building the session")?;
+    sess.sampling = breccia_engine::Sampling {
+        temperature: a.temperature,
+        top_k: 0,
+        seed: 0x9e37_79b9_7f4a_7c15,
+    };
+    println!(
+        "session  {} expert threads ({}) · {} MiB state + scratch · {} compiled pipelines",
+        sess.threads(),
+        breccia_kernels::cpu::path().name(),
+        sess.session_bytes() >> 20,
+        model.keys.len()
+    );
+
+    // ---- A. one token, twice: finite logits and a stable top-1 -------------
+    let t_first = std::time::Instant::now();
+    let l1 = feed_prompt(&mut sess, &prompt).context("the first forward pass")?;
+    let first_seconds = t_first.elapsed().as_secs_f64();
+    let l2 = feed_prompt(&mut sess, &prompt).context("the repeat forward pass")?;
+    let s1 = breccia_engine::LogitSummary::of_top(&l1, a.top_logits.max(10));
+    let s2 = breccia_engine::LogitSummary::of(&l2);
+    if let Some(path) = &a.dump_logits {
+        // `id logit` per line, best first: the row a parity diff reads.
+        let mut text = String::new();
+        for (id, logit) in &s1.top {
+            text.push_str(&format!("{id} {logit:.6}\n"));
+        }
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        println!(
+            "             dumped the top {} logits to {}",
+            s1.top.len(),
+            path.display()
+        );
+    }
+    let max_delta = l1
+        .iter()
+        .zip(l2.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    println!(
+        "\nfirst token  logits[{}] finite={} min={:.3} max={:.3} mean={:.4} rms={:.4} \
+         distinct={:.3}\n             top-1 {} ({:.4}) · top-2 {} ({:.4}) · gap {:.4}",
+        s1.vocab,
+        s1.all_finite,
+        s1.min,
+        s1.max,
+        s1.mean,
+        s1.rms,
+        s1.distinct_ratio,
+        s1.top1,
+        s1.top1_logit,
+        s1.top2,
+        s1.top2_logit,
+        s1.top1_logit - s1.top2_logit
+    );
+    println!("             top-10 {:?}", s1.top10);
+    println!(
+        "             repeat: top-1 {} (stable: {}) · max |Δlogit| {:.3e} · {:.2} s/token \
+         (prompt {})",
+        s2.top1,
+        s1.top1 == s2.top1,
+        max_delta,
+        first_seconds / prompt.len() as f64,
+        prompt.len()
+    );
+    if !s1.all_finite {
+        anyhow::bail!("the first token's logits are not all finite");
+    }
+    if s1.distinct_ratio < 0.5 {
+        anyhow::bail!(
+            "only {:.1}% of the logits are distinct — that looks like a broken head, not a model",
+            s1.distinct_ratio * 100.0
+        );
+    }
+
+    // ---- B/C. measured generations ----------------------------------------
+    let mut runs = Vec::with_capacity(a.runs);
+    let mut stages_acc: Vec<f64> = vec![0.0; breccia_engine::STAGES.len()];
+    let mut traces: Vec<breccia_engine::LayerTrace> = Vec::new();
+    let mut first_step_logits = Vec::new();
+    let mut last_logits = Vec::new();
+    for run in 0..a.runs.max(1) {
+        let dbg: Option<&mut Vec<breccia_engine::LayerTrace>> = if a.debug_layers && run == 0 {
+            Some(&mut traces)
+        } else {
+            None
+        };
+        let gen = sess
+            .generate(&prompt, a.gen, dbg)
+            .with_context(|| format!("generation run {run}"))?;
+        let row = breccia_engine::RunReport {
+            run,
+            decode_seconds: gen.decode_seconds,
+            forwards: gen.forwards,
+            tokens_per_s: gen.tokens_per_s(),
+            ms_per_token: gen.ms_per_token(),
+            prompt_ids: prompt.clone(),
+            generated: gen.tokens.clone(),
+            expert_bytes_per_token: gen.bytes_per_token(),
+        };
+        for (i, (_, ms)) in sess.timers.table(gen.forwards).iter().enumerate() {
+            stages_acc[i] += ms;
+        }
+        println!(
+            "run {run}  {:>6.2} tok/s  {:>6.2} ms/token  {} forwards  experts {} MiB/token  {:?}",
+            row.tokens_per_s,
+            row.ms_per_token,
+            row.forwards,
+            row.expert_bytes_per_token >> 20,
+            &row.generated[..row.generated.len().min(8)]
+        );
+        if run == 0 {
+            first_step_logits = gen.first_step_logits.clone();
+        }
+        last_logits = gen.last_logits.clone();
+        runs.push(row);
+    }
+
+    let runs_n = runs.len().max(1) as f64;
+    for v in stages_acc.iter_mut() {
+        *v /= runs_n;
+    }
+    let total_ms: f64 = stages_acc.iter().sum();
+    let stages: Vec<breccia_engine::StageRow> = breccia_engine::STAGES
+        .iter()
+        .zip(stages_acc.iter())
+        .map(|(name, ms)| breccia_engine::StageRow {
+            stage: (*name).to_string(),
+            ms_per_token: *ms,
+            share: if total_ms > 0.0 { *ms / total_ms } else { 0.0 },
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..stages.len()).collect();
+    order.sort_by(|&a, &b| {
+        stages[b]
+            .ms_per_token
+            .partial_cmp(&stages[a].ms_per_token)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let hotspots: Vec<String> = order
+        .iter()
+        .take(6)
+        .map(|&i| {
+            format!(
+                "{} {:.3} ms ({:.1}%)",
+                stages[i].stage,
+                stages[i].ms_per_token,
+                stages[i].share * 100.0
+            )
+        })
+        .collect();
+
+    let forwards: usize = runs.iter().map(|r| r.forwards).sum();
+    let seconds: f64 = runs.iter().map(|r| r.decode_seconds).sum();
+    let tps = if seconds > 0.0 {
+        forwards as f64 / seconds
+    } else {
+        0.0
+    };
+    let mspt = if forwards > 0 {
+        seconds * 1e3 / forwards as f64
+    } else {
+        0.0
+    };
+
+    println!("\nper stage (ms/token, mean of {} run(s)):", runs.len());
+    for row in &stages {
+        if row.ms_per_token > 0.0 {
+            println!(
+                "  {:<16} {:>7.3}  {:>5.1}%",
+                row.stage,
+                row.ms_per_token,
+                row.share * 100.0
+            );
+        }
+    }
+    println!(
+        "\ndecode  {tps:.2} tok/s  ({mspt:.2} ms/token)  vs {:.2} tok/s parity = {:.1}%",
+        breccia_engine::PARITY_TOKENS_PER_S,
+        tps / breccia_engine::PARITY_TOKENS_PER_S * 100.0
+    );
+
+    // ---- the report -------------------------------------------------------
+    // The parity anchor is the prompt's last-token row; `first_step` is kept for
+    // the "did the second step drift" question.
+    let first_summary = s1.clone();
+    let _ = &first_step_logits;
+    let notes = vec![
+        "Expert lane is host-only (-cmoe): no -ot per-block GPU expert overrides (M3).".to_string(),
+        "The router and every BF16-weight projection see an f32 activation; llama.cpp ".to_string()
+            + "rounds the activation to BF16 inside the BF16 matmul (measured 8.1e-3 logit "
+            + "error in strata, docs/specs/qwen4exp-architecture.md §8).",
+        "Quantised projections (attn_qkv, ssm_out, attn_q/k/v/output) use an f32 activation; "
+            .to_string()
+            + "the production kernels use Q8_K/Q8_0 (0.66-1.41% measured error, §14).",
+        "The PLE device block runs on the host (no kernel yet); ple_key/ple_value stay on the GPU."
+            .to_string(),
+        "KV cache is f16; the production service uses q4_0 K/V (-ctk q4_0 -ctv q4_0).".to_string(),
+        "No batched prefill: the prompt is fed one token at a time, so prefill tok/s is not "
+            .to_string()
+            + "the prefill number (decode tok/s is unaffected).",
+    ];
+    let report = breccia_engine::TokenReport {
+        schema_version: breccia_engine::TOKEN_SCHEMA_VERSION,
+        model: glob.clone(),
+        architecture: model.cfg.arch.clone(),
+        blocks: model.cfg.n_layers,
+        gdn_blocks: model.cfg.layer_counts().0,
+        qsa_blocks: model.cfg.layer_counts().1,
+        vocab: model.cfg.vocab,
+        devices: model
+            .stats
+            .devices
+            .iter()
+            .map(|d| format!("{} [{}]", d.name, d.pci))
+            .collect(),
+        load_plan: model.stats.plan.clone(),
+        load_seconds: model.stats.open_seconds,
+        upload_seconds: model.stats.upload_seconds,
+        dense_bytes: model.stats.dense_bytes,
+        head_bytes: model.stats.head_bytes,
+        session_bytes: sess.session_bytes(),
+        rss_bytes: model.stats.rss_bytes,
+        rss_peak_bytes: model.stats.rss_peak_bytes,
+        expert_bytes_mapped: model.stats.expert_bytes_mapped,
+        ple_bytes_mapped: model.stats.ple_bytes_mapped,
+        temperature: a.temperature,
+        threads: sess.threads(),
+        ctx_capacity: a.ctx,
+        runs,
+        tokens_per_s: tps,
+        ms_per_token: mspt,
+        stages,
+        first_token: first_summary,
+        hotspots,
+        debug_layers: traces,
+        notes,
+    };
+    println!("\nhotspots  {}", report.hotspots.join(" · "));
+    let _ = last_logits;
+    let _ = max_delta;
+
+    if let Some(path) = &a.json {
+        let text = serde_json::to_string_pretty(&report).context("serializing the report")?;
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
     }
     Ok(())
 }

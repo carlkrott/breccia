@@ -1,0 +1,246 @@
+//! Device↔host transfers with **one** round trip per direction per layer.
+//!
+//! The expert lane is host-resident (`-cmoe`), so every block hands the MoE
+//! activation down to the CPU and takes the FFN result back up. With one
+//! `vkQueueSubmit` + `vkWaitForFences` per transfer that would be ~10 round trips
+//! per block; this module keeps one persistent host-visible staging buffer and
+//! packs every copy of a phase into a single command buffer, so a block costs
+//! exactly one read and one write.
+//!
+//! The measured rates this is built against: RX 6950 XT PCIe H2D 28.25–28.71
+//! GB/s, Radeon VII gen3 ×4 ≈ 2.9 GB/s (`docs/phase-2/01`). At these sizes
+//! (10 KiB) latency dominates bandwidth, which is why the count of round trips
+//! — not their size — is what this module minimises.
+
+use anyhow::{anyhow, Result};
+use ash::vk;
+use breccia_vk::ctx::{Buf, Gpu, Qc};
+
+use breccia_kernels::GemvTiming;
+
+/// One persistent host-visible staging buffer, used for every transfer.
+///
+/// Deliberately *not* one buffer per call: `breccia_kernels::gemv::upload`
+/// allocates and frees a staging buffer per tensor, which is right for a load
+/// and wrong for a per-layer round trip.
+pub struct Staging {
+    buf: Buf,
+    /// The buffer, mapped once for the whole session.
+    ///
+    /// `Gpu::read_host`/`write_host` map and unmap on every call, which measures
+    /// as ~100 us of the ~150 us a 40 KiB round trip costs here — more than the
+    /// transfer itself. A staging buffer never changes its memory type, so the
+    /// mapping can be created once and used until the buffer is destroyed.
+    ptr: *mut u8,
+    cap: u64,
+    /// Bytes moved and round trips taken, for the report.
+    pub bytes_down: u64,
+    pub bytes_up: u64,
+    pub trips_down: u64,
+    pub trips_up: u64,
+    pub seconds_down: f64,
+    pub seconds_up: f64,
+}
+
+impl Staging {
+    /// Allocate a staging buffer of `cap` bytes (rounded up to 4).
+    pub fn new(gpu: &Gpu, cap: u64) -> Result<Self> {
+        let cap = cap.max(64);
+        let size = cap + breccia_kernels::gemv::TAIL_PAD;
+        let buf = gpu
+            .buf(
+                size,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .map_err(|e| anyhow!("allocating the {cap}-byte staging buffer: {e}"))?;
+        // SAFETY: `buf` is a HOST_VISIBLE | HOST_COHERENT allocation owned by this
+        // struct, and the mapping is created once and released in `release`
+        // before the buffer is destroyed.
+        let ptr = unsafe {
+            gpu.device
+                .map_memory(buf.mem, 0, size, vk::MemoryMapFlags::empty())
+                .map_err(|e| anyhow!("mapping the {cap}-byte staging buffer: {e}"))?
+                as *mut u8
+        };
+        Ok(Staging {
+            buf,
+            ptr,
+            cap,
+            bytes_down: 0,
+            bytes_up: 0,
+            trips_down: 0,
+            trips_up: 0,
+            seconds_down: 0.0,
+            seconds_up: 0.0,
+        })
+    }
+
+    pub fn capacity(&self) -> u64 {
+        self.cap
+    }
+    /// Bytes the staging buffer occupies (for the VRAM report).
+    pub fn bytes(&self) -> u64 {
+        self.buf.size
+    }
+    pub fn release(&self, gpu: &Gpu) {
+        // SAFETY: the mapping came from this buffer's device memory and is
+        // unmapped exactly once, before the memory is freed.
+        unsafe { gpu.device.unmap_memory(self.buf.mem) };
+        gpu.destroy_buf(&self.buf);
+    }
+
+    /// Device→host for a list of `(buffer, byte offset, length)` reads.
+    ///
+    /// All copies ride one command buffer and one fence wait; the returned
+    /// vectors are in the order the items were given.
+    pub fn read_batch(&mut self, gpu: &Gpu, items: &[(&Buf, u64, usize)]) -> Result<Vec<Vec<u8>>> {
+        let total: u64 = items.iter().map(|(_, _, n)| *n as u64).sum();
+        if total > self.cap {
+            return Err(anyhow!(
+                "read of {total} bytes exceeds the {}-byte staging buffer",
+                self.cap
+            ));
+        }
+        // Host-side bounds check: an out-of-range copy is a GPU page fault (a
+        // dead device, and on the display card a dead machine), not a wrong
+        // number. `docs/phase-3/06` §4.1 makes the same argument for `kv_append`.
+        for (src, off, n) in items {
+            if off.saturating_add(*n as u64) > src.size {
+                return Err(anyhow!(
+                    "read of {n} bytes at offset {off} is outside a {}-byte buffer",
+                    src.size
+                ));
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let mut offs = Vec::with_capacity(items.len());
+        let mut at = 0u64;
+        for (_, _, n) in items {
+            offs.push(at);
+            at += *n as u64;
+        }
+        let regions: Vec<(vk::Buffer, vk::BufferCopy)> = items
+            .iter()
+            .zip(offs.iter())
+            .map(|((src, off, n), dst_off)| {
+                (
+                    src.buf,
+                    vk::BufferCopy::default()
+                        .src_offset(*off)
+                        .dst_offset(*dst_off)
+                        .size(*n as u64),
+                )
+            })
+            .collect();
+        gpu.record(Qc::C, |d, cmd| unsafe {
+            Gpu::barrier_all(d, cmd);
+            for (src, region) in &regions {
+                d.cmd_copy_buffer(cmd, *src, self.buf.buf, std::slice::from_ref(region));
+            }
+            Gpu::barrier_all(d, cmd);
+        })
+        .map_err(|e| anyhow!("recording the readback: {e}"))?;
+        let fence = gpu
+            .submit(Qc::C)
+            .map_err(|e| anyhow!("submitting the readback: {e}"))?;
+        gpu.wait_fence(fence)
+            .map_err(|e| anyhow!("waiting for the readback: {e}"))?;
+
+        let mut raw = vec![0u8; total as usize];
+        // SAFETY: `read_batch` bounds-checked every `off + len` against the
+        // buffer and `total <= cap`; the mapping covers `cap + TAIL_PAD` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(self.ptr, raw.as_mut_ptr(), total as usize) };
+        let out = items
+            .iter()
+            .zip(offs.iter())
+            .map(|((_, _, n), off)| raw[*off as usize..*off as usize + n].to_vec())
+            .collect();
+        self.bytes_down += total;
+        self.trips_down += 1;
+        self.seconds_down += t0.elapsed().as_secs_f64();
+        Ok(out)
+    }
+
+    /// Host→device: write `data` into `dst` through the staging buffer.
+    pub fn write(&mut self, gpu: &Gpu, dst: &Buf, data: &[u8]) -> Result<f64> {
+        if data.len() as u64 > self.cap {
+            return Err(anyhow!(
+                "write of {} bytes exceeds the {}-byte staging buffer",
+                data.len(),
+                self.cap
+            ));
+        }
+        if data.len() as u64 > dst.size {
+            return Err(anyhow!(
+                "write of {} bytes is outside a {}-byte buffer",
+                data.len(),
+                dst.size
+            ));
+        }
+        let t0 = std::time::Instant::now();
+        // SAFETY: `data.len() <= cap` was checked above and the mapping covers
+        // `cap + TAIL_PAD` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr, data.len()) };
+        let region = vk::BufferCopy::default()
+            .src_offset(0)
+            .dst_offset(0)
+            .size(data.len() as u64);
+        let src = self.buf.buf;
+        let dstb = dst.buf;
+        gpu.record(Qc::C, |d, cmd| unsafe {
+            Gpu::barrier_all(d, cmd);
+            d.cmd_copy_buffer(cmd, src, dstb, &[region]);
+            Gpu::barrier_all(d, cmd);
+        })
+        .map_err(|e| anyhow!("recording the upload: {e}"))?;
+        let fence = gpu
+            .submit(Qc::C)
+            .map_err(|e| anyhow!("submitting the upload: {e}"))?;
+        gpu.wait_fence(fence)
+            .map_err(|e| anyhow!("waiting for the upload: {e}"))?;
+        let secs = t0.elapsed().as_secs_f64();
+        self.bytes_up += data.len() as u64;
+        self.trips_up += 1;
+        self.seconds_up += secs;
+        Ok(secs)
+    }
+
+    /// Read a single `f32` vector back (token logits, router weights, …).
+    pub fn read_f32(&mut self, gpu: &Gpu, src: &Buf, n: usize) -> Result<Vec<f32>> {
+        let v = self.read_batch(gpu, &[(src, 0, n * 4)])?;
+        Ok(breccia_kernels::ops::f32_from_bytes(&v[0]))
+    }
+
+    /// Summary of the traffic this buffer carried, for the report.
+    pub fn totals(&self) -> GemvTiming {
+        GemvTiming {
+            per_iter_s: self.seconds_down + self.seconds_up,
+            iters: (self.trips_down + self.trips_up) as u32,
+            total_s: self.bytes_down as f64 + self.bytes_up as f64,
+            used_timestamps: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The staging math is pure: `read_batch` lays items out back to back and the
+    /// offsets must tile `total` exactly (a mismatch would silently hand a caller
+    /// another buffer's bytes).
+    #[test]
+    fn read_offsets_tile_the_staging_buffer() {
+        let items = [(0u64, 4usize), (4, 12), (16, 40)];
+        let mut at = 0u64;
+        let mut offs = Vec::new();
+        for (_, n) in items {
+            offs.push(at);
+            at += n as u64;
+        }
+        assert_eq!(offs, vec![0, 4, 16]);
+        assert_eq!(at, 56);
+    }
+}

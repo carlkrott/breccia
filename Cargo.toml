@@ -7,6 +7,7 @@ members = [
     "crates/breccia-kernels",
     "crates/breccia-format",
     "crates/breccia-cache",
+    "crates/breccia-engine",
     "crates/breccia-draft",
     "crates/breccia-server",
     "crates/breccia-cli",

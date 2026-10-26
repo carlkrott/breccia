@@ -110,6 +110,7 @@ name = "breccia-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "breccia-engine",
  "breccia-flags",
  "breccia-kernels",
  "breccia-profile",
@@ -129,6 +130,22 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "breccia-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "breccia-format",
+ "breccia-kernels",
+ "breccia-profile",
+ "breccia-vk",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
