@@ -42,6 +42,18 @@ Per-invocation rules, mandatory once a test touches GPU memory:
    then repeat on `0000:03:00.0` only after the MI50 passes.
 6. After any GPU fault, check `journalctl -b -1` for `amdgpu ... page fault` / `Illegal opcode` and capture the process/thread names before rebooting.
 
+## Dual-GPU first (policy, 2026-10-26)
+
+The project goal is **proper dual-GPU usage** (RX 6950 XT + Radeon VII/MI50), not the fastest single card.
+- Performance work is measured and reported on the **dual configuration**. Do not sweep or tune
+  single-GPU configurations unless a blocker forces a single-device diagnostic — and when it does,
+  say so and return to dual immediately.
+- Placement must give **both cards real work**, matched to their measured strengths: RX = compute,
+  prefill, hot-expert batches and the streaming lane (28.7 GB/s PCIe, 100% overlap, Infinity Cache);
+  MI50 = resident expert/weight blocks and bandwidth-bound GEMV (826 GB/s HBM, but PCIe gen3x4 and
+  per-block round trips matter).
+- A single-card number is a diagnostic, never a target or a gate.
+
 ## Git
 
 See `docs/GIT-WORKFLOW.md`. No `git push` until a remote exists and the user has explicitly approved publication.
