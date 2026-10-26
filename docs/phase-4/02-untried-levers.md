@@ -468,11 +468,12 @@ Today every per-block handoff goes through host-coherent system memory with expl
 
 Expected: trims the mailbox/readback slice of the host-lane critical path (currently 55–71% of the step) and removes a class of fence round trips. Effort S–M; risk low (a memory-type selection plus mapping lifetime); measure with 2- and 4-stream `bench token`/`bench agents` plus the unchanged parity gate. It composes with every ranked item above, including the merged-prefill stream (item 1), where the CPU never touches the activations at all.
 
-> **Status after §8u (measured):** the merged-MoE byte budget is
-> **72.3 MiB/token at chunk 128** (11.1x fewer expert bytes than the 799 MiB/token
-> the host lane moves), and the routing is more concentrated than a uniform model
-> predicts (~370 of 512 experts per block per 128-token chunk). Derived per-token
-> costs at that budget: PCIe 2.6 ms (RX) / 25 ms (MI50, so hot experts must be
-> resident), GEMM ~0.5-1 ms, dispatch ~0.6 ms — all two orders below the host
-> lane's 163-320 ms. The remaining work is the multi-user GEMM shader, hot-expert
-> residence and an m-user fan-in; nothing in the budget argues against it.
+> **Status after §8u:** the budget is **72.3 MiB/token measured** (11.1x fewer
+> expert bytes than the host lane's 799 MiB/token; **2.7x** if routing were uniform,
+> which it is not - a 128-token chunk touches ~130 of 512 experts per block).
+> Per-token cost: PCIe **2.6 ms** (RX) / 25 ms (MI50, so hot experts must be
+> resident), **GEMM 0.5 ms measured**, dispatch 0.22 ms - against 163-320 ms today.
+> The first kernel is built and validated (`GemmMany`, IQ4_NL `down`): m = 8 is
+> **3.4x (MI50) / 5.1x (RX)** per-user throughput over m = 1, bit-identical to the
+> single-user GEMV for every m. Still missing: the `Q2_0` and `gate`/`up` shaders,
+> hot-expert residence, and the m-user fan-in.

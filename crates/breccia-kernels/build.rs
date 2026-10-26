@@ -31,6 +31,8 @@ const SHADERS: &[&str] = &[
     "gemv_f16",
     "gemv_bf16",
     "gemv_f32",
+    // multi-user (chunked-prefill) fused dequant + mat-vector: one expert, m users
+    "gemm_iq4_nl",
     // batched multi-expert variants (one dispatch over N experts' blobs)
     "gemv_iq2_xxs_moe",
     "gemv_iq2_xs_moe",

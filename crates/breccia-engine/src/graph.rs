@@ -1480,6 +1480,13 @@ impl<'m> Session<'m> {
                 .map(|p| p.last_distinct)
                 .unwrap_or_default();
             self.pf_distinct += distinct;
+            if std::env::var_os("BRECCIA_TRACE_ROUTE").is_some() {
+                eprintln!(
+                    "route blk {b:>2} t={t} draws={} distinct={distinct} uses/token={:.2}",
+                    t * k,
+                    distinct as f64 / t as f64
+                );
+            }
             self.pf_merged_bytes += (distinct as u64) * m.layers[b].experts.expert_bytes() as u64;
         }
         self.lane_s += t_lane.elapsed().as_secs_f64();

@@ -1,0 +1,15 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+//
+// Multi-user fused dequant + mat-vector for IQ4_NL (`down` role): one expert,
+// `m` users, the weight block decoded once per row block and reused.
+// Decode semantics: shaders/blocks.glsl (dequant_iq4_nl_unit).
+//
+#define QK 32u
+#define BLOCK_WORDS 9u
+#include "blocks.glsl"
+#define DEQUANT_UNIT dequant_iq4_nl_unit
+#include "gemm_body.glsl"

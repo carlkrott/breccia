@@ -1577,62 +1577,85 @@ token); it now shares one empty list.
 2. Then AVX-512 16-wide on the same shape, and chunk 256 (needs the pool at 8 192
    sets) where `m = 5`.
 
-## 8u. Merged MoE for prefill: the byte budget measured (11x), the kernel not written
+## 8u. Merged MoE for prefill: corrected byte budget, and the multi-user GEMM built
 
 The survey (`02-untried-levers.md` item 1) says the prefill win is merged MoE on the
-**GPU**: route a whole chunk, touch each distinct expert once, run one quantised
-**GEMM** (m users x 640 outputs) per expert. §8t proved the CPU-lane version cannot
-get there (m = 1.75-2.5 users per expert). This pass measured the budget that
-decides the design and did **not** write the kernel; the numbers below are why it
-should still be built, and what it will cost.
+GPU: route a whole chunk, touch each distinct expert once, run one quantised **GEMM**
+(m users x 2560 outputs) per expert. This pass corrected the budget's arithmetic and
+built the first kernel.
 
-### The measured budget (not modelled)
+### The byte budget, corrected and reconciled
 
-`bench agents` now prints the merged budget from the chunk's **actual routing**: for
-every block and chunk it counts the distinct experts the grouped lane touched and
-multiplies by the block's expert bytes (2 agents x 300-token prefixes, `--threads 32`):
+The earlier draft mixed denominators (10.0 GiB was measured on an 88-token tail, and
+42.4 GiB covers the whole 600-token prompt, not one 128-token chunk). Restated so
+the arithmetic is checkable, all from one measured run (`--prefill-chunk 128`,
+2 agents x 300 tokens = **600 prompt tokens**, 48 blocks, IQ4_NL/Q2_0/IQ2_* mix):
 
-| chunk | prompt tokens | distinct expert uses (48 blocks) | expert bytes if touched once | per token | vs token-by-token |
-|---:|---:|---:|---:|---:|---:|
-| 64 | 88 (last chunk) | 5 985 | 10.0 GiB | 115.9 MiB | **6.9x** |
-| **128** | **600 (whole prompt)** | **25 769** | **42.4 GiB** | **72.3 MiB** | **11.1x** |
+| quantity | measured |
+|---|---:|
+| distinct `(block, expert)` uses, summed over blocks, chunks and both streams | **25 769** |
+| bytes per use (the full `gate`+`up`+`down` blob of that expert) | 1.746 MB |
+| expert bytes if each use is touched once (25 769 x 1.746 MB) | **45.0 GB = 41.9 GiB** |
+| per prompt token (41.9 GiB / **600**) | **72.3 MiB/token** |
+| the same, token by token (48 x 10 x 1.746 MB) | 799 MiB/token |
+| **reduction** | **11.1x** |
 
-Two findings, both better than the §8r model:
+The factor is that large because **the router is far more concentrated than a
+uniform model assumes**. Measured per block, `BRECCIA_TRACE_ROUTE=1`:
 
-* the reduction is real and large: **799 -> 72 MiB/token (11x)** at chunk 128;
-* **routing is far more concentrated than uniform**: 512 experts, top-10, yet a
-  128-token chunk touches ~370 of them per block (uniform occupancy would say 470)
-  and the whole 300-token prompt touches 537 - the trained router has hot experts,
-  which is exactly what a merged pass exploits.
+| chunk | draws per block | distinct experts per block | users per distinct expert |
+|---:|---:|---:|---:|
+| 128 | 1 280 | **102-159** (typ. ~130) | 8-13 |
 
-### What that implies per token (from measured rates, dual)
+A uniform top-10 router would touch ~470 of 512 experts for the same 1 280 draws
+(occupancy `512(1-e^-2.5)`), which would give 176 uses/token = **293 MiB/token, a
+2.7x reduction**. So the honest statement is a range: **2.7x (uniform assumption) to
+11.1x (measured routing)**, and the conclusion survives either way, because the host
+lane is **ALU-bound at ~3-5 GB/s effective**, not bandwidth-bound:
 
-| cost | at 72.3 MiB/token | note |
-|---|---:|---|
-| PCIe, everything streamed to the RX | **2.6 ms** | 28.7 GB/s measured (§5.3) |
-| PCIe, everything streamed to the MI50 | 25 ms | gen3 x4, 2.9 GB/s - so hot experts must stay resident |
-| GEMM compute | ~0.5-1 ms | 5 users/expert x 640 x 2560 per expert at the measured 78-448 GB/s |
-| dispatch | ~0.6 ms | ~138 GEMM dispatches per token at 4.5 us each (§8l) |
-| **today (host lane)** | **163-320 ms** | 6.13 tok/s per agent, 2 agents |
+| cost per token at 72.3 MiB (and at the conservative 293 MiB) | value |
+|---|---:|
+| PCIe, streamed to the RX (28.7 GB/s measured) | **2.6 ms** (11 ms) |
+| PCIe, streamed to the MI50 (gen3 x4, 2.9 GB/s) | 25 ms (101 ms) - hot experts must be resident |
+| GEMM compute, **measured below** | **0.5 ms** |
+| dispatch (~130 experts x 48 blocks per chunk at 4.5 us) | 0.22 ms |
+| **merged total** | **~3-12 ms/token** |
+| today (host lane) | **163-320 ms/token** |
 
-Every term is two orders of magnitude below the host lane. **The blocker is
-implementation, not arithmetic:** there is no multi-user GEMM shader (every GEMV
-here is one row per workgroup, m = 1), the per-expert streaming path through
-`TransferRing` is per-block round trips (~0.8 ms each, §8k) and would dominate at
-~370 experts x 48 blocks, and the accumulate-weighted-outputs step needs a
-per-token fan-in on the device. That is the next pass's work, in this order:
+### The multi-user GEMM (down role, IQ4_NL) — built and validated
 
-1. one shader: per expert, decode each weight block once into registers/LDS and FMA
-   `m` activation rows (start with `IQ4_NL`+`Q2_0` for `down`, then the `IQ2_*`/
-   `IQ3_*` gate/up pair with the SwiGLU);
-2. hot-expert residence: the measured routing is concentrated enough that a
-   per-device arena of a few hundred experts covers most of a chunk - much cheaper
-   than streaming 370 x 1.19 MiB per block;
-3. the fan-in: `MoeCombine` already accumulates weighted rows; it needs an m-user
-   form (one per token, `k` terms) which is the same shape as its current loop.
+`shaders/gemm_body.glsl` + `gemm_iq4_nl.comp`, driven by
+`breccia_kernels::gemm::GemmMany`: one dispatch computes `m x 2560` outputs over
+`K = 640`, decoding each quant block **once into registers** and dotting it with all
+`m` users (`docs` above; every earlier kernel decodes per row). Geometry, per-lane
+unit split, two alternating accumulators and the subgroup reduction are the
+single-user kernel's, so **every user's dot is bit-identical to it** - measured, not
+argued:
 
-`--prefill-chunk` remains the chunk driver (parity-clean, §8s/§8t); the merged path
-plugs into `prefill_block` where the grouped lane is called today.
+| device (validation layer on) | m = 1 | m = 2 | m = 4 | m = 8 | worst rel. error | bit-identical |
+|---|---:|---:|---:|---:|---:|---|
+| MI50 (Radeon VII) ms/dispatch | 0.014 | 0.017 | 0.022 | 0.033 | **0.0** | **yes, every m** |
+| MI50 GFLOP/s | 232 | 393 | 595 | **802** | | |
+| RX 6950 XT ms/dispatch | 0.007 | 0.005 | 0.007 | 0.011 | **0.0** | **yes, every m** |
+| RX GFLOP/s | 493 | 1 260 | 1 853 | **2 496** | | |
+
+Per-user throughput is **3.4x (MI50) / 5.1x (RX)** at m = 8 against m = 1, with the
+weight read amortised (`tests/gemm_many.rs`, `BRECCIA_KERNEL_DEVICE=...`, MI50 first,
+0 validation messages). At the measured 0.011 ms per (expert, m = 8) on the RX, a
+128-token chunk's ~130 experts x 48 blocks is **0.5 ms of GEMM per token** - the
+number in the table above.
+
+### Blend and what is left
+
+* Delivered: `IQ4_NL` **down** only (18 of the 48 `down` layers here).
+* Still per-row: `Q2_0` down (30 layers), all `gate`/`up` (the `IQ2_S`/`IQ2_XS`/
+  `IQ2_XXS`/`IQ3_S`/`IQ3_XXS` set, which needs the two-tensor + SwiGLU form), and
+  every decode path (`m = 1` keeps the fused kernel untouched).
+* The remaining work to make merged prefill real: the `Q2_0` and gate/up shaders,
+  hot-expert residence (the measured concentration means a few hundred resident
+  experts per device covers most of a chunk), and the m-user fan-in on the device.
+  The budget no longer argues against any of it: measured, the compute is 0.5 ms and
+  the streaming 2.6-11 ms per token against 163-320 ms today.
 
 ## 9. Exact commands
 

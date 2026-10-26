@@ -48,6 +48,7 @@ pub mod cpu;
 pub mod device;
 pub mod dispatch_batch;
 pub mod gdn;
+pub mod gemm;
 pub mod gemv;
 pub mod moe;
 pub mod ops;
