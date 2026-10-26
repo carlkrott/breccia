@@ -538,6 +538,80 @@ pub fn record_copy(
     Ok(())
 }
 
+/// Record **many** copies into the open batch as one `vkCmdCopyBuffer` region
+/// array, behind a single transfer barrier.
+///
+/// [`record_copy`] costs 1.0-1.5 µs of host time per call (a barrier packet plus
+/// a copy packet); a region array costs ~0.13 µs per added region
+/// (`docs/research/02-vulkan-followups-and-powerinfer.md` §C). The graph's chunks
+/// are copy-dense — five lane-inputs per token, six per merged-prefill token, plus
+/// one per expert group — so this replaces ~5-8 record calls with one.
+///
+/// `items` are `(dst, dst_offset, src, src_offset, len)`; every range is bounds
+/// checked against its buffer (an out-of-range copy is a GPU page fault, not a
+/// wrong number).
+pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    // A/B arm for the region-array change (`docs/research/02-…` §C): one
+    // `record_copy` per region, i.e. the pre-§8w shape.
+    if std::env::var_os("BRECCIA_NO_COPY_ARRAYS").is_some() {
+        for (dst, dst_off, src, src_off, len) in items {
+            record_copy(gpu, dst, *dst_off, src, *src_off, *len)?;
+        }
+        return Ok(());
+    }
+    let slot = open_slot(gpu).ok_or_else(|| anyhow!("record_copies without an open batch"))?;
+    let cmd = gpu.cmds_c[1 + slot];
+    // A region array is per source *and* per destination buffer: Vulkan's
+    // `cmd_copy_buffer` takes one (src, dst) pair, so group by pair and emit one
+    // packet per group with every region of that group inside it.
+    let mut groups: Vec<(vk::Buffer, vk::Buffer, Vec<vk::BufferCopy>)> = Vec::new();
+    for (dst, dst_off, src, src_off, len) in items {
+        if src_off.saturating_add(*len) > src.size {
+            return Err(anyhow!(
+                "record_copies: {len} bytes at {src_off} is outside a {}-byte source",
+                src.size
+            ));
+        }
+        if dst_off.saturating_add(*len) > dst.size {
+            return Err(anyhow!(
+                "record_copies: {len} bytes at {dst_off} is outside a {}-byte destination",
+                dst.size
+            ));
+        }
+        let region = vk::BufferCopy::default()
+            .src_offset(*src_off)
+            .dst_offset(*dst_off)
+            .size(*len);
+        // Vulkan requires the regions of one `cmd_copy_buffer` to not overlap, so an
+        // in-place copy (source == destination) gets a packet of its own even when
+        // the ranges happen to be disjoint.
+        if src.buf == dst.buf {
+            groups.push((src.buf, dst.buf, vec![region]));
+            continue;
+        }
+        match groups
+            .iter_mut()
+            .find(|(sb, db, _)| *sb == src.buf && *db == dst.buf)
+        {
+            Some((_, _, regions)) => regions.push(region),
+            None => groups.push((src.buf, dst.buf, vec![region])),
+        }
+    }
+    if groups.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        transfer_barrier(&gpu.device, cmd);
+        for (src, dst, regions) in &groups {
+            gpu.device.cmd_copy_buffer(cmd, *src, *dst, regions);
+        }
+    }
+    Ok(())
+}
+
 /// Record a `BOTTOM_OF_PIPE` timestamp at `query` in the open batch.
 ///
 /// Two of these around a batch (one just after [`begin`], one just before
@@ -666,7 +740,12 @@ pub(crate) fn record(
             .cmd_push_constants(cmd, kernel.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
         gpu.device
             .cmd_dispatch(cmd, grid.0.max(1), grid.1.max(1), grid.2.max(1));
-        Gpu::barrier_all(&gpu.device, cmd);
+        // The narrowest correct fence between two dispatches: `Gpu::barrier_all`
+        // (ALL_COMMANDS → ALL_COMMANDS) costs 4.4 µs (MI50) / 5.2 µs (RX) of
+        // forced launch serialisation per dispatch, a compute-scoped sync2
+        // barrier 2.7 / 1.1 µs, and the dispatches themselves are 4-5 µs
+        // (`docs/research/02-vulkan-followups-and-powerinfer.md` §A1).
+        gpu.barrier_compute_on(cmd);
     }
     bump_open(gpu);
     RECORD_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));

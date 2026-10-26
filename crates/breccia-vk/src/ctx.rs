@@ -449,6 +449,40 @@ pub struct Gpu {
     /// `vkQueueSubmit2KHR`, which RADV does not export (it advertises sync2 only
     /// through the promoted 1.3 entry point), so the wrapper panics at submit.
     pub queue_submit2: Option<QueueSubmit2Fn>,
+    /// `vkCmdPipelineBarrier2` by its **core** 1.3 name (same loader caveat as
+    /// `queue_submit2`). Used for the per-dispatch compute→compute barrier, whose
+    /// `ALL_COMMANDS → ALL_COMMANDS` form costs 4.4 µs (MI50) / 5.2 µs (RX) per
+    /// dispatch against 2.7 / 1.1 µs for a compute-scoped sync2 barrier
+    /// (`docs/research/01-vulkan-and-mlc.md`, re-measured in
+    /// `docs/research/02-vulkan-followups-and-powerinfer.md` §A1).
+    pub pipeline_barrier2: Option<PipelineBarrier2Fn>,
+    /// Scope the compute→compute dispatch barrier uses: see [`BarrierScope`].
+    pub barrier_scope: BarrierScope,
+}
+
+/// `vkCmdPipelineBarrier2` with the lifetime erased.
+pub type PipelineBarrier2Fn = unsafe extern "system" fn(
+    command_buffer: vk::CommandBuffer,
+    dependency_info: *const vk::DependencyInfo<'static>,
+);
+
+/// How [`Gpu::barrier_compute`] fences one recorded dispatch against the next.
+///
+/// Decided by measurement, not taste: the full `ALL_COMMANDS → ALL_COMMANDS`
+/// memory barrier is correct but forces a launch serialisation that costs more
+/// than the dispatch it protects; `Sync2` narrows the scope to the compute stage
+/// with shader-storage access masks, which is the strictest scope that still
+/// covers "the next dispatch reads what this one wrote". `None` exists **only**
+/// for the three-arm bench and is never a shipped default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BarrierScope {
+    /// `ALL_COMMANDS → ALL_COMMANDS` memory barrier (`Gpu::barrier_all`).
+    Full,
+    /// `COMPUTE → COMPUTE` with shader read/write access masks (sync2).
+    #[default]
+    Sync2,
+    /// No barrier at all — bench arm only; produces wrong results.
+    None,
 }
 
 /// `vkQueueSubmit2` with the lifetime erased (it is an ABI-level function
@@ -656,6 +690,27 @@ impl Gpu {
                 Some(unsafe { std::mem::transmute::<vk::PFN_vkVoidFunction, QueueSubmit2Fn>(fp) })
             }
         };
+        // Load vkCmdPipelineBarrier2 by its core name (same caveat as submit2).
+        let pipeline_barrier2: Option<PipelineBarrier2Fn> = {
+            let name = c"vkCmdPipelineBarrier2";
+            let fp = unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) };
+            if fp.is_none() {
+                None
+            } else {
+                // SAFETY: the loader returned a non-null pointer for the core 1.3
+                // name; the signature is Vulkan's own.
+                Some(unsafe {
+                    std::mem::transmute::<vk::PFN_vkVoidFunction, PipelineBarrier2Fn>(fp)
+                })
+            }
+        };
+        // `BRECCIA_BARRIER=full|sync2|none` — the three-arm bench of §8w. `none`
+        // is a measurement arm only (it produces wrong results).
+        let barrier_scope = match std::env::var("BRECCIA_BARRIER").as_deref() {
+            Ok("full") => BarrierScope::Full,
+            Ok("none") => BarrierScope::None,
+            _ => BarrierScope::Sync2,
+        };
         Ok(Gpu {
             index,
             device,
@@ -680,6 +735,8 @@ impl Gpu {
             ts_ok_c: fam_c_props.timestamp_valid_bits > 0,
             ts_ok_x: fam_x_props.timestamp_valid_bits > 0,
             queue_submit2,
+            pipeline_barrier2,
+            barrier_scope,
         })
     }
 
@@ -963,6 +1020,49 @@ impl Gpu {
             &[],
             &[],
         );
+    }
+
+    /// The per-dispatch barrier: fence a recorded compute dispatch against the one
+    /// that follows it, at the narrowest scope that is still correct.
+    ///
+    /// A recorded graph dispatch always reads shader-storage data the previous
+    /// dispatch wrote, so the dependency is `COMPUTE → COMPUTE` with
+    /// `SHADER_WRITE → SHADER_READ|SHADER_WRITE`; that is *sufficient* for a
+    /// compute-only command stream and it is what the measured numbers say to use
+    /// (`ALL_COMMANDS → ALL_COMMANDS` costs 4.4 µs of launch serialisation on the
+    /// MI50 for a dispatch whose arithmetic is 4-5 µs). `BRECCIA_BARRIER` selects
+    /// the arm.
+    ///
+    /// # Safety
+    ///
+    /// `cmd` must be in the recording state on the thread that owns it, and every
+    /// access the next recorded dispatch can make must be covered by a
+    /// compute-stage fence with shader read/write masks — true for a compute-only
+    /// dispatch stream, **not** true across a transfer (copies keep
+    /// `Gpu::barrier_all`).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn barrier_compute_on(&self, cmd: vk::CommandBuffer) {
+        match self.barrier_scope {
+            BarrierScope::None => {}
+            BarrierScope::Full => unsafe { Gpu::barrier_all(&self.device, cmd) },
+            BarrierScope::Sync2 => {
+                let Some(f) = self.pipeline_barrier2 else {
+                    unsafe { Gpu::barrier_all(&self.device, cmd) };
+                    return;
+                };
+                let mb = vk::MemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .src_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(
+                        vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                    );
+                let dep = vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&mb));
+                // SAFETY: `cmd` is recording on this thread and the dependency
+                // covers every shader-visible access the next dispatch can make.
+                unsafe { f(cmd, &dep as *const vk::DependencyInfo<'_> as *const _) };
+            }
+        }
     }
 
     fn reset_record<F: FnOnce(&ash::Device, vk::CommandBuffer)>(

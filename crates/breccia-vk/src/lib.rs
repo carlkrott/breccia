@@ -29,7 +29,7 @@ pub mod report;
 pub mod transfer;
 pub mod transfer_bench;
 
-pub use ctx::{api_version_string, driver_version_string, Dev, Host};
+pub use ctx::{api_version_string, driver_version_string, BarrierScope, Dev, Host};
 pub use probe::{run_discovery, run_probe, ProbeOptions, ProbeOutcome};
 pub use report::*;
 pub use transfer::{RingConfig, RingStats, TransferRing};

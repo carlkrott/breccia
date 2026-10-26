@@ -84,22 +84,34 @@ pub fn gemv_into_many(
     #[cfg(target_arch = "x86_64")]
     if many_supported(path, ty) {
         let row_bytes = crate::cpu::row_bytes(ty, cols);
-        let ptrs: Vec<*const f32> = xs.iter().map(|x| x.as_ptr()).collect();
-        let mut tmp = vec![0f32; m];
-        for r in 0..rows {
-            let row = &packed[r * row_bytes..(r + 1) * row_bytes];
-            // SAFETY: `row` is one whole row, every activation has `cols` values
-            // (padded to whole blocks by the caller, as `gemv_into` requires) and
-            // `tmp` holds `m`.
-            unsafe {
-                match ty {
-                    QuantType::Iq4Nl => avx2::iq4_nl_many(row, &ptrs, tmp.as_mut_ptr()),
-                    QuantType::Q2_0 => avx2::q2_0_many(row, &ptrs, tmp.as_mut_ptr()),
-                    _ => unreachable!(),
+        // The dequant-once kernels hold `MANY_MAX` accumulators in registers, so a
+        // group larger than that is served in **passes of MANY_MAX users**. Each
+        // user's dot keeps its own accumulator and operation order, so the result
+        // is bit-identical to the single-user kernel either way — and a chunk
+        // (which can put a whole prompt's worth of tokens on one expert) can never
+        // silently lose the users past the register limit. That truncation was a
+        // real bug: `min(m, MANY_MAX)` dropped every user past 8, which is what
+        // made chunked prefill wrong for `--prefill-chunk >= 9` (§8w).
+        for group in 0..m.div_ceil(avx2::MANY_MAX) {
+            let lo = group * avx2::MANY_MAX;
+            let hi = (lo + avx2::MANY_MAX).min(m);
+            let ptrs: Vec<*const f32> = xs[lo..hi].iter().map(|x| x.as_ptr()).collect();
+            let mut tmp = vec![0f32; hi - lo];
+            for r in 0..rows {
+                let row = &packed[r * row_bytes..(r + 1) * row_bytes];
+                // SAFETY: `row` is one whole row, every activation has `cols` values
+                // (padded to whole blocks by the caller, as `gemv_into` requires) and
+                // `tmp` holds `hi - lo <= MANY_MAX`.
+                unsafe {
+                    match ty {
+                        QuantType::Iq4Nl => avx2::iq4_nl_many(row, &ptrs, tmp.as_mut_ptr()),
+                        QuantType::Q2_0 => avx2::q2_0_many(row, &ptrs, tmp.as_mut_ptr()),
+                        _ => unreachable!(),
+                    }
                 }
-            }
-            for (u, v) in tmp.iter().enumerate() {
-                out[u * rows + r] = *v;
+                for (u, v) in tmp.iter().enumerate() {
+                    out[(lo + u) * rows + r] = *v;
+                }
             }
         }
         return rows;

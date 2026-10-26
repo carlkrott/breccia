@@ -1525,6 +1525,23 @@ impl<'m> Session<'m> {
         for b in 0..mc.n_layers {
             self.prefill_block(b, t, pos0)?;
         }
+        // `BRECCIA_TRACE_PREFILL=1`: the chunk's own stage split, ms per prompt
+        // token, so "the dense chain" and "the expert lane" are numbers and not
+        // guesses. This is what decides whether a T-batched dense chain can pay.
+        if std::env::var_os("BRECCIA_TRACE_PREFILL").is_some() {
+            let rows: Vec<String> = self
+                .timers
+                .table(t)
+                .into_iter()
+                .filter(|(_, ms)| *ms > 0.01)
+                .map(|(name, ms)| format!("{name} {ms:.2}"))
+                .collect();
+            eprintln!(
+                "prefill stages blk48 t={t} (ms/token): {}",
+                rows.join(" · ")
+            );
+            self.timers.clear();
+        }
 
         // ---- the head sees the chunk's last token only -----------------------
         self.timers.mark(FINAL_HC);
@@ -1677,6 +1694,26 @@ impl<'m> Session<'m> {
             }
             self.pf_merged_bytes += (distinct as u64) * m.layers[b].experts.expert_bytes() as u64;
         }
+        // `BRECCIA_TRACE_CHUNK=1`: one line per (block, token) with the lane's
+        // inputs and its raw output, so a chunk-size disagreement can be traced to
+        // the readback, the lane or the ffn `HC_WRITE` instead of guessed at.
+        if std::env::var_os("BRECCIA_TRACE_CHUNK").is_some() {
+            for i in 0..t {
+                let mx = &self.pf_mixed[i * n_embd..i * n_embd + 3];
+                let sh = &shared[i * n_embd..i * n_embd + 3];
+                let ids = self.pf_ids[i]
+                    .iter()
+                    .take(5)
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let o = &out[i * n_embd..i * n_embd + 3];
+                eprintln!(
+                    "chunk blk {b:>2} tok {i:>3} mixed={mx:?} sh={sh:?} gate={:.6} ids=[{ids}] out={o:?}",
+                    gates[i]
+                );
+            }
+        }
         self.lane_s += t_lane.elapsed().as_secs_f64();
         self.lane_covered_s += self.lane_s.min(0.0); // set by the driver when relevant
         for i in 0..t {
@@ -1691,6 +1728,23 @@ impl<'m> Session<'m> {
 
         // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
         self.timers.mark(HC_WRITE_F);
+        if std::env::var_os("BRECCIA_TRACE_CHUNK").is_some() {
+            let mut rows = Vec::new();
+            for i in 0..t {
+                let v = &self.venues[dev];
+                let gpu = m.devices[dev].gpu();
+                let b = self.stagings[dev]
+                    .read_batch(gpu, &[(&v.inject_slots[i], 0, 16)])
+                    .map(|x| x[0].clone())
+                    .unwrap_or_default();
+                let f: Vec<f32> = b
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                rows.push(format!("{i}:{f:?}"));
+            }
+            eprintln!("chunk blk {b:>2} inject {rows:?}");
+        }
         self.ensure_batch(dev)?;
         for i in 0..t {
             self.swap_r_in(dev, i);
@@ -1764,20 +1818,25 @@ impl<'m> Session<'m> {
                 let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
                 let kb = (k * 4) as u64;
                 let nb = (n_embd * 4) as u64;
-                batch_cmd::record_copy(gpu, &pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb)?;
-                batch_cmd::record_copy(gpu, &pf.w, i as u64 * kb, &v.router_w, 0, kb)?;
-                batch_cmd::record_copy(gpu, &pf.mixed, i as u64 * nb, &ws.mixed, 0, nb)?;
-                batch_cmd::record_copy(gpu, &pf.shared, i as u64 * nb, &v.sh, 0, nb)?;
-                batch_cmd::record_copy(gpu, &pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4)?;
-                // The ffn `HC_WRITE` moves to pass 2, so this token's inject
-                // partials have to survive the rest of the chunk (§8s).
-                batch_cmd::record_copy(
+                // Six copies, one region array (and one barrier) per token.
+                batch_cmd::record_copies(
                     gpu,
-                    &v.inject_slots[i],
-                    0,
-                    &ws.inject,
-                    0,
-                    ws.inject.size.min(160),
+                    &[
+                        (&pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb),
+                        (&pf.w, i as u64 * kb, &v.router_w, 0, kb),
+                        (&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb),
+                        (&pf.shared, i as u64 * nb, &v.sh, 0, nb),
+                        (&pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4),
+                        // The ffn `HC_WRITE` moves to pass 2, so this token's
+                        // inject partials have to survive the rest of the chunk.
+                        (
+                            &v.inject_slots[i],
+                            0,
+                            &ws.inject,
+                            0,
+                            ws.inject.size.min(160),
+                        ),
+                    ],
                 )?;
             }
             self.swap_r_in(dev, i);
@@ -1866,22 +1925,23 @@ impl<'m> Session<'m> {
                 let down = pipes.gemm(down_ty).expect("the down multi-user GEMM");
                 // Gather the group's activation rows (a run of consecutive tokens
                 // is one copy), then one weights read at the expert's arena base.
+                let mut rows: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
                 let mut a = 0usize;
                 while a < mu {
                     let mut z = a + 1;
                     while z < mu && users[z] == users[z - 1] + 1 {
                         z += 1;
                     }
-                    batch_cmd::record_copy(
-                        gpu,
+                    rows.push((
                         &pf.x,
                         (a * n_embd * 4) as u64,
                         &pf.mixed,
                         (users[a] * n_embd * 4) as u64,
                         ((z - a) * n_embd * 4) as u64,
-                    )?;
+                    ));
                     a = z;
                 }
+                batch_cmd::record_copies(gpu, &rows)?;
                 let wbase = |words: u32| (*e as u32) * words;
                 gate.run_at(&pe.gate.buf, &pf.x, &pf.gg, n_ff, n_embd, mu, wbase(wgate))?;
                 up.run_at(&pe.up.buf, &pf.x, &pf.uu, n_ff, n_embd, mu, wbase(wup))?;
@@ -1930,17 +1990,19 @@ impl<'m> Session<'m> {
                 k,
                 n_embd,
             )?;
-            for i in 0..t {
-                batch_cmd::record_copy(
-                    gpu,
-                    &v.moe_out[i].buf,
-                    0,
-                    &pf.out,
-                    (i * n_embd * 4) as u64,
-                    (n_embd * 4) as u64,
-                )?;
-                self.dev_up[dev] += (n_embd * 4) as u64;
-            }
+            let rows: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
+                .map(|i| {
+                    (
+                        &v.moe_out[i].buf,
+                        0u64,
+                        &pf.out,
+                        (i * n_embd * 4) as u64,
+                        (n_embd * 4) as u64,
+                    )
+                })
+                .collect();
+            batch_cmd::record_copies(gpu, &rows)?;
+            self.dev_up[dev] += (t * n_embd * 4) as u64;
         }
         self.submit_batch()?;
         self.flush()?;
@@ -2012,39 +2074,20 @@ impl<'m> Session<'m> {
         let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
         let base = crate::xfer::BLOCK_REGION * slot as u64;
         let offs = lane_offsets(mc.n_embd, k);
-        batch_cmd::record_copy(
+        // One region array per token (five copies, one barrier packet) instead of
+        // five `record_copy`s: ~5 µs of host record time saved per token per block,
+        // which is the whole `xfer-down` stage of a chunk.
+        let stb = st.buffer();
+        batch_cmd::record_copies(
             gpu,
-            st.buffer(),
-            base + offs[0],
-            &ws.mixed,
-            0,
-            (mc.n_embd * 4) as u64,
+            &[
+                (stb, base + offs[0], &ws.mixed, 0, (mc.n_embd * 4) as u64),
+                (stb, base + offs[1], &v.router_ids, 0, (k * 4) as u64),
+                (stb, base + offs[2], &v.router_w, 0, (k * 4) as u64),
+                (stb, base + offs[3], &v.sh, 0, (mc.n_embd * 4) as u64),
+                (stb, base + offs[4], &v.sh_gate_logit, 0, 4),
+            ],
         )?;
-        batch_cmd::record_copy(
-            gpu,
-            st.buffer(),
-            base + offs[1],
-            &v.router_ids,
-            0,
-            (k * 4) as u64,
-        )?;
-        batch_cmd::record_copy(
-            gpu,
-            st.buffer(),
-            base + offs[2],
-            &v.router_w,
-            0,
-            (k * 4) as u64,
-        )?;
-        batch_cmd::record_copy(
-            gpu,
-            st.buffer(),
-            base + offs[3],
-            &v.sh,
-            0,
-            (mc.n_embd * 4) as u64,
-        )?;
-        batch_cmd::record_copy(gpu, st.buffer(), base + offs[4], &v.sh_gate_logit, 0, 4)?;
         batch_cmd::record_barrier_to_host(gpu)?;
         Ok(())
     }

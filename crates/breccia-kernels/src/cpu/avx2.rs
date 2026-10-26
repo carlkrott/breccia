@@ -1000,6 +1000,72 @@ mod tests {
         }
     }
 
+    /// `gemv_into_many` must stay bit-identical to one `gemv_into` per user **past
+    /// the register limit**: the dequant-once kernels hold `MANY_MAX` accumulators,
+    /// and a grouped chunk can put a whole prompt's tokens on one expert. The
+    /// first version clamped `m` to `MANY_MAX` and quietly dropped every user past
+    /// 8 — which is what broke chunked prefill for `--prefill-chunk >= 9` (§8w).
+    #[test]
+    fn many_user_dots_are_bit_identical_past_the_register_limit() {
+        if !super::super::avx2_available() {
+            eprintln!("skipping: no AVX2 on this CPU");
+            return;
+        }
+        let cols: usize = 2560;
+        let rows: usize = 3;
+        for ty in [QuantType::Iq4Nl, QuantType::Q2_0] {
+            let bpr = cols.div_ceil(ty.block_elems());
+            let bb = ty.block_bytes();
+            let mut packed = vec![0u8; rows * bpr * bb];
+            let mut s = 0x5eed_1234u32;
+            for b in packed.iter_mut() {
+                s ^= s << 13;
+                s ^= s >> 17;
+                s ^= s << 5;
+                *b = s as u8;
+            }
+            // Every block's scale field gets 0.5, so nothing overflows.
+            for blk in packed.chunks_exact_mut(bb) {
+                for &off in crate::real::scale_offsets(ty) {
+                    blk[off..off + 2].copy_from_slice(&0x3800u16.to_le_bytes());
+                }
+                let _ = bpr;
+            }
+            let m = super::MANY_MAX + 4;
+            let xs: Vec<Vec<f32>> = (0..m)
+                .map(|u| {
+                    (0..cols)
+                        .map(|i| (((i * 7 + u * 13) % 29) as f32 - 14.0) * 0.01)
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[f32]> = xs.iter().map(|x| x.as_slice()).collect();
+            let mut many = vec![0f32; m * rows];
+            crate::cpu::gemv_into_many(
+                crate::cpu::Path::Avx2,
+                ty,
+                &packed,
+                rows,
+                cols,
+                &refs,
+                &mut many,
+            );
+            for (u, x) in xs.iter().enumerate() {
+                let mut one = vec![0f32; rows];
+                crate::cpu::gemv_into(crate::cpu::Path::Avx2, ty, &packed, rows, cols, x, &mut one);
+                for r in 0..rows {
+                    assert_eq!(
+                        many[u * rows + r].to_bits(),
+                        one[r].to_bits(),
+                        "{ty} user {u} of {m}, row {r}: many {} vs one {}",
+                        many[u * rows + r],
+                        one[r]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn avx2_is_deterministic() {
         for ty in QuantType::ALL {

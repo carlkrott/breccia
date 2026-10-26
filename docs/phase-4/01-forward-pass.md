@@ -1855,6 +1855,155 @@ needs no new kernel — only an upload path and the expert types the host blocks
 
 
 
+## 8w. The chunk>=9 bug found and fixed, a compute-scoped barrier, and where prefill time really goes
+
+Three items, each measured in-window and each with its own switch. The round's
+headline is a **correctness** result: chunked prefill had been silently dropping
+work since §8t.
+
+### 1. Chunked prefill was wrong for chunk >= 9 — the `MANY_MAX` clamp (A1, fixed)
+
+§8v's parity sweep found the symptom (32/32 at chunk 0/8, 2/32 at 16, 0/32 at 27+)
+but not the cause. `BRECCIA_TRACE_CHUNK=1` dumps every (block, token) lane input
+and output, and the diff is unambiguous: **blocks 0-11 are bit-identical between a
+9-token chunk and a 1-token chunk; block 12 is the first that differs, with
+identical `mixed`, identical router ids/weights, identical shared output and
+gate**, while its lane output differs in the third decimal.
+
+The cause is §8t's dequantise-once dot — `gemv_into_many` clamped the user count:
+
+```rust
+let m = xs.len().min(MANY_MAX);   // MANY_MAX = 8, the register budget
+```
+
+Users past the 8th were never computed and their rows stayed zero, so a chunk that
+put nine or more tokens on one expert **silently dropped those tokens'
+contribution** to that expert. Blocks 0-11 masked it because none of their experts
+had nine users for the last token; block 12 was the first that did. The same clamp
+also means every chunked number in §8s/§8t/§8u/§8v was measured on a path that did
+*less* work than advertised.
+
+Fixed by serving users in **passes of `MANY_MAX`** (`cpu/mod.rs`); each user keeps
+its own accumulator and operation order, so the result stays bit-identical to
+`gemv_into`. New regression test
+`many_user_dots_are_bit_identical_past_the_register_limit` (m = 12, IQ4_NL and Q2_0,
+bit-compared against 12 single-user calls).
+
+Parity, 27-token reference prompt, 32 greedy tokens, `bench token --gen 32`:
+
+| chunk | RX 6950 XT | MI50 | top-1 logit (RX) |
+|---|---|---|---|
+| 0 | **32/32** | — | 13.170521 |
+| 8 | **32/32** | — | 13.170561 |
+| 16 | **32/32** | — | 13.170561 |
+| 32 | **32/32** | **32/32** | 13.170561 |
+| 64 | **32/32** | — | 13.170561 |
+| 128 | **32/32** | — | 13.170561 |
+| 128 + `--prefill-merged` (9 resident blocks) | **32/32** | — | 13.170429 |
+
+Chunking is now bit-identical to token-by-token **within a device** — the residual
+1e-5 spread across chunk sizes is the documented expert-set accumulation order
+(§8s), and the RX/MI50 difference (13.1705 vs 13.1705) is the pre-existing
+device-to-device one.
+
+### 2. Prefill after the fix, and where its time actually goes
+
+2 agents x 300-token prefixes, 8 generated tokens, RX + MI50 one stream each,
+alternating in one window (a *slow* window: decode 9.3-13.1 aggregate against the
+recorded 20.0-20.3, host lane 100+ ms/step — the expert mmap is re-read from NVMe,
+~21 GB per run, because 41 GB of experts + 27 GB of PLE do not fit the 45 GB page
+cache; every comparison is in-window):
+
+| prefill path | tok/s per agent |
+|---|---:|
+| token by token (chunk 0) | **5.35** (5.27, 5.42) |
+| chunk 128 | 5.02 |
+| chunk 128 + `--prefill-merged` | 5.08 |
+| chunk 128 + merged, region arrays off | 4.95 |
+
+`BRECCIA_TRACE_PREFILL=1` prints the chunk's own stage split (ms per prompt
+token, 128-token chunk, one stream, RX):
+
+| stage | token by token | chunked |
+|---|---:|---:|
+| **experts(host)** | **69.0** | **93.4** |
+| shared-exp | 15.4 | 15.4 |
+| mixer | 6.2 | 6.1 |
+| ple | 1.3 | **14.7** |
+| hc-read(attn/ffn) + hc-write(attn/ffn) + router + embed | 0.3 | 0.3 |
+| **total** | **92** | **130** |
+
+So: **the host expert lane is 72-75 % of prefill**, the shared-expert GEMV is the
+largest *dense* stage (15.4), the hyper-connection chain — the thing a T-batched
+dense pass would target — is **0.3 ms/token**, and the chunked path is 38 ms/token
+*worse* than token-by-token: +24 ms because the grouped lane now does the work
+§8t's clamp was skipping, +11 ms because each chunked `ple_step` pays two flushes.
+
+That is why a T-batched dense chain was **not** landed this round: with the fix in
+place it can address at most shared-exp + mixer (21.6 of 92 ms, 23 %), and the
+honest sequencing is to attack the lane first — the merged pass pointed at the
+**39 non-resident blocks** (stream each expert once per chunk, §8u's 2.6-11
+ms/token against the lane's ~70), or PowerInfer-style per-expert residency. A
+T-batched shared-expert GEMV (same weights, T users — the `GemmMany` machinery is
+already built) is the dense-chain piece to do, worth ~15 ms/token.
+
+### 3. Barrier scope: `COMPUTE -> COMPUTE` sync2, measured (B)
+
+`Gpu::barrier_all` (ALL_COMMANDS -> ALL_COMMANDS) fenced every recorded dispatch —
+1 509 of them per decode token. `Gpu::barrier_compute_on` now issues
+`vkCmdPipelineBarrier2` at the narrowest scope that is still correct for a
+compute-only stream (`COMPUTE_SHADER -> COMPUTE_SHADER`, shader read/write access
+masks), loaded by its **core 1.3** name (RADV does not export the KHR alias — same
+caveat as `vkQueueSubmit2`). `BRECCIA_BARRIER=full|sync2|none` selects the arm;
+`none` exists only for the bench.
+
+2 streams, 64-token prefixes, 8 decode steps, A/B/A:
+
+| arm | aggregate tok/s | GPU busy (ms/step, both cards) |
+|---|---:|---:|
+| full | 9.50 / 9.26 | 137.4 / 136.9 |
+| **sync2 (default)** | **13.14 / 10.01** | **127.7 / 129.6** |
+| none | **NaN in the warm pass** — not shippable | — |
+
+`sync2` is **-8.5 ms/step of GPU busy** and +23 % aggregate decode in this window
+(the aggregate is noisy because the lane, not the GPU, binds the step; the GPU
+number is the clean one). Correctness: bit-identical tokens on the MI50 with
+`VK_LAYER_KHRONOS_validation` on, 0 validation messages.
+
+### 4. Region arrays for the chunk's copies (C)
+
+`batch_cmd::record_copies` groups copies by (source, destination) buffer pair and
+records them as one `vkCmdCopyBuffer` region array behind a single transfer
+barrier — the chunked/merged passes are copy-dense (5-6 per token, one per expert
+group, one per token in the fan-in). A/B on the same work (11 3xx expert groups,
+11.8 GiB of arena reads):
+
+| chunk 128 + merged | GEMM wall | fan-in | prefill |
+|---|---:|---:|---:|
+| per-copy (old) | 850.9 ms | 23.5 ms | 4.95 |
+| **region arrays** | **757.9 ms** | **8.9 ms** | **5.08** |
+
+-108 ms per 600-token prompt (-0.18 ms/token of host record time), default on,
+`BRECCIA_NO_COPY_ARRAYS=1` for the old shape.
+
+### 5. Dropped: Wave32 on the RX (D)
+
+Not attempted: `docs/research/02-vulkan-followups-and-powerinfer.md` measures
+**1.001x** on a dependent-load latency probe (VGPR 8 -> 16) and finds the MI50
+*silently ignores* the requested subgroup size, which would make a wave32 arm
+there a fake no-op. A 0.1 % lever with a 64-lane device that lies is not worth a
+round.
+
+### What this round changed in the gates
+
+- Chunked prefill is **parity-correct at every chunk size** (was wrong for >= 9);
+  `--prefill-chunk` is now a *valid* substrate, still 5 % slower than token by
+  token, so it stays off.
+- Decode: the default barrier is now compute-scoped — a free -8.5 ms/step of GPU
+  busy, no parity change.
+- Nothing in the merged prefill changes the verdict of §8v: it stays behind
+  `--prefill-merged`.
+
 ## 9. Exact commands
 
 
