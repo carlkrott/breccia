@@ -717,7 +717,86 @@ Memory-bound vs latency-bound, against the phase-3 rates:
 Item 2 is the cheap one (host-side only, `< 1 hour`) and is the recommendation for
 the next pass; item 1 is the biggest single win and is contained.
 
+## 8m. The two next workstreams, specified (not implemented)
+
+No code from this section landed: both items are changes that cannot be left
+half-applied (a partially added semaphore in `breccia-vk` or a half-fused shader
+would break the build or the parity gate for the next pass), and this pass had no
+budget for an implement-measure-fix cycle on either. What follows is the design
+with the exact signatures and ordering, so the next pass starts at the edit.
+
+### 1. Mid-batch sync: a timeline semaphore the host can poll
+
+Today `breccia_kernels::batch_cmd` can only end a batch by submitting and waiting
+on a binary fence, which is why the host cannot see the router's ids until the
+whole phase is done — the reason overlap loses ~0.8 ms/block (§8k) and K cannot
+exceed 2 (§8e).
+
+**API to add in `breccia-vk` (additive, existing calls untouched):**
+
+```rust
+impl Gpu {
+    /// A timeline semaphore plus the host-visible counter buffer it is paired with.
+    pub fn timeline(&self, initial: u64) -> R<Timeline>;
+}
+pub struct Timeline { pub sem: vk::Semaphore, pub counter: Buf /* u64, host-visible */ }
+impl Timeline {
+    /// `vkCmdWriteTimestamp`-free progress marker: the batch records a signal of
+    /// `value` at this point, so the host can observe when the GPU reached it.
+    pub fn signal(&self, d: &ash::Device, cmd: vk::CommandBuffer, value: u64);
+    /// Block until the GPU signals at least `value` (host-side, no fence for the batch).
+    pub fn wait_host(&self, value: u64, timeout_ns: u64) -> R<()>;
+}
+```
+
+**Recording rule:** `vkCmdWriteTimestamp` cannot signal a timeline, so the batch
+records the marker as `vkCmdWaitEvents`-free pair:
+`vkCmdWriteTimestamp(query)` for the GPU-side timestamp *plus* a
+`vkCmdPipelineBarrier(HOST→HOST)` and a `vkUpdateDescriptorSets`-free host read of
+a **host-visible u64 the previous dispatch wrote** (`moe_map`/`router` can write
+`1` into it as their last act). `Timeline::wait_host` then spins on that u64 with
+`vkGetQueryPoolResults(..., WAIT)` as the fallback. Either way the host learns
+"the router has completed" **without** `vkWaitForFences` on the batch, which is
+what keeps the rest of the batch running.
+
+**Then the two pay-offs, both already scoped:**
+
+* **Overlap** (§8k): record phase A + router + `moe_map`/GEMV for the first
+  `k_gpu` ids; signal; host waits on the marker, computes the complement
+  (`pool.moe_topk(plan, &ids[k_gpu..], &w[k_gpu..], …)`) while the GPU is still
+  executing; `MoeCombine` gains a `cpu` binding and a `+ CPU[i]` term. Expected:
+  −0.15/−0.30/−0.45 ms per block for `k_gpu = 2/4/6`, with **zero** extra
+  submissions, i.e. −7/−14/−22 ms/token instead of the current −17…−31.
+* **K > 2** (§8e): with the marker, block *n+1*'s phase A can be recorded and
+  submitted behind block *n*'s MoE readback as long as the *state* buffers it
+  reads are disjoint — the QSA workspace is now hoisted (§8i) and the GDN state is
+  per layer, so K = 2–4 blocks in flight is reachable. The serialisation that
+  remains is the host lane for the 37 host blocks, which is exactly what the
+  overlap above removes for its share.
+
+**Validation:** the semaphore must be created with
+`VK_KHR_timeline_semaphore` (already enabled: `lib.rs` asserts it on every
+device — `enumerates_three_devices_on_this_host`); the host-side spin must be
+bounded (`timeout_ns`) and must fall back to `vkWaitForFences` + a warning rather
+than hanging the box; first run on the MI50 with the validation layer.
+
+### 2. Op-family fusion: the dispatch budget, in priority order
+
+| # | fusion | dispatches removed | shader work | expected |
+|---|---|---:|---|---:|
+| 1 | **HC read**: fold `norm` into the `down` GEMV's prologue and `gated`+`inject` into one pass (5 → 3) | 192 | 2 shaders (`hc_down_fused`, extend `hc_gated_mean`) | −2.5 ms |
+| 2 | **Shared expert**: gate+up in one dispatch (two row ranges of one 1280-row GEMV) then SwiGLU+down in one pass with the 640-wide intermediate in LDS (5 → 2) | 144 | 2 shaders | −3.0 ms |
+| 3 | **split-K HC `down`** via the existing `Gemv::run_split` (host plumbing only) | 0 | none | −1.0 ms |
+| 4 | **GDN**: conv+SiLU, q/k L2 and beta/gate over the same 10 240 channels as one pass; delta rule with the 128-float column in LDS instead of re-reading the 9 MiB state | 72 | 2 shaders | −4.0 ms |
+| 5 | one-pass GDN (all three) | 72 | 3 shaders' semantics in one | −0.3 ms |
+
+Items 1–4 total **≈ −10.5 ms** and **408 fewer dispatches** (1 509 → ≈1 100), all
+inside kernels that already have conformance suites; the pattern to keep is the
+one that made §8d correct: a unit-level byte/value diff against the host reference
+**before** the end-to-end parity run.
+
 ## 9. Exact commands
+
 
 
 
