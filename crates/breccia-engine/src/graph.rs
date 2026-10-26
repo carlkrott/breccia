@@ -237,6 +237,12 @@ pub struct SessionCfg {
     /// the generated tokens are bit-identical with it on and off on all three
     /// device configurations (`docs/phase-4/01-forward-pass.md` §8).
     pub batching: bool,
+    /// Record a block's readback (`mixed`, router ids/weights, shared expert out
+    /// and gate) as **copies inside the block's own batch**, and read them out of
+    /// the staging mapping after the wait — instead of a `vkQueueSubmit` +
+    /// `vkWaitForFences` of their own (§8o measured 0.55 ms/block of host time in
+    /// a two-stream pair, where the GPU has slack).
+    pub inbatch_read: bool,
     /// Enable the GPU-time probe (`BRECCIA_GPU_TIME=1` also turns it on).
     /// It stamps every batch, so a two-stream run can report per-card
     /// utilisation instead of only fence waits.
@@ -262,6 +268,22 @@ pub struct BlockDigests {
     pub mixed_attn: Option<Checksum>,
     pub mixer_out: Option<Checksum>,
     pub mixed_ffn: Option<Checksum>,
+}
+
+/// Byte offsets of a block's readback inside the staging block region:
+/// `mixed | router ids | router weights | shared out | shared gate`.
+fn lane_offsets(n_embd: usize, k: usize) -> [u64; 5] {
+    let mut o = [0u64; 5];
+    let mut at = 0u64;
+    for (i, n) in [n_embd * 4, k * 4, k * 4, n_embd * 4, 4]
+        .into_iter()
+        .enumerate()
+    {
+        o[i] = at;
+        at += n as u64;
+    }
+    debug_assert!(at <= crate::xfer::BLOCK_REGION);
+    o
 }
 
 fn kind_name(m: &Model, b: usize) -> String {
@@ -318,6 +340,8 @@ pub struct Session<'m> {
     pub dispatches: u64,
     /// See [`SessionCfg::batching`].
     pub batching: bool,
+    /// See [`SessionCfg::inbatch_read`].
+    pub inbatch_read: bool,
     /// GPU-time probe (`BRECCIA_GPU_TIME=1`): one timestamp pool per device and
     /// the number of batches stamped so far (`None` = done or disabled).
     probe_pools: Vec<ash::vk::QueryPool>,
@@ -557,6 +581,7 @@ impl<'m> Session<'m> {
             submits: 0,
             dispatches: 0,
             batching: cfg.batching,
+            inbatch_read: cfg.inbatch_read,
             probe_pools: {
                 let on = cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some();
                 let mut v = Vec::with_capacity(model.devices.len());
@@ -1119,6 +1144,32 @@ impl<'m> Session<'m> {
             });
         }
 
+        // The block's readback can ride this submission: five `cmd_copy_buffer`s
+        // into the staging block region plus a host-visibility barrier, so the
+        // host reads the mapping after the wait instead of paying a submission
+        // and a fence of its own (§8o).
+        if self.inbatch_read {
+            let k = mc.n_expert_used;
+            let gpu = m.devices[dev].gpu();
+            let v = &self.venues[dev];
+            let st = &self.stagings[dev];
+            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+            let offs = lane_offsets(mc.n_embd, k);
+            batch_cmd::record_copy(
+                gpu,
+                st.buffer(),
+                offs[0],
+                &ws.mixed,
+                0,
+                (mc.n_embd * 4) as u64,
+            )?;
+            batch_cmd::record_copy(gpu, st.buffer(), offs[1], &v.router_ids, 0, (k * 4) as u64)?;
+            batch_cmd::record_copy(gpu, st.buffer(), offs[2], &v.router_w, 0, (k * 4) as u64)?;
+            batch_cmd::record_copy(gpu, st.buffer(), offs[3], &v.sh, 0, (mc.n_embd * 4) as u64)?;
+            batch_cmd::record_copy(gpu, st.buffer(), offs[4], &v.sh_gate_logit, 0, 4)?;
+            batch_cmd::record_barrier_to_host(gpu)?;
+        }
+
         // The host block's submission ends here: the readback is
         // [`Session::finish_block`]'s job, after the wait.
         self.submit_batch()?;
@@ -1192,16 +1243,28 @@ impl<'m> Session<'m> {
             .as_ref()
             .expect("the session's hc workspace")
             .mixed;
-        let raw = self.stagings[dev].read_batch(
-            m.devices[dev].gpu(),
-            &[
-                (ws_mixed, 0, mc.n_embd * 4),
-                (&self.venues[dev].router_ids, 0, k * 4),
-                (&self.venues[dev].router_w, 0, k * 4),
-                (&self.venues[dev].sh, 0, mc.n_embd * 4),
-                (&self.venues[dev].sh_gate_logit, 0, 4),
-            ],
-        )?;
+        let raw = if self.inbatch_read {
+            let offs = lane_offsets(mc.n_embd, k);
+            let st = &self.stagings[dev];
+            vec![
+                st.read_block(offs[0], mc.n_embd * 4).to_vec(),
+                st.read_block(offs[1], k * 4).to_vec(),
+                st.read_block(offs[2], k * 4).to_vec(),
+                st.read_block(offs[3], mc.n_embd * 4).to_vec(),
+                st.read_block(offs[4], 4).to_vec(),
+            ]
+        } else {
+            self.stagings[dev].read_batch(
+                m.devices[dev].gpu(),
+                &[
+                    (ws_mixed, 0, mc.n_embd * 4),
+                    (&self.venues[dev].router_ids, 0, k * 4),
+                    (&self.venues[dev].router_w, 0, k * 4),
+                    (&self.venues[dev].sh, 0, mc.n_embd * 4),
+                    (&self.venues[dev].sh_gate_logit, 0, 4),
+                ],
+            )?
+        };
         self.dev_down[dev] += (mc.n_embd * 2 + k * 8 + 4) as u64;
         let mixed = f32_from_bytes(&raw[0]);
         let ids: Vec<usize> = raw[1]

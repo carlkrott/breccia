@@ -265,9 +265,15 @@ enum BenchKind {
         /// Independent sequences decoded in lockstep, one per device: `2` puts
         /// one sequence on each card and interleaves them at the block level so
         /// each expert lane runs under the other stream's GPU phase. `1` is the
-        /// single-stream graph.
+        /// single-stream graph; more streams than devices puts two on one card.
         #[arg(long, default_value_t = 1)]
         streams: usize,
+        /// Record a block's readback as copies inside the block's own batch and
+        /// read the staging mapping, instead of a submission of its own.
+        /// **On by default**: in a two-stream pair the GPU has slack, and the
+        /// removed round trip is worth 4-7 % of the aggregate (§8p).
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        inbatch_read: bool,
     },
 }
 fn main() {
@@ -415,6 +421,7 @@ fn run(cli: Cli) -> Result<()> {
                     split_blocks,
                     gpu_experts,
                     streams,
+                    inbatch_read,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -435,6 +442,7 @@ fn run(cli: Cli) -> Result<()> {
             split_blocks,
             gpu_experts,
             streams,
+            inbatch_read,
         }),
     }
 }
@@ -1412,6 +1420,7 @@ struct TokenArgs {
     split_blocks: Option<String>,
     gpu_experts: Option<String>,
     streams: usize,
+    inbatch_read: bool,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1462,12 +1471,44 @@ fn feed_prompt(sess: &mut breccia_engine::Session<'_>, prompt: &[u32]) -> Result
 fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     let n_streams = a.streams;
     let devs: Vec<String> = a.devices.clone();
-    if devs.len() < n_streams {
-        anyhow::bail!(
-            "--streams {n_streams} needs {n_streams} devices, got {:?}",
-            devs
-        );
+    if devs.is_empty() {
+        anyhow::bail!("--streams {n_streams} needs at least one --devices entry");
     }
+    // `--gpu-experts` is a per-stream list; `;` separates streams (the last group
+    // repeats). Two streams on the same card are allowed: their GPU phases then
+    // queue behind each other, which is what the scaling curve measures.
+    let expert_sets: Vec<Vec<usize>> = {
+        let groups: Vec<Vec<usize>> = a
+            .gpu_experts
+            .as_ref()
+            .map(|s| {
+                s.split(';')
+                    .map(|g| {
+                        g.split(',')
+                            .filter_map(|t| t.trim().parse::<usize>().ok())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if groups.is_empty() && n_streams == 2 && devs.len() >= 2 {
+            // Measured default for a two-stream pair (§8p): the production mapping's
+            // nine hottest blocks. It costs GPU time the RX cannot use otherwise and
+            // buys ~17 ms/step of host lane, worth +2.5 tok/s aggregate. It does not
+            // fit once two streams share a card, so it is not used above two streams.
+            vec![vec![0, 1, 2, 4, 8, 18, 20, 22, 23]; n_streams]
+        } else {
+            (0..n_streams)
+                .map(|i| {
+                    groups
+                        .get(i)
+                        .or_else(|| groups.last())
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+    };
     println!(
         "breccia bench token --streams {n_streams}: {} prompt ids, {} to generate each, \
          one device per stream",
@@ -1477,17 +1518,18 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     let mut models = Vec::with_capacity(n_streams);
     #[allow(clippy::needless_range_loop)]
     for s in 0..n_streams {
+        let dev = devs[s % devs.len()].clone();
         let model = breccia_engine::Model::load(
             glob,
             &breccia_engine::LoadOptions {
-                devices: vec![devs[s].clone()],
+                devices: vec![dev.clone()],
                 ctx_capacity: a.ctx,
                 blocks: None,
-                gpu_experts: Vec::new(),
+                gpu_experts: expert_sets[s].clone(),
                 verbose: s == 0,
             },
         )
-        .with_context(|| format!("loading stream {s}'s model on {}", devs[s]))?;
+        .with_context(|| format!("loading stream {s}'s model on {dev}"))?;
         if s == 0 {
             print!("{}", model.stats.banner(&model.cfg));
         }
@@ -1500,6 +1542,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         threads: a.threads.unwrap_or(0),
         timers: a.timers,
         batching: a.batching,
+        inbatch_read: a.inbatch_read,
         probe: std::env::var_os("BRECCIA_GPU_TIME").is_some(),
         pool: None,
     };
@@ -1524,7 +1567,16 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         multi.streams[0].session_bytes() >> 20
     );
     for (i, (name, pci)) in names.iter().enumerate() {
-        println!("  stream {i}  {name:<40} {pci}");
+        let pe = &expert_sets[i];
+        println!(
+            "  stream {i}  {name:<40} {pci}  {} expert block(s) on the device{}",
+            pe.len(),
+            if pe.is_empty() {
+                String::new()
+            } else {
+                format!(" {:?}", pe)
+            }
+        );
     }
 
     // ---- warm pass (page cache; discarded) --------------------------------
@@ -1572,22 +1624,33 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 &st.tokens[..st.tokens.len().min(8)]
             );
         }
-        // The probe measures GPU busy time, so utilisation is per card and
-        // independent of what the host was doing.
+        // The probe measures GPU busy time per *device*, so utilisation is per
+        // card: with two streams on one card the two sessions' busy times add up.
+        let mut per_card: Vec<(String, String, Vec<usize>, f64)> = Vec::new();
         let mut busy_total = 0.0;
         for (i, sess) in multi.streams.iter_mut().enumerate() {
             let busy = sess.gpu_busy_s()?;
             let b = busy.first().copied().unwrap_or(0.0);
             busy_total += b;
+            sess.reset_gpu_busy()?;
+            let pci = names[i].1.clone();
+            match per_card.iter_mut().find(|c| c.1 == pci) {
+                Some(c) => {
+                    c.2.push(i);
+                    c.3 += b;
+                }
+                None => per_card.push((names[i].0.clone(), pci, vec![i], b)),
+            }
+        }
+        for (name, _pci, streams_on_it, b) in &per_card {
             let util = if g.decode_seconds > 0.0 {
                 b / g.decode_seconds * 100.0
             } else {
                 0.0
             };
-            sess.reset_gpu_busy()?;
             println!(
-                "  card {i}    {}  GPU busy {:.1} ms over {:.0} ms of decode = {:.0}% utilised",
-                names[i].0,
+                "  card      {name:<40} streams {streams_on_it:?}  GPU busy {:.0} ms of \
+                 {:.0} ms = {:.0}% utilised",
                 b * 1e3,
                 g.decode_seconds * 1e3,
                 util
@@ -1601,14 +1664,14 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         );
         println!(
             "  record {:.1} ms/step of host recording, {:.1} ms/step of ring waits \
-             (both streams)",
+             (all streams)",
             breccia_kernels::batch_cmd::record_seconds() * 1e3 / g.steps.max(1) as f64,
             breccia_kernels::batch_cmd::wait_seconds() * 1e3 / g.steps.max(1) as f64
         );
         println!(
-            "  aggregate GPU busy {:.1} ms/step across {} cards",
+            "  aggregate GPU busy {:.1} ms/step across {} card(s)",
             busy_total * 1e3 / g.steps.max(1) as f64,
-            n_streams
+            per_card.len()
         );
         runs.push(g);
     }
@@ -1733,6 +1796,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         threads: a.threads.unwrap_or(0),
         timers: a.timers,
         batching: a.batching,
+        inbatch_read: a.inbatch_read,
         probe: false,
         pool: None,
     };

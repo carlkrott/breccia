@@ -1101,6 +1101,120 @@ timeout 900 env BRECCIA_GPU_TIME=1 ./target/release/breccia bench token --stream
 Artifacts: `$D/f-{a,b}.{json,log}` (the alternating single/two-stream window),
 `$D/two-probe.json` (utilisation + both streams' tokens), `$D/two.sh`.
 
+## 8p. Two-stream, second pass: GPU experts and in-batch reads pay where the GPU has slack
+
+§8o left the pair at 15.8–16.5 tok/s with the host lane at 55 % of the critical
+path and the RX at 55 % utilisation. Two things that *lost* single-stream were
+re-tested with that slack, and both now win. Stream scaling is measured too.
+
+| item | before | after | verdict |
+|---|---|---|---|
+| in-batch readback copies (§8n item 2: 139.7 vs 121.9 single-stream) | 15.91 / 16.03 | **16.54 / 17.14** | **kept, on by default** |
+| GPU-resident experts (§8d: +22 ms single-stream) — 9 blocks | 16.05 / 16.74 | **18.66 / 18.87**, gen-32 3-run mean **18.58** | **kept, default for `--streams 2`** |
+| the same at 11 blocks (the full production mapping) | — | 15.56 / 14.48 | rejected: VRAM ceiling |
+| GPU-resident experts at 4 streams | 24.74 | 24.03 | rejected: two streams per card double the GPU, not the lane |
+
+### 1. In-batch readback: the round trip was the right thing to delete after all
+
+A block's five readback items (`mixed`, router ids/weights, shared expert out and
+gate) are now **`cmd_copy_buffer`s inside the block's own batch**, into a 32 KiB
+reserved region at the head of the staging buffer, followed by one
+`HOST_READ` barrier; `finish_block` reads the mapping instead of submitting. In
+§8n this cost 17 ms single-stream because the copies force a
+compute→transfer→compute transition in a GPU that had no slack. With two streams
+the RX sits at 55 % utilisation, so the transitions are free and only the removed
+round trip remains:
+
+| cell | aggregate | finish_block ms/step | HOST_READ region |
+|---|---:|---:|---|
+| separate submission | 15.91 / 16.03 | 107.7 / 107.1 | — |
+| **in-batch copies** | **16.54 / 17.14** | 103.0 / 98.6 | 32 KiB/block |
+
++4–7 % of aggregate, ~0.13 ms/block of host time. `--inbatch-read false` restores
+the old path (identical tokens); the default is on.
+
+### 2. GPU-resident experts: +2.5 tok/s once the host lane is the bottleneck
+
+The §8d mechanism (`MoeMap` builds the row map on the device, `MoeCombine` folds
+routed + shared, `PlacedExperts` holds all 512 experts of a block in VRAM) was
+correct but 22 ms slower single-stream, because it trades 0.76 ms of host lane for
+~2 ms of GPU per block. In a two-stream pair the host lane *is* the critical path,
+so the same trade pays. Each stream's model gets its own placement on its own card:
+
+| expert blocks per stream | aggregate tok/s | lane ms/step (pair) | finish_block ms/step |
+|---:|---:|---:|---:|
+| 0 | 16.05 / 16.74 | ~50 | 106.4 / 101.6 |
+| 4 (`0,1,2,4`) | 16.40 / 17.04 | — | 103.5 / 99.1 |
+| **9 (`0,1,2,4,8,18,20,22,23`)** | **18.66 / 18.87**; gen-32 mean **18.58** | **38.7–40.1** | **88.5–91.1** |
+| 11 (full production mapping) | 15.56 / 14.48 | — | 109–119 |
+
+* **Host lane: 50 → 39 ms/step** (−22 %, 0.52 → 0.41 ms/block), i.e. 79 MiB/token
+  per stream stops crossing the host.
+* **Per-card utilisation** (probe on, ~5 % instrumentation cost): MI50 **31 → 44 %**,
+  RX **55 → 64 %**. Both cards are still the ones with headroom, which is why this
+  works.
+* **11 blocks regresses** — 9.9 GiB of expert arena + 3.66 GiB dense on a 16 GiB
+  card is past the point where the driver keeps everything resident (the arena is
+  what §8d measured at 9 913 MiB for 11 blocks). Nine is the knee here.
+* **Parity 64/64** with the device-side MoE path in both streams, as §8d predicted
+  from the byte-for-byte `MoeMap` check: the same routed sum, computed on the GPU.
+* The default for `--streams 2` is that nine-block mapping; it is *not* the default
+  for one stream (where it still loses) and not for 3+ streams (VRAM).
+
+### 3. Stream scaling: 2 → 6 streams, 25 tok/s plateau
+
+`--streams N` cycles the model over the available devices, so 3–6 streams put two
+or three sequences on each card (their GPU phases then queue behind each other,
+which is the point of the curve). `--threads 32`, gen 32, one 32-token cell each
+(2 and 4 are 3-run means):
+
+| streams | aggregate tok/s | per stream tok/s | per-stream latency | lane ms/step | fence ms/step | models per card |
+|---:|---:|---:|---:|---:|---:|---|
+| 2 | **18.58** | 9.29 | 108 ms | 39 | 48 | 1 (+9 expert blocks each) |
+| 3 | 23.29 | 7.76 | 129 ms | ~60 | — | 2 / 1 |
+| 4 | **24.74** | 6.18 | 162 ms | 98 | 14 | 2 |
+| 6 | 25.03 | 4.17 | 240 ms | ~150 | — | 3 |
+
+**The plateau is ~25 tok/s, and it is two limits at once:** the host expert lane
+(98 ms of the 162 ms 4-stream step, at ~33 GB/s of page-cache reads — the 32-thread
+lane's own ceiling) and the GPUs (each card now runs two streams' worth of blocks,
+so the fence wait collapses from 48 ms to 14 ms and the cards become the
+constraint). Giving every stream expert blocks does not help at 4 streams: 24.03
+vs 24.74, because two models per card double the device MoE work on a card that is
+already the long pole.
+
+What would raise the plateau, with the numbers:
+
+* **A third discrete GPU**: the curve is linear in *cards* while the lane keeps up;
+  2 cards give 25 tok/s at 4 streams, so a third would take 6 streams to ~37 tok/s
+  (the lane has ~40 % headroom left at 4 streams).
+* **Fewer expert bytes per token**: at 4 streams the lane is 98 ms/step for
+  4 × 799 MiB = 33 GB/s. Cutting a quarter of the expert reads (a stronger
+  resident mapping, or fewer experts per token) is worth ~25 ms/step, i.e. +4 tok/s
+  — but only if the cards have the VRAM, and at 2 models/card they do not
+  (14.5 GiB of 16 GiB with four blocks each, and it measured *slower*).
+* **Less host work per block**: at 2 streams, `finish_block` is 88 ms/step of which
+  39 is the lane and ~25 is wait + readbacks + the ffn-write record; the GPU is at
+  44/64 % utilisation, so any further host-side removal still pays at 2 streams.
+
+Commands:
+
+```bash
+D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+# the two-stream gate: nine expert blocks per stream (the default), in-batch reads
+timeout 1200 ./target/release/breccia bench token --streams 2 \
+  --devices 0000:0e:00.0,0000:03:00.0 --prompt-ids-file $D/parity-server.json.ids \
+  --gen 32 --runs 3 --threads 32 --json $D/g-2.json
+# the scaling curve
+for n in 2 3 4 6; do STREAMS=$n GEN=16 $D/sweep.sh 1 "n$n:"; done
+# alternating A/B of any two variants in one window
+$D/sweep.sh 2 "base:" "inbatch:--inbatch-read=true" "exp9:--gpu-experts=0,1,2,4,8,18,20,22,23"
+```
+
+Artifacts: `$D/s-{base,inbatch,exp4,exp9,exp11}-*.{json,log}` (the A/B sweeps),
+`$D/g-{2,4}.json` (the gen-32 cells), `$D/g-4e.json` (4 streams with experts),
+`$D/p-two.json` (utilisation + parity with the device-side MoE), `$D/sweep.sh`.
+
 ## 9. Exact commands
 
 
@@ -1155,20 +1269,21 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 
 ## 10. What to do next, in order
 
-1. **Two-stream decode landed (§8o): 15.8-16.5 tok/s aggregate, 64/64 parity.**
-   The next lever is host work per block, not GPU work: the pair time is lane
-   50 ms + readback 12 + ffn-write record 11 + heads 10 + ple 3 against 80 ms of
-   RX GPU, so the GPU is 55 % utilised. Try the in-batch readback copies *here*
-   (they lost 17 ms single-stream in §8n, where the GPU had no slack; with 45 %
-   idle GPU time the trade is different), then cut GPU dispatches per block so the
-   RX stream's 80 ms/token falls.
-2. **A second MI50-class card would nearly double the ceiling.** The RX's 1.6 ms
-   per block is why the second stream adds 39 % over a 32-thread single stream
-   instead of the ~90 % the lane budget allows.
-3. **The host expert lane is the first limit again** (50 ms of a 122 ms pair at 32
-   threads, and 215 ms at 8). Anything that cuts expert bytes per token pays 1:1
-   on both streams.
+1. **The two-stream gate is 18.58 tok/s at `--streams 2 --threads 32`** (9
+   GPU-resident expert blocks per stream, in-batch reads), 9.29 tok/s per stream,
+   parity 64/64 (§8p). The 4-6 stream plateau is ~25 tok/s.
+2. **Raise the plateau with a third card, not with more host tricks.** At 4
+   streams the lane (98 ms/step, 33 GB/s) and the two cards (fence wait down to
+   14 ms) bind together; a third discrete GPU takes 6 streams to ~37 tok/s while
+   the lane still has ~40 % headroom. Try a third device before optimising further.
+3. **Per-block host work still pays at 2 streams** (GPU at 44/64 % utilisation):
+   `finish_block` is 88 ms/step against ~50 ms of GPU per card. Next candidates are
+   the ffn-write record (11 ms/step) and the readback copies themselves (0.13
+   ms/block even in-batch).
 4. **GDN's delta rule** (43 us on the RX for 9 MiB of state = 217 GB/s, 2.6x off
-   the ceiling) is the largest single *kernel* left: the 128-float column in LDS.
-5. **Keep the split-K discipline** (§8n): it paid 3.6 ms on a 320x10 240 long
-   reduction and lost 7 ms on 640x2560 short rows. Measure per shape.
+   the ceiling) is the largest single kernel left: the 128-float column in LDS.
+   It is GPU work, so it only pays once the cards, not the lane, are the limit —
+   i.e. at 4+ streams.
+5. **Keep the VRAM budget in view**: 9 expert blocks/stream fits at 2 streams
+   (44/64 % utilisation), 11 does not (15.6 tok/s, worse than none), and at 4
+   streams even four blocks per stream is a net loss.

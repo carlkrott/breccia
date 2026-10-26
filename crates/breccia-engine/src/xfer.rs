@@ -42,11 +42,17 @@ pub struct Staging {
     pub seconds_up: f64,
 }
 
+/// Bytes at the head of every staging buffer that [`Staging::read_batch`] never
+/// touches, so a block's readback can ride **inside the block's own batch**
+/// (`breccia_kernels::batch_cmd::record_copy`) instead of paying a submission and
+/// a fence of its own.
+pub const BLOCK_REGION: u64 = 32 << 10;
+
 impl Staging {
     /// Allocate a staging buffer of `cap` bytes (rounded up to 4).
     pub fn new(gpu: &Gpu, cap: u64) -> Result<Self> {
         let cap = cap.max(64);
-        let size = cap + breccia_kernels::gemv::TAIL_PAD;
+        let size = cap + BLOCK_REGION + breccia_kernels::gemv::TAIL_PAD;
         let buf = gpu
             .buf(
                 size,
@@ -93,6 +99,24 @@ impl Staging {
         gpu.destroy_buf(&self.buf);
     }
 
+    /// The buffer itself, for [`breccia_kernels::batch_cmd::record_copy`].
+    pub fn buffer(&self) -> &Buf {
+        &self.buf
+    }
+
+    /// Bytes the GPU wrote into the block region **inside an open batch** at
+    /// `off` (relative to [`BLOCK_REGION`]); the caller has waited for that
+    /// batch's segment, so the mapping is current.
+    pub fn read_block(&self, off: u64, len: usize) -> &[u8] {
+        assert!(
+            off.saturating_add(len as u64) <= BLOCK_REGION,
+            "read_block({off}, {len}) escapes the {BLOCK_REGION}-byte block region"
+        );
+        // SAFETY: bounds checked against the region, which is inside the mapping
+        // (`cap + BLOCK_REGION + TAIL_PAD`), and the memory is host-coherent.
+        unsafe { std::slice::from_raw_parts(self.ptr.add(off as usize), len) }
+    }
+
     /// Device→host for a list of `(buffer, byte offset, length)` reads.
     ///
     /// All copies ride one command buffer and one fence wait; the returned
@@ -118,7 +142,8 @@ impl Staging {
         }
         let t0 = std::time::Instant::now();
         let mut offs = Vec::with_capacity(items.len());
-        let mut at = 0u64;
+        // Past the block region: the in-batch copies own the head of the mapping.
+        let mut at = BLOCK_REGION;
         for (_, _, n) in items {
             offs.push(at);
             at += *n as u64;
@@ -152,12 +177,23 @@ impl Staging {
 
         let mut raw = vec![0u8; total as usize];
         // SAFETY: `read_batch` bounds-checked every `off + len` against the
-        // buffer and `total <= cap`; the mapping covers `cap + TAIL_PAD` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(self.ptr, raw.as_mut_ptr(), total as usize) };
+        // buffer and `total <= cap`; the mapping covers
+        // `cap + BLOCK_REGION + TAIL_PAD` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.ptr.add(BLOCK_REGION as usize),
+                raw.as_mut_ptr(),
+                total as usize,
+            )
+        };
+        let base = BLOCK_REGION as usize;
         let out = items
             .iter()
             .zip(offs.iter())
-            .map(|((_, _, n), off)| raw[*off as usize..*off as usize + n].to_vec())
+            .map(|((_, _, n), off)| {
+                let start = *off as usize - base;
+                raw[start..start + n].to_vec()
+            })
             .collect();
         self.bytes_down += total;
         self.trips_down += 1;
@@ -183,10 +219,16 @@ impl Staging {
         }
         let t0 = std::time::Instant::now();
         // SAFETY: `data.len() <= cap` was checked above and the mapping covers
-        // `cap + TAIL_PAD` bytes.
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr, data.len()) };
+        // `cap + BLOCK_REGION + TAIL_PAD` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.ptr.add(BLOCK_REGION as usize),
+                data.len(),
+            )
+        };
         let region = vk::BufferCopy::default()
-            .src_offset(0)
+            .src_offset(BLOCK_REGION)
             .dst_offset(0)
             .size(data.len() as u64);
         let src = self.buf.buf;
