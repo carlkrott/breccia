@@ -978,6 +978,129 @@ Artifacts: `$D/ab-{base,v2,v3,v4,v5,v6}-*.json`, `$D/x-{base,v6}-*.log`
 (the 0/48 A/B), `$D/sp-*.log` (the placement sweep), `$D/parity-dual.json`,
 `$D/parity-dual048.json`, `$D/compare.sh`, `$D/parity-check.py`, `$D/ab2.sh`.
 
+## 8o. Two-stream decode: one sequence per card, interleaved at the block level
+
+§8n's conclusion was that a *single* stream cannot hide its own host expert lane:
+block *b+1*'s GPU work cannot be recorded until the host has written block *b*'s
+MoE result, so the token is `48 x (GPU phase + lane)`. The independent work that
+does exist is another sequence. This section is that: **two sequences, one card
+each, interleaved per block**, which is also the product shape (parallel agents).
+
+| item | value |
+|---|---|
+| aggregate | **15.8–16.5 tok/s** (median 15.8 over 5 cells; best 16.52) |
+| per stream | **7.9–8.3 tok/s**, 121–127 ms per stream-token (the block-pair time) |
+| single stream, same window, same 32 threads | 11.33 tok/s / 88.2 ms |
+| single stream at the inherited `--split-blocks 0,48`, 16 threads (§8n) | 9.82 tok/s / 101.8 ms |
+| **gain** | **1.39x** over the same-thread single stream, **1.61x** over the inherited 9.82 |
+| host-lane overlap | **100 %** of both lanes ran under the other stream's GPU work |
+| GPU utilisation (probe on) | **31 %** MI50 / **55 %** RX; 45 and 80 ms of GPU per stream-token |
+| greedy parity | **64/64** — each stream produced the server's 32 tokens bit-identically |
+| validation | 0 messages (both cards in one process, `VK_LAYER_KHRONOS_validation`) |
+
+### The design
+
+`Session` was already a complete single-sequence engine (model, state, pipelines,
+expert-lane handle), so a **stream is a `Session`** and the new type is a driver,
+`breccia_engine::Multi`, that owns N of them. Each stream gets **one device** and
+therefore its own copy of the dense weights (3.66 GiB: MI50 16 GiB and RX 16 GiB
+both hold it, measured 2.4 s to upload each).
+
+```text
+submit A(0) ─┐
+submit B(0) ─┴─▶ wait A(0) · lane A(0) · submit A(1)   ← B(0) executes on the RX
+                 wait B(0) · lane B(0) · submit B(1)   ← A(1) executes on the MI50
+                 wait A(1) · lane A(1) · submit A(2)   ← B(1) executes on the RX
+```
+
+What each piece needed:
+
+* **`submit_block` / `finish_block`** — `Session::block` split in two. The record
+  half submits the block's segment *without waiting*; the wait, the readback, the
+  lane and the mailbox write are the other half. A block is still **one
+  submission** (the deferred ffn `HC_WRITE` rides the next block's batch).
+* **Per-device open batches.** `dispatch_batch` used to allow one open batch per
+  *thread*; two sessions interleaving need one per *device* (each device has its
+  own command buffers, so this is only bookkeeping). The ring went 3 → 6 slots and
+  `begin` now prefers a slot with **no fence** — taking an own-but-in-flight slot
+  first made every block wait for the previous block's submission and cost 96 ms
+  per token pair.
+* **Scoped flushes.** `wait_all` takes the devices to drain and leaves other
+  sessions' slots alone; before that, stream A's flush waited for stream B's GPU
+  (i.e. no overlap at all).
+* **Interleaved heads.** `end_token` split into `submit_head` + `finish_head`, so
+  the two streams' 248 320-row head GEMVs (7–10 ms each) overlap instead of
+  serialising: +0.6 tok/s.
+* **One shared expert lane.** The pool is an `Arc<Mutex<ExpertPool>>` handed to
+  every session, so N streams use `threads` workers, not N x `threads`. The lanes
+  run serially by construction (one host thread), which is exactly why one pool is
+  right.
+
+### Threads: the lane is the first limit, the RX is the second
+
+Two-stream aggregate, one 16-token cell each, `--devices MI50,RX`:
+
+| `--threads` | aggregate tok/s | lane ms/step (both streams) | fence ms/step |
+|---:|---:|---:|---:|
+| 8 | 7.13 | 215.6 | 30.3 |
+| 16 | 14.69 | 69.9 | 37.9 |
+| 24 | 14.32 | 59.3 | 51.0 |
+| **32** | **15.83** | **50.0** | **47.3** |
+
+The lane is the binding constraint up to 24 threads (it is decode-bound, §8c, and
+scales with workers); by 32 threads the **RX stream** is: it needs 80 ms of GPU per
+token against the MI50's 45 (§8n's 1.6 vs 0.9 ms per block), so a pair costs
+`max(lane, RX)` and the RX sits at 55 % utilisation waiting for its own host work.
+Sharing 16 threads between both streams is *correct but 14 % slower* than 32 — the
+recommended setting for two streams is `--threads 32`, i.e. one worker per hardware
+thread of the 7950X (16 cores / 32 threads).
+
+### Why one card per stream, and not the 20/28 split for both
+
+Blocks are serial *within* a stream, so a token costs the sum of its blocks: with
+one shared placement, block *b* of both streams lands on the same card and the two
+GPU phases queue behind each other. That configuration measures **114 ms per token
+pair** (2 x 20 x 1.6 + 2 x 28 x 0.9 of GPU on each card, no concurrency) against
+the **~100 ms** the device-per-stream design lands at. Pairing a stream with a card
+is what makes the two GPU phases concurrent, and it is why `Multi::new` refuses a
+model with more than one device.
+
+### What this means for 4–6 agents
+
+* **The ceiling is ~16 tok/s aggregate on this host, not 16 per stream.** Two
+  cards, one stream each: a third and fourth agent must *time-share* the two
+  streams (queue behind them), so 4 agents ≈ 8 tok/s each and 6 agents ≈ 5 tok/s
+  each, while aggregate stays ~16. Per-agent latency is what degrades, and it
+  degrades linearly in agents per stream.
+* **What would raise it**: less host work per block. The pair time is now
+  `lane (50 ms) + readback (12) + ffn-write record (11) + heads (10) + ple (3)`
+  against 80 ms of GPU, i.e. the host is at ~55 % of the critical path. The two
+  levers are (a) the in-batch readback copies that lost *single*-stream in §8n
+  (−17 ms there, where the GPU had no slack) but would win here, where the GPU is
+  45 % idle, and (b) fewer GPU dispatches per block so the RX stream's 80 ms falls.
+* **What would double it**: two MI50-class cards. The RX's 1.6 ms/block is the
+  reason the second stream only adds 39 % over a 32-thread single stream instead of
+  the ~90 % the lane budget would allow.
+
+Commands (one GPU process; both cards in it, which is the point):
+
+```bash
+D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+# the two-stream number (parity is checked from the JSON afterwards)
+timeout 900 ./target/release/breccia bench token --streams 2 \
+  --devices 0000:0e:00.0,0000:03:00.0 --prompt-ids-file $D/parity-server.json.ids \
+  --gen 32 --runs 3 --threads 32 --json $D/two-probe.json
+# the same-thread single-stream control, alternating in the same window
+$D/two.sh 32 32
+# per-card utilisation (the GPU-time probe costs ~10 %, so it is a diagnostic run)
+timeout 900 env BRECCIA_GPU_TIME=1 ./target/release/breccia bench token --streams 2 \\
+  --devices 0000:0e:00.0,0000:03:00.0 --prompt-ids-file $D/parity-server.json.ids \\
+  --gen 32 --runs 1 --threads 32 --json $D/two-probe.json
+```
+
+Artifacts: `$D/f-{a,b}.{json,log}` (the alternating single/two-stream window),
+`$D/two-probe.json` (utilisation + both streams' tokens), `$D/two.sh`.
+
 ## 9. Exact commands
 
 
@@ -1032,24 +1155,20 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 
 ## 10. What to do next, in order
 
-1. **Give the two cards concurrent work, or stop splitting blocks between them.**
-   §8n measured the per-block GPU cost per card in-graph (RX 1.5-1.6 ms, MI50
-   0.9-1.1 ms) and the serial residual stream means the token pays the sum: the
-   measured dual optimum is 0 RX blocks (101.8 ms) instead of 20/28 (118.7 ms).
-   The levers that would make the RX earn its keep are all concurrency, not
-   placement: two sequences (batch-2 decode) so one card's blocks overlap the
-   other's expert lane, or a parallel-K split of the *host* lane. Batch-2 decode
-   is also the only way to hide the 38 ms host lane at all (§8n item 1), and the
-   marker/semaphore primitive needed for it is in the tree.
-2. **The host expert lane is now the co-equal bottleneck** (36-38 ms of a 100 ms
-   token) and it is decode-bound at 20.8 GB/s with 16 threads (§8c). Anything that
-   cuts expert bytes per token or the number of experts per block pays 1:1.
-3. **GDN's delta rule** (43 us on the RX for 9 MiB of state = 217 GB/s, 2.6x off
-   the ceiling) is the largest single *kernel* left after split-K fixed `down`:
-   the 128-float column in LDS is the §8m design and is unchanged.
-4. **Keep the split-K discipline**: it paid 3.6 ms on a 320-row x 10 240 long
-   reduction and lost 7 ms on 640x2560 short rows. Measure per shape, never
-   globally.
-5. **Do not rebuild the two-segment marker for overlap** (139.7 vs 121.9 ms), and
-   do not move the block readback's copies into the compute stream (same
-   139.7 vs 121.9). Both are measured, not estimated (§8n items 1-2).
+1. **Two-stream decode landed (§8o): 15.8-16.5 tok/s aggregate, 64/64 parity.**
+   The next lever is host work per block, not GPU work: the pair time is lane
+   50 ms + readback 12 + ffn-write record 11 + heads 10 + ple 3 against 80 ms of
+   RX GPU, so the GPU is 55 % utilised. Try the in-batch readback copies *here*
+   (they lost 17 ms single-stream in §8n, where the GPU had no slack; with 45 %
+   idle GPU time the trade is different), then cut GPU dispatches per block so the
+   RX stream's 80 ms/token falls.
+2. **A second MI50-class card would nearly double the ceiling.** The RX's 1.6 ms
+   per block is why the second stream adds 39 % over a 32-thread single stream
+   instead of the ~90 % the lane budget allows.
+3. **The host expert lane is the first limit again** (50 ms of a 122 ms pair at 32
+   threads, and 215 ms at 8). Anything that cuts expert bytes per token pays 1:1
+   on both streams.
+4. **GDN's delta rule** (43 us on the RX for 9 MiB of state = 217 GB/s, 2.6x off
+   the ceiling) is the largest single *kernel* left: the 128-float column in LDS.
+5. **Keep the split-K discipline** (§8n): it paid 3.6 ms on a 320x10 240 long
+   reduction and lost 7 ms on 640x2560 short rows. Measure per shape.

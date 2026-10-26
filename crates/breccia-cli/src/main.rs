@@ -262,6 +262,12 @@ enum BenchKind {
         /// `0,1,2,4,8,18,20,22,23,24,35`
         #[arg(long, value_name = "N[,N]")]
         gpu_experts: Option<String>,
+        /// Independent sequences decoded in lockstep, one per device: `2` puts
+        /// one sequence on each card and interleaves them at the block level so
+        /// each expert lane runs under the other stream's GPU phase. `1` is the
+        /// single-stream graph.
+        #[arg(long, default_value_t = 1)]
+        streams: usize,
     },
 }
 fn main() {
@@ -408,6 +414,7 @@ fn run(cli: Cli) -> Result<()> {
                     batching,
                     split_blocks,
                     gpu_experts,
+                    streams,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -427,6 +434,7 @@ fn run(cli: Cli) -> Result<()> {
             batching,
             split_blocks,
             gpu_experts,
+            streams,
         }),
     }
 }
@@ -1403,6 +1411,7 @@ struct TokenArgs {
     batching: bool,
     split_blocks: Option<String>,
     gpu_experts: Option<String>,
+    streams: usize,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1444,12 +1453,247 @@ fn feed_prompt(sess: &mut breccia_engine::Session<'_>, prompt: &[u32]) -> Result
     Ok(logits)
 }
 
+/// Two (or more) sequences, one per device, interleaved at the block level.
+///
+/// The number that matters is the **aggregate** token rate: each stream's own
+/// latency is the block-pair time and does not improve, but every expert lane now
+/// runs while the other stream's GPU phase is executing
+/// (`docs/phase-4/01-forward-pass.md` §8o).
+fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
+    let n_streams = a.streams;
+    let devs: Vec<String> = a.devices.clone();
+    if devs.len() < n_streams {
+        anyhow::bail!(
+            "--streams {n_streams} needs {n_streams} devices, got {:?}",
+            devs
+        );
+    }
+    println!(
+        "breccia bench token --streams {n_streams}: {} prompt ids, {} to generate each, \
+         one device per stream",
+        prompt.len(),
+        a.gen
+    );
+    let mut models = Vec::with_capacity(n_streams);
+    #[allow(clippy::needless_range_loop)]
+    for s in 0..n_streams {
+        let model = breccia_engine::Model::load(
+            glob,
+            &breccia_engine::LoadOptions {
+                devices: vec![devs[s].clone()],
+                ctx_capacity: a.ctx,
+                blocks: None,
+                gpu_experts: Vec::new(),
+                verbose: s == 0,
+            },
+        )
+        .with_context(|| format!("loading stream {s}'s model on {}", devs[s]))?;
+        if s == 0 {
+            print!("{}", model.stats.banner(&model.cfg));
+        }
+        breccia_engine::graph::assert_head(&model)?;
+        models.push(model);
+    }
+    let refs: Vec<&breccia_engine::Model> = models.iter().collect();
+    let cfg = breccia_engine::SessionCfg {
+        ctx_capacity: a.ctx,
+        threads: a.threads.unwrap_or(0),
+        timers: a.timers,
+        batching: a.batching,
+        probe: std::env::var_os("BRECCIA_GPU_TIME").is_some(),
+        pool: None,
+    };
+    let mut multi = breccia_engine::Multi::new(&refs, &cfg).context("building the streams")?;
+    for s in multi.streams.iter_mut() {
+        s.sampling = breccia_engine::Sampling {
+            temperature: a.temperature,
+            top_k: 0,
+            seed: 0x9e37_79b9_7f4a_7c15,
+        };
+    }
+    let names: Vec<(String, String)> = multi
+        .streams
+        .iter()
+        .map(|s| s.device_names().into_iter().next().unwrap_or_default())
+        .collect();
+    println!(
+        "session  {} streams · {} shared expert threads ({}) · {} MiB state + scratch per stream",
+        multi.len(),
+        multi.streams[0].threads(),
+        breccia_kernels::cpu::path().name(),
+        multi.streams[0].session_bytes() >> 20
+    );
+    for (i, (name, pci)) in names.iter().enumerate() {
+        println!("  stream {i}  {name:<40} {pci}");
+    }
+
+    // ---- warm pass (page cache; discarded) --------------------------------
+    let warm = multi
+        .generate(prompt, a.gen.min(8))
+        .context("the warm pass")?;
+    println!(
+        "warm     {:.2} tok/s aggregate ({:.2} tok/s per stream)",
+        warm.aggregate_tokens_per_s(),
+        warm.stream_tokens_per_s()
+    );
+    for s in multi.streams.iter_mut() {
+        s.reset_counters()?;
+    }
+
+    // ---- measured ---------------------------------------------------------
+    let mut runs = Vec::with_capacity(a.runs.max(1));
+    for run in 0..a.runs.max(1) {
+        let g = multi
+            .generate(prompt, a.gen)
+            .with_context(|| format!("the two-stream run {run}"))?;
+        println!(
+            "run {run}  {:>6.2} tok/s aggregate  {:>6.2} tok/s/stream  {:>6.2} ms/stream-token  \
+             {} steps  lane {:.1} ms/step  fence {:.1} ms/step  overlap {:.0}%",
+            g.aggregate_tokens_per_s(),
+            g.stream_tokens_per_s(),
+            g.stream_ms_per_token(),
+            g.steps,
+            g.lane_ms_per_step(),
+            g.fence_ms_per_step(),
+            g.overlap_efficiency() * 100.0
+        );
+        for (i, st) in g.streams.iter().enumerate() {
+            println!(
+                "  stream {i}  {} tokens  lane {:.1} ms/step ({:.0}% under the other stream's GPU)  \
+                 fence {:.1} ms/step  {:?}",
+                st.tokens.len(),
+                st.lane_s * 1e3 / g.steps.max(1) as f64,
+                if st.lane_s > 0.0 {
+                    st.lane_covered_s / st.lane_s * 100.0
+                } else {
+                    0.0
+                },
+                st.fence_s * 1e3 / g.steps.max(1) as f64,
+                &st.tokens[..st.tokens.len().min(8)]
+            );
+        }
+        // The probe measures GPU busy time, so utilisation is per card and
+        // independent of what the host was doing.
+        let mut busy_total = 0.0;
+        for (i, sess) in multi.streams.iter_mut().enumerate() {
+            let busy = sess.gpu_busy_s()?;
+            let b = busy.first().copied().unwrap_or(0.0);
+            busy_total += b;
+            let util = if g.decode_seconds > 0.0 {
+                b / g.decode_seconds * 100.0
+            } else {
+                0.0
+            };
+            sess.reset_gpu_busy()?;
+            println!(
+                "  card {i}    {}  GPU busy {:.1} ms over {:.0} ms of decode = {:.0}% utilised",
+                names[i].0,
+                b * 1e3,
+                g.decode_seconds * 1e3,
+                util
+            );
+        }
+        println!(
+            "  host {:.1} ms/step in finish_block (wait+read+lane), {:.1} ms/step in \
+             submit_block (record+submit)",
+            multi.t_finish * 1e3 / g.steps.max(1) as f64,
+            multi.t_submit * 1e3 / g.steps.max(1) as f64
+        );
+        println!(
+            "  record {:.1} ms/step of host recording, {:.1} ms/step of ring waits \
+             (both streams)",
+            breccia_kernels::batch_cmd::record_seconds() * 1e3 / g.steps.max(1) as f64,
+            breccia_kernels::batch_cmd::wait_seconds() * 1e3 / g.steps.max(1) as f64
+        );
+        println!(
+            "  aggregate GPU busy {:.1} ms/step across {} cards",
+            busy_total * 1e3 / g.steps.max(1) as f64,
+            n_streams
+        );
+        runs.push(g);
+    }
+
+    let runs_n = runs.len().max(1) as f64;
+    let agg: f64 = runs.iter().map(|g| g.aggregate_tokens_per_s()).sum::<f64>() / runs_n;
+    let per: f64 = runs.iter().map(|g| g.stream_tokens_per_s()).sum::<f64>() / runs_n;
+    let lat: f64 = runs.iter().map(|g| g.stream_ms_per_token()).sum::<f64>() / runs_n;
+    let ovl: f64 = runs.iter().map(|g| g.overlap_efficiency()).sum::<f64>() / runs_n;
+    println!(
+        "\ndecode  {agg:.2} tok/s aggregate · {per:.2} tok/s per stream · {lat:.2} ms per \
+         stream-token · overlap {:.0}% of the host lane hidden",
+        ovl * 100.0
+    );
+    if a.timers {
+        for (i, sess) in multi.streams.iter().enumerate() {
+            println!(
+                "\nstream {i} per-stage (ms per stream-token; *wall* attribution — a stage\
+                 also contains the other stream's work, so use the numbers above)"
+            );
+            let table = sess
+                .timers
+                .table(runs.last().map(|g| g.steps).unwrap_or(1).max(1));
+            for (name, ms) in table {
+                if ms >= 0.05 {
+                    println!("  {name:<20} {ms:>8.3}");
+                }
+            }
+        }
+    }
+    let same = runs
+        .last()
+        .map(|g| g.streams.windows(2).all(|w| w[0].tokens == w[1].tokens))
+        .unwrap_or(false);
+    println!(
+        "parity   every stream generated the same {} tokens: {same}",
+        runs.last().map(|g| g.streams[0].tokens.len()).unwrap_or(0)
+    );
+
+    if let Some(path) = &a.json {
+        let value = serde_json::json!({
+            "streams": n_streams,
+            "prompt_ids": prompt,
+            "aggregate_tokens_per_s": agg,
+            "stream_tokens_per_s": per,
+            "stream_ms_per_token": lat,
+            "overlap_efficiency": ovl,
+            "devices": names.iter().map(|(n, p)| serde_json::json!({"name": n, "pci": p})).collect::<Vec<_>>(),
+            "runs": runs.iter().map(|g| serde_json::json!({
+                "aggregate_tokens_per_s": g.aggregate_tokens_per_s(),
+                "stream_tokens_per_s": g.stream_tokens_per_s(),
+                "stream_ms_per_token": g.stream_ms_per_token(),
+                "steps": g.steps,
+                "decode_seconds": g.decode_seconds,
+                "lane_ms_per_step": g.lane_ms_per_step(),
+                "fence_ms_per_step": g.fence_ms_per_step(),
+                "overlap_efficiency": g.overlap_efficiency(),
+                "streams": g.streams.iter().map(|s| serde_json::json!({
+                    "tokens": s.tokens,
+                    "lane_s": s.lane_s,
+                    "lane_covered_s": s.lane_covered_s,
+                    "fence_s": s.fence_s,
+                    "expert_bytes": s.expert_bytes,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, serde_json::to_string_pretty(&value)? + "\n")
+            .with_context(|| format!("writing {}", path.display()))?;
+        println!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
 fn bench_token(a: TokenArgs) -> Result<()> {
     let prompt = parse_prompt_ids(&a)?;
     let glob = a
         .gguf
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL_GLOB.to_string());
+    if a.streams > 1 {
+        return bench_token_multi(&a, &prompt, &glob);
+    }
     println!(
         "breccia bench token: {} prompt ids, {} to generate, {} run(s)",
         prompt.len(),
@@ -1489,6 +1733,8 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         threads: a.threads.unwrap_or(0),
         timers: a.timers,
         batching: a.batching,
+        probe: false,
+        pool: None,
     };
     let mut sess = breccia_engine::Session::new(&model, &cfg).context("building the session")?;
     sess.sampling = breccia_engine::Sampling {
