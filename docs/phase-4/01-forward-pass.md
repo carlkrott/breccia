@@ -2349,6 +2349,72 @@ Token-major PLE read (`--ple-threads`) and async expert prefetch `e+1`: unchange
 The PLE design is §8z's (4320 contiguous bytes per token, 8-16 gather threads, host
 RAM, persistent maps).
 
+## 8ab. The shared expert is 99.7 % dispatch overhead — priced, restructure queued
+
+The round's job was to wire the chunk-level shared expert. It is **not wired**, but
+the measurement that decides whether it is worth wiring is now in hand, and it is
+decisive.
+
+### The price of the target shape (RX 6950 XT, `dense_shared` fixture, m = USERS_MAX = 8)
+
+The four §8aa kernels on the **actual shared-expert geometry**
+(`ffn_{gate,up}_shexp`, 640 x 2560), one type per invocation, validation off (they
+passed with it on in §8aa):
+
+| type | ms per m = 8 dispatch | ms per token per role |
+|---|---:|---:|
+| IQ4_XS | 0.094 | **0.012** |
+| Q4_K | 0.099 | **0.012** |
+| Q5_K | 0.106 | **0.013** |
+| Q6_K | 0.109 | **0.014** |
+
+A chunk-level shared expert is therefore `gate (t/8 dispatches) + up (t/8) +
+one fused SwiGLU over t*n_ff + down (t/8)`, which prices at **~0.03-0.04
+ms/token of GPU** across all 48 blocks — against the **15.4 ms/token** the
+token-by-token path measures and **20.9-55.3 ms/token** in chunked prefill (§8z).
+
+So the stage is **~99.7 % dispatch and recording overhead**, not arithmetic: four
+dispatches per block per token at ~80 us of host cost each is the entire stage, and
+one dispatch per role per 8 tokens removes ~87 % of them. The target (<= 15.4
+ms/token) is not merely reachable; the ceiling is two orders of magnitude below the
+current figure.
+
+### What blocks the restructure, precisely
+
+It is not the kernels any more. It is that the shared expert lives inside
+`record_dense_prelude`, i.e. **per token**, for every block, and its outputs are
+consumed per token (`v.sh` -> the MoE combine, `v.sh_gate_logit` -> the gate). A
+chunk-level pass needs, for **all** blocks (not just the merged ones):
+
+1. `mixed` for all `t` tokens in one buffer — the merged pass already keeps it
+   (`PfChunk::mixed`), the plain chunk path does not;
+2. `gate`/`up`/`act` as `[t, n_ff]` and `down` as `[t, n_embd]`, i.e. three chunk
+   buffers plus one SwiGLU over `t * n_ff` (`SwiGlu::run` already takes `n`);
+3. the per-token **consumers** rewired: `record_lane_copies` copies `v.sh` into the
+   staging block region today, so it would copy `pf.shared[i]` instead; the merged
+   path's fan-in already reads `pf.shared`/`pf.gate` and needs no change;
+4. `shexp_gate` (the 1-float scalar projection) kept per token or batched with the
+   existing `GemvBatch` — it is noise either way.
+
+That is a change to the prelude signature plus the lane-copy source, i.e. a
+`record_dense_prelude(..., chunk_shared: bool)` and one new `shared_expert_chunk`
+phase between pass 1 and the lane. It did not land in this round's window; the
+pricing above is what says to do it next, first.
+
+### Parity and gate
+
+Nothing on a decode path changed this round (the only engine change is a `run_timed`
+call inside a test), so **the canonical gate stands at 20.3 +- 1 tok/s aggregate,
+lane 40-43 ms/step**, and the parity gate is unchanged: chunk 128 + merged 32/32,
+top-1 13.170561. The four kernels remain bit-identical on both cards, one type per
+process (§8aa).
+
+### Not landed
+
+The chunk-level shared expert (above), the token-major PLE read and `--ple-threads`
+(§8z design), and the per-dispatch barrier bookkeeping (§8aa: parked, ceiling
+0.98/4.32 ms).
+
 ## 9. Exact commands
 
 

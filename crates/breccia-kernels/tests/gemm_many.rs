@@ -417,6 +417,17 @@ fn dense_shared_expert_gemm_matches_the_gemv() {
         ty.name()
     );
     assert!(same_m1, "{}: m = 1 must be bit-identical", ty.name());
+    // Price the chunk-level shared expert (§8ab): one dispatch serves USERS_MAX
+    // tokens, so a `t`-token chunk costs `t/m` dispatches per role instead of `t`.
+    let timing = many
+        .run_timed(&w, &x, &out_many, rows, cols, m, 0.002)
+        .expect("timed");
+    println!(
+        "dense_gemm: {} m = {m}: {:.3} ms/dispatch -> {:.3} ms/token/role",
+        ty.name(),
+        timing.per_iter_s * 1e3,
+        timing.per_iter_s * 1e3 / m as f64
+    );
     gpu.destroy_buf(&out_ref);
     gpu.destroy_buf(&out_many);
     gpu.destroy_buf(&x);
