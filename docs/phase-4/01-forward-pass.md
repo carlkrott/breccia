@@ -1511,6 +1511,72 @@ Until then `--prefill-chunk` stays **off**: it is parity-correct and it is the
 substrate the amortising kernel plugs into, but as measured it is a 12-14 % tax on
 prompt ingestion.
 
+## 8t. Dequant-once, dot-many: the down role amortises, the blend is parity, AVX-512 not done
+
+§8s showed grouping the expert *reads* saves bytes the lane is not bound by. This
+pass attacks the thing that actually costs: the **dequantisation**. A weight block
+is now decoded **once into registers** and dotted with every user (`m` tokens) of
+that expert, so the table lookup / int→float / scale multiply is paid once instead
+of once per user. Scope delivered: `IQ4_NL` and `Q2_0`, the two types the model's
+`down` role uses (48 of 48 layers), AVX2 8-wide; `gate`/`up` and every other type
+keep the fused per-user kernel (the blend below).
+
+### Measured
+
+| prefill path (2 agents x 300, per agent) | tok/s | vs token-by-token |
+|---|---:|---:|
+| token by token (§8r baseline) | **6.13** | — |
+| chunk 64, grouped reads only (§8s) | 5.37 | -12 % |
+| chunk 64, **dequant-once down** | **5.62** | -8 % |
+| chunk 128, **dequant-once down** | **6.16** | **+0.5 %** |
+
+The `down` amortisation recovers the chunking tax and reaches parity at chunk 128,
+where the occupancy gives `m ~ T/51 = 2.5` users per expert. It does not yet beat
+the token-by-token path because:
+
+* **only one of the three roles amortises.** `gate`+`up` are two tensors fused with
+  a SwiGLU in between, so their many-user form needs a two-tensor inner loop; they
+  are 2/3 of the expert decodes and still run per user. The `down` role alone caps
+  the gain at the ~2.5x its share would allow at `m = 8`.
+* **`m` is small at chunk 64-128 by occupancy.** `m = 10*T/512`, so `m = 1.75` at
+  T = 64, 2.5 at T = 128, 5 at T = 256. The kernel's benefit grows with `m`; the
+  chunk sizes measured are the low half of the curve. Chunk 256 needs a bigger
+  descriptor pool than the 4 096 sets the ring now budgets (256 tokens x ~30
+  dispatches) and was not measured.
+* **AVX-512 is not implemented.** The kernels are 8-wide AVX2. The restructure is
+  what makes 16-wide mechanical — the dequantised vector and the per-user FMA are
+  already separate — but `_mm512` variants of `iq4_nl_many` / `q2_0_many` were not
+  written in this pass, so no 16-wide claim is made.
+
+### Bit-identity (unchanged gate)
+
+The many-user kernels use the same operation order per user as the fused kernel
+(`mul` the dequantised value, then `fmadd` into the user's accumulator, block
+major, same `finish` reduction), so each user's dot is **bit-identical** to the
+single-user path; the only deviation left in the grouped comparison is the
+documented expert-order sum. `grouped_chunk_lane_matches_the_per_token_lane` still
+reports 1.49e-8 / 7.45e-9 worst relative, and the chunked prompt at chunk 8 gives
+the identical logit `17.5689`, chunk 32/64 the reference token sequence.
+
+### Decode
+
+`m = 1` never enters the many-user kernel (the fused path is kept exactly as it
+was), so decode is unchanged *by construction*. The two-stream cell measured after
+this pass is **15.8-16.5 tok/s aggregate** against the 20.28 of the §8p window, with
+the lane at 56 ms/step against 48 — this window's page cache was pushed out by the
+prefill runs (the same binary measured 10.1 -> 16.5 across warming passes in this
+session), so the gate is not re-established here and no regression is claimed
+either way. One real inefficiency this pass found and removed: the single-user path
+was allocating an empty `Arc<Vec<_>>` per shard (up to ~8 600 allocations per
+token); it now shares one empty list.
+
+### Next
+
+1. Extend the many-user kernel to `gate`+`up` (two tensors, SwiGLU over `m` rows)
+   and to `IQ3_S`/`IQ3_XXS`/`IQ2_*`. That is 2/3 of the decodes.
+2. Then AVX-512 16-wide on the same shape, and chunk 256 (needs the pool at 8 192
+   sets) where `m = 5`.
+
 ## 9. Exact commands
 
 
