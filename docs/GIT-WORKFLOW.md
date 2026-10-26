@@ -5,14 +5,15 @@ Standard trunk-based development with short-lived branches, Conventional Commits
 ## Repository identity
 
 - Local root: `/home/korphaus/projects/Breccia` (its own repo — **not** part of the `$HOME` repo that contains it).
-- GitHub remote: **`origin` = https://github.com/carlkrott/breccia** — created **private** and pushed
-  2026-10-26 (publication gate approved by the user; `gh` CLI auth as `carlkrott`, SSH key also works).
-  Visibility stays **private** until the user explicitly says otherwise; flipping to public is the
-  irreversible direction.
-- **Pending cleanup:** the initial push carried a 65 MB build artifact in history
-  (`harnesses/vk-probe/target/...`, committed by mistake before `.gitignore` was fixed). Git warns
-  GH001. The rewrite (`filter-branch` dropping `harnesses/vk-probe/target`) is deferred until the
-  working tree is clean, then force-pushed — no collaborators exist, so this is safe.
+- GitHub remote: **`origin` = https://github.com/carlkrott/breccia** — **PUBLIC** since 2026-10-26
+  (user approved publication and the public switch; `gh` auth as `carlkrott`, SSH key also works).
+- **History was rewritten on 2026-10-26** before going public: dropped the accidentally-committed
+  `harnesses/vk-probe/target/` build artifacts (65 MB rlib/rmeta) and replaced the machine hostname
+  with `<host>` across every commit. Repo shrank 63 MB → 916 KB; 26 commits preserved; force-pushed
+  (no collaborators existed). Any pre-rewrite clone is obsolete.
+- Pre-publication audit (full history, all blobs): **no secrets** (no `tskey`/`ghp`/`gho`/`sk-`/
+  `AKIA`/private-key/password/Bearer patterns), and no tailnet IPs, node names, router endpoints or
+  live status were ever committed.
 - The GitHub **MCP** server's configured token is stale (`Bad credentials`); use `gh`/git until it is
   refreshed.
 
