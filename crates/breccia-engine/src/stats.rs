@@ -99,6 +99,31 @@ pub struct LayerTrace {
     /// PLE only: the per-stream gate and the conv output digest.
     pub ple_gate: Option<Checksum>,
     pub ple_conv: Option<Checksum>,
+    /// GDN blocks only: every stage of the 19-step list, so the first
+    /// implausible one can be named instead of guessed.
+    #[serde(default)]
+    pub gdn: Option<GdnTrace>,
+}
+
+/// The GDN sublayer's intermediate values, one digest per stage of
+/// `docs/specs/qwen4exp-architecture.md` §4.2.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct GdnTrace {
+    /// `attn_qkv @ x`, then convolved (+SiLU) and L2-normalised in place — i.e.
+    /// `h` of §4.2 step 5/6, `[2*h_k*S + h_v*S] = 10240`.
+    pub h: Checksum,
+    /// `attn_gate @ x` — the output gate `z`, `[6144]`.
+    pub z: Checksum,
+    /// raw `ssm_alpha @ x`, `[48]`.
+    pub alpha: Checksum,
+    /// `sigmoid(ssm_beta @ x)`, `[48]`.
+    pub beta: Checksum,
+    /// `softplus(alpha + dt) * a`, `[48]` — must be negative and O(1).
+    pub gate: Checksum,
+    /// the delta-rule output `[6144]` — `normed / sigmoid(z)` before the norm.
+    pub step: Checksum,
+    /// `rmsnorm(step, ssm_norm) * sigmoid(z)` `[6144]` — the `ssm_out` input.
+    pub normed: Checksum,
 }
 
 #[cfg(test)]

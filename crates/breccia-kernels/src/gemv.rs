@@ -321,10 +321,35 @@ impl<'g> Gemv<'g> {
     /// `padded_cols()` fp32 values (zero-padded past `cols`), `out` receives
     /// `rows` fp32 values.
     pub fn run(&self, w: &Buf, x: &Buf, out: &Buf) -> Result<()> {
+        if crate::dispatch_batch::is_open() {
+            return self.record_split(self.gpu, 1, &[w, x, out, &self.tables], None);
+        }
         self.bind(w, x, out)?;
         self.gpu
             .wall_run(Qc::C, |d, cmd| self.dispatch_split(d, cmd, 1))
             .map_err(|e| anyhow!("{e}"))?;
+        Ok(())
+    }
+
+    /// Record the split dispatch (+ reduce when `splits > 1`) into the batch that
+    /// is open on the compute queue. The batch allocates its own descriptor sets,
+    /// so nothing needs binding first.
+    fn record_split(
+        &self,
+        gpu: &Gpu,
+        splits: u32,
+        bufs: &[&Buf],
+        reduce_bufs: Option<&[&Buf]>,
+    ) -> Result<()> {
+        let pc = self.push_constants(splits);
+        let (gx, gy) = self.grid_for(ROWS_PER_WG);
+        crate::dispatch_batch::record(gpu, &self.kernel, bufs, &pc, (gx, gy, splits.max(1)))?;
+        if splits > 1 {
+            let (rx, ry) = self.grid_for(256);
+            if let Some(rb) = reduce_bufs {
+                crate::dispatch_batch::record(gpu, &self.reduce, rb, &pc, (rx, ry, 1))?;
+            }
+        }
         Ok(())
     }
 
@@ -340,6 +365,14 @@ impl<'g> Gemv<'g> {
         splits: u32,
     ) -> Result<()> {
         let splits = splits.max(1);
+        if crate::dispatch_batch::is_open() {
+            return self.record_split(
+                self.gpu,
+                splits,
+                &[w, x, partials, &self.tables],
+                Some(&[partials, out]),
+            );
+        }
         self.bind(w, x, partials)?;
         self.gpu
             .bind_kernel(&self.reduce, &[partials.buf, out.buf])

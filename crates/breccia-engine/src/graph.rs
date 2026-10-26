@@ -34,6 +34,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use breccia_vk::ctx::Buf;
 
+use breccia_kernels::batch_cmd;
 use breccia_kernels::cpu::{self, ExpertPool};
 use breccia_kernels::ops::{
     f32_from_bytes, f32_to_bytes, EmbGather, HcMixer, HcWeights, HcWorkspace, Router, SwiGlu,
@@ -47,7 +48,7 @@ use crate::config::LayerKind;
 use crate::model::{HcW, Model, PipelineSet};
 use crate::ple::PleHost;
 use crate::sampler::{Sampler, Sampling};
-use crate::stats::{Checksum, LayerTrace};
+use crate::stats::{Checksum, GdnTrace, LayerTrace};
 use crate::xfer::Staging;
 
 /// Per-stage timer slots, in graph order.
@@ -186,6 +187,13 @@ pub struct SessionCfg {
     pub threads: usize,
     /// Collect per-stage timings.
     pub timers: bool,
+    /// Record each GPU phase into one command buffer and submit it once
+    /// (`crate::graph`'s batching). **Off by default**: the mechanism is verified
+    /// bit-identical in `breccia-kernels/tests/batching.rs`, but the graph
+    /// integration still trips a command-buffer lifecycle violation
+    /// (`VUID-vkCmdBindPipeline-commandBuffer-recording`) at run time — see
+    /// `docs/phase-4/01-forward-pass.md` §batching. Off is the reference path.
+    pub batching: bool,
 }
 
 impl Default for SessionCfg {
@@ -194,6 +202,7 @@ impl Default for SessionCfg {
             ctx_capacity: 256,
             threads: 0,
             timers: false,
+            batching: false,
         }
     }
 }
@@ -215,6 +224,15 @@ pub struct Session<'m> {
     /// Forward passes run since the last reset (the decode denominator).
     pub forwards: usize,
     pub expert_bytes: u64,
+    /// Device whose dispatch batch is currently open (`None` = none). At most
+    /// one, because the batching flag is per thread while each device owns its
+    /// own command buffer.
+    pending_batch: Option<usize>,
+    /// Submits and recorded dispatches, for the report's before/after.
+    pub submits: u64,
+    pub dispatches: u64,
+    /// See [`SessionCfg::batching`].
+    pub batching: bool,
 }
 
 impl<'m> Session<'m> {
@@ -377,7 +395,41 @@ impl<'m> Session<'m> {
             },
             forwards: 0,
             expert_bytes: 0,
+            pending_batch: None,
+            submits: 0,
+            dispatches: 0,
+            batching: cfg.batching,
         })
+    }
+
+    /// Close the open batch (submit once, wait once), if any.
+    fn flush(&mut self) -> Result<()> {
+        if let Some(d) = self.pending_batch.take() {
+            batch_cmd::end(self.model.devices[d].gpu())
+                .map_err(|e| anyhow!("closing the dispatch batch on device {d}: {e}"))?;
+            self.submits += 1;
+            self.dispatches += u64::from(batch_cmd::recorded());
+        }
+        Ok(())
+    }
+
+    /// Make sure a batch is open on `dev`, flushing any batch on another device.
+    ///
+    /// Everything recorded between here and the next [`Session::flush`] costs one
+    /// submit and one fence wait, instead of one per kernel: the ~29 dispatches
+    /// of a block collapse to a single round trip.
+    fn ensure_batch(&mut self, dev: usize) -> Result<()> {
+        if !self.batching {
+            return Ok(());
+        }
+        if self.pending_batch == Some(dev) {
+            return Ok(());
+        }
+        self.flush()?;
+        batch_cmd::begin(self.model.devices[dev].gpu())
+            .map_err(|e| anyhow!("opening a dispatch batch on device {dev}: {e}"))?;
+        self.pending_batch = Some(dev);
+        Ok(())
     }
 
     /// Threads the host expert lane is running.
@@ -396,6 +448,7 @@ impl<'m> Session<'m> {
         if let Some(p) = self.ple.as_mut() {
             p.reset();
         }
+        self.flush()?;
         self.expert_bytes = 0;
         self.forwards = 0;
         self.timers.clear();
@@ -467,6 +520,7 @@ impl<'m> Session<'m> {
         let mut trace = debug;
 
         // ---- embedding: 4 gathered rows ARE the hc copies of the vector ------
+        self.flush()?;
         self.timers.start();
         {
             let dev = m.device_of(0);
@@ -484,10 +538,11 @@ impl<'m> Session<'m> {
         }
 
         // ---- the final mixer (the output norm) and the head ------------------
+        self.flush()?;
         self.timers.mark(FINAL_HC);
         let last = m.device_of(mc.n_layers - 1);
-        let raw = {
-            let gpu = m.devices[last].gpu();
+        self.ensure_batch(last)?;
+        {
             let v = &self.venues[last];
             let hw = HcWeights {
                 norm: &m.out_hc_norm,
@@ -503,8 +558,14 @@ impl<'m> Session<'m> {
                 .as_ref()
                 .ok_or_else(|| anyhow!("the last device has no logits buffer"))?;
             v.pipes.get(&m.head.key)?.run(&m.head.buf, &ws.mixed, out)?;
-            self.stagings[last].read_batch(gpu, &[(out, 0, mc.vocab * 4)])?
-        };
+        }
+        self.flush()?;
+        let logits_buf = self.venues[last]
+            .logits
+            .as_ref()
+            .ok_or_else(|| anyhow!("the last device has no logits buffer"))?;
+        let raw = self.stagings[last]
+            .read_batch(m.devices[last].gpu(), &[(logits_buf, 0, mc.vocab * 4)])?;
         self.timers.stop();
         self.forwards += 1;
         let values = f32_from_bytes(&raw[0]);
@@ -550,6 +611,9 @@ impl<'m> Session<'m> {
             self.timers.mark(PLE);
             self.ple_step(b, tok)?;
         }
+
+        // Every dispatch from here to the MoE readback rides one command buffer.
+        self.ensure_batch(dev)?;
 
         // ---- (B) HC_READ(attn) -----------------------------------------------
         self.timers.mark(HC_READ_A);
@@ -625,6 +689,7 @@ impl<'m> Session<'m> {
 
         // ---- one readback: mixed, ids, weights, shared out, shared gate ------
         self.timers.mark(XFER_DOWN);
+        self.flush()?;
         let k = mc.n_expert_used;
         let ws_mixed = &self.venues[dev]
             .hc_ws
@@ -678,14 +743,24 @@ impl<'m> Session<'m> {
 
         // ---- (H) HC_WRITE(ffn) -----------------------------------------------
         self.timers.mark(HC_WRITE_F);
+        self.ensure_batch(dev)?;
         {
             let v = &self.venues[dev];
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
             v.hc.write(ws, &v.r, &v.block_out, &v.r)?;
         }
+        // Closed here rather than carried into the next block: spanning a host
+        // round trip would need the command buffer to stay recording across a
+        // submit. Two submits per block still carry ~28 dispatches each.
+        self.flush()?;
 
         if let Some(t) = trace.as_mut() {
             let residual = self.checksum(dev, BufKind::R, mc.hc_dim())?;
+            let gdn = if m.layers[b].kind == LayerKind::Gdn {
+                Some(self.gdn_trace(dev)?)
+            } else {
+                None
+            };
             t.push(LayerTrace {
                 block: b,
                 kind: match m.layers[b].kind {
@@ -702,6 +777,7 @@ impl<'m> Session<'m> {
                 router_weights: weights,
                 ple_gate: None,
                 ple_conv: None,
+                gdn,
             });
         }
         Ok(())
@@ -798,6 +874,8 @@ impl<'m> Session<'m> {
 
     /// The PLE insertion: host hash → GPU projections → host block → write back.
     fn ple_step(&mut self, b: usize, tok: u32) -> Result<()> {
+        // PLE needs the residual on the host, so it runs outside any batch.
+        self.flush()?;
         let m = self.model;
         let mc = &m.cfg;
         let raw = m
@@ -840,6 +918,7 @@ impl<'m> Session<'m> {
 
         // 3. readback R, key, value; run the block on the host; write R back.
         let gpu = m.devices[dev].gpu();
+        self.flush()?;
         let parts = {
             let v = &self.venues[dev];
             self.stagings[dev].read_batch(
@@ -863,6 +942,42 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// Digest every stage of a GDN sublayer's workspace.
+    fn gdn_trace(&mut self, dev: usize) -> Result<GdnTrace> {
+        self.flush()?;
+        let gpu = self.model.devices[dev].gpu();
+        // Sizes are the workspace's own shapes: h = conv channels, the rest as
+        // declared in `GdnWorkspace`.
+        let (h_n, v_n, g_n) = (10240usize, 6144usize, 48usize);
+        let items = {
+            let ws = self.venues[dev]
+                .gdn_ws
+                .as_ref()
+                .ok_or_else(|| anyhow!("no GDN workspace on device {dev}"))?;
+            [
+                (&ws.qkv, h_n * 4),
+                (&ws.z, v_n * 4),
+                (&ws.alpha, g_n * 4),
+                (&ws.beta, g_n * 4),
+                (&ws.gate, g_n * 4),
+                (&ws.step, v_n * 4),
+                (&ws.normed, v_n * 4),
+            ]
+        };
+        let refs: Vec<(&Buf, u64, usize)> = items.iter().map(|(b, n)| (*b, 0u64, *n)).collect();
+        let raw = self.stagings[dev].read_batch(gpu, &refs)?;
+        let c = |i: usize| Checksum::of(&f32_from_bytes(&raw[i]), 4);
+        Ok(GdnTrace {
+            h: c(0),
+            z: c(1),
+            alpha: c(2),
+            beta: c(3),
+            gate: c(4),
+            step: c(5),
+            normed: c(6),
+        })
+    }
+
     fn maybe_checksum(
         &mut self,
         wanted: bool,
@@ -878,6 +993,7 @@ impl<'m> Session<'m> {
 
     /// Download one of a venue's scratch buffers and digest it.
     fn checksum(&mut self, dev: usize, what: BufKind, n: usize) -> Result<Checksum> {
+        self.flush()?;
         let gpu = self.model.devices[dev].gpu();
         let v = &self.venues[dev];
         let buf = match what {

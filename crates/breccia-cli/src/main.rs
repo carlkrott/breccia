@@ -249,6 +249,10 @@ enum BenchKind {
         /// How many logits `--dump-logits` keeps
         #[arg(long, default_value_t = 256)]
         top_logits: usize,
+        /// Record each GPU phase into one command buffer (experimental: the
+        /// mechanism is verified bit-identical, the graph integration is not)
+        #[arg(long)]
+        batching: bool,
     },
 }
 fn main() {
@@ -392,6 +396,7 @@ fn run(cli: Cli) -> Result<()> {
                     json,
                     dump_logits,
                     top_logits,
+                    batching,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -408,6 +413,7 @@ fn run(cli: Cli) -> Result<()> {
             json,
             dump_logits,
             top_logits,
+            batching,
         }),
     }
 }
@@ -1381,6 +1387,7 @@ struct TokenArgs {
     json: Option<PathBuf>,
     dump_logits: Option<PathBuf>,
     top_logits: usize,
+    batching: bool,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1452,6 +1459,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         ctx_capacity: a.ctx,
         threads: a.threads.unwrap_or(0),
         timers: a.timers,
+        batching: a.batching,
     };
     let mut sess = breccia_engine::Session::new(&model, &cfg).context("building the session")?;
     sess.sampling = breccia_engine::Sampling {

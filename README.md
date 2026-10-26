@@ -46,7 +46,8 @@ Breccia/
 | 0 — baselines, backend risk, specs, reference engines | **complete — Gate A passed** (`docs/phase-0/gate-A-report.md`) |
 | 1 — workspace, `breccia-profile` (M1a), launch-flag surface | in progress — `breccia profile` verified on hardware (`docs/phase-1/01-profile-report.md`); flag parser landing |
 | 2 — DMA/transfer harness + zero-copy loader | **complete** — transfer ring measured (`docs/phase-2/01`), GGUF/pack/MTP loader validated on the real 75 GB shards (`docs/phase-2/02`) |
-| 3 — kernels + forward pass (M2) | in progress — all 14 quant types, expert batching 3.4×, 10 ops + attention/GDN/paged-KV conformant, **CPU expert lane 20.4 GB/s = 117% of the parity bar** (`docs/phase-3/01–08`); forward-pass graph is the remaining step (blueprint: `docs/phase-3/05`) |
+| 3 — kernels (M2) | **complete** — all 14 quant types, 3.4× expert batching, 10 ops + attention/GDN/paged-KV conformant, CPU expert lane 117–174% of the parity bar (`docs/phase-3/01–08`) |
+| 4 — forward pass (M2) | **parity reached** — first end-to-end tokens; **32/32 greedy tokens identical to the production server** (`docs/phase-4/01`); 5.0–5.7 tok/s on MI50 while dispatch-bound; batching + RX/dual tuning in progress |
 
 Backend decision (2026-10-26): **Vulkan primary**, HIP-style launch flags preserved, HIP secondary. Architecture rules from Gate A: RX 6950 XT = streaming/compute home; MI50 = static-resident only (PCIe ≈2.9 GB/s, no DMA overlap); expert-parallel placement by default.
 

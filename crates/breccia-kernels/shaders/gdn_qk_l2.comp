@@ -70,10 +70,16 @@ void main() {
         }
         barrier();
     }
+    // `inv` IS `build_gdn_l2_norm` in full (models.h:14-18): `rms_norm(x, eps/n)`
+    // normalises to unit *rms* and the `1/sqrt(n)` scale that follows converts
+    // that to unit *L2* norm, so the two factors compose to exactly
+    // `x / sqrt(sum x^2 + eps)` — there is no leftover 1/sqrt(S) to fold in.
+    // The delta rule then scales q once by `1/sqrt(S)` (delta-net-base.cpp:316)
+    // and leaves k alone. Charging q `1/S` and k `1/sqrt(S)` additionally
+    // shrinks `o = v*beta*(k.q)` by S = 128, which is the "GDN output is zero"
+    // defect this kernel shipped with.
     float inv = inversesqrt(red[0] + pc.eps);
-    // q additionally carries the delta-rule 1/sqrt(S); S is the head width, so
-    // the two factors together are 1/S.
-    float scale = r < pc.h_k ? inv / float(pc.S) : inv * inversesqrt(float(pc.S));
+    float scale = r < pc.h_k ? inv * inversesqrt(float(pc.S)) : inv;
     for (uint i = tid; i < pc.S; i += 128u) {
         QKV[base + i] *= scale;
     }

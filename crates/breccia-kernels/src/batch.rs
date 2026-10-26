@@ -260,8 +260,27 @@ impl<'g> GemvBatch<'g> {
     /// Run one batched dispatch: `out[experts*rows_per_expert]` = every expert's
     /// `W_e · x_e`, synchronously.
     pub fn run(&self, w: &Buf, x: &Buf, out: &Buf, map: &Buf, experts: usize) -> Result<()> {
-        self.bind(w, x, out, map)?;
         let rows = self.rows(experts);
+        if crate::dispatch_batch::is_open() {
+            // Same push constants and grid as `dispatch`, recorded instead of
+            // submitted (`readme` in `dispatch_batch`).
+            let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
+            let gx = groups.min(WG_X_MAX);
+            let gy = groups.div_ceil(WG_X_MAX);
+            let mut pc = [0u8; 16];
+            pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
+            pc[4..8].copy_from_slice(&(self.cols as u32).to_le_bytes());
+            pc[8..12].copy_from_slice(&(self.blocks_per_row() as u32).to_le_bytes());
+            pc[12..16].copy_from_slice(&1u32.to_le_bytes());
+            return crate::dispatch_batch::record(
+                self.gpu,
+                &self.kernel,
+                &[w, x, out, &self.tables, map],
+                &pc,
+                (gx, gy, 1),
+            );
+        }
+        self.bind(w, x, out, map)?;
         self.gpu
             .wall_run(Qc::C, |d, cmd| self.dispatch(d, cmd, rows))
             .map_err(|e| anyhow!("{e}"))?;

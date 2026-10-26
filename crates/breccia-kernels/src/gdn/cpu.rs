@@ -71,7 +71,13 @@ pub fn conv_seq(
 }
 
 /// L2 normalisation of the q and k halves of `qkv` (in place), with the
-/// delta-rule `1/S` folded into q: `x / sqrt(sum x^2 + eps) * scale`.
+/// delta-rule `1/sqrt(S)` folded into q.
+///
+/// `1/sqrt(sum x^2 + eps)` is `build_gdn_l2_norm` **in full**: `rms_norm(x,
+/// eps/n)` normalises to unit *rms* and the `1/sqrt(n)` scale after it converts
+/// that to unit *L2* norm (`models.h:14-18`). The delta rule then scales q by
+/// `1/sqrt(S)` once (`delta-net-base.cpp:316-318`) and leaves k alone. The
+/// `+ eps` is on the raw sum of squares, not on the mean.
 pub fn qk_l2_norm(qkv: &mut [f64], tokens: usize, h_k: usize, s: usize, channels: usize, eps: f64) {
     for t in 0..tokens {
         for r in 0..2 * h_k {
@@ -79,9 +85,9 @@ pub fn qk_l2_norm(qkv: &mut [f64], tokens: usize, h_k: usize, s: usize, channels
             let ss: f64 = (0..s).map(|i| qkv[base + i] * qkv[base + i]).sum();
             let inv = 1.0 / (ss + eps).sqrt();
             let scale = if r < h_k {
-                inv / s as f64
-            } else {
                 inv / (s as f64).sqrt()
+            } else {
+                inv
             };
             for i in 0..s {
                 qkv[base + i] *= scale;
@@ -389,11 +395,12 @@ mod tests {
         buf[0..2].copy_from_slice(&v); // q head 0
         buf[2..4].copy_from_slice(&v); // k head 0
         qk_l2_norm(&mut buf, 1, 1, 2, 8, 0.0);
-        // q carries the delta rule's 1/S = 1/2 on top of 1/5; k only 1/sqrt(2).
-        assert!((buf[0] - 3.0 / 5.0 / 2.0).abs() < 1e-12);
-        assert!((buf[1] - 4.0 / 5.0 / 2.0).abs() < 1e-12);
-        assert!((buf[2] - 3.0 / 5.0 / 2f64.sqrt()).abs() < 1e-12);
-        assert!((buf[3] - 4.0 / 5.0 / 2f64.sqrt()).abs() < 1e-12);
+        // 1/5 is the unit-L2 normalisation; q carries the delta rule's
+        // 1/sqrt(S) = 1/sqrt(2) on top of it, and k carries nothing.
+        assert!((buf[0] - 3.0 / 5.0 / 2f64.sqrt()).abs() < 1e-12);
+        assert!((buf[1] - 4.0 / 5.0 / 2f64.sqrt()).abs() < 1e-12);
+        assert!((buf[2] - 3.0 / 5.0).abs() < 1e-12);
+        assert!((buf[3] - 4.0 / 5.0).abs() < 1e-12);
     }
 
     #[test]

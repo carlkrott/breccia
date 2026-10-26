@@ -187,6 +187,15 @@ impl<'g> Pipe<'g> {
 
     /// One dispatch, synchronously.
     pub(crate) fn run(&self, bufs: &[&Buf], pc: &Pc, grid: (u32, u32, u32)) -> Result<()> {
+        if crate::dispatch_batch::is_open() {
+            return crate::dispatch_batch::record(
+                self.gpu,
+                &self.kernel,
+                bufs,
+                pc.as_bytes(),
+                grid,
+            );
+        }
         self.bind(bufs)?;
         self.gpu
             .wall_run(Qc::C, |d, cmd| {

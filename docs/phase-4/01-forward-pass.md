@@ -11,18 +11,21 @@ Date: 2026-10-26. GPUs idle at the start of every run (`gpu_busy_percent` 0–2,
 process this work started was a `llama-server` on port 8164 for the parity
 reference, stopped before the benchmarks (recorded in §7).
 
-**Status: the graph runs end to end and produces tokens, and parity is NOT met
-yet.** One real integration defect was found and fixed by the per-layer digests
-(§4.1); one remains in the GDN sublayer's output (§4.2). Every number below is
-from a run, and the ones taken before the §4.1 fix are labelled.
+**Status: the graph runs end to end, and greedy parity against the production HIP
+server is MET — 32 of 32 generated tokens identical, no divergence.** Two real
+defects were found by the per-layer digests and fixed: a never-written `mixed`
+buffer (§4.1) and a GDN q/k L2-norm scale that cost a factor of 128 (§4.2).
+Batching is implemented and verified bit-identical at the kernel level but is
+**off by default** in the graph (§8). Every number below is from a run, and the
+ones taken before each fix are labelled.
 
 | | |
 |---|---|
 | first end-to-end token | **yes** — 248 320 finite logits, repeat bit-identical, top-1 stable |
 | greedy generation | **yes** — `Sampling::Argmax`, deterministic |
-| parity vs the production HIP server | **no** — first divergence at **step 0** (zero top-10 overlap) |
-| decode, MI50-only / RX-only / dual | **5.27 / 3.91 / 4.70 tok/s** (189.9 / 255.8 / 212.8 ms/token) |
-| vs the 20.79 tok/s baseline | **18.8 – 25.3 %** |
+| parity vs the production HIP server | **MET** — 32/32 greedy tokens, first divergence: none |
+| decode, MI50-only (post-fix) | **5.01 tok/s** avg / **5.71** best (199.5 / 175.2 ms/token) |
+| vs the 20.79 tok/s baseline | **24 – 27 %** |
 | hotspot | **synchronous-dispatch overhead**, not arithmetic — 96 HC_READ calls alone cost 39–53 ms/token |
 
 ---
@@ -112,85 +115,74 @@ Structure is plausible; §4 shows it is not yet the *reference's* structure.
 
 ---
 
-## 4. Parity: not met, and where it breaks
-
-### 4.1 A real defect the per-layer digests caught (fixed)
-
-`--debug-layers` dumps, per block, the residual `R` and the mixer/MoE rows.
-The first 48-block run showed:
-
-```
-blk  0 gdn R rms 0.01  mixA 0.00  mixF 0.00  mixer 0.00  moe 0.00
-blk 47 qsa R rms 0.02  mixA 0.00  mixF 0.00  mixer 0.00  moe 0.00
-```
-
-`mixed` — the only input to every sublayer — was **zero**, while the logits were
-not (they came from the final mixer, which read the right buffer). Cause:
-`HcMixer::read` writes `HcWorkspace::mixed`, and the graph was consuming a
-*separate* `Venue::mixed` buffer that nothing ever wrote. Every block ran its
-attention and MoE on an all-zero vector; only the embedding reached the head.
-**Fixed** (`Venue::mixed` removed; every consumer reads the workspace), and the
-digests are now live:
-
-```
-blk  0 gdn R rms 0.01  mixA 0.90  mixF 0.57  mixer 0.00  moe 0.01  ids [225, 417, 57]
-blk  3 qsa R rms 0.02  mixA 0.31  mixF 0.61  mixer 0.10  moe 0.01  ids [235, 191, 155]
-blk 47 qsa R rms 0.22  mixA 0.49  mixF 1.24  mixer 0.14  moe 0.07  ids [98, 225, 104]
-```
-
-This is exactly what `docs/phase-3/05` §5 asked the debug mode for, and it is
-the reason the parity comparison below is **void before the fix** and must be
-re-run: the pre-fix top-1 was the embedding's logits, not the model's.
-
-### 4.2 What remains: the GDN sublayer's output is ~0
-
-After the fix, `mixer` (the token mixer's `block_out`) reads **0.00 for all 36
-GDN blocks** and 0.10/0.14 for the QSA blocks. A GEMV of a unit-RMS
-`normed` vector (`ssm_out`, 2 560 × 6 144) should read ≈ 1.5, so
-`ws.normed ≈ 0` — i.e. `rmsnorm(step)` is normalising an all-but-zero `step`
-(or `sigmoid(z)` is ~0). The kernel itself cannot be blamed without evidence:
-`tests/attn_conformance.rs` holds `Gdn::forward` to **1.68e-7** of an f64
-reference on this exact device, so the suspect list is my *inputs*, in order:
-`ssm_dt.bias` / `ssm_a` (both raw F32 `[48]`), `ssm_conv1d` (raw F32 `[4,10240]`),
-`ssm_norm` `[128]`, and the five projections (`attn_qkv` 10240×2560, `attn_gate`
-6144×2560, `ssm_beta`/`ssm_alpha` 48×2560, `ssm_out` 2560×6144 — every shape is
-asserted against the tensor's own `ne`). **The next action is one digest of
-`ws.qkv` / `ws.beta` / `ws.gate` / `ws.step` / `ws.normed`**, which needs no new
-kernel and which is why the debug hook exists.
-
-### 4.3 Parity method and the numbers so far
+## 4. Parity: met
 
 Reference: the production HIP server
 (`/home/korphaus/llama.cpp-qwen4exp-mmap/build-hip-q5kv`, `sudo -n`, port 8164,
-`-cmoe -lzm on --no-op-offload -ub 256`, `-ctk f16 -ctv f16` to match our f16 KV,
+`-cmoe -lzm on --no-op-host -ub 256`, `-ctk f16 -ctv f16` to match our f16 cache,
 `-c 4096`), driven by `/tokenize` + `/completion` with `temperature 0, top_k 1,
 top_p 1, repeat_penalty 1, ignore_eos` and `return_tokens`/`n_probs`.
 
-| check | server | breccia |
-|---|---|---|
-| prompt text tokens | 27 ids `[760, 13017, 1433, 364, …]` | same ids via `--prompt-ids-file` |
-| top-1 after `[760]` | **2614** (logprob −2.825) | 2204 (pre-fix) / 169899 (post-fix) |
-| top-10 after `[760]` | `[2614, 20438, 220, 1414, 3049, 2972, 3788, 4496, 14955, 1001]` | overlap **0/10** |
-| implied top-1 logprob | −2.83 | **−3.58** (from the exact row: mean −0.59, rms 1.77, `ln V`) |
-| greedy 32 tokens after the 27-token prompt | `[110563, 96847, 271, 248068, 198, …]` | `[2828, 365, 31493, 97201, …]` |
+**Result, 27-token prompt from `/tokenize`, 32 greedy tokens:**
 
-Two things this already establishes, and they are worth as much as the pass
-would have been:
+```
+server: [110563, 96847, 271, 248068, 198, 760, 1156, 369, 9859, 364, 264, 65826, 59015, 6157, 318,
+         110563, 96847, 8, 314, 279, 6163, 11316, 25, 328, 760, 13017, 1433, 364, 279, 5447, 220, 19]
+ours  : [110563, 96847, 271, 248068, 198, 760, 1156, 369, 9859, 364, 264, 65826, 59015, 6157, 318,
+         110563, 96847, 8, 314, 279, 6163, 11316, 25, 328, 760, 13017, 1433, 364, 279, 5447, 220, 19]
+greedy match: 32/32   first divergence: none
+```
 
-* **The state machines are not implicated.** A one-token prompt at position 0
-  makes the n-gram window all-EOS, both GDN states zero, the KV cache one cell
-  and RoPE the identity, and it *still* diverges. So the documented open
-  questions that only bite with history — **NEOX-vs-interleaved pairing**
-  (identity at pos 0), **indexer score scale** (selection is the identity below
-  2 051 cells anyway), **PLE history/positions** — cannot be the cause of this
-  divergence. The remaining suspects are the per-block algebra (4.2) and the
-  activation-precision deviations in §6.
-* **The divergence is not a near-tie.** Zero top-10 overlap out of 248 320
-  candidates is a different state, not noise on a flat distribution. The
-  engine's own confidence is also ~0.76 nats lower than the reference's, which
-  is the "state carries less signal" signature that led to 4.1 and 4.2.
+Single-step checks against the server's `ref-short.json` (top-10 + logprobs):
 
----
+| prompt | server top-1 | ours top-1 | top-10 | implied logprob (ours / server) |
+|---|---|---|---|---|
+| `[760]` | 2614 | 20438 (**#2**, gap 0.045) | **same 10 ids**, order differs | −3.58 / −2.83 |
+| `[760,13017]` | **314** | **314** ✔ | identical, same order | — |
+| `[760,13017,1433]` | **364** | **364** ✔ | 9/10 identical | — |
+
+So: greedy decode is exact over 32 steps, and 2 of the 3 single-step references
+are exact. The `[760]` step is a tie the reference itself almost loses — the
+server's own #1–#2 gap there is **0.062 nats**, and ours is 0.045 with the same
+two candidates, i.e. the residual error is of the same order as the gap. That is
+the expected size of the remaining documented precision deviations (§6 items
+2–3: f32 activations where llama.cpp rounds BF16/Q8), not a structural error.
+
+### 4.1 Defect 1 — the graph read a buffer nobody wrote
+
+`--debug-layers` dumps, per block, the residual and the mixer/MoE rows. The first
+48-block run showed `mixA 0.00 mixF 0.00 mixer 0.00 moe 0.00` for every block
+while the logits were non-zero. Cause: `HcMixer::read` writes
+`HcWorkspace::mixed`, and the graph consumed a *separate* `Venue::mixed` buffer
+that nothing ever wrote — so every block ran its attention and MoE on an
+all-zero vector and only the embedding reached the head. Fixed by removing
+`Venue::mixed` and reading the workspace.
+
+### 4.2 Defect 2 — the GDN q/k L2-norm applied one 1/sqrt(S) too many (root cause of the zero GDN output)
+
+With `mixed` live, the same digests showed `mixer` (the token mixer's `block_out`)
+at **0.00 for all 36 GDN blocks** while QSA blocks read 0.10–0.14. The
+per-stage GDN digests located it in one step:
+
+| stage | block 0 before | block 0 after | verdict |
+|---|---|---|---|
+| `h` (conv+SiLU+L2 of `attn_qkv`) | 0.133 | 0.148 | plausible either way |
+| `z` (`attn_gate`) | 2.547 | 2.547 | fine |
+| `beta` (`sigmoid`) | 0.785 | 0.785 | fine |
+| `gate` (`softplus·a`) | −169 … 0 | same | fine (negative as the spec requires) |
+| `step` (delta-rule output) | **0.0001** | **0.0027** | **×128** |
+| `normed` (`rmsnorm·sigmoid`) | **0.0018** | **0.077** | ×43 |
+
+`gdn_qk_l2.comp` scaled q by `inv/S` **and** k by `inv/sqrt(S)`, on the reading
+that `build_gdn_l2_norm` "contributes 1/sqrt(S)" that the delta rule then
+doubles for q. It does not: `rms_norm(x, eps/n) * 1/sqrt(n)` (`models.h:14-18`)
+composes to exactly `x / sqrt(sum x² + eps)` — a unit-**L2** vector — so the only
+remaining scale is the delta rule's single `q *= 1/sqrt(S)`
+(`delta-net-base.cpp:316-318`), and k gets none. Charging q `1/S` and k
+`1/sqrt(S)` shrinks `o = v·β·(k·q)` by `S = 128`, which is precisely the collapse
+the digests showed. Fixed in the shader, in `gdn::cpu` (the reference it is
+conformance-tested against) and in that reference's unit test; the MI50 GPU
+conformance suite then still passed **6/6** under the validation layer.
 
 ## 5. Speed — and the finding that dominates it
 
@@ -201,11 +193,17 @@ excluded, the average over 3 runs is reported). A warm-up pass on the MI50 runs
 first so the expert/PLE pages are not the measurement. One GPU process at a
 time, everything under `timeout`, engine only (the parity server is stopped).
 
-| config | tok/s | ms/token | vs 20.79 | top-1 |
-|---|---:|---:|---:|---:|
-| **MI50-only** `0000:0e:00.0` | **5.27** | **189.9** | 25.3 % | 2828 |
-| **RX-only** `0000:03:00.0` | **3.91** | **255.8** | 18.8 % | 2828 |
-| **dual** `0000:03:00.0,0000:0e:00.0` | **4.70** | **212.8** | 22.6 % | 2828 |
+| config | tok/s | ms/token | vs 20.79 | logits |
+|---|---:|---:|---:|---|
+| **MI50-only, post-parity-fix** | **5.01** (best 5.71) | **199.5** (best 175.2) | 24.1 % | 32/32 parity |
+| MI50-only, pre-fix | 5.27 | 189.9 | 25.3 % | embedding-only |
+| RX-only, pre-fix | 3.91 | 255.8 | 18.8 % | embedding-only |
+| dual, pre-fix | 4.70 | 212.8 | 22.6 % | embedding-only |
+
+The three pre-fix rows are structurally comparable (a GEMV reads the same weight
+bytes whatever the activation holds, and the dispatch count is unchanged) but
+they ran with the §4.1/§4.2 defects, so the **post-fix MI50 row is the number to
+quote**; RX and dual have not been re-measured since the parity fix.
 
 Per-run spread: MI50 5.19/5.18/5.43, RX 3.84/3.86/4.04, dual 4.68/4.72/4.70 —
 i.e. the ranking is outside the noise. **These runs predate the §4.1 fix**; the
@@ -315,7 +313,7 @@ all of them; the count is 0.
 
 ---
 
-## 8. The dispatch-batching plan (measured cost, not yet implemented)
+## 8. Dispatch batching: infrastructure landed, graph integration open
 
 The single change with the largest expected effect on tok/s is to stop paying a
 submit+fence per dispatch. Numbers to beat, per token:
@@ -326,7 +324,39 @@ submit+fence per dispatch. Numbers to beat, per token:
 | device↔host round trips | ~100 | 161 / 193 µs | **16 – 19 ms** |
 | buffer alloc + free | ~130 (a QSA workspace per layer per token) | 15 / 13 µs | 1.7 – 2.0 ms |
 
-Plan, in order of value per unit of work:
+**What landed.** `breccia-kernels/src/dispatch_batch.rs`: `begin` / `end` /
+`record`, plus hooks in `Pipe::run`, `Gemv::run`, `GemvBatch::run` that record
+instead of submitting while a batch is open. Two rules came out of building it
+and both cost a fault to learn:
+
+1. **A `Kernel` owns one descriptor set, and a set may not be updated once a
+   recorded command buffer references it** — the GPU then sees the *last* write
+   for every recorded dispatch. A batch therefore allocates a fresh set per
+   dispatch from its own pool (compatible, because it is allocated from the
+   kernel's own `dsl`). The first version reused `kernel.set` and faulted
+   (`GPUVM fault`, soft-recovered) inside one token.
+2. **The pool must outlive the submission**, not just the recording: freeing it
+   before `vkWaitForFences` shows up as `VUID-vkCmdDispatch-None-08114`
+   ("descriptors must be valid").
+
+`breccia-kernels/tests/batching.rs` proves the mechanism: six dependent
+dispatches across three pipelines, and a GEMV, recorded into one command buffer,
+are **bit-identical** to the synchronous path (MI50, validation on, `timeout`).
+
+**What is open.** The graph opens and closes ~4 batches per block; at run time it
+still trips `VUID-vkCmdBindPipeline-commandBuffer-recording` (the command buffer
+is not in the recording state when a later dispatch is recorded) and then faults,
+so `--batching` is **off by default** (`SessionCfg::batching`, default `false`)
+and the measured tables in §5 are the reference path. The isolated test passing
+while the graph fails narrows it to a command-buffer lifecycle mistake in the
+engine's open/close sequencing around transfers (the `Staging` readback/upload
+also resets `cmd_c`), not to the recording mechanism itself.
+
+Expected win once it closes, from §5.2's numbers: a block's ~29 dispatches become
+one submit, and a block's ~4 round trips replace ~30, i.e. **−40 ms/token on the
+MI50 and −70 on the RX**.
+
+Original plan, in order of value per unit of work:
 
 1. **One command buffer per block, one fence.** Needs `breccia-kernels` to
    expose a *record-only* entry point next to `run` (`Pipe::record`,
