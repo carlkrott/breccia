@@ -24,9 +24,9 @@ from a run, and the ones taken before each fix are labelled.
 | first end-to-end token | **yes** — 248 320 finite logits, repeat bit-identical, top-1 stable |
 | greedy generation | **yes** — `Sampling::Argmax`, deterministic |
 | parity vs the production HIP server | **MET** — 32/32 greedy tokens, first divergence: none |
-| decode, MI50-only, batching on, 16 host threads | **7.92 tok/s** (126.3 ms/token) |
-| vs the 20.79 tok/s baseline | **38.1 %** (24.6 % before batching, 28.0 % with batching alone) |
-| best dual configuration | **0 blocks on the RX** — see §5.3 |
+| decode, **dual** (20 RX / 28 MI50 blocks), batching on, 16 threads | **7.42 tok/s** (134.9 ms/token) |
+| vs the 20.79 tok/s baseline | **35.7 %** (dual was 29.0 % before this pass) |
+| single-card diagnostic (not a target) | 8.55 tok/s / 117.0 ms |
 | hotspot | **synchronous-dispatch overhead**, not arithmetic — 96 HC_READ calls alone cost 39–53 ms/token |
 
 ---
@@ -213,49 +213,46 @@ first sweep through the thread curve had the flag overridden to `false`, which i
 why the earlier note said 152.8 ms for what is really the batching-*off* 16-thread
 cell.)
 
-### 5.3 Dual-GPU: the balance is the wrong lever (measured)
+### 5.3 Dual-GPU: both cards working, and the split that does it
 
-`--split-blocks` makes the block assignment explicit. Warm cache, 3×32, batching
-on, 16 threads, same prompt; **all four configurations generate the same 32
-tokens (32/32 vs the server, bit-identical to each other)**:
+Policy (AGENTS.md, 2026-10-26): the target is proper **dual-GPU** use, so every
+number in this subsection is a dual run; single-card figures appear only as
+diagnostics to explain a dual result.
 
-| config (RX blocks, MI50 blocks) | tok/s | ms/token | vs 20.79 | inferred cost per block |
-|---|---:|---:|---:|---|
-| MI50-only (single device) | 6.43 | 155.5 | 30.9 % | 3.24 ms (MI50) |
-| **0, 48** (dual plan, all on the MI50) | **6.49** | **154.1** | **31.2 %** | 3.24 ms |
-| 21, 27 | 5.30 | 188.6 | 25.5 % | 4.80 ms (RX) |
-| 27, 21 (the old default) | 5.03 | 199.0 | 24.2 % | 4.80 ms |
-| **0, 48 + batching + 16 threads** | **7.84** | **127.5** | 37.7 % | — |
+Two changes since the last pass: the **`block_out` mailbox** (the MoE result is
+memcpy'd into a permanently-mapped host-visible buffer instead of being uploaded
+through a submit+fence) and **leaving the batch open across the block boundary**
+(the ffn `HC_WRITE` of block *n* and phase A of block *n+1* are one submission,
+because nothing host-side sits between them any more). A block is now **two round
+trips** instead of four.
 
-Two things fall out:
+Warm, 3×32, batching on, 16 threads, `--split-blocks`:
 
-1. **An RX block costs ~1.48× an MI50 block** (4.80 vs 3.24 ms). The model is
-   consistent across the splits: 21×3.24 + 27×4.80 = 198 ms ≈ the measured 199.
-2. **Every split is worse than putting everything on the faster card**, and the
-   `0, 48` control shows the dual *plan* costs nothing when the RX is idle
-   (154.1 vs 155.5 ms) — so the loss is entirely the work placed on the RX plus
-   the PCIe hand-off of the 40 KiB residual stack.
+| split (RX, MI50) | tok/s | ms/token | vs 20.79 | fence wait RX : MI50 |
+|---|---:|---:|---:|---:|
+| 24, 24 | 5.10 | 196.1 | 24.5 % | 1.24 : 1 |
+| 28, 20 | 6.80 | 147.1 | 32.7 % | 1.75 : 1 |
+| **20, 28** | **7.42** | **134.9** | **35.7 %** | **0.95 : 1** |
+| 27, 21 (before this pass) | 6.03 | 165.9 | 29.0 % | — |
 
-**Recommendation:** for this graph, place **all 48 blocks on the MI50** and leave
-the RX available but idle (`--devices 0000:03:00.0,0000:0e:00.0 --split-blocks 0,48`,
-or simply `--devices 0000:0e:00.0`). The RX wins only if its per-block cost drops
-below the MI50's — it is currently 1.48× worse, so it needs **≥ 32 % off** its
-per-dispatch round trip (or a graph where the weights, not the dispatch count,
-dominate: they do not, dense is 3.2 GiB). The concrete route is the same one that
-made batching pay: fewer submissions per block, i.e. arena/workspace hoisting and
-a fused HC read, plus checking RADV's per-submit cost on the display card (64 µs
-vs the MI50's 36 µs, measured on an idle desktop).
+**The best dual configuration is 20 blocks on the RX and 28 on the MI50 at
+7.42 tok/s (134.9 ms/token), and it is the only split where the two cards'
+accumulated fence wait is balanced (0.95 : 1)** — i.e. the split is chosen so the
+two cards finish their halves together, which is the criterion that matters, not
+the block count. 24/24 is badly unbalanced (1.24:1 with the RX far ahead in work
+per block) because an RX block is ~1.5× an MI50 block, and 28/20 over-loads the
+RX (1.75:1).
 
-**Parity invariant.** All six configurations generate the *same* 32 tokens, and
-they are the server's 32 (32/32 each). Batching changes timing, not arithmetic.
+Both cards do real work every token: at 20/28 the RX executes 20 blocks and the
+MI50 28, each with its own 0.7 / 1.0 MiB of host traffic per token (the three
+`[hc, n_embd]` readbacks and mailbox writes per block, split by card).
 
-**The dual configuration still does not beat MI50-only** (6.03 vs 6.74 tok/s).
-Splitting 48 blocks over two cards moves half the work to the RX, whose host
-round trip is ~1.8× the MI50's (64 vs 36 µs measured) and which adds a PCIe
-hand-off of the 40 KiB residual stack per token; the RX's 2× compute does not
-pay for that in a graph this dispatch-bound. The RX advantage the plan predicted
-would need the *per-phase* dispatch count to fall further, or the larger weights
-to be the constraint (they are not: dense is 3.2 GiB).
+**Dual is now ahead of the previous dual** (6.03 → 7.42 tok/s, −31 ms/token) but
+still behind the single-card diagnostic (8.55 tok/s / 117.0 ms), which is the
+number this policy deliberately does not target. The gap is the per-block cost
+ratio (§5.3 note above) and the PCIe hand-off; closing it needs the per-block
+submission count to fall further (pre-recorded command buffers, §8f) or the
+experts to move onto the cards (§8d).
 
 ### 5.2 Where the time goes
 
@@ -490,6 +487,52 @@ would be judged against, so the next pass starts from numbers:
   new arithmetic. Numerical expectation: the same decode path that conformance
   holds to 1e-7 against the CPU reference, so ≤1e-5 vs the host lane is the
   expected outcome, not the risk.
+
+## 8e. Synchronisation restructure: what the mailbox bought
+
+| item | before | after |
+|---|---:|---:|
+| round trips per block | 4 | **2** (3 on QSA blocks, whose workspace must not straddle a batch) |
+| submissions per token | 192 + 96 = ~290 | **~110** |
+| `xfer-up` | 3.24 ms | **0.64 ms** |
+| `hc-write(ffn)` | 6.78 ms | **1.19 ms** |
+| token (single-card diagnostic) | 126.3 ms | **117.0 ms** (−9.3) |
+
+**Multi-block in flight (K > 1) is not available in this graph, and that is a
+structural fact, not a missing feature.** The dependency chain per block is
+`R → HC_READ → mixer → HC_WRITE → HC_READ → router → experts → HC_WRITE → R`, and
+the expert step needs the router's ids *and* `mixed` on the host. Block *n+1*'s
+HC_READ therefore cannot start before block *n*'s MoE result is back. There is no
+K to sweep: the only independent work is block *n*'s own ffn `HC_WRITE` against
+block *n+1*'s phase A, and that is exactly the merge implemented above (K = 2
+phases, one submission). The K-curve is therefore **K=1 → 4 round trips, K=2 →
+2 round trips (measured −9.3 ms), K>2 → no further merge exists**. The way past
+this is to remove the host from the MoE loop (§8d), which makes a block fully
+device-resident and lets several blocks be in flight.
+
+## 8f. Graph replay: per-block is where it stops
+
+The analogue of CUDA graphs here is a pre-recorded command buffer per block,
+replayed with `vkQueueSubmit` only. Feasibility, from the code:
+
+* **Descriptor sets are already fixed** (buffers do not move), and the batch
+  allocates them once — so a recorded block's sets can be kept alive in one pool
+  per block. That part works.
+* **GDN blocks (36 of 48) are replayable today**: their push constants are
+  shape-only, and their state lives in fixed buffers.
+* **QSA blocks are not**: `pos0` is a push constant (baked into the recorded
+  command buffer), so a replay would need one recorded buffer per (block,
+  position) — 12 × 256 pairs at the current window. The fix is a device-side
+  position indirection (the rope table already holds `pos[i] = i`; the kernel
+  reads `positions[pos_base + row]`, so zeroing `pos_base` and advancing a
+  device-side base would make the record position-independent). That is a shader
+  change with a conformance implication, so it is specified rather than done.
+* **A full-token replay** additionally needs the QSA workspace hoisted out of the
+  per-token allocation (it rotates today) — the same first step as §8d.
+
+Expected: a replayed GDN block removes the ~29 `vkCmd*` recordings (~18.7 ms of
+`mixer` recording + the graph's own recording) but not the fence, so the ceiling
+is the ~19 ms of recording, not the wait.
 
 ## 9. Exact commands
 

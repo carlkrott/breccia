@@ -49,7 +49,7 @@ use crate::model::{HcW, Model, PipelineSet};
 use crate::ple::PleHost;
 use crate::sampler::{Sampler, Sampling};
 use crate::stats::{Checksum, GdnTrace, LayerTrace};
-use crate::xfer::Staging;
+use crate::xfer::{Mailbox, Staging};
 
 /// Per-stage timer slots, in graph order.
 pub const STAGES: [&str; 15] = [
@@ -160,9 +160,10 @@ pub struct Venue<'m> {
     pub emb_ple: EmbGather<'m>,
     /// The residual stack `[hc, n_embd]`.
     pub r: Buf,
-    /// The sublayer + MoE input. **This is `HcWorkspace::mixed`**, i.e. what
-    /// `HcMixer::read` wrote — see [`Venue::mixed`].
-    pub block_out: Buf,
+    /// The token mixer's / MoE's output, as a **host-visible mailbox**: the MoE
+    /// result is written straight into the mapping instead of being uploaded
+    /// through a submit + fence.
+    pub block_out: Mailbox,
     pub sh: Buf,
     pub sh_gate_logit: Buf,
     pub shexp_gate: Buf,
@@ -231,6 +232,12 @@ pub struct Session<'m> {
     pub dispatches: u64,
     /// See [`SessionCfg::batching`].
     pub batching: bool,
+    /// Per device: fence-wait seconds and host↔device bytes, so a dual run can
+    /// say what *each* card did instead of only a total.
+    pub dev_wait_s: Vec<f64>,
+    pub dev_down: Vec<u64>,
+    pub dev_up: Vec<u64>,
+    pub dev_blocks: Vec<usize>,
 }
 
 impl<'m> Session<'m> {
@@ -292,7 +299,7 @@ impl<'m> Session<'m> {
             };
             let n = mc.n_embd as u64;
             let r = alloc(mc.hc_dim() as u64 * 4, "the residual stack")?;
-            let block_out = alloc(n * 4, "block_out")?;
+            let block_out = Mailbox::new(gpu, n * 4)?;
             let sh = alloc(n * 4, "shared-expert out")?;
             let sh_gate_logit = alloc(4, "shared-expert gate")?;
             let shexp_gate = alloc(mc.n_ff as u64 * 4, "shexp gate")?;
@@ -397,14 +404,25 @@ impl<'m> Session<'m> {
             submits: 0,
             dispatches: 0,
             batching: cfg.batching,
+            dev_wait_s: vec![0.0; model.devices.len()],
+            dev_down: vec![0; model.devices.len()],
+            dev_up: vec![0; model.devices.len()],
+            dev_blocks: {
+                let mut v = vec![0usize; model.devices.len()];
+                for b in 0..model.cfg.n_layers {
+                    v[model.device_of(b)] += 1;
+                }
+                v
+            },
         })
     }
 
     /// Close the open batch (submit once, wait once), if any.
     fn flush(&mut self) -> Result<()> {
         if let Some(d) = self.pending_batch.take() {
-            batch_cmd::end(self.model.devices[d].gpu())
+            let wait = batch_cmd::end(self.model.devices[d].gpu())
                 .map_err(|e| anyhow!("closing the dispatch batch on device {d}: {e}"))?;
+            self.dev_wait_s[d] += wait;
             self.submits += 1;
             self.dispatches += u64::from(batch_cmd::recorded());
         }
@@ -453,13 +471,29 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// What each card actually did: blocks, fence-wait time, host traffic.
+    pub fn per_device(&self, forwards: usize) -> Vec<String> {
+        let n = forwards.max(1) as f64;
+        (0..self.model.devices.len())
+            .map(|i| {
+                format!(
+                    "device {i} {:<42} {:>2} blocks  {:>6.2} ms/token fence wait                       {:>5.1} MiB down {:>5.1} MiB up",
+                    self.venues[i].name,
+                    self.dev_blocks[i],
+                    self.dev_wait_s[i] * 1e3 / n,
+                    self.dev_down[i] as f64 / n / (1 << 20) as f64,
+                    self.dev_up[i] as f64 / n / (1 << 20) as f64,
+                )
+            })
+            .collect()
+    }
+
     /// Bytes of VRAM the session itself allocated (state + scratch).
     pub fn session_bytes(&self) -> u64 {
         let mut total = 0u64;
         for v in &self.venues {
             for b in [
                 &v.r,
-                &v.block_out,
                 &v.sh,
                 &v.sh_gate_logit,
                 &v.shexp_gate,
@@ -595,6 +629,10 @@ impl<'m> Session<'m> {
 
         // ---- move the residual stack if the block lives elsewhere -----------
         if b > 0 && m.device_of(b - 1) != dev {
+            // The hand-off uses `Staging`, which records into its own command
+            // buffer — so the open batch (the previous block's ffn `HC_WRITE`)
+            // must be submitted first.
+            self.flush()?;
             self.timers.mark(HANDOFF);
             let prev = m.device_of(b - 1);
             let bytes = self.stagings[prev].read_batch(
@@ -648,7 +686,7 @@ impl<'m> Session<'m> {
         {
             let v = &self.venues[dev];
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-            v.hc.write(ws, &v.r, &v.block_out, &v.r)?;
+            v.hc.write(ws, &v.r, &v.block_out.buf, &v.r)?;
         }
 
         // ---- (E) HC_READ(ffn) ------------------------------------------------
@@ -718,6 +756,7 @@ impl<'m> Session<'m> {
                 (&self.venues[dev].sh_gate_logit, 0, 4),
             ],
         )?;
+        self.dev_down[dev] += (mc.n_embd * 2 + k * 8 + 4) as u64;
         let mixed = f32_from_bytes(&raw[0]);
         let ids: Vec<usize> = raw[1]
             .chunks_exact(4)
@@ -747,11 +786,9 @@ impl<'m> Session<'m> {
 
         // ---- upload the FFN result -------------------------------------------
         self.timers.mark(XFER_UP);
-        self.stagings[dev].write(
-            m.devices[dev].gpu(),
-            &self.venues[dev].block_out,
-            &f32_to_bytes(&out),
-        )?;
+        // A memcpy into the mailbox: no submit, no fence.
+        self.venues[dev].block_out.write(&f32_to_bytes(&out))?;
+        self.dev_up[dev] += (mc.n_embd * 4) as u64;
 
         // ---- (H) HC_WRITE(ffn) -----------------------------------------------
         self.timers.mark(HC_WRITE_F);
@@ -759,12 +796,12 @@ impl<'m> Session<'m> {
         {
             let v = &self.venues[dev];
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-            v.hc.write(ws, &v.r, &v.block_out, &v.r)?;
+            v.hc.write(ws, &v.r, &v.block_out.buf, &v.r)?;
         }
-        // Closed here rather than carried into the next block: spanning a host
-        // round trip would need the command buffer to stay recording across a
-        // submit. Two submits per block still carry ~28 dispatches each.
-        self.flush()?;
+        // **Left open on purpose.** No host round trip happens between this
+        // dispatch and the next block's phase A (the mailbox write is a memcpy),
+        // so the two ride one submission: a block now costs one submit plus one
+        // readback instead of four round trips.
 
         if let Some(t) = trace.as_mut() {
             let residual = self.checksum(dev, BufKind::R, mc.hc_dim())?;
@@ -832,7 +869,7 @@ impl<'m> Session<'m> {
             .as_ref()
             .ok_or_else(|| anyhow!("block {b} has no GDN state"))?;
         let mixed = &v.hc_ws.as_ref().expect("the session's hc workspace").mixed;
-        gdn.forward(state, ws, &weights, &proj, mixed, &v.block_out)
+        gdn.forward(state, ws, &weights, &proj, mixed, &v.block_out.buf)
     }
 
     fn run_qsa(&mut self, b: usize, dev: usize, pos: usize) -> Result<()> {
@@ -902,7 +939,15 @@ impl<'m> Session<'m> {
                 w_out: &qw.out.buf,
             };
             let hc = v.hc_ws.as_ref().expect("the session's hc workspace");
-            qsa.forward(state, &ws, &weights, &proj, &hc.mixed, &v.block_out, pos)
+            qsa.forward(
+                state,
+                &ws,
+                &weights,
+                &proj,
+                &hc.mixed,
+                &v.block_out.buf,
+                pos,
+            )
         };
 
         self.flush()?;
@@ -1042,7 +1087,7 @@ impl<'m> Session<'m> {
         let buf = match what {
             BufKind::R => &v.r,
             BufKind::Mixed => &v.hc_ws.as_ref().expect("hc workspace").mixed,
-            BufKind::BlockOut => &v.block_out,
+            BufKind::BlockOut => &v.block_out.buf,
         };
         let raw = self.stagings[dev].read_batch(gpu, &[(buf, 0, n * 4)])?;
         Ok(Checksum::of(&f32_from_bytes(&raw[0]), 8))
@@ -1072,6 +1117,10 @@ impl<'m> Session<'m> {
         self.forwards = 0;
         self.expert_bytes = 0;
         self.timers.clear();
+        // The prompt passes must not inflate the per-device figures.
+        self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
+        self.dev_down.iter_mut().for_each(|x| *x = 0);
+        self.dev_up.iter_mut().for_each(|x| *x = 0);
 
         let mut out = Vec::with_capacity(n);
         let mut first_step_logits = Vec::new();
@@ -1118,9 +1167,9 @@ impl Drop for Session<'_> {
         let m = self.model;
         for (i, v) in self.venues.iter_mut().enumerate() {
             let gpu = m.devices[i].gpu();
+            v.block_out.release(gpu);
             for b in [
                 &v.r,
-                &v.block_out,
                 &v.sh,
                 &v.sh_gate_logit,
                 &v.shexp_gate,

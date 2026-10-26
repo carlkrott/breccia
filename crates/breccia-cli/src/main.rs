@@ -1714,6 +1714,10 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         debug_layers: traces,
         notes,
     };
+    println!("\nper device (per generated token):");
+    for line in sess.per_device(forwards / runs_n.max(1.0).floor() as usize) {
+        println!("  {line}");
+    }
     println!("\nhotspots  {}", report.hotspots.join(" · "));
     let _ = last_logits;
     let _ = max_delta;

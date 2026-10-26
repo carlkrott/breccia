@@ -226,6 +226,71 @@ impl Staging {
     }
 }
 
+/// A device buffer that is **permanently mapped** into host memory, for the one
+/// vector a block hands down to the host and takes straight back.
+///
+/// The MoE result has to travel host→device once per block. Going through
+/// [`Staging`] costs a record + submit + `vkWaitForFences` per block (~180 µs
+/// here, 48 times a token); writing straight into a coherent mapping costs a
+/// `memcpy`, because `vkQueueSubmit` already orders prior host writes to coherent
+/// memory against the submitted work — and the next thing that reads this buffer
+/// is the ffn `HC_WRITE`, which is the next submission.
+pub struct Mailbox {
+    pub buf: Buf,
+    ptr: *mut u8,
+    size: u64,
+}
+
+impl Mailbox {
+    pub fn new(gpu: &Gpu, size: u64) -> Result<Self> {
+        let size = size.max(16);
+        let buf = gpu
+            .buf(
+                size + breccia_kernels::gemv::TAIL_PAD,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+                    | vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )
+            .map_err(|e| anyhow!("allocating the {size}-byte mailbox: {e}"))?;
+        // SAFETY: host-visible, host-coherent memory owned by this struct; the
+        // mapping outlives every use and is released before the buffer.
+        let ptr = unsafe {
+            gpu.device
+                .map_memory(buf.mem, 0, buf.size, vk::MemoryMapFlags::empty())
+                .map_err(|e| anyhow!("mapping the mailbox: {e}"))? as *mut u8
+        };
+        Ok(Mailbox { buf, ptr, size })
+    }
+
+    /// Copy `data` into the mapping. No driver call, no submission.
+    pub fn write(&self, data: &[u8]) -> Result<()> {
+        if data.len() as u64 > self.size {
+            return Err(anyhow!(
+                "mailbox write of {} bytes into {}-byte buffer",
+                data.len(),
+                self.size
+            ));
+        }
+        // SAFETY: bounds checked above; the mapping covers `size + TAIL_PAD`.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr, data.len()) };
+        Ok(())
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.buf.size
+    }
+
+    pub fn release(&self, gpu: &Gpu) {
+        // SAFETY: unmapped exactly once, before the memory is freed.
+        unsafe { gpu.device.unmap_memory(self.buf.mem) };
+        gpu.destroy_buf(&self.buf);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// The staging math is pure: `read_batch` lays items out back to back and the
