@@ -1,0 +1,57 @@
+#version 450
+//
+// HC_READ tail: the gated mean over the hyper-connection streams.
+//
+//   gated[c][d] = xn[c][d] * sigmoid(gate[c][d])
+//   mixed[d]    = (1/hc) * sum_c gated[c][d]        -> [n_embd]
+//
+// (`docs/specs/qwen4exp-architecture.md` §4.1, `LC/src/models/qwen4exp.cpp:313-397`,
+// `ST/include/strata/kernels/gr.hpp:77-124`.)
+//
+// This is the only place the four streams are collapsed to the one vector the
+// sublayer consumes, so it is the natural place to fuse the gate: `gate` arrives
+// from the `w_up` projection and `xn` from the grouped RMSNorm, both already
+// `[n_embd, hc, T]`, and nothing else reads `xn * sigmoid(gate)`.
+//
+// Layout (GGML `ne` order, fastest axis first):
+//   xn, gate :: [n_embd, hc, T]  -> index = (c + hc*t) * n_embd + d
+//   mixed    :: [n_embd, T]      -> index =  t * n_embd + d
+// One invocation per (token, d), so `n_embd * T` units, wrapped over grid.y.
+//
+// `mean`, not `sum`: §4.1 writes `mean_over_streams(gated)`, which is a divide
+// by `hc` (4). See the report's open questions — a sum instead of a mean is a
+// plausible-looking factor-of-4 error.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XnVec { float XN[]; };
+layout(std430, binding = 1) readonly buffer GateVec { float G[]; };
+layout(std430, binding = 2) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint n_embd; // elements per stream
+    uint hc;     // streams to collapse (mean over these)
+    uint tokens; // T
+    uint pad0;
+} pc;
+
+#include "ops_math.glsl"
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint gid = wg * 256u + gl_LocalInvocationID.x;
+    if (gid >= pc.n_embd * pc.tokens) {
+        return;
+    }
+    uint t = gid / pc.n_embd;
+    uint d = gid - t * pc.n_embd;
+
+    float acc = 0.0;
+    for (uint c = 0u; c < pc.hc; ++c) {
+        uint idx = (c + pc.hc * t) * pc.n_embd + d;
+        acc += XN[idx] * breccia_sigmoid(G[idx]);
+    }
+    O[t * pc.n_embd + d] = acc / float(pc.hc);
+}

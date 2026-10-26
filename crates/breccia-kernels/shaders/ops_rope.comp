@@ -1,0 +1,89 @@
+#version 450
+//
+// Partial **NEOX-paired** rotary embedding (the model's "IMRoPE" for text).
+//
+//   inv[j]  = theta^(-2j/n_rot)                       j in [0, n_rot/2)
+//   ang     = pos * inv[j]                            pos from an int32 per row
+//   cos,sin = table[pos][j]                           HOST-precomputed, fp32
+//   out[j]           = x[j]     * cos - x[j+n_rot/2] * sin
+//   out[j + n_rot/2] = x[j]     * sin + x[j+n_rot/2] * cos
+//   dims [n_rot, head_dim) pass through unchanged
+//
+// THE PAIRING IS NEOX — `(j, j + n_rot/2)`, NOT the adjacent pair `(2j, 2j+1)`.
+// This is the one place the op could be silently wrong (correctly shaped,
+// scrambled content), so it is pinned to both references:
+//
+//   * llama.cpp `ggml_compute_forward_rope_flt` → `rotate_pairs(n_dims,
+//     n_offset = n_dims/2, cache, src, dst)` for `GGML_ROPE_TYPE_NEOX` /
+//     `MROPE` / `IMROPE` (`ggml/src/ggml-cpu/ops.cpp:6505-6514`), and this
+//     artifact's `rope_type` is `LLAMA_ROPE_TYPE_IMROPE`
+//     (`src/llama-model.cpp:3677`, `src/models/qwen4exp.cpp:1062,1068`).
+//   * strata `include/strata/kernels/rope.hpp:1-16` states it outright:
+//     "Pairing is NEOX: (i, i + n_rot/2), NOT the adjacent pair (2i, 2i+1)",
+//     with `rope_neox_pair` as the single shared definition.
+//
+// WHY NO SECTION LOGIC. `rope.dimension_sections [11,11,10,0]` selects which of
+// the three position streams (t/h/w) each pair rotates by. All three bases are
+// the same `freq_base` and all three advance by the same `theta_scale`
+// (`ggml/src/ggml-cpu/ops.cpp:6224-6276`), so for text (t = h = w) the section
+// mapping is the identity and the rotation is plain 1-D partial RoPE
+// (`docs/specs/qwen4exp-architecture.md` §13 closing note). The vision path is
+// the only case that needs the per-pair sector table (`strata/kernels/mrope.hpp`)
+// and it is not part of the trunk; see the report's open questions.
+//
+// IN-PLACE IS SAFE: under NEOX no two pairs share an element (the two halves are
+// disjoint), so a thread reads both inputs before writing both outputs. Bind the
+// same buffer for X and O to apply in place.
+//
+// Work: one invocation per (row, pair) with `head_dim/2` units per row — pair
+// index `j < n_rot/2` rotates, `j >= n_rot/2` copies the untouched tail in
+// adjacent pairs starting at `n_rot`.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer XVec { float X[]; };
+/// `[max_pos][n_rot/2]` of `vec2(cos, sin)` — one 8-byte load per pair.
+layout(std430, binding = 1) readonly buffer Table { vec2 CS[]; };
+/// One int32 rotary position per row (a device array, not a host scalar: a
+/// captured graph must not replay the first token's position forever).
+layout(std430, binding = 2) readonly buffer Positions { int POS[]; };
+layout(std430, binding = 3) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint rows;     // rows in the tensor (heads * tokens)
+    uint head_dim; // elements per row
+    uint n_rot;    // rotated dims (must be even)
+    uint max_pos;  // positions in the table
+} pc;
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint hrot = pc.n_rot / 2u;
+    uint units = pc.head_dim / 2u; // one unit covers two elements of the row
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint gid = wg * 64u + gl_LocalInvocationID.x;
+    if (gid >= pc.rows * units) {
+        return;
+    }
+    uint row = gid / units;
+    uint j = gid - row * units;
+    uint base = row * pc.head_dim;
+
+    if (j < hrot) {
+        float a = X[base + j];
+        float b = X[base + j + hrot];
+        int p = POS[row];
+        // Clamp defensively: an out-of-range position must not become an
+        // out-of-bounds table read (a fault, not a wrong number).
+        uint pi = p < 0 ? 0u : (uint(p) < pc.max_pos ? uint(p) : pc.max_pos - 1u);
+        vec2 cs = CS[pi * hrot + j];
+        O[base + j] = a * cs.x - b * cs.y;
+        O[base + j + hrot] = a * cs.y + b * cs.x;
+    } else {
+        // Untouched tail: `j - hrot` counts adjacent pairs from dim `n_rot`.
+        uint src = pc.n_rot + 2u * (j - hrot);
+        O[base + src] = X[base + src];
+        O[base + src + 1u] = X[base + src + 1u];
+    }
+}

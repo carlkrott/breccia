@@ -452,7 +452,7 @@ fn report_warmup_failure(e: anyhow::Error) {
 }
 
 /// Bandwidth-bound F32 GEMV on a ~24 MiB matrix, repeated for `secs`.
-fn clock_warmup(dev: &Device, secs: f64) -> Result<()> {
+pub(crate) fn clock_warmup(dev: &Device, secs: f64) -> Result<()> {
     let gpu = dev.gpu();
     let shape = Shape::new(2560, 3072);
     let gemv = Gemv::new(gpu, QuantType::F32, shape.rows, shape.cols)?;

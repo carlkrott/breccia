@@ -11,6 +11,7 @@
 //! breccia bench transfer [--device <profile-index|pci>]... [--json PATH] [--quick]
 //! breccia bench gemv [--type T]... [--rows N --cols N] [--device <idx|pci>]... [--json PATH] [--quick] [--real]
 //! breccia bench gemv --experts 1,2,4,8,10,16 [--type T]... [--rows N --cols N]   # batched MoE decode
+//! breccia bench ops --op rmsnorm [--tokens 1,256] [--device <idx|pci>] [--json PATH]
 //! ```
 //!
 //! Behaviour: with a cached profile whose fingerprint matches (and whose
@@ -148,6 +149,26 @@ enum BenchKind {
         #[arg(long, value_name = "f32|f16", default_value = "f32")]
         accum: String,
     },
+    /// Phase 3: elementwise/utility op kernels — latency and effective GB/s
+    Ops {
+        /// One op per invocation (AGENTS.md GPU crash safety);
+        /// default = every op in sequence
+        #[arg(long = "op", value_name = "OP")]
+        ops: Vec<String>,
+        /// Batch sizes (decode = 1, prefill chunk = 256)
+        #[arg(long, value_name = "N[,N...]", value_delimiter = ',', default_values_t = [1usize, 256])]
+        tokens: Vec<usize>,
+        /// Device by cached-profile index or PCI address (repeatable);
+        /// default = every discrete GPU
+        #[arg(long = "device", value_name = "PROFILE_INDEX|PCI")]
+        device: Vec<String>,
+        /// Write the full JSON report here
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
+        /// Short benchmark windows (CI-speed, noisier numbers)
+        #[arg(long)]
+        quick: bool,
+    },
 }
 
 fn main() {
@@ -180,7 +201,9 @@ fn run(cli: Cli) -> Result<()> {
                  breccia bench transfer [--device <idx|pci>]... [--json PATH] [--quick]\n  \
                  breccia bench gemv [--type IQ3_S]... [--rows N --cols N] [--device <idx|pci>]... \\\n                 \
                  [--json PATH] [--quick] [--real [--layer N] [--role gate|up|down] [--expert E]]\n                 \
-                 [--experts 1,2,4,8,10,16] [--accum f32|f16]"
+                 [--experts 1,2,4,8,10,16] [--accum f32|f16]\n  \
+                 breccia bench ops --op rmsnorm|rope|swiglu|softmax|router|emb_gather|hc|add \\\n                 \
+                 [--tokens 1,256] [--device <idx|pci>] [--json PATH] [--quick]"
             );
             Ok(())
         }
@@ -227,6 +250,22 @@ fn run(cli: Cli) -> Result<()> {
             tensor,
             experts,
             accum,
+        }),
+        Command::Bench {
+            kind:
+                Some(BenchKind::Ops {
+                    ops,
+                    tokens,
+                    device,
+                    json,
+                    quick,
+                }),
+        } => bench_ops(OpsArgs {
+            ops,
+            tokens,
+            device,
+            json,
+            quick,
         }),
     }
 }
@@ -977,4 +1016,139 @@ fn print_gemv_summary(rep: &breccia_kernels::GemvReport) {
             c.conformance_max_rel.unwrap_or(f64::NAN),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// bench ops — Phase 3 elementwise/utility op kernels
+// ---------------------------------------------------------------------------
+
+struct OpsArgs {
+    ops: Vec<String>,
+    tokens: Vec<usize>,
+    device: Vec<String>,
+    json: Option<PathBuf>,
+    quick: bool,
+}
+
+/// Everything a `bench ops` JSON file contains: one run per device, because each
+/// device needs its own instance/logical device and its own numbers.
+#[derive(serde::Serialize)]
+struct OpsBundle {
+    schema_version: u32,
+    runs: Vec<breccia_kernels::OpsReport>,
+}
+
+fn bench_ops(args: OpsArgs) -> Result<()> {
+    use breccia_kernels::{OpKind, OpsBenchOptions};
+
+    let ops: Vec<OpKind> = args
+        .ops
+        .iter()
+        .map(|s| s.parse::<OpKind>().map_err(|e| anyhow::anyhow!(e)))
+        .collect::<Result<_>>()?;
+    let tokens: Vec<usize> = args.tokens.iter().copied().filter(|t| *t > 0).collect();
+    if tokens.is_empty() {
+        anyhow::bail!("--tokens needs at least one non-zero batch size");
+    }
+
+    let profile = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+        .ok()
+        .flatten();
+    let devices: Vec<String> = if args.device.is_empty() {
+        breccia_kernels::bench::discrete_devices()?
+    } else {
+        args.device
+            .iter()
+            .map(|spec| {
+                Ok(match selector_for(spec, profile.as_ref())? {
+                    DeviceSelector::Pci(pci) => pci,
+                    DeviceSelector::Index(i) => i.to_string(),
+                })
+            })
+            .collect::<Result<_>>()?
+    };
+
+    let mut runs = Vec::new();
+    for dev in &devices {
+        let opts = OpsBenchOptions {
+            ops: ops.clone(),
+            devices: vec![dev.clone()],
+            quick: args.quick,
+            tokens: tokens.clone(),
+        };
+        let report = breccia_kernels::run_ops_bench(&opts)
+            .with_context(|| format!("ops benchmark on {dev}"))?;
+        print_ops_summary(&report);
+        runs.push(report);
+    }
+
+    if let Some(path) = &args.json {
+        let bundle = OpsBundle {
+            schema_version: breccia_kernels::ops::OPS_SCHEMA_VERSION,
+            runs,
+        };
+        let text = serde_json::to_string_pretty(&bundle).context("serializing the ops report")?;
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
+        println!("\nwrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn print_ops_summary(rep: &breccia_kernels::OpsReport) {
+    let e = &rep.environment;
+    println!(
+        "\nop-kernel benchmark ({} mode, schema v{})",
+        if rep.quick { "quick" } else { "full" },
+        rep.schema_version
+    );
+    println!(
+        "  host {} · {} · device {} ({}) {} · subgroup {}",
+        e.hostname,
+        e.timestamp,
+        rep.device.name,
+        rep.device.device_id,
+        rep.device.pci_address,
+        rep.device.subgroup_size
+    );
+    println!(
+        "  geometry: n_embd {} · hc {}/{} · head_dim {}/n_rot {} · {} experts top-{} · n_ff {} · n_head {}",
+        e.n_embd, e.hc, e.hc_lr, e.head_dim, e.n_rot, e.n_expert, e.top_k, e.n_ff, e.n_head
+    );
+    if e.vulkan_validation {
+        println!("  validation layer: enabled");
+    }
+    for w in &rep.warnings {
+        println!("  warning: {w}");
+    }
+
+    println!(
+        "\n  {:<11} {:<20} {:>5} {:>12} {:>10} {:>9} {:>9} {:>10}",
+        "op", "case", "T", "units", "µs", "GB/s", "GFLOP/s", "MiB moved"
+    );
+    for c in &rep.cells {
+        println!(
+            "  {:<11} {:<20} {:>5} {:>12} {:>10.2} {:>9.1} {:>9.1} {:>10.2}",
+            c.op,
+            c.case,
+            c.tokens,
+            format!("{} {}", c.units, c.units_name),
+            c.us,
+            c.gbps,
+            c.gops,
+            c.bytes as f64 / (1 << 20) as f64
+        );
+    }
+    println!(
+        "  (µs is one dispatch, best of {} windows; GB/s = bytes read+written / time; \
+         timestamps {})",
+        rep.cells.first().map(|c| c.us_all.len()).unwrap_or(0),
+        if rep.cells.iter().all(|c| c.used_timestamps) {
+            "on"
+        } else {
+            "partly wall clock"
+        }
+    );
 }

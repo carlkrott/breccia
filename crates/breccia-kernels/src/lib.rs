@@ -16,6 +16,7 @@
 //! | [`Accum`] | fp32 (default) or fp16 dot-product accumulation; fp16 is a measured research path, not recommended |
 //! | [`dequant_to_f32`] | standalone block dequantiser (same decode path, used by conformance tests and by anything that needs f32 weights) |
 //! | [`GemvBatch`] | one dispatch over N routed experts' blobs (row indirection + per-expert `x`), the MoE decode shape |
+//! | [`ops`] | the elementwise/utility ops the graph needs around the GEMVs: RMSNorm, IMRoPE, SwiGLU, softmax, router top-k, quantised gather, HC mixer, residual add |
 //! | [`reference`] | scalar CPU port of `ggml-quants.c` (decode + dot) used as the conformance oracle |
 //! | [`bench`] | `breccia bench gemv`: throughput vs bytes-read, plus a real-model mode that runs the kernel on an expert tensor straight out of the GGUF mapping |
 //!
@@ -41,6 +42,7 @@ pub mod batch;
 pub mod bench;
 pub mod device;
 pub mod gemv;
+pub mod ops;
 pub mod quant;
 pub mod real;
 pub mod reference;
@@ -50,6 +52,8 @@ pub use batch::{GemvBatch, XLayout};
 pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
 pub use gemv::{dequant_to_f32, Accum, Gemv, GemvTiming};
+pub use ops::bench::{run_ops_bench, OpKind, OpsBenchOptions, OpsReport};
+pub use ops::{HcMixer, HcWeights, HcWorkspace, RmsNorm, Rope, RopeTable, Router};
 pub use quant::QuantType;
 
 #[cfg(test)]

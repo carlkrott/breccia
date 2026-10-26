@@ -1,0 +1,65 @@
+#version 450
+//
+// Elementwise activation/rescale: one shader, five modes.
+//
+// Built for the HC mixer (`docs/specs/qwen4exp-architecture.md` §4.1):
+//
+//   lo    = silu( (xn @ w_down.T) / hc )        mode SiluDiv (s = hc)
+//   w[c]  = 2 * sigmoid(inject[c] / hc)         ops_hc_write.comp (own shader)
+//
+// and for the graph's scalar rescalings:
+//
+//   out = x * s          mode Scale   (residual/attention scaling, the shared
+//                                      expert's sigmoid gate `g`, 1/sqrt(S),
+//                                      `1/kpool` for the indexer pooling)
+//   out = silu(x) * s    mode SiluScale
+//   out = sigmoid(x)     mode Sigmoid  (attention output gate, GDN output gate,
+//                                      GDN beta, the PLE signed-sqrt result)
+//
+// The DIVIDE BEFORE THE SiLU is not a detail: `silu(x/hc)` and `silu(x)/hc`
+// differ, and §4.1 writes `silu( (xn @ w_down.T) / hc )`.  `s` is the divisor in
+// `SiluDiv` and the multiplier in `Scale`/`SiluScale` — one field, named by the
+// mode's own docstring here and in `ops::ActMode`.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XVec { float X[]; };
+layout(std430, binding = 1) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint  n;
+    uint  mode;
+    float s;
+    uint  pad0;
+} pc;
+
+#include "ops_math.glsl"
+
+#define WG_X_MAX 65535u
+#define MODE_SILU 0u
+#define MODE_SILU_DIV 1u
+#define MODE_SIGMOID 2u
+#define MODE_SCALE 3u
+#define MODE_SILU_SCALE 4u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint i = wg * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    float x = X[i];
+    float y;
+    if (pc.mode == MODE_SILU) {
+        y = breccia_silu(x);
+    } else if (pc.mode == MODE_SILU_DIV) {
+        y = breccia_silu(x / pc.s);
+    } else if (pc.mode == MODE_SIGMOID) {
+        y = breccia_sigmoid(x);
+    } else if (pc.mode == MODE_SCALE) {
+        y = x * pc.s;
+    } else {
+        y = breccia_silu(x) * pc.s;
+    }
+    O[i] = y;
+}

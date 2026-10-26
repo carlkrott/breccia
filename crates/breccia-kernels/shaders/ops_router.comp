@@ -1,0 +1,146 @@
+#version 450
+//
+// MoE router in one dispatch: softmax over ALL experts -> top-k -> clamp-renormalise.
+//
+//     p    = softmax(logits)                        over all n_expert
+//     ids  = stable descending argsort(-p)[:k]      ties break by index, ascending
+//     w    = gather(p, ids)
+//     s    = max(sum(w), 2^-14)
+//     emit (ids, w / s)
+//
+// from `docs/specs/qwen4exp-architecture.md` §5.4/§8 (llama-graph.cpp:2171,2237,
+// 2251,2265-2273) and strata's independent transcription
+// (`src/kernels/cuda/router_top10.cu:3-17,108`, `max(sum, 6.103515625e-05)`).
+//
+// WHY THE SELECTION RUNS ON p, NOT ON THE LOGITS.  Ranking is monotone either
+// way, but the *clamp* is applied to the sum of the gathered probabilities, so
+// reproducing the gather form is what makes the clamp land in the same place
+// (strata's header says this explicitly).  The kernel therefore materialises
+// `p` and selects from it.
+//
+// TIES.  "Stable descending argsort, ties by ascending index" is implemented as
+// k passes of a block-wide argmax that keeps the LOWEST index on a tie: the
+// reduction compares a lower lane index against a higher one, so a tie can only
+// keep the lower one. This is the same rule as strata's
+// rank-by-counting (`rank(e) = #{f : p[f] > p[e]} + #{f < e : p[f] == p[e]}`),
+// and it is deterministic: no atomics, no workgroup ordering, one workgroup per
+// row with a fixed reduction tree.
+//
+// PRECISION.  strata accumulates the exponentials, the sum and the
+// renormalisation in **double**; `breccia-vk` does not enable `shaderFloat64`
+// (and fp64 is 1/16 rate on gfx1030), so this kernel is f32 throughout.  That
+// moves the weights by ~1e-7 relative and the ranking only when two
+// probabilities are within that — exact ties (equal logits) still tie exactly in
+// both, because `exp` is deterministic and applied to identical inputs.
+// Conformance therefore requires the **id sets to match exactly** and the
+// weights to match to 1e-5 (`docs/phase-3/04`).
+//
+// GEOMETRY.  One workgroup of 512 threads per row, `n_expert <= 512` (the
+// model's 512 exactly) and `k <= n_expert`.  Everything lives in shared memory
+// (8 KiB), so the whole router is one dispatch with 10 barriers per row.
+
+layout(local_size_x = 512) in;
+
+layout(std430, binding = 0) readonly buffer Logits { float L[]; };
+layout(std430, binding = 1) writeonly buffer Ids { uint ID[]; };
+layout(std430, binding = 2) writeonly buffer Weights { float W[]; };
+
+layout(push_constant) uniform Params {
+    uint rows;     // tokens
+    uint n_expert; // experts (<= 512)
+    uint k;        // experts to select (<= n_expert)
+    uint pad0;
+} pc;
+
+#define WG_X_MAX 65535u
+#define NEG -3.0e38
+
+shared float s_v[512];  // scratch: max / sum / argmax value
+shared uint  s_i[512];  // scratch: argmax index
+shared float s_p[512];  // probabilities
+shared uint  s_taken[512];
+shared uint  s_id[16];  // selected ids (k <= 16)
+shared float s_sel[16]; // selected probabilities, renormalised at the end
+
+void main() {
+    uint row = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint n = pc.n_expert;
+    uint k = pc.k;
+    uint base = row * n;
+    bool live = tid < n;
+
+    // ---- max: a fmax tree is exact and order-independent
+    float l = live ? L[base + tid] : NEG;
+    s_v[tid] = l;
+    barrier();
+    for (uint off = 256u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_v[tid] = max(s_v[tid], s_v[tid + off]);
+        }
+        barrier();
+    }
+    float mx = s_v[0];
+    barrier();
+
+    // ---- the n exponentials, once each
+    float e = live ? exp(l - mx) : 0.0;
+    s_v[tid] = e;
+    barrier();
+    for (uint off = 256u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_v[tid] += s_v[tid + off];
+        }
+        barrier();
+    }
+    float sum = s_v[0];
+    barrier();
+    s_p[tid] = live ? e / sum : NEG;
+    s_taken[tid] = 0u;
+    barrier();
+
+    // ---- k passes of a block-wide argmax (ties keep the lowest index)
+    for (uint i = 0u; i < k; ++i) {
+        s_v[tid] = s_taken[tid] == 0u ? s_p[tid] : NEG;
+        s_i[tid] = tid;
+        barrier();
+        for (uint off = 256u; off > 0u; off >>= 1u) {
+            if (tid < off) {
+                float ov = s_v[tid + off];
+                uint oi = s_i[tid + off];
+                float av = s_v[tid];
+                uint ai = s_i[tid];
+                if (ov > av || (ov == av && oi < ai)) {
+                    s_v[tid] = ov;
+                    s_i[tid] = oi;
+                }
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            uint id = s_i[0];
+            if (id < n) {
+                s_id[i] = id;
+                s_sel[i] = s_v[0];
+                s_taken[id] = 1u;
+            }
+        }
+        barrier();
+    }
+
+    // ---- renormalise with ggml's lower clamp (2^-14), ascending on one thread
+    if (tid == 0u) {
+        float s = 0.0;
+        for (uint i = 0u; i < k; ++i) {
+            s += s_sel[i];
+        }
+        float sc = max(s, 6.103515625e-05);
+        for (uint i = 0u; i < k; ++i) {
+            ID[row * k + i] = s_id[i];
+            W[row * k + i] = s_sel[i] / sc;
+        }
+    }
+}

@@ -1,0 +1,15 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+//
+// embedding gather + dequant for f16 — thin wrapper: block geometry + decode unit.
+// Decode semantics: shaders/blocks.glsl (dequant_f16_unit); gather body: shaders/ops_gather.glsl.
+// Adapted from ggml-vulkan (MIT), vulkan-shaders/dequant_funcs.glsl, commit 6050b46.
+//
+#define QK 8u
+#define BLOCK_WORDS 8u
+#include "blocks.glsl"
+#define DEQUANT_UNIT dequant_f16_unit
+#include "ops_gather.glsl"

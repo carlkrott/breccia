@@ -61,6 +61,33 @@ const SHADERS: &[&str] = &[
     "dequant_f16",
     "dequant_bf16",
     "dequant_f32",
+    // Phase-3 op kernels (`docs/phase-3/04-op-kernels.md`): elementwise /
+    // reduction / gather ops the forward-pass graph needs around the GEMVs.
+    "ops_rmsnorm",
+    "ops_rope",
+    "ops_swiglu",
+    "ops_softmax",
+    "ops_router",
+    "ops_act",
+    "ops_add",
+    "ops_hc_gated_mean",
+    "ops_hc_write",
+    // quantised row gather + dequant, one wrapper per type (same decode units as
+    // `dequant_<type>.comp`; `src/ops::EmbGather` selects the stem).
+    "ops_gather_iq2_xxs",
+    "ops_gather_iq2_xs",
+    "ops_gather_iq2_s",
+    "ops_gather_iq3_xxs",
+    "ops_gather_iq3_s",
+    "ops_gather_iq4_nl",
+    "ops_gather_iq4_xs",
+    "ops_gather_q4_k",
+    "ops_gather_q5_k",
+    "ops_gather_q6_k",
+    "ops_gather_q2_0",
+    "ops_gather_f16",
+    "ops_gather_bf16",
+    "ops_gather_f32",
 ];
 
 fn main() {

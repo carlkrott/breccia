@@ -1,0 +1,38 @@
+#version 450
+//
+// Residual add with a scale on the second term: `out = a + beta * b`.
+//
+// The graph's residual plumbing: `beta = 1` is the plain add of a sublayer
+// output to a stream (HC_WRITE does the per-stream version itself, because its
+// gate is per stream and lives on the device); `beta != 1` is the scaled-add form
+// used when a sublayer output needs a multiplier before it lands (the MTP `e`
+// term and the PLE insertion are the two that arrive that way,
+// `docs/specs/qwen4exp-architecture.md` §4.5/§9.2).
+//
+// Kept deliberately trivial and separate from `ops_act` so a residual update is
+// one dispatch over `n` floats with no mode branch in the inner loop. Every
+// element is read/written once, so `out` may alias `a` or `b`.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer AVec { float A[]; };
+layout(std430, binding = 1) readonly buffer BVec { float B[]; };
+layout(std430, binding = 2) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint  n;
+    float beta;
+    uint  pad0;
+    uint  pad1;
+} pc;
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint i = wg * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    O[i] = A[i] + pc.beta * B[i];
+}

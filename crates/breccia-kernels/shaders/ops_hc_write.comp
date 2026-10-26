@@ -1,0 +1,65 @@
+#version 450
+//
+// HC_WRITE: the per-stream gated residual combine.
+//
+//   w[c]     = 2 * sigmoid(inject[c] / hc)        centres the gate on 1
+//   R_out[c] = R[c] + block_out * w[c]            the SAME block_out to every stream
+//
+// (`docs/specs/qwen4exp-architecture.md` §4.1, `LC/src/models/qwen4exp.cpp:369-397`,
+// `ST/include/strata/kernels/gr.hpp:121-124`.)
+//
+// Both halves of that contract are load-bearing and both are visible here:
+// the gate is `2*sigmoid(...)` (so an `inject` of 0 gives exactly 1, i.e. a plain
+// residual add) and it is divided by `hc` **before** the sigmoid, matching the
+// `silu((xn @ w_down.T)/hc)` normalisation on the read side.
+//
+// Layout:
+//   r, out :: [n_embd, hc, T]  -> index = (c + hc*t) * n_embd + d
+//   block  :: [n_embd, T]      -> index =  t * n_embd + d
+//   inject :: [hc, T]          -> index =  t * hc + c
+//
+// One workgroup per (token, 256-element chunk) so the `hc` gate values are
+// computed once per token in shared memory instead of once per element.
+//
+// `r` and `out` may be the same buffer (in-place residual update): every element
+// is read and written by exactly one invocation.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer RVec { float R[]; };
+layout(std430, binding = 1) readonly buffer BlockVec { float B[]; };
+layout(std430, binding = 2) readonly buffer InjectVec { float INJ[]; };
+layout(std430, binding = 3) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint n_embd;
+    uint hc;      // streams (<= 32: the gate cache below is per workgroup)
+    uint tokens;
+    uint pad0;
+} pc;
+
+#include "ops_math.glsl"
+
+shared float s_w[32];
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    if (tid < pc.hc && tid < 32u) {
+        s_w[tid] = 2.0 * breccia_sigmoid(INJ[t * pc.hc + tid] / float(pc.hc));
+    }
+    barrier();
+
+    uint d = gl_WorkGroupID.x * 256u + tid;
+    if (d >= pc.n_embd) {
+        return;
+    }
+    float block = B[t * pc.n_embd + d];
+    for (uint c = 0u; c < pc.hc; ++c) {
+        uint idx = (c + pc.hc * t) * pc.n_embd + d;
+        O[idx] = R[idx] + block * s_w[c];
+    }
+}

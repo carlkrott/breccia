@@ -222,7 +222,10 @@ impl<'g> GemvBatch<'g> {
             .map_err(|e| anyhow!("{e}"))
     }
 
-    fn dispatch(&self, d: &ash::Device, cmd: vk::CommandBuffer, rows: usize) {
+    /// Record one batched dispatch. `pub(crate)` so the HC mixer
+    /// ([`crate::ops::HcMixer`]) can put a projection in the middle of its own
+    /// command buffer instead of round-tripping through `run`.
+    pub(crate) fn dispatch(&self, d: &ash::Device, cmd: vk::CommandBuffer, rows: usize) {
         // Rows per row-group = ROWS_PER_WG, wrapped over grid.y exactly like the
         // single-expert kernel (`grid.x <= 65535`).
         let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;

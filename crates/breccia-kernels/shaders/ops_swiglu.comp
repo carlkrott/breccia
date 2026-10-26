@@ -1,0 +1,46 @@
+#version 450
+//
+// SwiGLU: `out[i] = silu(gate[i]) * up[i]`, elementwise, fp32.
+//
+// This is the expert FFN activation (`docs/specs/qwen4exp-architecture.md` §5.4):
+//
+//     out = sum_j w_j * down_j( silu(gate_j @ x) * (up_j @ x) )
+//
+// so the 640-wide routed intermediate and the 640-wide shared expert are the
+// same kernel over `640 * experts * T` elements — one dispatch for the whole
+// layer's routed set (the `--experts` batching win of `docs/phase-3/02` §2)
+// instead of ten.  `docs/phase-3/01` §7 item 5 and `02` §7 item 7 both list this
+// as the natural companion of the batched GEMV: `gate` and `up` are already
+// concatenated in one output buffer (`gate` then `up`, or interleaved per row),
+// and the alternates here are simply two `float[]` views of it.
+//
+// The activation is ggml's `GGML_SILU_FP32` (see `ops_math.glsl`); the
+// shared-expert *scalar* gate is a sigmoid, a different op (`ops::Act::Sigmoid`
+// or `ops::Act::Scale`, applied after its dot product) — the spec is explicit
+// that it is sigmoid and not SiLU (§14).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer GateVec { float G[]; };
+layout(std430, binding = 1) readonly buffer UpVec { float U[]; };
+layout(std430, binding = 2) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint n;    // elements
+    uint pad0;
+    uint pad1;
+    uint pad2;
+} pc;
+
+#include "ops_math.glsl"
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint i = wg * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    O[i] = breccia_silu(G[i]) * U[i];
+}

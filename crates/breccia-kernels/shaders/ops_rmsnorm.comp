@@ -1,0 +1,71 @@
+#version 450
+//
+// Row-wise RMSNorm: `y[i] = x[i] * rsqrt(mean(x^2) + eps) * gamma[g(i)*cols + i]`.
+//
+// Covers every norm in the model (`docs/specs/qwen4exp-architecture.md` §13
+// ops 3/4/5, §14 "RMSNorm epsilon is 1e-6 everywhere"):
+//
+//   * plain hidden norm            rows = T,      cols = 2560, wgroups = 1
+//   * per-head norm (Q/K, indexer)  rows = 24*T,   cols = 256 (or 128), wgroups = 1
+//   * GDN post-recurrence (ssm)     rows = 48*T,   cols = 128, wgroups = 1
+//   * grouped RMS over the HC stack rows = hc*T,   cols = 2560, wgroups = hc
+//
+// The grouped case is the `hc_*_norm.weight [10240]` gamma viewed as
+// `[2560, hc]`: row `r` of the flat `[n_embd, hc, T]` residual stack belongs to
+// stream `r % hc`, so its gamma slice is `(r % hc) * cols`. `wgroups = 0` means
+// "no gamma" (the L2-norm predecessor of the GDN q/k normalisation, which is
+// this same kernel with gamma = 1 and eps = eps/n — see `ops::RmsNorm`).
+//
+// One workgroup per row (256 threads): the row is strided across the workgroup
+// for the sum of squares, then reduced in shared memory.  Rows are wrapped over
+// grid.y so `grid.x` stays inside the guaranteed 65535 workgroups.
+//
+// The reduction is a shared-memory tree, so it is deterministic for a fixed
+// workgroup size but not bit-identical to a serial scan; conformance is held to
+// 1e-5 relative against an f64 CPU reference (`crates/.../src/ops/cpu.rs`).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XVec { float X[]; };
+layout(std430, binding = 1) readonly buffer GVec { float G[]; };
+layout(std430, binding = 2) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint  rows;    // rows to normalise
+    uint  cols;    // row length
+    uint  wgroups; // gamma slices (0 = no gamma)
+    float eps;     // added to the mean square, inside the rsqrt
+} pc;
+
+#define WG_X_MAX 65535u
+shared float s_red[256];
+
+void main() {
+    uint row = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.cols;
+
+    float ss = 0.0;
+    for (uint i = tid; i < pc.cols; i += 256u) {
+        float v = X[base + i];
+        ss += v * v;
+    }
+    s_red[tid] = ss;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_red[tid] += s_red[tid + off];
+        }
+        barrier();
+    }
+    float inv = inversesqrt(s_red[0] / float(pc.cols) + pc.eps);
+
+    uint gbase = pc.wgroups == 0u ? 0u : (row % pc.wgroups) * pc.cols;
+    for (uint i = tid; i < pc.cols; i += 256u) {
+        float w = pc.wgroups == 0u ? 1.0 : G[gbase + i];
+        O[base + i] = X[base + i] * inv * w;
+    }
+}

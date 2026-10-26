@@ -1,0 +1,86 @@
+#version 450
+//
+// Stable row-wise softmax: `out[i] = exp(x[i] - max) / sum(exp(x - max))`.
+//
+// Two callers in the model:
+//   * the MoE router over all 512 logits (`docs/specs/qwen4exp-architecture.md`
+//     §5.4 / §8: softmax is taken over ALL experts, never over the selected
+//     subset — the `2^-14` clamp belongs to the renormalisation, so the subset
+//     form is not equivalent);
+//   * attention probabilities over the selection width (`min(n_kv, 2051)`
+//     rows, §10.4) once the attention kernel lands — the widths this must
+//     handle are 512..2048 with a ragged tail, hence no fixed-width
+//     assumptions and no shared-memory staging of the row.
+//
+// The maximum subtraction is the usual overflow guard: logits here are BF16
+// GEMV outputs and can be tens of units wide, where `exp(x)` alone overflows
+// f32 above 88.
+//
+// One workgroup per row (256 threads). The row is walked three times (max, sum,
+// write) and `exp` is evaluated twice per element: that is a deliberate
+// simplicity-for-bytes trade. At 2048 x 24 heads x T the row does not fit a
+// shared-memory staging buffer that would be safe on every device, and the
+// kernel is memory-bound (one f32 read + one write per element against two
+// transcendentals), so a second pass costs nothing measurable. The exp inputs
+// are identical in both passes, so the recomputation is exact.
+//
+// The reduction is a shared-memory tree: deterministic for a fixed workgroup
+// size, not bit-identical to a serial scan (conformance: 1e-5 relative against
+// an f64 CPU reference).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XVec { float X[]; };
+layout(std430, binding = 1) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint rows;
+    uint cols;
+    uint pad0;
+    uint pad1;
+} pc;
+
+#define WG_X_MAX 65535u
+shared float s_red[256];
+
+void main() {
+    uint row = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.cols;
+
+    float mx = -3.0e38;
+    for (uint i = tid; i < pc.cols; i += 256u) {
+        mx = max(mx, X[base + i]);
+    }
+    s_red[tid] = mx;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_red[tid] = max(s_red[tid], s_red[tid + off]);
+        }
+        barrier();
+    }
+    mx = s_red[0];
+    barrier();
+
+    float sum = 0.0;
+    for (uint i = tid; i < pc.cols; i += 256u) {
+        sum += exp(X[base + i] - mx);
+    }
+    s_red[tid] = sum;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_red[tid] += s_red[tid + off];
+        }
+        barrier();
+    }
+    float inv = 1.0 / s_red[0];
+
+    for (uint i = tid; i < pc.cols; i += 256u) {
+        O[base + i] = exp(X[base + i] - mx) * inv;
+    }
+}
