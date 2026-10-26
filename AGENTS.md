@@ -56,4 +56,4 @@ The project goal is **proper dual-GPU usage** (RX 6950 XT + Radeon VII/MI50), no
 
 ## Git
 
-See `docs/GIT-WORKFLOW.md`. No `git push` until a remote exists and the user has explicitly approved publication.
+See `docs/GIT-WORKFLOW.md`. Remote exists and is **public** (`origin` = github.com/carlkrott/breccia); push to `main` after `scripts/verify.sh` passes. Making the repo public was explicitly approved on 2026-10-26; publishing anything else (releases, packages, other remotes) still needs a fresh gate.
