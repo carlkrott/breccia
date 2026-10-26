@@ -1065,6 +1065,55 @@ impl Gpu {
         }
     }
 
+    /// Fence a **copy** against the dispatch stream, precisely: `pre` orders prior
+    /// shader writes before the copy (COMPUTE -> COPY), `!pre` orders the copy's
+    /// writes before the next dispatch (COPY -> COMPUTE).
+    ///
+    /// An `ALL_COMMANDS -> ALL_COMMANDS` barrier does both in one packet but forces
+    /// a full launch serialisation, and the copy-dense passes (chunked prefill,
+    /// merged experts) pay it 2-6 times per expert group — measured as a 10x
+    /// regression in per-group GEMM time (§8x). The stage pair here is the same
+    /// dependency without the global stall.
+    ///
+    /// # Safety
+    ///
+    /// `cmd` must be recording on the calling thread; `pre` must describe the
+    /// caller's actual producer/consumer order.
+    pub unsafe fn copy_dependency(&self, cmd: vk::CommandBuffer, pre: bool) {
+        let (src_stage, src_access, dst_stage, dst_access) = if pre {
+            (
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_WRITE,
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+            )
+        } else {
+            (
+                vk::PipelineStageFlags2::COPY,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::COMPUTE_SHADER,
+                vk::AccessFlags2::SHADER_READ,
+            )
+        };
+        let Some(f) = self.pipeline_barrier2 else {
+            // No sync2: the coarse barrier is the only correct form available.
+            unsafe { Gpu::barrier_all(&self.device, cmd) };
+            return;
+        };
+        if self.barrier_scope == BarrierScope::None {
+            return;
+        }
+        let mb = vk::MemoryBarrier2::default()
+            .src_stage_mask(src_stage)
+            .src_access_mask(src_access)
+            .dst_stage_mask(dst_stage)
+            .dst_access_mask(dst_access);
+        let dep = vk::DependencyInfo::default().memory_barriers(std::slice::from_ref(&mb));
+        // SAFETY: `cmd` is recording on this thread and the dependency is the
+        // caller's declared producer/consumer pair.
+        unsafe { f(cmd, &dep as *const vk::DependencyInfo<'_> as *const _) };
+    }
+
     fn reset_record<F: FnOnce(&ash::Device, vk::CommandBuffer)>(
         &self,
         cmd: vk::CommandBuffer,

@@ -2004,6 +2004,108 @@ round.
 - Nothing in the merged prefill changes the verdict of §8v: it stays behind
   `--prefill-merged`.
 
+## 8x. Streamed experts do not pay, copy fences must be staged, and cold vs steady-state is now a flag
+
+Three things this round: the 39 non-resident blocks got a merged **streaming** path
+(and it does not beat the host lane), a real **race** the streaming path exposed in
+the §8w barrier change (fixed with staged copy fences), and a **`--warm` +
+`cache`** protocol because this box's I/O behaviour had been misread all along.
+
+### 1. Cold vs steady-state is now measured, not inferred (`--warm N`)
+
+`bench agents` and `bench token` take `--warm N` (N full generations before the
+window) and print
+
+```
+cache    {GiB} read from storage during the measured window ({MiB}/prompt token) · --warm N
+```
+
+from `/proc/self/io` `read_bytes` (page faults included). Combined with the paired
+research's btrfs read-ahead fix (8 MiB -> 128 KiB per backing device), the picture
+changed completely:
+
+| 2 agents x 64 prefix, 8 gen steps | storage read in the window | decode aggregate |
+|---|---:|---:|
+| token-by-token, `--warm 1` | 1.09 GiB (8.8 MiB/token) | 8.61 / 13.83 |
+| merged+streamed, `--warm 1` | 0.11 GiB (0.9 MiB/token) | 14.56 / 13.30 |
+| 300-prefix, token-by-token | 4.30 GiB (7.3 MiB/token) | 12.40 |
+| 300-prefix, merged+streamed | 0.15 GiB (0.3 MiB/token) | 13.39 |
+
+**Steady-state decode gate (2 streams, 8 steps, 64-token prefixes, `--warm 1`):
+13.3-14.6 tok/s aggregate.** The 9.3-13.1 numbers of §8w were measured with the old
+8 MiB read-ahead and are **not comparable**; the 26 GiB/window cold reads quoted
+there are gone (a cold 64-prefix window is now ~1 GiB).
+
+### 2. Streamed (non-resident) experts: built, parity-clean, and it does not pay (A)
+
+`--prefill-merged` now also covers blocks with no arena: per chunk, per **distinct**
+expert, the three blobs are memcpy'd out of the mmap into one of `STREAM_SLOTS = 8`
+host-visible slots (`[gate | up | down]`), copied to the device inside the batch,
+and the same three multi-user GEMMs + `SwiGLU` + fan-in run with `base_words = 0`.
+Eight experts ride one submit, so a chunk pays one fence per 8 experts per block.
+A block whose role type has no multi-user GEMM keeps the per-token host lane
+(documented fallback; today that only ever triggers for the *shared-expert* shapes,
+never for a routed-expert role).
+
+Parity: **32/32 at chunk 8/16/32/128 and with `--prefill-merged`**, and on the RX
+the streamed path's top-1 logit is **identical** to the non-chunked, non-streamed
+run (13.170561) — the streaming is numerically invisible, which is what the §8v
+bit-identity buys.
+
+Measured, 2 agents x 300 prefix, 8 gen, dual, `--warm 1`:
+
+| prefill | tok/s per agent |
+|---|---:|
+| token by token | **6.45** |
+| chunk 128 + merged (39 blocks streamed) | 6.07 |
+
+and at 64-token prefixes: 4.33 / 7.02 (baseline) against 5.11 / 5.07 (streamed) —
+*direction of the delta is inside this window's noise*, and at the longer prefix it
+is 6 % worse. Meanwhile the bytes read fall **25x** (0.15 vs 4.30 GiB) — so the
+lane is no longer I/O-bound (the read-ahead fix removed that), and the streaming
+pass costs more than the lane's per-token dequantisation because **it does not
+overlap**: `fill slot -> copy -> 3 GEMMs` per expert, serialised by the slot flush.
+
+Per-group cost says the same thing: **429-530 µs per expert group** for the streamed
+blocks against 67-84 µs for the resident ones (§8v). The next step is not a bigger
+slot: it is **prefetching expert `e+1` while `e` computes** — the `TransferRing` the
+plan named — plus the fused single-dispatch MoE the exllamav2 audit prices at
+2.0 -> 1.0-1.2 ms/block.
+
+### 3. The race the streaming path found: copy fences must be staged
+
+Streaming 1.7 MB per expert made a latent bug in §8w's barrier change visible: the
+per-dispatch fence is now `COMPUTE -> COMPUTE`, which by construction does **not**
+order `COPY -> COMPUTE`; the copies had only a *pre* barrier, so a GEMM could read
+its upload before it landed. Symptom: the MI50 produced `max |Δlogit| 2.46` between
+two identical prompts (non-deterministic) and the wrong top-1 logit, while the RX
+happened to pass — a lucky-timing race that only large copies expose.
+
+`Gpu::copy_dependency(cmd, pre)` now emits the precise pair
+(`COMPUTE_SHADER/SHADER_WRITE -> COPY/TRANSFER_WRITE` before,
+`COPY/TRANSFER_WRITE -> COMPUTE_SHADER/SHADER_READ` after) and `record_copy`/
+`record_copies` fence both sides with it. Determinism returned
+(`max |Δlogit| 0.000e0`) **and** the coarse `ALL_COMMANDS -> ALL_COMMANDS` form the
+first fix used cost 10x per group (715 -> 429-530 µs), so the staged form is also
+the fast one. Parity re-verified 32/32 on both devices.
+
+### 4. Not done, with the measured reason (B, D)
+
+* **T-batched shared expert (B)**: blocked on kernels, not on orchestration. The
+  shared expert's `gate`/`up` are `IQ4_XS`/`Q4_K`/`Q5_K`/`Q6_K`, which have **no**
+  multi-user GEMM (the delivered set is IQ4_NL, Q2_0, IQ2_XXS/XS/S, IQ3_XXS/S);
+  only its `down` (IQ4_NL 40 blocks, Q2_0 8) could be batched today. The 15.4
+  ms/token in §8w's trace also belongs to PLE + shared expert together, and the
+  research shows the PLE half is a **single-threaded cold gather** (65 µs per cold
+  90-byte row, 48x btrfs extent over-read) — so the ordered fix is: batch the PLE
+  gather per chunk (one flush for T tokens instead of two per token, which is the
+  `ple 1.3 -> 14.7 ms` regression in §8w), *then* add the four missing multi-user
+  kernels, *then* the shared expert.
+* **Item D (madvise / fadvise)**: not attempted — the paired research measures
+  `MADV_RANDOM`/`FADV_RANDOM` as worse or ignored and `O_DIRECT` as throwing away
+  the 58 GB/s warm cache, and the actual lever (btrfs `read_ahead_kb`) is fixed at
+  the filesystem, outside this engine.
+
 ## 9. Exact commands
 
 

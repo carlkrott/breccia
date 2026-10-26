@@ -531,12 +531,12 @@ pub fn record_copy(
         .dst_offset(dst_off)
         .size(len);
     unsafe {
-        transfer_barrier(&gpu.device, cmd);
+        gpu.copy_dependency(cmd, true);
         gpu.device
             .cmd_copy_buffer(cmd, src.buf, dst.buf, std::slice::from_ref(&region));
         // See `record_copies`: the compute-scoped dispatch barrier does not cover
         // COPY -> COMPUTE, so the copy closes its own dependency.
-        transfer_barrier(&gpu.device, cmd);
+        gpu.copy_dependency(cmd, false);
     }
     Ok(())
 }
@@ -608,7 +608,7 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
     }
     unsafe {
         // Before: the writes this copy consumes (shader or earlier transfer).
-        transfer_barrier(&gpu.device, cmd);
+        gpu.copy_dependency(cmd, true);
         for (src, dst, regions) in &groups {
             gpu.device.cmd_copy_buffer(cmd, *src, *dst, regions);
         }
@@ -617,8 +617,8 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
         // construction does not cover COPY -> COMPUTE, so a copy that feeds a
         // dispatch must close its own dependency. Without this the streamed-expert
         // GEMMs race their uploads — measured as non-deterministic logits on the
-        // MI50 (max |Δlogit| 2.46 between two identical prompts, §8x).
-        transfer_barrier(&gpu.device, cmd);
+        // MI50 (max |Δlogit| 2.46 between two identical prompts, §8w/§8x).
+        gpu.copy_dependency(cmd, false);
     }
     Ok(())
 }
@@ -666,6 +666,10 @@ pub fn record_barrier_to_host(gpu: &Gpu) -> Result<()> {
     Ok(())
 }
 
+/// The coarse `ALL_COMMANDS -> ALL_COMMANDS` memory barrier. The copy paths use
+/// [`Gpu::copy_dependency`] instead (precise stages, no global stall); this stays
+/// for callers that need to fence everything at once.
+#[allow(dead_code)]
 unsafe fn transfer_barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)

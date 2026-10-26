@@ -680,7 +680,7 @@ impl<'m> Session<'m> {
                     u_max = u_max.max(e.up.bytes());
                     d_max = d_max.max(e.down.bytes());
                 }
-                let align = |v: usize| ((v as u64 + 255) & !255) as u64;
+                let align = |v: usize| (v as u64 + 255) & !255;
                 let (gb, ub, db) = (align(g_max), align(u_max), align(d_max));
                 let slot_stride = gb + ub + db;
                 Some(PfChunk {
@@ -1649,9 +1649,7 @@ impl<'m> Session<'m> {
             let pipes = &self.venues[dev].pipes;
             // A role type with no multi-user GEMM keeps the per-token path for
             // that block (documented fallback, §8v/§8x).
-            let ready = [gt, ut, dt]
-                .iter()
-                .all(|ty| pipes.gemm(*ty).is_some());
+            let ready = [gt, ut, dt].iter().all(|ty| pipes.gemm(*ty).is_some());
             if ready {
                 return self.prefill_block_merged(b, t, pos0, pe);
             }
@@ -1833,13 +1831,7 @@ impl<'m> Session<'m> {
     /// tokens gives 8-13 users per distinct expert, so the bytes read from the
     /// mmap drop by that factor too — which matters because the lane is I/O-bound
     /// on this box (§8x).
-    fn fill_stream_slot(
-        &mut self,
-        dev: usize,
-        b: usize,
-        expert: usize,
-        slot: usize,
-    ) -> Result<()> {
+    fn fill_stream_slot(&mut self, dev: usize, b: usize, expert: usize, slot: usize) -> Result<()> {
         let m = self.model;
         let t0 = std::time::Instant::now();
         let slices = m.layers[b]
@@ -2050,7 +2042,7 @@ impl<'m> Session<'m> {
                 prev_expert = Some(*e);
                 // Refill a slot; when the slots are exhausted, drain first so the
                 // in-flight copies never see the next expert's bytes.
-                if expert_index > 0 && expert_index % STREAM_SLOTS == 0 {
+                if expert_index > 0 && expert_index.is_multiple_of(STREAM_SLOTS) {
                     let t0 = std::time::Instant::now();
                     self.submit_batch()?;
                     self.flush()?;
