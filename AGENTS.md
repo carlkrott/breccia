@@ -54,6 +54,14 @@ The project goal is **proper dual-GPU usage** (RX 6950 XT + Radeon VII/MI50), no
   per-block round trips matter).
 - A single-card number is a diagnostic, never a target or a gate.
 
+## Paired research (standing rule, 2026-10-26)
+
+Every time an implementation or test subagent is launched, launch **one paired research subagent** alongside it that:
+1. audits Vulkan parameters/features/extensions we are not using, tied to the current bottleneck (driver caps, memory types, pipeline/shader features, subgroup and int-dot paths, RADV knobs), and
+2. audits **one** inference engine not yet covered, extracting workflows, methods and specific advantages to adapt, with a measurable sketch.
+
+Output goes to `docs/research/NN-<engine>.md`; the rotation and coverage table live in `docs/research/README.md`. Research subagents are read-only and never modify engine code. Implementation agents cite the research item they consume.
+
 ## Git
 
 See `docs/GIT-WORKFLOW.md`. Remote exists and is **public** (`origin` = github.com/carlkrott/breccia); push to `main` after `scripts/verify.sh` passes. Making the repo public was explicitly approved on 2026-10-26; publishing anything else (releases, packages, other remotes) still needs a fresh gate.
