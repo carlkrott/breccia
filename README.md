@@ -45,7 +45,7 @@ Breccia/
 |---|---|
 | 0 — baselines, backend risk, specs, reference engines | **complete — Gate A passed** (`docs/phase-0/gate-A-report.md`) |
 | 1 — workspace, `breccia-profile` (M1a), launch-flag surface | in progress — `breccia profile` verified on hardware (`docs/phase-1/01-profile-report.md`); flag parser landing |
-| 2 — DMA/transfer harness, kernels, forward pass | planned |
+| 2 — DMA/transfer harness, format loader, kernels | in progress — transfer ring measured (`docs/phase-2/01-transfer-harness.md`); loader + kernels landing |
 
 Backend decision (2026-10-26): **Vulkan primary**, HIP-style launch flags preserved, HIP secondary. Architecture rules from Gate A: RX 6950 XT = streaming/compute home; MI50 = static-resident only (PCIe ≈2.9 GB/s, no DMA overlap); expert-parallel placement by default.
 
