@@ -52,7 +52,7 @@ use crate::stats::{Checksum, GdnTrace, LayerTrace};
 use crate::xfer::{Mailbox, Staging};
 
 /// Per-stage timer slots, in graph order.
-pub const STAGES: [&str; 15] = [
+pub const STAGES: [&str; 16] = [
     "embed",
     "ple",
     "hc-read(attn)",
@@ -61,6 +61,7 @@ pub const STAGES: [&str; 15] = [
     "hc-read(ffn)",
     "router",
     "shared-exp",
+    "wait-gpu",
     "xfer-down",
     "experts(host)",
     "xfer-up",
@@ -78,16 +79,18 @@ const HC_WRITE_A: usize = 4;
 const HC_READ_F: usize = 5;
 const ROUTER: usize = 6;
 const SHARED: usize = 7;
-const XFER_DOWN: usize = 8;
-const EXPERTS: usize = 9;
-const XFER_UP: usize = 10;
-const HC_WRITE_F: usize = 11;
-const HANDOFF: usize = 12;
-const FINAL_HC: usize = 13;
-const HEAD: usize = 14;
+const WAIT_GPU: usize = 8;
+const XFER_DOWN: usize = 9;
+const EXPERTS: usize = 10;
+const XFER_UP: usize = 11;
+const HC_WRITE_F: usize = 12;
+const HANDOFF: usize = 13;
+const FINAL_HC: usize = 14;
+const HEAD: usize = 15;
 
-/// Batches the `BRECCIA_GPU_TIME` probe stamps (one token's worth).
-const GPU_PROBE_BATCHES: usize = 56;
+/// Batches the `BRECCIA_GPU_TIME` probe holds before reading the pool out and
+/// starting again (256 batches = ~5 tokens of a two-stream run).
+const GPU_PROBE_BATCHES: usize = 256;
 
 /// Wall-clock accounting: host-side deltas around synchronous dispatch groups.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -142,7 +145,7 @@ impl Timers {
             self.ns[self.stage] += last.elapsed().as_nanos() as u64;
         }
     }
-    fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.ns = [0; STAGES.len()];
         self.dispatches = [0; STAGES.len()];
         self.last = None;
@@ -221,9 +224,9 @@ pub struct Venue<'m> {
 }
 
 /// Session setup.
-#[derive(Clone, Debug)]
+#[derive(Clone, Default)]
 pub struct SessionCfg {
-    /// KV cells each QSA layer may use.
+    /// KV cells each QSA layer may use (0 = the default, 256).
     pub ctx_capacity: usize,
     /// Host expert-lane threads (`0` = the lane's default).
     pub threads: usize,
@@ -234,16 +237,37 @@ pub struct SessionCfg {
     /// the generated tokens are bit-identical with it on and off on all three
     /// device configurations (`docs/phase-4/01-forward-pass.md` §8).
     pub batching: bool,
+    /// Enable the GPU-time probe (`BRECCIA_GPU_TIME=1` also turns it on).
+    /// It stamps every batch, so a two-stream run can report per-card
+    /// utilisation instead of only fence waits.
+    pub probe: bool,
+    /// Share one host expert lane between sessions (two-stream decode).
+    ///
+    /// The lane's workers are `threads` OS threads; two streams run their lanes
+    /// **serially** (each one hides under the other's GPU work), so a shared pool
+    /// is the right shape: 16 threads serve both streams, not 32.
+    pub pool: Option<std::sync::Arc<std::sync::Mutex<ExpertPool>>>,
 }
 
-impl Default for SessionCfg {
-    fn default() -> Self {
-        SessionCfg {
-            ctx_capacity: 256,
-            threads: 0,
-            timers: false,
-            batching: true,
-        }
+/// Reset the host-side record/wait accumulators (per measured window).
+pub fn batch_cmd_reset() {
+    batch_cmd::reset_record_seconds();
+}
+
+/// The per-stage digests [`Session::submit_block`] takes while recording — the
+/// debug trace's inputs, carried to [`Session::finish_block`] because the trace
+/// also needs the router's ids and the MoE result.
+#[derive(Clone, Debug, Default)]
+pub struct BlockDigests {
+    pub mixed_attn: Option<Checksum>,
+    pub mixer_out: Option<Checksum>,
+    pub mixed_ffn: Option<Checksum>,
+}
+
+fn kind_name(m: &Model, b: usize) -> String {
+    match m.layers[b].kind {
+        LayerKind::Gdn => "gdn".to_string(),
+        LayerKind::Qsa => "qsa".to_string(),
     }
 }
 
@@ -264,7 +288,7 @@ pub struct Session<'m> {
     /// outside the batch, release after it) plus eleven allocations per layer
     /// per token — 24 round trips a token, ~19 ms.
     qsa_ws: Vec<Option<QsaWorkspace>>,
-    pool: ExpertPool,
+    pool: std::sync::Arc<std::sync::Mutex<ExpertPool>>,
     ple: Option<PleHost>,
     sampler: Sampler,
     pub sampling: Sampling,
@@ -276,6 +300,19 @@ pub struct Session<'m> {
     /// one, because the batching flag is per thread while each device owns its
     /// own command buffer.
     pending_batch: Option<usize>,
+    /// The segment a block submitted but whose fence has not been waited for.
+    /// Two-stream decode keeps one of these per session in flight, so stream A's
+    /// block executes while stream B's expert lane runs (§8o).
+    pending_seg: Option<breccia_kernels::batch_cmd::Segment>,
+    pending_dev: Option<usize>,
+    /// Position of the token being processed (QSA's rope/selection input).
+    pos: usize,
+    /// The token id being processed (the PLE hash needs it).
+    cur_tok: u32,
+    /// Host seconds inside the expert lane, and the share of them that ran while
+    /// **another stream's** GPU work was in flight — the overlap efficiency.
+    pub lane_s: f64,
+    pub lane_covered_s: f64,
     /// Submits and recorded dispatches, for the report's before/after.
     pub submits: u64,
     pub dispatches: u64,
@@ -285,6 +322,8 @@ pub struct Session<'m> {
     /// the number of batches stamped so far (`None` = done or disabled).
     probe_pools: Vec<ash::vk::QueryPool>,
     probe_batches: Option<u32>,
+    /// Accumulated GPU-busy seconds per device (the probe's total).
+    gpu_busy_s: Vec<f64>,
     /// Per device: fence-wait seconds and host↔device bytes, so a dual run can
     /// say what *each* card did instead of only a total.
     pub dev_wait_s: Vec<f64>,
@@ -300,6 +339,11 @@ impl<'m> Session<'m> {
     /// Compile every pipeline, allocate every buffer, zero the state.
     pub fn new(model: &'m Model, cfg: &SessionCfg) -> Result<Self> {
         let mc = &model.cfg;
+        let ctx_capacity = if cfg.ctx_capacity == 0 {
+            256
+        } else {
+            cfg.ctx_capacity
+        };
         let head_dev = model.device_of(mc.n_layers - 1);
         let emb_ty = ty_of(model, "token_embd.weight")?;
         let ple_ty = ty_of(model, "per_layer_token_embd.weight")?;
@@ -332,7 +376,7 @@ impl<'m> Session<'m> {
                 (None, None)
             };
             let qsa = if needs_qsa {
-                Some(Qsa::new(gpu, cfg.ctx_capacity.max(8))?)
+                Some(Qsa::new(gpu, ctx_capacity.max(8))?)
             } else {
                 None
             };
@@ -439,7 +483,7 @@ impl<'m> Session<'m> {
                     qsa_state.push(None);
                 }
                 LayerKind::Qsa => {
-                    let st = QsaState::new(gpu, cfg.ctx_capacity, cfg.ctx_capacity.max(8))
+                    let st = QsaState::new(gpu, ctx_capacity, ctx_capacity.max(8))
                         .with_context(|| format!("allocating the QSA state of block {b}"))?;
                     gdn_state.push(None);
                     qsa_state.push(Some(st));
@@ -460,7 +504,7 @@ impl<'m> Session<'m> {
                 .qsa
                 .as_ref()
                 .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
-            qsa_ws.push(Some(qsa.workspace(gpu, 1, cfg.ctx_capacity)?));
+            qsa_ws.push(Some(qsa.workspace(gpu, 1, ctx_capacity)?));
         }
 
         let threads = if cfg.threads == 0 {
@@ -468,7 +512,14 @@ impl<'m> Session<'m> {
         } else {
             cfg.threads
         };
-        let pool = ExpertPool::new(std::sync::Arc::clone(&model.shards), threads, cpu::path());
+        let pool = match &cfg.pool {
+            Some(p) => std::sync::Arc::clone(p),
+            None => std::sync::Arc::new(std::sync::Mutex::new(ExpertPool::new(
+                std::sync::Arc::clone(&model.shards),
+                threads,
+                cpu::path(),
+            ))),
+        };
         let ple = match &model.ple {
             Some(p) => Some(PleHost::new(
                 mc,
@@ -497,11 +548,17 @@ impl<'m> Session<'m> {
             forwards: 0,
             expert_bytes: 0,
             pending_batch: None,
+            pending_seg: None,
+            pending_dev: None,
+            pos: 0,
+            cur_tok: 0,
+            lane_s: 0.0,
+            lane_covered_s: 0.0,
             submits: 0,
             dispatches: 0,
             batching: cfg.batching,
             probe_pools: {
-                let on = std::env::var_os("BRECCIA_GPU_TIME").is_some();
+                let on = cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some();
                 let mut v = Vec::with_capacity(model.devices.len());
                 for i in 0..model.devices.len() {
                     v.push(if on {
@@ -515,11 +572,12 @@ impl<'m> Session<'m> {
                 }
                 v
             },
-            probe_batches: if std::env::var_os("BRECCIA_GPU_TIME").is_some() {
+            probe_batches: if cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some() {
                 Some(0)
             } else {
                 None
             },
+            gpu_busy_s: vec![0.0; model.devices.len()],
             dev_wait_s: vec![0.0; model.devices.len()],
             dev_down: vec![0; model.devices.len()],
             dev_up: vec![0; model.devices.len()],
@@ -535,7 +593,21 @@ impl<'m> Session<'m> {
         })
     }
 
-    /// Close the open batch (submit once, wait once), if any.
+    /// This session's devices (one model's placement).
+    fn device_gpus(&self) -> Vec<&breccia_vk::ctx::Gpu> {
+        self.model.devices.iter().map(|d| d.gpu()).collect()
+    }
+
+    /// Is a segment of this session's still in flight?
+    pub fn in_flight(&self) -> bool {
+        self.pending_seg.is_some() || self.pending_batch.is_some()
+    }
+
+    /// Close the open batch and wait for **this session's** submissions.
+    ///
+    /// Scoped to `self.model`'s devices: with two sessions (one per stream, each
+    /// on its own card) a flush of stream A must not wait for stream B's GPU
+    /// work — that would serialise exactly what the interleave is for.
     fn flush(&mut self) -> Result<()> {
         if let Some(d) = self.pending_batch.take() {
             let rec = batch_cmd::recorded();
@@ -543,12 +615,54 @@ impl<'m> Session<'m> {
             self.timers.count_dispatches(stage, rec);
             let gpu = self.model.devices[d].gpu();
             self.probe_stamp(d, true)?;
-            let wait = batch_cmd::end(gpu)
+            let seg = batch_cmd::end_submit(gpu, None)
                 .map_err(|e| anyhow!("closing the dispatch batch on device {d}: {e}"))?;
-            self.dev_wait_s[d] += wait;
             self.submits += 1;
-            self.dispatches += u64::from(batch_cmd::recorded());
+            self.dispatches += u64::from(rec);
+            self.pending_seg = Some(seg);
+            self.pending_dev = Some(d);
         }
+        if let Some(seg) = self.pending_seg.take() {
+            let d = self.pending_dev.take();
+            let wait = {
+                let gpus = self.device_gpus();
+                batch_cmd::wait(&gpus, seg)
+                    .map_err(|e| anyhow!("waiting for a block segment: {e}"))?
+            };
+            if let Some(d) = d {
+                self.dev_wait_s[d] += wait;
+            } else if let Some(v) = self.dev_wait_s.first_mut() {
+                *v += wait;
+            }
+        }
+        let wait = {
+            let gpus = self.device_gpus();
+            batch_cmd::wait_all(&gpus)
+                .map_err(|e| anyhow!("waiting for the in-flight segments: {e}"))?
+        };
+        if let Some(v) = self.dev_wait_s.first_mut() {
+            *v += wait;
+        }
+        Ok(())
+    }
+
+    /// Submit the open batch without waiting; the fence is kept in
+    /// [`Session::pending_seg`] so [`Session::finish_block`] can wait for it.
+    fn submit_batch(&mut self) -> Result<()> {
+        let Some(d) = self.pending_batch.take() else {
+            return Ok(());
+        };
+        let gpu = self.model.devices[d].gpu();
+        let rec = batch_cmd::recorded();
+        let stage = self.timers.stage;
+        self.timers.count_dispatches(stage, rec);
+        self.probe_stamp(d, true)?;
+        let seg = batch_cmd::end_submit(gpu, None)
+            .map_err(|e| anyhow!("submitting the block on device {d}: {e}"))?;
+        self.submits += 1;
+        self.dispatches += u64::from(rec);
+        self.pending_seg = Some(seg);
+        self.pending_dev = Some(d);
         Ok(())
     }
 
@@ -590,27 +704,31 @@ impl<'m> Session<'m> {
         let Some(k) = self.probe_batches else {
             return Ok(());
         };
-        if k as usize >= GPU_PROBE_BATCHES {
-            return Ok(());
-        }
         let pool = self.probe_pools[dev];
         let query = 2 * k + u32::from(end);
         batch_cmd::record_timestamp(self.model.devices[dev].gpu(), pool, query)?;
         if end {
-            self.probe_batches = Some(k + 1);
+            let k = k + 1;
+            if k as usize >= GPU_PROBE_BATCHES {
+                // The pool is full: read it out and start again, so the probe
+                // measures the whole run rather than its first 256 batches.
+                self.probe_flush()?;
+            } else {
+                self.probe_batches = Some(k);
+            }
         }
         Ok(())
     }
 
-    /// Print and disable the GPU-time probe (called once a token).
-    fn probe_report(&mut self) -> Result<()> {
+    /// Read the pending probe timestamps into [`Session::gpu_busy_s`] and reset
+    /// the pools (the caller has waited for the submissions that wrote them).
+    fn probe_flush(&mut self) -> Result<()> {
         let Some(k) = self.probe_batches else {
             return Ok(());
         };
         if k == 0 {
             return Ok(());
         }
-        let mut lines = Vec::new();
         for (i, pool) in self.probe_pools.iter().enumerate() {
             if *pool == ash::vk::QueryPool::null() {
                 continue;
@@ -619,33 +737,101 @@ impl<'m> Session<'m> {
             let ts = gpu
                 .timestamps(*pool, k)
                 .map_err(|e| anyhow!("reading the GPU-time probe: {e}"))?;
-            let mut spans = Vec::new();
+            let mut sum = 0.0f64;
             for c in ts.chunks_exact(2) {
-                spans.push(c[1] - c[0]);
+                // A batch that belongs to the other device leaves a (0, 0) pair.
+                if c[1] >= c[0] {
+                    sum += c[1] - c[0];
+                }
             }
-            if spans.is_empty() {
-                continue;
+            self.gpu_busy_s[i] += sum / 1e9;
+            gpu.reset_queries(*pool, 2 * GPU_PROBE_BATCHES as u32);
+        }
+        self.probe_batches = Some(0);
+        Ok(())
+    }
+
+    /// GPU seconds each of this session's devices was busy, from the probe
+    /// (flushed, so it is current). Zero when the probe is off.
+    pub fn gpu_busy_s(&mut self) -> Result<Vec<f64>> {
+        self.probe_flush()?;
+        Ok(self.gpu_busy_s.clone())
+    }
+
+    /// Zero the per-run counters (the decode window starts after the prompt).
+    pub fn reset_counters(&mut self) -> Result<()> {
+        self.forwards = 0;
+        self.expert_bytes = 0;
+        self.lane_s = 0.0;
+        self.lane_covered_s = 0.0;
+        self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
+        self.dev_down.iter_mut().for_each(|x| *x = 0);
+        self.dev_up.iter_mut().for_each(|x| *x = 0);
+        self.timers.clear();
+        self.reset_gpu_busy()
+    }
+
+    /// Zero the probe's accumulated busy time and drop any unread timestamps, so
+    /// the next window is measured from scratch.
+    pub fn reset_gpu_busy(&mut self) -> Result<()> {
+        for (i, pool) in self.probe_pools.iter().enumerate() {
+            if *pool != ash::vk::QueryPool::null() {
+                self.model.devices[i]
+                    .gpu()
+                    .reset_queries(*pool, 2 * GPU_PROBE_BATCHES as u32);
             }
-            let sum: f64 = spans.iter().sum();
-            let max = spans.iter().cloned().fold(0.0f64, f64::max);
-            lines.push(format!(
-                "device {i}: {} batches, GPU busy {:.2} ms/token, mean {:.0} us, max {:.0} us",
-                spans.len(),
-                sum / 1e6,
-                sum / spans.len() as f64 / 1e3,
-                max / 1e3
-            ));
         }
-        for l in lines {
-            eprintln!("gpu-time {l}");
+        if self.probe_batches.is_some() {
+            self.probe_batches = Some(0);
         }
-        self.probe_batches = None;
+        self.gpu_busy_s.iter_mut().for_each(|x| *x = 0.0);
+        Ok(())
+    }
+
+    /// Print and disable the GPU-time probe (called once a token).
+    fn probe_report(&mut self) -> Result<()> {
+        self.probe_flush()?;
+        if std::env::var_os("BRECCIA_GPU_TIME_VERBOSE").is_some() {
+            for (i, s) in self.gpu_busy_s.iter().enumerate() {
+                eprintln!(
+                    "gpu-time device {i}: GPU busy {:.2} ms over {} token(s)",
+                    s * 1e3,
+                    self.forwards.max(1)
+                );
+            }
+        }
         Ok(())
     }
 
     /// Threads the host expert lane is running.
     pub fn threads(&self) -> usize {
-        self.pool.threads()
+        self.pool.lock().map(|p| p.threads()).unwrap_or(0)
+    }
+
+    /// The pool this session draws its expert lane from (shared by design in a
+    /// two-stream run).
+    pub fn pool(&self) -> &std::sync::Arc<std::sync::Mutex<ExpertPool>> {
+        &self.pool
+    }
+
+    /// Sample the next token from `logits` with this session's sampler and
+    /// sampling settings.
+    pub fn sample(&mut self, logits: &[f32]) -> Option<u32> {
+        self.sampler.sample(logits, &self.sampling)
+    }
+
+    /// The device this session's block `b` runs on (for per-card reporting).
+    pub fn device_of(&self, b: usize) -> usize {
+        self.model.device_of(b)
+    }
+
+    /// `(name, pci address)` of each of this session's devices.
+    pub fn device_names(&self) -> Vec<(String, String)> {
+        self.model
+            .devices
+            .iter()
+            .map(|d| (d.info.name.clone(), d.info.pci_address.clone()))
+            .collect()
     }
 
     /// Zero every recurrent state and the PLE history — a new sequence.
@@ -737,12 +923,30 @@ impl<'m> Session<'m> {
     }
 
     /// Run one token at `pos`; returns its logits.
+    /// One token, start to finish: the single-stream convenience wrapper over
+    /// [`Session::begin_token`] / [`Session::submit_block`] /
+    /// [`Session::finish_block`] / [`Session::end_token`].
     pub fn token(
         &mut self,
         tok: u32,
         pos: usize,
         debug: Option<&mut Vec<LayerTrace>>,
     ) -> Result<Vec<f32>> {
+        let mut trace = debug;
+        self.begin_token(tok, pos)?;
+        let n = self.model.cfg.n_layers;
+        for b in 0..n {
+            let digests = self.submit_block(b, &mut trace)?;
+            self.finish_block(b, digests, &mut trace, false)?;
+        }
+        self.end_token()
+    }
+
+    /// Embed the token into the residual stack and start the per-token timers.
+    ///
+    /// Split out so two sessions can be driven block by block with one stream's
+    /// GPU work running under the other stream's expert lane (§8o).
+    pub fn begin_token(&mut self, tok: u32, pos: usize) -> Result<()> {
         let m = self.model;
         let mc = &m.cfg;
         if pos >= mc.n_ctx_max {
@@ -751,8 +955,8 @@ impl<'m> Session<'m> {
                 mc.n_ctx_max
             );
         }
-        let mut trace = debug;
-
+        self.pos = pos;
+        self.cur_tok = tok;
         // ---- embedding: 4 gathered rows ARE the hc copies of the vector ------
         self.flush()?;
         self.timers.start();
@@ -766,68 +970,25 @@ impl<'m> Session<'m> {
             v.emb.release(gpu, &staged);
         }
         self.timers.mark(PLE);
-
-        for block in 0..mc.n_layers {
-            self.block(block, pos, tok, &mut trace)?;
-        }
-
-        // ---- the final mixer (the output norm) and the head ------------------
-        self.flush()?;
-        self.timers.mark(FINAL_HC);
-        let last = m.device_of(mc.n_layers - 1);
-        self.ensure_batch(last)?;
-        {
-            let v = &self.venues[last];
-            let hw = HcWeights {
-                norm: &m.out_hc_norm,
-                down: &m.out_hc_down.buf,
-                up: &m.out_hc_up.buf,
-                inject: None,
-            };
-            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-            v.final_hc.read(ws, &v.r, &hw)?;
-            self.timers.mark(HEAD);
-            let out = v
-                .logits
-                .as_ref()
-                .ok_or_else(|| anyhow!("the last device has no logits buffer"))?;
-            v.pipes.get(&m.head.key)?.run(&m.head.buf, &ws.mixed, out)?;
-        }
-        self.flush()?;
-        let logits_buf = self.venues[last]
-            .logits
-            .as_ref()
-            .ok_or_else(|| anyhow!("the last device has no logits buffer"))?;
-        let raw = self.stagings[last]
-            .read_batch(m.devices[last].gpu(), &[(logits_buf, 0, mc.vocab * 4)])?;
-        self.timers.stop();
-        self.probe_report()?;
-        self.forwards += 1;
-        let values = f32_from_bytes(&raw[0]);
-        if values.len() != mc.vocab {
-            bail!(
-                "the head produced {} logits, expected {}",
-                values.len(),
-                mc.vocab
-            );
-        }
-        // A non-finite logit is a numerical failure, not a sampling preference.
-        if let Some(i) = values.iter().position(|v| !v.is_finite()) {
-            bail!("logit {i} is not finite ({})", values[i]);
-        }
-        Ok(values)
+        Ok(())
     }
 
-    /// One block, start to finish.
-    fn block(
+    /// Record block `b` and **submit it without waiting**.
+    ///
+    /// The segment it submits contains the previous block's ffn `HC_WRITE` (which
+    /// reads the `block_out` mailbox this host wrote after the previous lane),
+    /// this block's two HC reads, its mixer, the router and the shared expert —
+    /// one submission per block, exactly as before; only the *wait* moved to
+    /// [`Session::finish_block`], where the other stream's GPU work can run
+    /// underneath it.
+    pub fn submit_block(
         &mut self,
         b: usize,
-        pos: usize,
-        tok: u32,
         trace: &mut Option<&mut Vec<LayerTrace>>,
-    ) -> Result<()> {
+    ) -> Result<BlockDigests> {
         let m = self.model;
         let mc = &m.cfg;
+        let pos = self.pos;
         let dev = m.device_of(b);
 
         // ---- move the residual stack if the block lives elsewhere -----------
@@ -848,7 +1009,7 @@ impl<'m> Session<'m> {
         // ---- (A) PLE insertion (block 1 only) --------------------------------
         if mc.is_ple_layer(b) {
             self.timers.mark(PLE);
-            self.ple_step(b, tok)?;
+            self.ple_step(b)?;
         }
 
         // `BRECCIA_TRACE_BATCH=1` prints one line per block: kind, whether a
@@ -944,37 +1105,75 @@ impl<'m> Session<'m> {
         if let Some(pe) = m.placed.get(&b) {
             self.timers.mark(EXPERTS);
             self.run_placed_moe(b, dev, pe, mc.n_embd, mc.n_ff, mc.n_expert_used)?;
-            let moe_out = if trace.is_some() {
-                Some(Checksum::of(&[0.0f32; 0], 0))
-            } else {
-                None
-            };
             self.timers.mark(HC_WRITE_F);
-            self.ensure_batch(dev)?;
             {
                 let v = &self.venues[dev];
                 let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
                 v.hc.write(ws, &v.r, &v.block_out.buf, &v.r)?;
             }
+            self.submit_batch()?;
+            return Ok(BlockDigests {
+                mixed_attn,
+                mixer_out,
+                mixed_ffn,
+            });
+        }
+
+        // The host block's submission ends here: the readback is
+        // [`Session::finish_block`]'s job, after the wait.
+        self.submit_batch()?;
+        Ok(BlockDigests {
+            mixed_attn,
+            mixer_out,
+            mixed_ffn,
+        })
+    }
+
+    /// Wait for block `b`'s segment, read its MoE inputs, run the host expert
+    /// lane, hand the result back through the mailbox and open the next batch
+    /// with the ffn `HC_WRITE`.
+    ///
+    /// `covered` says whether **another stream's** GPU work was in flight while
+    /// this lane ran (the multi-stream driver knows; the single-stream wrapper
+    /// passes `false`). It only affects the reported overlap efficiency.
+    pub fn finish_block(
+        &mut self,
+        b: usize,
+        digests: BlockDigests,
+        trace: &mut Option<&mut Vec<LayerTrace>>,
+        covered: bool,
+    ) -> Result<()> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let dev = m.device_of(b);
+
+        // ---- wait for this block's segment ----------------------------------
+        self.timers.mark(WAIT_GPU);
+        if let Some(seg) = self.pending_seg.take() {
+            let d = self.pending_dev.take().unwrap_or(dev);
+            let wait = {
+                let gpus = self.device_gpus();
+                batch_cmd::wait(&gpus, seg)
+                    .map_err(|e| anyhow!("waiting for block {b}'s segment: {e}"))?
+            };
+            self.dev_wait_s[d] += wait;
+        }
+
+        // ---- a block whose experts are resident: nothing left to do ---------
+        if m.placed.contains_key(&b) {
+            self.timers.mark(HC_WRITE_F);
             if let Some(t) = trace.as_mut() {
                 let residual = self.checksum(dev, BufKind::R, mc.hc_dim())?;
-                let gdn = if m.layers[b].kind == LayerKind::Gdn {
-                    Some(self.gdn_trace(dev)?)
-                } else {
-                    None
-                };
+                let gdn = self.gdn_trace_if(b, dev, m)?;
                 t.push(LayerTrace {
                     block: b,
-                    kind: match m.layers[b].kind {
-                        LayerKind::Gdn => "gdn".to_string(),
-                        LayerKind::Qsa => "qsa".to_string(),
-                    },
+                    kind: kind_name(m, b),
                     device: dev,
                     residual,
-                    mixed_attn: mixed_attn.unwrap_or_default(),
-                    mixed_ffn: mixed_ffn.unwrap_or_default(),
-                    mixer_out: mixer_out.unwrap_or_default(),
-                    moe_out: moe_out.unwrap_or_default(),
+                    mixed_attn: digests.mixed_attn.unwrap_or_default(),
+                    mixed_ffn: digests.mixed_ffn.unwrap_or_default(),
+                    mixer_out: digests.mixer_out.unwrap_or_default(),
+                    moe_out: Checksum::of(&[0.0f32; 0], 0),
                     router_ids: Vec::new(),
                     router_weights: Vec::new(),
                     ple_gate: None,
@@ -987,7 +1186,6 @@ impl<'m> Session<'m> {
 
         // ---- one readback: mixed, ids, weights, shared out, shared gate ------
         self.timers.mark(XFER_DOWN);
-        self.flush()?;
         let k = mc.n_expert_used;
         let ws_mixed = &self.venues[dev]
             .hc_ws
@@ -1018,10 +1216,18 @@ impl<'m> Session<'m> {
         // ---- host expert lane -------------------------------------------------
         self.timers.mark(EXPERTS);
         let mut out = vec![0f32; mc.n_embd];
+        let t_lane = std::time::Instant::now();
         let bytes = self
             .pool
+            .lock()
+            .expect("the expert pool's lock")
             .moe_topk(&m.layers[b].experts, &ids, &weights, &mixed, &mut out)
             .with_context(|| format!("the expert lane on block {b}"))?;
+        let lane = t_lane.elapsed().as_secs_f64();
+        self.lane_s += lane;
+        if covered {
+            self.lane_covered_s += lane;
+        }
         self.expert_bytes += bytes as u64;
         for i in 0..mc.n_embd {
             out[i] += shared[i] * gate;
@@ -1038,7 +1244,12 @@ impl<'m> Session<'m> {
         self.venues[dev].block_out.write(&f32_to_bytes(&out))?;
         self.dev_up[dev] += (mc.n_embd * 4) as u64;
 
-        // ---- (H) HC_WRITE(ffn) -----------------------------------------------
+        // ---- (H) HC_WRITE(ffn): recorded, left open --------------------------
+        //
+        // It reads the mailbox written just above, so it must be *submitted after
+        // that write*; the next block's `submit_block` records on top of it and
+        // submits once. That is what keeps a block at one submission even though
+        // the write happens on the host.
         self.timers.mark(HC_WRITE_F);
         self.ensure_batch(dev)?;
         {
@@ -1046,29 +1257,18 @@ impl<'m> Session<'m> {
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
             v.hc.write(ws, &v.r, &v.block_out.buf, &v.r)?;
         }
-        // **Left open on purpose.** No host round trip happens between this
-        // dispatch and the next block's phase A (the mailbox write is a memcpy),
-        // so the two ride one submission: a block now costs one submit plus one
-        // readback instead of four round trips.
 
         if let Some(t) = trace.as_mut() {
             let residual = self.checksum(dev, BufKind::R, mc.hc_dim())?;
-            let gdn = if m.layers[b].kind == LayerKind::Gdn {
-                Some(self.gdn_trace(dev)?)
-            } else {
-                None
-            };
+            let gdn = self.gdn_trace_if(b, dev, m)?;
             t.push(LayerTrace {
                 block: b,
-                kind: match m.layers[b].kind {
-                    LayerKind::Gdn => "gdn".to_string(),
-                    LayerKind::Qsa => "qsa".to_string(),
-                },
+                kind: kind_name(m, b),
                 device: dev,
                 residual,
-                mixed_attn: mixed_attn.unwrap_or_default(),
-                mixed_ffn: mixed_ffn.unwrap_or_default(),
-                mixer_out: mixer_out.unwrap_or_default(),
+                mixed_attn: digests.mixed_attn.unwrap_or_default(),
+                mixed_ffn: digests.mixed_ffn.unwrap_or_default(),
+                mixer_out: digests.mixer_out.unwrap_or_default(),
                 moe_out: moe_out.unwrap_or_default(),
                 router_ids: ids.iter().map(|&i| i as u32).collect(),
                 router_weights: weights,
@@ -1078,6 +1278,81 @@ impl<'m> Session<'m> {
             });
         }
         Ok(())
+    }
+
+    fn gdn_trace_if(&mut self, b: usize, dev: usize, m: &Model) -> Result<Option<GdnTrace>> {
+        if m.layers[b].kind == LayerKind::Gdn {
+            Ok(Some(self.gdn_trace(dev)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// The output norm, the head, and the logits row for the token just fed.
+    pub fn end_token(&mut self) -> Result<Vec<f32>> {
+        self.submit_head()?;
+        self.finish_head()
+    }
+
+    /// Record and submit the output norm + head **without waiting**; pair it with
+    /// [`Session::finish_head`] so two streams' heads run concurrently (they are
+    /// the last serial GPU work of a stream, ~7-10 ms each).
+    pub fn submit_head(&mut self) -> Result<()> {
+        let m = self.model;
+        let mc = &m.cfg;
+        self.flush()?;
+        self.timers.mark(FINAL_HC);
+        let last = m.device_of(mc.n_layers - 1);
+        self.ensure_batch(last)?;
+        {
+            let v = &self.venues[last];
+            let hw = HcWeights {
+                norm: &m.out_hc_norm,
+                down: &m.out_hc_down.buf,
+                up: &m.out_hc_up.buf,
+                inject: None,
+            };
+            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+            v.final_hc.read(ws, &v.r, &hw)?;
+            self.timers.mark(HEAD);
+            let out = v
+                .logits
+                .as_ref()
+                .ok_or_else(|| anyhow!("the last device has no logits buffer"))?;
+            v.pipes.get(&m.head.key)?.run(&m.head.buf, &ws.mixed, out)?;
+        }
+        self.submit_batch()?;
+        Ok(())
+    }
+
+    /// Wait for the head and read the logits row back.
+    pub fn finish_head(&mut self) -> Result<Vec<f32>> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let last = m.device_of(mc.n_layers - 1);
+        self.flush()?;
+        let logits_buf = self.venues[last]
+            .logits
+            .as_ref()
+            .ok_or_else(|| anyhow!("the last device has no logits buffer"))?;
+        let raw = self.stagings[last]
+            .read_batch(m.devices[last].gpu(), &[(logits_buf, 0, mc.vocab * 4)])?;
+        self.timers.stop();
+        self.probe_report()?;
+        self.forwards += 1;
+        let values = f32_from_bytes(&raw[0]);
+        if values.len() != mc.vocab {
+            bail!(
+                "the head produced {} logits, expected {}",
+                values.len(),
+                mc.vocab
+            );
+        }
+        // A non-finite logit is a numerical failure, not a sampling preference.
+        if let Some(i) = values.iter().position(|v| !v.is_finite()) {
+            bail!("logit {i} is not finite ({})", values[i]);
+        }
+        Ok(values)
     }
 
     /// One block's MoE, entirely on the device: ids→map, gate/up/SwiGLU, down,
@@ -1238,7 +1513,8 @@ impl<'m> Session<'m> {
     }
 
     /// The PLE insertion: host hash → GPU projections → host block → write back.
-    fn ple_step(&mut self, b: usize, tok: u32) -> Result<()> {
+    fn ple_step(&mut self, b: usize) -> Result<()> {
+        let tok = self.cur_tok;
         // PLE needs the residual on the host, so it runs outside any batch.
         self.flush()?;
         let m = self.model;

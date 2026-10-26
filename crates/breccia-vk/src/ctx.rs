@@ -335,12 +335,13 @@ pub struct Timing {
 /// Command buffers the compute pool owns: index 0 is the **synchronous one-shot**
 /// buffer (`Gpu::cmd_c`, used by `record`/`wall_run`), the rest are the
 /// pipelining ring that `breccia_kernels::dispatch_batch` records a block's
-/// segments into.
+/// segments into (six: two streams keep one block's batch open each, plus the
+/// segments still in flight).
 ///
 /// They must be separate objects: a buffer that is pending execution cannot be
 /// reset, and the whole point of the ring is to have one segment in flight while
 /// the next is being recorded.
-pub const BATCH_CMDS: usize = 3;
+pub const BATCH_CMDS: usize = 6;
 
 /// A timeline semaphore, used as a **mid-batch sync point**: a submission can
 /// signal a value part-way through a block's work and the host can wait for it

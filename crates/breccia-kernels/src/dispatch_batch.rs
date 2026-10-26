@@ -53,7 +53,10 @@
 //!   records them into the open batch.
 //! * Every recorded dispatch is followed by a full barrier, so a batch may mix
 //!   dependant kernels freely.
-//! * One batch per thread; [`begin`] refuses to nest.
+//! * **One open batch per device** (`begin` refuses to nest on the same device).
+//!   Two-stream decode keeps stream A's block open on card A while stream B
+//!   records on card B; the per-device state is what makes that legal, since each
+//!   device has its own command buffer (§8o).
 
 use anyhow::{anyhow, Result};
 use ash::vk;
@@ -61,14 +64,10 @@ use breccia_vk::ctx::{Buf, Gpu, Kernel, Qc, Timeline};
 use std::cell::{Cell, RefCell};
 
 thread_local! {
-    /// Is a batch open on this thread?
-    static OPEN: Cell<bool> = const { Cell::new(false) };
-    /// Ring slot being recorded (index into `POOLS`/`FENCES`).
-    static SLOT: Cell<usize> = const { Cell::new(0) };
+    /// Batches currently being recorded, one per device.
+    static OPEN: RefCell<Vec<Open>> = const { RefCell::new(Vec::new()) };
     /// Round-robin cursor for [`begin`].
     static NEXT: Cell<usize> = const { Cell::new(0) };
-    /// Dispatches recorded into the open batch.
-    static COUNT: Cell<u32> = const { Cell::new(0) };
     /// Per-slot descriptor pool of the **in-flight** submission (freed when its
     /// fence is waited on).
     static POOLS: RefCell<Vec<vk::DescriptorPool>> = const { RefCell::new(Vec::new()) };
@@ -87,7 +86,29 @@ thread_local! {
 /// Segments that may be in flight at once. Two are enough for a block (the
 /// pre-router segment and the shared-expert segment); three leaves room for the
 /// next block's first segment to be recorded while the previous one drains.
-pub const RING: usize = 3;
+pub const RING: usize = 6;
+
+/// One device's open recording.
+#[derive(Clone, Copy, Debug)]
+struct Open {
+    dev: vk::Device,
+    slot: usize,
+    count: u32,
+}
+
+fn open_slot(gpu: &Gpu) -> Option<usize> {
+    let dev = gpu.device.handle();
+    OPEN.with(|o| o.borrow().iter().find(|x| x.dev == dev).map(|x| x.slot))
+}
+
+fn bump_open(gpu: &Gpu) {
+    let dev = gpu.device.handle();
+    OPEN.with(|o| {
+        if let Some(x) = o.borrow_mut().iter_mut().find(|x| x.dev == dev) {
+            x.count += 1;
+        }
+    });
+}
 
 /// Sets a batch budgets for. A segment holds at most a block's ~30 dispatches,
 /// so 256 is a bounded, predictable budget with room to spare.
@@ -121,14 +142,31 @@ fn ensure_slots() {
     });
 }
 
-/// Is a batch open on this thread?
+/// Is a batch open on this thread (on any device)?
 pub fn is_open() -> bool {
-    OPEN.with(|c| c.get())
+    OPEN.with(|o| !o.borrow().is_empty())
 }
 
-/// Dispatches recorded into the batch that is (or was last) open.
+/// Is a batch open on `gpu`'s device?
+pub fn is_open_on(gpu: &Gpu) -> bool {
+    open_slot(gpu).is_some()
+}
+
+/// Dispatches recorded into the open batches (all devices).
 pub fn recorded() -> u32 {
-    COUNT.with(|c| c.get())
+    OPEN.with(|o| o.borrow().iter().map(|x| x.count).sum())
+}
+
+/// Dispatches recorded into `gpu`'s open batch (0 when none is open).
+pub fn recorded_on(gpu: &Gpu) -> u32 {
+    let dev = gpu.device.handle();
+    OPEN.with(|o| {
+        o.borrow()
+            .iter()
+            .find(|x| x.dev == dev)
+            .map(|x| x.count)
+            .unwrap_or(0)
+    })
 }
 
 /// Host seconds spent recording since the last [`reset_record_seconds`].
@@ -154,15 +192,56 @@ pub fn reset_record_seconds() {
 /// (that is the ring's back-pressure — with the engine's two-segment block it
 /// never actually blocks, because the slot was drained two segments ago).
 pub fn begin(gpu: &Gpu) -> Result<()> {
-    if is_open() {
-        return Err(anyhow!("a dispatch batch is already open on this thread"));
+    if is_open_on(gpu) {
+        return Err(anyhow!(
+            "a dispatch batch is already open on device {} of this thread",
+            gpu.index
+        ));
     }
     ensure_slots();
-    let slot = NEXT.with(|c| {
-        let s = c.get() % RING;
-        c.set(c.get().wrapping_add(1));
-        s
-    });
+    let dev = gpu.device.handle();
+    // Slots another open batch is recording into are off limits, and a slot whose
+    // fence belongs to another device can be neither waited nor freed here (§8o:
+    // two streams, one card each).
+    //
+    // Two passes: a slot with **no fence** first (nothing to wait for — that is
+    // what keeps the pipeline deep), and only if every slot is busy do we wait on
+    // one of our own. (Taking an own-but-in-flight slot first would make every
+    // block wait for the previous block's submission and serialise the stream.)
+    let open_slots: Vec<usize> = OPEN.with(|o| o.borrow().iter().map(|x| x.slot).collect());
+    let mut slot = usize::MAX;
+    for i in 0..RING {
+        if open_slots.contains(&i) {
+            continue;
+        }
+        if FENCES.with(|f| f.borrow()[i]) == vk::Fence::null() {
+            slot = i;
+            break;
+        }
+    }
+    if slot == usize::MAX {
+        for i in 0..RING {
+            if open_slots.contains(&i) {
+                continue;
+            }
+            if DEVICES.with(|d| d.borrow()[i]) == dev {
+                slot = i;
+                break;
+            }
+        }
+    }
+    if slot == usize::MAX {
+        return Err(anyhow!(
+            "no free ring slot for device {} ({RING} slots, {} open, {} in flight)",
+            gpu.index,
+            open_slots.len(),
+            FENCES.with(|f| f
+                .borrow()
+                .iter()
+                .filter(|x| **x != vk::Fence::null())
+                .count()),
+        ));
+    }
     let old = FENCES.with(|f| f.borrow()[slot]);
     if old != vk::Fence::null() {
         let t0 = std::time::Instant::now();
@@ -199,9 +278,13 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
             .map_err(|e| anyhow!("creating the batch descriptor pool: {e}"))?;
         POOLS.with(|p| p.borrow_mut()[slot] = pool);
     }
-    SLOT.with(|c| c.set(slot));
-    OPEN.with(|c| c.set(true));
-    COUNT.with(|c| c.set(0));
+    OPEN.with(|o| {
+        o.borrow_mut().push(Open {
+            dev: gpu.device.handle(),
+            slot,
+            count: 0,
+        })
+    });
     Ok(())
 }
 
@@ -211,12 +294,21 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
 /// This is the mid-batch sync point: the caller can submit a second segment
 /// immediately and then wait on the timeline to learn that *this* segment is
 /// done while the second one runs.
-pub fn end_submit(gpu: &Gpu, signal: Option<(&Timeline, u64)>) -> Result<()> {
-    if !is_open() {
-        return Err(anyhow!("no dispatch batch is open on this thread"));
+pub fn end_submit(gpu: &Gpu, signal: Option<(&Timeline, u64)>) -> Result<Segment> {
+    let dev = gpu.device.handle();
+    let slot = OPEN.with(|o| {
+        let mut o = o.borrow_mut();
+        match o.iter().position(|x| x.dev == dev) {
+            Some(i) => o.remove(i).slot,
+            None => usize::MAX,
+        }
+    });
+    if slot == usize::MAX {
+        return Err(anyhow!(
+            "no dispatch batch is open on device {} of this thread",
+            gpu.index
+        ));
     }
-    OPEN.with(|c| c.set(false));
-    let slot = SLOT.with(|c| c.get());
     let cmd = gpu.cmds_c[1 + slot];
     unsafe {
         gpu.device
@@ -228,26 +320,83 @@ pub fn end_submit(gpu: &Gpu, signal: Option<(&Timeline, u64)>) -> Result<()> {
         .map_err(|e| anyhow!("submitting the batch: {e}"))?;
     FENCES.with(|f| f.borrow_mut()[slot] = fence);
     DEVICES.with(|d| d.borrow_mut()[slot] = gpu.device.handle());
-    Ok(())
+    Ok(Segment(slot))
+}
+
+/// A handle to a submitted segment: [`wait`] on it to learn that its GPU work
+/// is done (and to free its descriptor pool).
+///
+/// Two-stream decode keeps one of these per stream in flight, so the host can
+/// wait for stream A's block while stream B's block is still executing — the
+/// whole point of interleaving at the block level.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment(usize);
+
+impl Segment {
+    pub fn slot(self) -> usize {
+        self.0
+    }
+}
+
+/// Wait for one segment (the device that submitted it must be in `gpus`).
+/// Returns the host seconds spent waiting.
+pub fn wait(gpus: &[&Gpu], seg: Segment) -> Result<f64> {
+    ensure_slots();
+    let slot = seg.0;
+    let fence = FENCES.with(|f| f.borrow()[slot]);
+    if fence == vk::Fence::null() {
+        return Ok(0.0);
+    }
+    let gpu = DEVICES.with(|d| {
+        d.borrow()
+            .get(slot)
+            .and_then(|dev| gpus.iter().find(|g| g.device.handle() == *dev))
+            .copied()
+    });
+    let gpu = gpu.ok_or_else(|| {
+        anyhow!("segment {slot} belongs to a device that was not passed to `wait`")
+    })?;
+    let t0 = std::time::Instant::now();
+    gpu.wait_fence(fence)
+        .map_err(|e| anyhow!("waiting for segment {slot}: {e}"))?;
+    FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
+    let pool = POOLS.with(|p| p.borrow()[slot]);
+    if pool != vk::DescriptorPool::null() {
+        unsafe { gpu.device.destroy_descriptor_pool(pool, None) };
+        POOLS.with(|p| p.borrow_mut()[slot] = vk::DescriptorPool::null());
+    }
+    let secs = t0.elapsed().as_secs_f64();
+    WAIT_NS.with(|c| c.set(c.get() + (secs * 1e9) as u64));
+    Ok(secs)
 }
 
 /// Close the recording, submit and wait for **every** segment in flight.
 /// Returns the host seconds spent waiting.
 pub fn end(gpu: &Gpu) -> Result<f64> {
-    end_submit(gpu, None)?;
-    wait_all(&[gpu])
+    let seg = end_submit(gpu, None)?;
+    wait(&[gpu], seg)
 }
 
 /// Wait for every submission still in flight (and free its descriptor pool).
 /// Returns the host seconds spent waiting.
 ///
-/// `gpus` must contain every device the ring can hold work for: a fence belongs
-/// to the device that created it, so each slot is waited on with its own device.
+/// `gpus` is the set of devices the caller wants drained: a fence belongs to the
+/// device that created it, so each slot is waited on with its own device, and a
+/// slot belonging to a device **outside** the list is left alone. That is what
+/// makes a flush scoped: with one stream per card, stream A's flush must not
+/// wait for stream B's GPU work (§8o).
 pub fn wait_all(gpus: &[&Gpu]) -> Result<f64> {
+    // An open batch is only an error when it is one of *these* devices': recorded
+    // but unsubmitted work on a device being waited on would be silently skipped.
+    // With one stream per card, another session's open batch is not our business.
     if is_open() {
-        return Err(anyhow!(
-            "wait_all with an open batch: close it first (its work would be lost)"
-        ));
+        let open: Vec<vk::Device> = OPEN.with(|o| o.borrow().iter().map(|x| x.dev).collect());
+        if gpus.iter().any(|g| open.contains(&g.device.handle())) {
+            return Err(anyhow!(
+                "wait_all with an open batch on one of these devices: close it first \
+                 (its work would be lost)"
+            ));
+        }
     }
     ensure_slots();
     let t0 = std::time::Instant::now();
@@ -260,9 +409,10 @@ pub fn wait_all(gpus: &[&Gpu]) -> Result<f64> {
                     .and_then(|dev| gpus.iter().find(|g| g.device.handle() == *dev))
                     .copied()
             });
-            let gpu = gpu.ok_or_else(|| {
-                anyhow!("ring slot {slot} holds a fence whose device was not passed to wait_all")
-            })?;
+            let Some(gpu) = gpu else {
+                // Another session's device owns this slot.
+                continue;
+            };
             // Only now: the recorded command buffer references these sets, so
             // freeing the pool before the submission completes is a use-after-free
             // (`VUID-vkCmdDispatch-None-08114`).
@@ -321,7 +471,8 @@ pub fn record_copy(
             dst.size
         ));
     }
-    let cmd = gpu.cmds_c[1 + SLOT.with(|c| c.get())];
+    let slot = open_slot(gpu).ok_or_else(|| anyhow!("record_copy without an open batch"))?;
+    let cmd = gpu.cmds_c[1 + slot];
     let region = vk::BufferCopy::default()
         .src_offset(src_off)
         .dst_offset(dst_off)
@@ -341,10 +492,8 @@ pub fn record_copy(
 /// compare against its fence wait: the difference between them is the
 /// submission latency the host pays on top of the GPU's work.
 pub fn record_timestamp(gpu: &Gpu, pool: vk::QueryPool, query: u32) -> Result<()> {
-    if !is_open() {
-        return Err(anyhow!("record_timestamp without an open batch"));
-    }
-    let cmd = gpu.cmds_c[1 + SLOT.with(|c| c.get())];
+    let slot = open_slot(gpu).ok_or_else(|| anyhow!("record_timestamp without an open batch"))?;
+    let cmd = gpu.cmds_c[1 + slot];
     unsafe {
         gpu.device
             .cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, query);
@@ -359,7 +508,9 @@ pub fn record_barrier_to_host(gpu: &Gpu) -> Result<()> {
     if !is_open() {
         return Err(anyhow!("record_barrier_to_host without an open batch"));
     }
-    let cmd = gpu.cmds_c[1 + SLOT.with(|c| c.get())];
+    let slot =
+        open_slot(gpu).ok_or_else(|| anyhow!("record_barrier_to_host without an open batch"))?;
+    let cmd = gpu.cmds_c[1 + slot];
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -408,8 +559,10 @@ pub(crate) fn record(
     grid: (u32, u32, u32),
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
-    let cmd = gpu.cmds_c[1 + SLOT.with(|c| c.get())];
-    let pool = POOLS.with(|p| p.borrow()[SLOT.with(|c| c.get())]);
+    let slot =
+        open_slot(gpu).ok_or_else(|| anyhow!("recording a dispatch without an open batch"))?;
+    let cmd = gpu.cmds_c[1 + slot];
+    let pool = POOLS.with(|p| p.borrow()[slot]);
     if pool == vk::DescriptorPool::null() {
         return Err(anyhow!("recording a dispatch without an open batch"));
     }
@@ -462,7 +615,7 @@ pub(crate) fn record(
             .cmd_dispatch(cmd, grid.0.max(1), grid.1.max(1), grid.2.max(1));
         Gpu::barrier_all(&gpu.device, cmd);
     }
-    COUNT.with(|c| c.set(c.get() + 1));
+    bump_open(gpu);
     RECORD_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
     Ok(())
 }

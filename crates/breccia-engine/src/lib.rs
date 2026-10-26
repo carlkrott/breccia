@@ -46,6 +46,7 @@
 pub mod config;
 pub mod graph;
 pub mod model;
+pub mod multi;
 pub mod placement;
 pub mod ple;
 pub mod report;
@@ -56,6 +57,7 @@ pub mod xfer;
 pub use config::{LayerKind, ModelConfig};
 pub use graph::{Generation, Session, SessionCfg, Timers, STAGES};
 pub use model::{LoadOptions, LoadStats, Model};
+pub use multi::{Multi, MultiGeneration, StreamReport};
 pub use placement::{DeviceSpec, Placement};
 pub use report::{LogitSummary, RunReport, StageRow, TokenReport, TOKEN_SCHEMA_VERSION};
 pub use sampler::{Sampler, Sampling};
