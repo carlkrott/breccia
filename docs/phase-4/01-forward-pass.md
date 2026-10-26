@@ -25,7 +25,7 @@ from a run, and the ones taken before each fix are labelled.
 | greedy generation | **yes** — `Sampling::Argmax`, deterministic |
 | parity vs the production HIP server | **MET** — 32/32 greedy tokens, first divergence: none |
 | decode, **dual** (20 RX / 28 MI50 blocks), batching on, 16 threads | **7.42 tok/s** (134.9 ms/token) |
-| GPU-resident experts (`--gpu-experts`) | **off** — 0/32 parity, 6.50 tok/s (§8d) |
+| GPU-resident experts (`--gpu-experts`) | **off** — correct (32/32) but slower, 6.37 tok/s (§8d) |
 | vs the 20.79 tok/s baseline | **35.7 %** (dual was 29.0 % before this pass) |
 | single-card diagnostic (not a target) | 8.55 tok/s / 117.0 ms |
 | hotspot | **synchronous-dispatch overhead**, not arithmetic — 96 HC_READ calls alone cost 39–53 ms/token |
@@ -464,58 +464,67 @@ single item and the only one that does not depend on which GPU runs.
   the next token's expert pages during the current block's GPU phase (`docs/phase-3/08`
   §7 item 5).
 
-## 8d. GPU-resident expert blocks: device-side indirection landed, **numerically wrong, off by default**
+## 8d. GPU-resident expert blocks: **correct, and slower than the host lane — flag stays off**
 
-The host-free MoE path exists and runs, and it is **not correct yet** — stated
-plainly, because the numbers are unambiguous:
+Correctness is fixed and proven at three levels. Speed is not there, so the flag
+stays **off** and the dual number in §5.3 (7.42 tok/s) is unchanged.
 
 | | flag off (host lane) | `--gpu-experts 0,1,2,4,8,18,20,22,23,24,35` |
 |---|---|---|
-| dual tok/s (20/28 split, 16 threads) | **7.42** (134.9 ms) | 6.50 (154.0 ms) |
-| greedy parity vs the server | **32/32** | **0/32** (`16, 15, 25, 18, 15, …`) |
-| logits vs the host path (top-15 ids) | — | max \|Δ\| **1.38**, mean **0.50** |
-| VRAM arena | — | **9 913 MiB** (11 blocks, 512 experts each) |
-| per-card fence wait (per token) | 0.95 : 1 (RX : MI50) | 34.3 ms : 39.6 ms |
+| dual tok/s (20/28, 16 threads, 3×32) | **7.42** (134.9 ms) | 6.37 (157.0 ms) |
+| greedy parity vs the server | **32/32** | **32/32** |
+| top-1 logit (prompt `[760,13017]`) | 17.5689 | **17.5689** (identical) |
+| validation messages | 0 | **0** |
+| VRAM arena | — | 9 913 MiB (11 blocks × 512 experts) |
+| per-card fence wait / token | 34.3 : 39.6 ms | 34.6 : 39.6 ms |
 
-It is **slower as well as wrong**, so there is no trade-off to weigh: the flag
-stays **off** and no number in this report depends on it.
+### The bug: the row map is per **row**, not per expert
 
-### What was built (and is worth keeping)
+`map_for_blobs` (`batch.rs:195-215`) writes
 
-* `shaders/moe_map.comp` + `breccia_kernels::MoeMap` — the router's top-k ids
-  never leave VRAM: one dispatch turns `ids` into the exact `GemvBatch` row map
-  (`map[row] = base_words + ids[j]·blob_words`, `map[rows+row] = j·stride`), which
-  removes the host-built 200 KiB map upload and the id readback that were the
-  stated blocker.
-* `shaders/moe_combine.comp` + `MoeCombine` — `out = Σ_j w_j·down_j +
-  shared·sigmoid(gate)` on device, taking the gate *logit* so the scalar never
-  needs to be a push constant.
-* `Placement`/`LoadOptions::gpu_experts` + `PlacedExperts`: the whole 512-expert
-  role tensor per placed block, in VRAM, on the device that owns the block
-  (`-ot`-equivalent), so expert `id` is at `id·blob_words` with no bookkeeping.
-* A block whose experts are resident now executes **without a single host round
-  trip**, and consecutive placed blocks ride one submission: `dispatch_batch`
-  grew a soft limit (200 dispatches) because a batch can now span several blocks
-  instead of one phase.
+```text
+map[e*rpe + r] = base + r * bpr * block_words(ty)      // one entry per ROW
+map[rows + i]  = x_stride * e                          // activation base
+```
 
-### Suspects, in the order the next pass should check them
+The first `moe_map.comp` wrote `base + ids[j]·blob_words` for *every* row of expert
+`j`, so all 640 (or 2 560) rows of an expert read that expert's **first row** —
+finite, plausible, and wrong. That single mistake explains both symptoms: parity
+0/32 and logits off by up to 1.38 nats.
 
-1. **`blob_words` units** in `MoeMap`: `GemvBatch::map_for_blobs` uses `blob_words
-   = blob_bytes/2` (u16 words) for the block base and `padded_cols/4` (vec4) for
-   the activation base. If either is off by a factor, the arena is read at the
-   wrong expert — plausible numbers, wrong model, which is exactly the signature.
-2. **`up` reuses the gate map.** Valid only when `ffn_gate_exps` and
-   `ffn_up_exps` have the same type *and* blob size for that block. True for this
-   artifact's per-block table, but unchecked in code — add an assertion and a
-   second map when they differ.
-3. **`moe_combine`'s weight order**: `router_w` is in the router's descending
-   order and the down rows are ordered by `ids[j]`; any disagreement re-weights
-   the experts. Compare the combine's output against `pool.moe_topk` for a single
-   block before touching anything else.
+### The three checks that now gate this path
 
-Note the arena is 9.9 GiB for 11 blocks, so on a 20/28 split the RX carries 9 of
-them (~8.6 GiB) beside 1.3 GiB of dense weights — it fits, but a larger placed set
-does not.
+`crates/breccia-kernels/tests/moe_indirection.rs` (MI50, validation on):
+
+| check | result |
+|---|---|
+| device map vs `map_for_blobs`, **byte for byte** — IQ2_XS `Shared`, IQ4_NL `PerExpert`, Q2_0 `PerExpert` (12 800 / 51 200 / 51 200 entries) | **identical**, including a non-zero `base_words` so an offset error cannot hide |
+| `MoeCombine` vs `Σ w_j·in_j + shared·sigmoid(g)` in f64 | worst \|Δ\| **1.99e-8** |
+| end-to-end greedy, dual, flag on | **32/32**, logits identical to the host path |
+
+Suspects 2 and 3 were fixed as part of the same pass: each role now gets **its own
+map** driven by its own `GemvBatch` (`rows_per_expert`, `blocks_per_row`, quant
+block size and activation stride all come from the pipeline, so a call site cannot
+get the units wrong), and `MoeMap::run` takes the `GemvBatch` rather than loose
+numbers.
+
+### Why it is slower (the remaining question)
+
+The work moved from 16 CPU threads (~0.76 ms/block) to the device, but the path
+adds **eight dispatches per placed block** (three maps, three GEMV, SwiGLU,
+combine) and the 640-row expert GEMV shape is the latency-bound one
+(`docs/phase-3/02` §2.1: 81–161 GB/s for 640-row shapes against 251–448 for the
+6 400-row set). Eleven blocks therefore pay ~+22 ms of dispatch latency and
+under-filled grids to save ~8 ms of host lane, plus the longer batches (soft limit
+200 dispatches) reduce host/GPU interleaving.
+
+**Verdict per the work order:** keep `--gpu-experts` **off**. Revisit when it can
+beat the host lane: after the QSA position indirection / replay work (which drops
+the per-block submission count), with **larger** expert blocks (a 640-row GEMV per
+role stays latency-bound; batching *across* blocks would fill the grid), or by
+keeping the host lane for the gate/up roles and moving only `down` where the shape
+is 2 560 rows. The mechanism (`MoeMap`, `MoeCombine`, `PlacedExperts`, arena,
+device-side ids) is correct and is the substrate for all of those.
 
 ## 9. Exact commands
 

@@ -7,9 +7,11 @@
 // map[rows, 2*rows) = row's activation base, in vec4 units into X
 // (the layout `GemvBatch::map_for_blobs` builds on the host)
 //
-// Blobs are back to back, so expert `id` of this block sits at
-// `base_words + id * blob_words`; `base_words` carries the arena offset of the
-// block's role tensor.
+// The entry is **per row**, not per expert: row `r` of expert `id` lives at
+// `base_words + id*blob_words + r*bpr*block_words`, exactly as
+// `GemvBatch::map_for_blobs` lays it out. Writing the expert base for every row
+// (the first version of this kernel) makes all rows of an expert read its first
+// row — finite, plausible, wrong.
 layout(local_size_x = 64) in;
 
 layout(std430, binding = 0) readonly buffer Ids { uint IDS[]; };
@@ -22,8 +24,8 @@ layout(push_constant) uniform Params {
     uint base_words;
     uint per_expert_pc4; // 0 = one shared activation, else padded_cols / 4
     uint rows_total;
-    uint pad0;
-    uint pad1;
+    uint bpr;            // blocks per row
+    uint block_words;     // u16 words per quant block
 } pc;
 
 #define WG_X_MAX 65535u
@@ -38,6 +40,7 @@ void main() {
     if (j >= pc.experts) {
         return;
     }
-    MAP[row] = pc.base_words + IDS[j] * pc.blob_words;
+    uint r = row - j * pc.rows_per_expert;
+    MAP[row] = pc.base_words + IDS[j] * pc.blob_words + r * pc.bpr * pc.block_words;
     MAP[pc.rows_total + row] = pc.per_expert_pc4 == 0u ? 0u : j * pc.per_expert_pc4;
 }

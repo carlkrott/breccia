@@ -183,6 +183,7 @@ pub struct Venue<'m> {
     pub moe_act: Buf,
     pub moe_down: Buf,
     pub moe_map_gate: Buf,
+    pub moe_map_up: Buf,
     pub moe_map_down: Buf,
     pub moe_map: breccia_kernels::MoeMap<'m>,
     pub moe_combine: breccia_kernels::MoeCombine<'m>,
@@ -339,6 +340,7 @@ impl<'m> Session<'m> {
             let moe_act = alloc((k * ff) as u64 * 4, "moe act")?;
             let moe_down = alloc((k * mc.n_embd) as u64 * 4, "moe down")?;
             let moe_map_gate = alloc((2 * k * ff) as u64 * 4, "moe map gate")?;
+            let moe_map_up = alloc((2 * k * ff) as u64 * 4, "moe map up")?;
             let moe_map_down = alloc((2 * k * mc.n_embd) as u64 * 4, "moe map down")?;
             let moe_map = breccia_kernels::MoeMap::new(gpu)?;
             let moe_combine = breccia_kernels::MoeCombine::new(gpu)?;
@@ -373,6 +375,7 @@ impl<'m> Session<'m> {
                 moe_act,
                 moe_down,
                 moe_map_gate,
+                moe_map_up,
                 moe_map_down,
                 moe_map,
                 moe_combine,
@@ -553,6 +556,7 @@ impl<'m> Session<'m> {
                 &v.moe_act,
                 &v.moe_down,
                 &v.moe_map_gate,
+                &v.moe_map_up,
                 &v.moe_map_down,
             ] {
                 total += b.size;
@@ -941,48 +945,26 @@ impl<'m> Session<'m> {
         n_ff: usize,
         k: usize,
     ) -> Result<()> {
-        let bpr_gate = pe.gate.key.cols.div_ceil(pe.gate.key.ty.block_elems());
-        let blob_gate = (pe.gate.key.rows * bpr_gate * pe.gate.key.ty.block_bytes() / 2) as u32;
-        let bpr_down = pe.down.key.cols.div_ceil(pe.down.key.ty.block_elems());
-        let blob_down = (pe.down.key.rows * bpr_down * pe.down.key.ty.block_bytes() / 2) as u32;
+        let _ = n_ff;
         let v = &self.venues[dev];
-        // gate / up: every expert reads the same `mixed`
-        v.moe_map
-            .run(&v.router_ids, &v.moe_map_gate, k, n_ff, blob_gate, 0, 0)?;
         let pipes = &v.pipes;
-        pipes.batch(&pe.gate.key)?.run(
-            &pe.gate.buf,
-            &v.hc_ws.as_ref().expect("hc ws").mixed,
-            &v.moe_gate,
-            &v.moe_map_gate,
-            k,
-        )?;
-        pipes.batch(&pe.up.key)?.run(
-            &pe.up.buf,
-            &v.hc_ws.as_ref().expect("hc ws").mixed,
-            &v.moe_up,
-            &v.moe_map_gate,
-            k,
-        )?;
+        let mixed = &v.hc_ws.as_ref().expect("hc ws").mixed;
+        // gate / up: one shared activation, and **one map per role** — the two
+        // tensors need not share a type, and the row map's units depend on it.
+        let gate = pipes.batch(&pe.gate.key)?;
+        v.moe_map
+            .run(&v.router_ids, &v.moe_map_gate, gate, k, 0, false)?;
+        gate.run(&pe.gate.buf, mixed, &v.moe_gate, &v.moe_map_gate, k)?;
+        let up = pipes.batch(&pe.up.key)?;
+        v.moe_map
+            .run(&v.router_ids, &v.moe_map_up, up, k, 0, false)?;
+        up.run(&pe.up.buf, mixed, &v.moe_up, &v.moe_map_up, k)?;
         v.swiglu.run(&v.moe_gate, &v.moe_up, &v.moe_act, k * n_ff)?;
         // down: one activation row per expert, so the map carries the stride
-        let pe_pc4 = (n_ff.div_ceil(32) * 32 / 4) as u32;
-        v.moe_map.run(
-            &v.router_ids,
-            &v.moe_map_down,
-            k,
-            n_embd,
-            blob_down,
-            0,
-            pe_pc4,
-        )?;
-        pipes.batch(&pe.down.key)?.run(
-            &pe.down.buf,
-            &v.moe_act,
-            &v.moe_down,
-            &v.moe_map_down,
-            k,
-        )?;
+        let down = pipes.batch(&pe.down.key)?;
+        v.moe_map
+            .run(&v.router_ids, &v.moe_map_down, down, k, 0, true)?;
+        down.run(&pe.down.buf, &v.moe_act, &v.moe_down, &v.moe_map_down, k)?;
         v.moe_combine.run(
             &v.moe_down,
             &v.router_w,
@@ -1350,6 +1332,7 @@ impl Drop for Session<'_> {
                 &v.moe_act,
                 &v.moe_down,
                 &v.moe_map_gate,
+                &v.moe_map_up,
                 &v.moe_map_down,
             ] {
                 gpu.destroy_buf(b);

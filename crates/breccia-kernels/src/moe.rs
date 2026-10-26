@@ -34,31 +34,42 @@ impl<'g> MoeMap<'g> {
         })
     }
 
-    /// Write the map for `experts` blobs of `rows_per_expert` rows each.
+    /// Write the map for `experts` blobs of one `batch`'s shape.
     ///
-    /// * `blob_words` — one expert blob's length in `u16` words (`GemvBatch::blob_words`).
-    /// * `base_words` — the block's role tensor offset inside the arena, same units.
-    /// * `per_expert_pc4` — `0` for one shared activation vector, else
-    ///   `padded_cols / 4` (the `XLayout::PerExpert` stride in `vec4`).
-    #[allow(clippy::too_many_arguments)]
+    /// Everything the row map depends on comes from the pipeline the map will be
+    /// used with — `rows_per_expert`, `blocks_per_row`, the quant block size and
+    /// the activation stride — so a call site cannot get the units wrong. Use a
+    /// **separate map per role**: `ffn_gate_exps` and `ffn_up_exps` need not share
+    /// a type (this artifact's blocks do, per `docs/specs/model-artifacts-inventory.md`
+    /// §4.2, but nothing enforces it).
+    ///
+    /// * `base_words` — the block's role-tensor offset inside the arena, in `u16`
+    ///   words (zero when the arena holds one block's tensor).
+    /// * `per_expert` — `true` for `XLayout::PerExpert` (one activation row per
+    ///   expert, the `down` role), `false` for `XLayout::Shared` (gate/up).
     pub fn run(
         &self,
         ids: &Buf,
         map: &Buf,
+        batch: &crate::GemvBatch<'_>,
         experts: usize,
-        rows_per_expert: usize,
-        blob_words: u32,
         base_words: u32,
-        per_expert_pc4: u32,
+        per_expert: bool,
     ) -> Result<()> {
-        let rows = experts * rows_per_expert;
+        let rows = batch.rows(experts);
         let pc = Pc::new()
             .u(experts as u32)
-            .u(rows_per_expert as u32)
-            .u(blob_words)
+            .u(batch.rows_per_expert() as u32)
+            .u(batch.blob_words())
             .u(base_words)
-            .u(per_expert_pc4)
-            .u(rows as u32);
+            .u(if per_expert {
+                (batch.padded_cols() / 4) as u32
+            } else {
+                0
+            })
+            .u(rows as u32)
+            .u(batch.blocks_per_row() as u32)
+            .u(crate::batch::block_words(batch.ty()));
         let (gx, gy) = grid_for(rows, 64);
         self.pipe.run(&[ids, map], &pc, (gx, gy, 1))
     }
