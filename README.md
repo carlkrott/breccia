@@ -41,4 +41,16 @@ Breccia/
 
 ## Status
 
-Phase 0 — baselines & backend risk retirement. See `docs/plan/` for the gated milestone plan.
+| Phase | State |
+|---|---|
+| 0 — baselines, backend risk, specs, reference engines | **complete — Gate A passed** (`docs/phase-0/gate-A-report.md`) |
+| 1 — workspace, `breccia-profile` (M1a), launch-flag surface | in progress — `breccia profile` verified on hardware (`docs/phase-1/01-profile-report.md`); flag parser landing |
+| 2 — DMA/transfer harness, kernels, forward pass | planned |
+
+Backend decision (2026-10-26): **Vulkan primary**, HIP-style launch flags preserved, HIP secondary. Architecture rules from Gate A: RX 6950 XT = streaming/compute home; MI50 = static-resident only (PCIe ≈2.9 GB/s, no DMA overlap); expert-parallel placement by default.
+
+```bash
+cargo run -p breccia-cli -- profile --quick          # calibrate → hw_profile.json
+cargo run -p breccia-cli -- profile --dry-run-plan   # role table + placement sketch
+./scripts/verify.sh                                  # pre-merge gate (build/test/clippy/fmt)
+```
