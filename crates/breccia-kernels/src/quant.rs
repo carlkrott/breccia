@@ -9,7 +9,7 @@
 //! | IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / Q4_K / Q5_K / Q6_K / IQ4_XS | 256 elems | 66 / 74 / 82 / 98 / 110 / 144 / 176 / 210 / 136 | one warp per super-block |
 //! | IQ4_NL | 32 | 18 | 4 units per block, 8 blocks per warp iteration |
 //! | Q2_0 (fork) | 64 | 18 | 16 B 2-bit codes + fp16 scale |
-//! | BF16 / F32 | 8 | 16 / 32 | *virtual* blocks: GGML stores these per element, the kernels treat 8 elements as one block so every type shares the same unit-of-8 decode contract |
+//! | F16 / BF16 / F32 | 8 | 16 / 16 / 32 | *virtual* blocks: GGML stores these per element, the kernels treat 8 elements as one block so every type shares the same unit-of-8 decode contract |
 //!
 //! Every supported type therefore decodes as units of 8 consecutive elements,
 //! and `cols` must be handled with the tail path when it is not a multiple of
@@ -31,13 +31,14 @@ pub enum QuantType {
     Q5K,
     Q6K,
     Q2_0,
+    F16,
     Bf16,
     F32,
 }
 
 impl QuantType {
     /// Every type this crate implements a kernel for.
-    pub const ALL: [QuantType; 13] = [
+    pub const ALL: [QuantType; 14] = [
         QuantType::Iq3S,
         QuantType::Q2_0,
         QuantType::Iq2Xxs,
@@ -49,6 +50,7 @@ impl QuantType {
         QuantType::Q4K,
         QuantType::Q5K,
         QuantType::Q6K,
+        QuantType::F16,
         QuantType::Bf16,
         QuantType::F32,
     ];
@@ -67,6 +69,7 @@ impl QuantType {
             QuantType::Q5K => "Q5_K",
             QuantType::Q6K => "Q6_K",
             QuantType::Q2_0 => "Q2_0",
+            QuantType::F16 => "F16",
             QuantType::Bf16 => "BF16",
             QuantType::F32 => "F32",
         }
@@ -76,6 +79,7 @@ impl QuantType {
     pub const fn ggml_id(self) -> u32 {
         match self {
             QuantType::F32 => 0,
+            QuantType::F16 => 1,
             QuantType::Q4K => 12,
             QuantType::Q5K => 13,
             QuantType::Q6K => 14,
@@ -105,6 +109,7 @@ impl QuantType {
             QuantType::Q5K => "q5_k",
             QuantType::Q6K => "q6_k",
             QuantType::Q2_0 => "q2_0",
+            QuantType::F16 => "f16",
             QuantType::Bf16 => "bf16",
             QuantType::F32 => "f32",
         }
@@ -115,7 +120,7 @@ impl QuantType {
         match self {
             QuantType::Iq4Nl => 32,
             QuantType::Q2_0 => 64,
-            QuantType::Bf16 | QuantType::F32 => 8,
+            QuantType::F16 | QuantType::Bf16 | QuantType::F32 => 8,
             _ => 256,
         }
     }
@@ -134,6 +139,7 @@ impl QuantType {
             QuantType::Q5K => 176,
             QuantType::Q6K => 210,
             QuantType::Q2_0 => 18,
+            QuantType::F16 => 16,
             QuantType::Bf16 => 16,
             QuantType::F32 => 32,
         }
@@ -143,7 +149,7 @@ impl QuantType {
     /// per-element geometry, not the 8-element kernel view).
     pub fn bits_per_value(self) -> f64 {
         match self {
-            QuantType::Bf16 => 16.0,
+            QuantType::F16 | QuantType::Bf16 => 16.0,
             QuantType::F32 => 32.0,
             _ => (self.block_bytes() as f64 * 8.0) / self.block_elems() as f64,
         }
@@ -221,9 +227,9 @@ mod tests {
 
     #[test]
     fn geometry_matches_the_format_crate_for_real_block_types() {
-        // BF16/F32 are the documented exception (virtual 8-element blocks).
+        // F16/BF16/F32 are the documented exception (virtual 8-element blocks).
         for q in QuantType::ALL {
-            if matches!(q, QuantType::Bf16 | QuantType::F32) {
+            if matches!(q, QuantType::F16 | QuantType::Bf16 | QuantType::F32) {
                 continue;
             }
             let g = GgmlType::from_id(q.ggml_id())

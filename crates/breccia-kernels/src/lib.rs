@@ -11,8 +11,9 @@
 //!
 //! | Item | What it does |
 //! |---|---|
-//! | [`QuantType`] | the nine types with a kernel, in kernel (block) geometry |
+//! | [`QuantType`] | the fourteen types with a kernel, in kernel (block) geometry |
 //! | [`Gemv`] | device-independent `{type, rows, cols}` + compiled pipeline; [`Gemv::run`] dispatches one decode+GEMV |
+//! | [`Accum`] | fp32 (default) or fp16 dot-product accumulation; fp16 is a measured research path, not recommended |
 //! | [`dequant_to_f32`] | standalone block dequantiser (same decode path, used by conformance tests and by anything that needs f32 weights) |
 //! | [`GemvBatch`] | one dispatch over N routed experts' blobs (row indirection + per-expert `x`), the MoE decode shape |
 //! | [`reference`] | scalar CPU port of `ggml-quants.c` (decode + dot) used as the conformance oracle |
@@ -48,7 +49,7 @@ pub(crate) mod tables;
 pub use batch::{GemvBatch, XLayout};
 pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
-pub use gemv::{dequant_to_f32, Gemv, GemvTiming};
+pub use gemv::{dequant_to_f32, Accum, Gemv, GemvTiming};
 pub use quant::QuantType;
 
 #[cfg(test)]

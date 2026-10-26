@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::{map_to_bytes, GemvBatch, XLayout};
 use crate::device::Device;
-use crate::gemv::{alloc, download, upload, Gemv, GemvTiming};
+use crate::gemv::{alloc, download, upload, Accum, Gemv, GemvTiming};
 use crate::quant::QuantType;
 
 /// Measured DRAM read bandwidth per device id (vendor:device), from the
@@ -84,6 +84,8 @@ pub struct GemvBenchOptions {
     /// each requested expert count (empty = off). Shapes come from
     /// `--rows/--cols` or default to the model's 640x2560 routed-expert shape.
     pub experts: Vec<usize>,
+    /// Accumulator precision of the fused dot product (default fp32).
+    pub accum: Accum,
 }
 
 /// The shapes that matter for one decode step of this model
@@ -181,6 +183,13 @@ pub struct Cell {
     pub shape: Shape,
     pub bits_per_value: f64,
     pub weight_bytes: u64,
+    /// Accumulator precision used (`f32` unless `--accum f16`).
+    #[serde(default)]
+    pub accum: String,
+    /// Max |GPU - CPU reference| / max(1, |CPU|) over the first rows (a slice:
+    /// 4 rows are enough to show the fp16 error, which is uniform across rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conformance_max_rel: Option<f64>,
     /// GPU seconds per GEMV (best of the measured windows).
     pub seconds_per_iter: f64,
     /// Best window, and every window, for spread checking.
@@ -205,6 +214,17 @@ pub struct RealCell {
     pub experts: usize,
     pub expert: Option<usize>,
     pub weight_bytes: u64,
+    /// Accumulator precision used (`f32` unless `--accum f16`).
+    #[serde(default)]
+    pub accum: String,
+    /// Absolute GGUF file byte range of the rows actually benchmarked (the
+    /// `--expert` slice, or the whole tensor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_range: Option<[u64; 2]>,
+    /// True when the tensor's rows were folded to a whole kernel block
+    /// (`real::usable_shape`), e.g. F16 `ple_conv1d` `[4, 10240]` -> 5120x8.
+    #[serde(default)]
+    pub folded_rows: bool,
     pub seconds_per_iter: f64,
     pub seconds_per_iter_all: Vec<f64>,
     pub iters: u32,
@@ -228,6 +248,9 @@ pub struct RealCell {
 pub struct BatchCell {
     pub ty: String,
     pub quant_id: u32,
+    /// Accumulator precision used (`f32` unless `--accum f16`).
+    #[serde(default)]
+    pub accum: String,
     /// Shape of **one** expert (`rows_per_expert x cols`).
     pub shape: Shape,
     pub experts: usize,
@@ -407,8 +430,17 @@ pub fn run_gemv_bench(opts: &GemvBenchOptions) -> Result<GemvReport> {
 
     for ty in types {
         for shape in &shapes {
-            let cell = run_cell(&dev, ty, *shape, window, repeats, opts.splits, &reference)
-                .with_context(|| format!("{ty} {shape}"))?;
+            let cell = run_cell(
+                &dev,
+                ty,
+                *shape,
+                window,
+                repeats,
+                opts.splits,
+                opts.accum,
+                &reference,
+            )
+            .with_context(|| format!("{ty} {shape}"))?;
             report.synthetic.push(cell);
         }
     }
@@ -476,8 +508,10 @@ fn run_batch_cells(
             }
             for layout in [XLayout::Shared, XLayout::PerExpert] {
                 cells.push(
-                    run_batch_cell(dev, ty, shape, experts, layout, window, repeats, reference)
-                        .with_context(|| format!("{ty} {shape} x{experts} ({layout:?})"))?,
+                    run_batch_cell(
+                        dev, ty, shape, experts, layout, window, repeats, opts.accum, reference,
+                    )
+                    .with_context(|| format!("{ty} {shape} x{experts} ({layout:?})"))?,
                 );
             }
         }
@@ -503,11 +537,12 @@ fn run_batch_cell(
     layout: XLayout,
     window: f64,
     repeats: usize,
+    accum: Accum,
     reference: &ReferenceBandwidth,
 ) -> Result<BatchCell> {
     let gpu = dev.gpu();
-    let single = Gemv::new(gpu, ty, shape.rows, shape.cols)?;
-    let batch = GemvBatch::new(gpu, ty, shape.rows, shape.cols)?;
+    let single = Gemv::with_accum(gpu, ty, shape.rows, shape.cols, accum)?;
+    let batch = GemvBatch::with_accum(gpu, ty, shape.rows, shape.cols, accum)?;
 
     // One synthetic blob per expert (distinct weights, distinct activations),
     // concatenated in W exactly like the M3 slot ring holds them.
@@ -608,6 +643,7 @@ fn run_batch_cell(
     let cell = BatchCell {
         ty: ty.name().to_string(),
         quant_id: ty.ggml_id(),
+        accum: accum.name().to_string(),
         shape,
         experts,
         blob_bytes: batch.blob_bytes(),
@@ -664,6 +700,7 @@ struct ReferenceBandwidth {
     note: Option<String>,
 }
 
+#[allow(clippy::too_many_arguments)] // device, shape, windows, split-K, accumulator, reference
 fn run_cell(
     dev: &Device,
     ty: QuantType,
@@ -671,10 +708,11 @@ fn run_cell(
     window: f64,
     repeats: usize,
     opts_splits: Option<u32>,
+    accum: Accum,
     reference: &ReferenceBandwidth,
 ) -> Result<Cell> {
     let gpu = dev.gpu();
-    let gemv = Gemv::new(gpu, ty, shape.rows, shape.cols)?;
+    let gemv = Gemv::with_accum(gpu, ty, shape.rows, shape.cols, accum)?;
     let (packed, x) = crate::real::synthetic_inputs(ty, shape, 0x5eed_1234);
 
     let w = upload(gpu, &packed).context("uploading weights")?;
@@ -720,6 +758,25 @@ fn run_cell(
     let weight_bytes = gemv.weight_bytes();
     let gbps = weight_bytes as f64 / best / 1e9;
 
+    // Accuracy of the same pipeline on the same bytes (4 rows is plenty: the
+    // fp16 error is the row's running sum, not a per-row accident).
+    let conformance_max_rel = {
+        let got = read_out(dev, &out, shape.rows)?;
+        let row_bytes = gemv.blocks_per_row() * ty.block_bytes();
+        let mut worst = 0.0f64;
+        for r in 0..shape.rows.min(4) {
+            let cpu = crate::reference::dot_row(
+                ty,
+                &packed[r * row_bytes..(r + 1) * row_bytes],
+                shape.cols,
+                &x,
+            );
+            let g = f64::from(got[r]);
+            worst = worst.max((g - cpu).abs() / cpu.abs().max(1.0));
+        }
+        Some(worst)
+    };
+
     if let Some(p) = &partials {
         gpu.destroy_buf(p);
     }
@@ -733,6 +790,8 @@ fn run_cell(
         shape,
         bits_per_value: ty.bits_per_value(),
         weight_bytes,
+        accum: accum.name().to_string(),
+        conformance_max_rel,
         seconds_per_iter: best,
         seconds_per_iter_all: all,
         iters,

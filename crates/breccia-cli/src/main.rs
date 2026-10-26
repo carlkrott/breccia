@@ -80,6 +80,7 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parse-only, built once per process (same reason as `Command`)
 enum BenchKind {
     /// M1b: async transfer ring — H2D throughput, overlap, host-memory caps
     Transfer {
@@ -142,6 +143,10 @@ enum BenchKind {
         /// the per-expert loop in the same run.
         #[arg(long, value_name = "N[,N...]", value_delimiter = ',')]
         experts: Vec<usize>,
+        /// Dot-product accumulator: f32 (default, the conformance bar) or f16
+        /// (research path — measured error ~1e-2, see docs/phase-3/03)
+        #[arg(long, value_name = "f32|f16", default_value = "f32")]
+        accum: String,
     },
 }
 
@@ -175,7 +180,7 @@ fn run(cli: Cli) -> Result<()> {
                  breccia bench transfer [--device <idx|pci>]... [--json PATH] [--quick]\n  \
                  breccia bench gemv [--type IQ3_S]... [--rows N --cols N] [--device <idx|pci>]... \\\n                 \
                  [--json PATH] [--quick] [--real [--layer N] [--role gate|up|down] [--expert E]]\n                 \
-                 [--experts 1,2,4,8,10,16]"
+                 [--experts 1,2,4,8,10,16] [--accum f32|f16]"
             );
             Ok(())
         }
@@ -204,6 +209,7 @@ fn run(cli: Cli) -> Result<()> {
                     splits,
                     tensor,
                     experts,
+                    accum,
                 }),
         } => bench_gemv(GemvArgs {
             types,
@@ -220,6 +226,7 @@ fn run(cli: Cli) -> Result<()> {
             splits,
             tensor,
             experts,
+            accum,
         }),
     }
 }
@@ -723,6 +730,7 @@ struct GemvArgs {
     splits: Option<u32>,
     tensor: Option<String>,
     experts: Vec<usize>,
+    accum: String,
 }
 
 /// Everything a `bench gemv` JSON file contains: one run per device, because
@@ -734,7 +742,12 @@ struct GemvBundle {
 }
 
 fn bench_gemv(args: GemvArgs) -> Result<()> {
-    use breccia_kernels::{GemvBenchOptions, QuantType};
+    use breccia_kernels::{Accum, GemvBenchOptions, QuantType};
+
+    let accum: Accum = args
+        .accum
+        .parse::<Accum>()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let types: Vec<QuantType> = args
         .types
@@ -780,6 +793,7 @@ fn bench_gemv(args: GemvArgs) -> Result<()> {
             splits: args.splits,
             real_tensor: args.tensor.clone(),
             experts: args.experts.clone(),
+            accum,
         };
         let report = breccia_kernels::run_gemv_bench(&opts)
             .with_context(|| format!("GEMV benchmark on {dev}"))?;
@@ -819,6 +833,17 @@ fn print_gemv_summary(rep: &breccia_kernels::GemvReport) {
     );
     if rep.environment.vulkan_validation {
         println!("  validation layer: enabled");
+    }
+    if let Some(acc) = rep
+        .synthetic
+        .first()
+        .map(|c| c.accum.clone())
+        .or_else(|| rep.real.first().map(|c| c.accum.clone()))
+        .or_else(|| rep.batch.first().map(|c| c.accum.clone()))
+    {
+        if acc != "f32" {
+            println!("  accumulator: {acc} (non-default; f32 is the conformance path)");
+        }
     }
     for w in &rep.warnings {
         println!("  warning: {w}");
@@ -876,13 +901,17 @@ fn print_gemv_summary(rep: &breccia_kernels::GemvReport) {
     if !rep.real.is_empty() {
         for c in &rep.real {
             println!(
-                "\n  {} ({} {}) as {}x{} — {} MiB of packed weights{}",
+                "\n  {} ({} {}) as {}x{} — {} of packed weights{}",
                 c.tensor,
                 c.ty,
                 c.shape,
                 c.shape.rows,
                 c.shape.cols,
-                c.weight_bytes >> 20,
+                if c.weight_bytes >= 1 << 20 {
+                    format!("{} MiB", c.weight_bytes >> 20)
+                } else {
+                    format!("{} KiB", c.weight_bytes >> 10)
+                },
                 c.expert
                     .map(|e| format!(", expert {e} of {}", c.experts))
                     .unwrap_or_else(|| format!(", all {} experts", c.experts))
@@ -913,17 +942,28 @@ fn print_gemv_summary(rep: &breccia_kernels::GemvReport) {
                     c.conformance_rows, rel
                 );
             }
+            if let Some([start, end]) = c.file_range {
+                println!(
+                    "    file bytes 0x{start:x}..0x{end:x} ({:.0} KiB){}",
+                    (end - start) as f64 / 1024.0,
+                    if c.folded_rows {
+                        " · rows folded to a whole kernel block"
+                    } else {
+                        ""
+                    }
+                );
+            }
         }
         return;
     }
 
     println!(
-        "\n  {:<8} {:>12} {:>6} {:>10} {:>11} {:>9} {:>9}",
-        "type", "shape", "bpw", "MiB read", "ms/GEMV", "GB/s", "of DRAM"
+        "\n  {:<8} {:>12} {:>6} {:>10} {:>11} {:>9} {:>9} {:>9}",
+        "type", "shape", "bpw", "MiB read", "ms/GEMV", "GB/s", "of DRAM", "max rel"
     );
     for c in &rep.synthetic {
         println!(
-            "  {:<8} {:>12} {:>6.2} {:>10.2} {:>11.3} {:>9.1} {:>8} {:>5}",
+            "  {:<8} {:>12} {:>6.2} {:>10.2} {:>11.3} {:>9.1} {:>8} {:>5} {:>9.2e}",
             c.ty,
             format!("{}x{}", c.shape.rows, c.shape.cols),
             c.bits_per_value,
@@ -933,7 +973,8 @@ fn print_gemv_summary(rep: &breccia_kernels::GemvReport) {
             c.percent_of_reference
                 .map(|p| format!("{p:.0}%"))
                 .unwrap_or_else(|| "-".to_string()),
-            c.splits
+            c.splits,
+            c.conformance_max_rel.unwrap_or(f64::NAN),
         );
     }
 }

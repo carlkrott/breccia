@@ -112,6 +112,11 @@ pub fn dequant_block(ty: QuantType, blk: &[u8], out: &mut Vec<f32>) {
                 out.push(f32::from_bits(u32::from(w16(blk, j)) << 16));
             }
         }
+        QuantType::F16 => {
+            for j in 0..8 {
+                out.push(f16_to_f32(w16(blk, j)));
+            }
+        }
         QuantType::Iq2Xxs => {
             let d = scale(blk, 0);
             for ib32 in 0..8 {

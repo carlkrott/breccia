@@ -3,6 +3,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : enable
+#ifdef BRECCIA_F16_ACCUM
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 //
 // gemv for BF16 — thin wrapper: block geometry + decode unit selection.
 // Decode semantics: shaders/blocks.glsl (GGML_FP16_TO_FP32-style widening).

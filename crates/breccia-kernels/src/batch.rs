@@ -48,7 +48,7 @@ use anyhow::{anyhow, Result};
 use ash::vk;
 use breccia_vk::ctx::{Buf, Gpu, Qc};
 
-use crate::gemv::{alloc, table_bytes, upload, GemvTiming, ROWS_PER_WG, WG_X_MAX};
+use crate::gemv::{alloc, table_bytes, upload, Accum, GemvTiming, ROWS_PER_WG, WG_X_MAX};
 use crate::quant::QuantType;
 
 /// Where a batch's activation vectors live.
@@ -76,6 +76,7 @@ impl XLayout {
 /// indirection the batched body needs (descriptor set 0: W, X, O, tables, map).
 pub struct GemvBatch<'g> {
     ty: QuantType,
+    accum: Accum,
     rows_per_expert: usize,
     cols: usize,
     gpu: &'g Gpu,
@@ -84,16 +85,34 @@ pub struct GemvBatch<'g> {
 }
 
 impl<'g> GemvBatch<'g> {
-    /// Compile the batched pipeline for `ty` on `gpu`.
+    /// Compile the batched pipeline for `ty` on `gpu` (fp32 accumulation).
     pub fn new(gpu: &'g Gpu, ty: QuantType, rows_per_expert: usize, cols: usize) -> Result<Self> {
+        Self::with_accum(gpu, ty, rows_per_expert, cols, Accum::F32)
+    }
+
+    /// Compile the batched pipeline for `ty` on `gpu` with an explicit
+    /// accumulator (see [`Accum`]).
+    pub fn with_accum(
+        gpu: &'g Gpu,
+        ty: QuantType,
+        rows_per_expert: usize,
+        cols: usize,
+        accum: Accum,
+    ) -> Result<Self> {
         if rows_per_expert == 0 || cols == 0 {
             return Err(anyhow!(
                 "expert shape must be non-empty ({rows_per_expert}x{cols})"
             ));
         }
+        if accum == Accum::F16 && !gpu.feats.shader_float16 {
+            return Err(anyhow!(
+                "device {} does not support shaderFloat16, which fp16 accumulation requires",
+                gpu.index
+            ));
+        }
         let kernel = gpu
-            .kernel(gemv_moe_spv(ty), 5)
-            .map_err(|e| anyhow!("creating the {ty} batched GEMV pipeline: {e}"))?;
+            .kernel(gemv_moe_spv(ty, accum), 5)
+            .map_err(|e| anyhow!("creating the {ty} batched GEMV pipeline ({accum} accum): {e}"))?;
         let tables = match upload(gpu, &table_bytes()) {
             Ok(b) => b,
             Err(e) => {
@@ -103,6 +122,7 @@ impl<'g> GemvBatch<'g> {
         };
         Ok(GemvBatch {
             ty,
+            accum,
             rows_per_expert,
             cols,
             gpu,
@@ -113,6 +133,10 @@ impl<'g> GemvBatch<'g> {
 
     pub fn ty(&self) -> QuantType {
         self.ty
+    }
+    /// Accumulator precision this pipeline was compiled for.
+    pub fn accum(&self) -> Accum {
+        self.accum
     }
     pub fn rows_per_expert(&self) -> usize {
         self.rows_per_expert
@@ -308,20 +332,35 @@ macro_rules! spv {
     };
 }
 
-fn gemv_moe_spv(ty: QuantType) -> &'static [u8] {
-    match ty {
-        QuantType::Iq2Xxs => spv!("gemv_iq2_xxs_moe"),
-        QuantType::Iq2Xs => spv!("gemv_iq2_xs_moe"),
-        QuantType::Iq2S => spv!("gemv_iq2_s_moe"),
-        QuantType::Iq3Xxs => spv!("gemv_iq3_xxs_moe"),
-        QuantType::Iq3S => spv!("gemv_iq3_s_moe"),
-        QuantType::Iq4Nl => spv!("gemv_iq4_nl_moe"),
-        QuantType::Iq4Xs => spv!("gemv_iq4_xs_moe"),
-        QuantType::Q4K => spv!("gemv_q4_k_moe"),
-        QuantType::Q5K => spv!("gemv_q5_k_moe"),
-        QuantType::Q6K => spv!("gemv_q6_k_moe"),
-        QuantType::Q2_0 => spv!("gemv_q2_0_moe"),
-        QuantType::Bf16 => spv!("gemv_bf16_moe"),
-        QuantType::F32 => spv!("gemv_f32_moe"),
+fn gemv_moe_spv(ty: QuantType, accum: Accum) -> &'static [u8] {
+    match (ty, accum) {
+        (QuantType::Iq2Xxs, Accum::F32) => spv!("gemv_iq2_xxs_moe"),
+        (QuantType::Iq2Xxs, Accum::F16) => spv!("gemv_iq2_xxs_moe_f16acc"),
+        (QuantType::Iq2Xs, Accum::F32) => spv!("gemv_iq2_xs_moe"),
+        (QuantType::Iq2Xs, Accum::F16) => spv!("gemv_iq2_xs_moe_f16acc"),
+        (QuantType::Iq2S, Accum::F32) => spv!("gemv_iq2_s_moe"),
+        (QuantType::Iq2S, Accum::F16) => spv!("gemv_iq2_s_moe_f16acc"),
+        (QuantType::Iq3Xxs, Accum::F32) => spv!("gemv_iq3_xxs_moe"),
+        (QuantType::Iq3Xxs, Accum::F16) => spv!("gemv_iq3_xxs_moe_f16acc"),
+        (QuantType::Iq3S, Accum::F32) => spv!("gemv_iq3_s_moe"),
+        (QuantType::Iq3S, Accum::F16) => spv!("gemv_iq3_s_moe_f16acc"),
+        (QuantType::Iq4Nl, Accum::F32) => spv!("gemv_iq4_nl_moe"),
+        (QuantType::Iq4Nl, Accum::F16) => spv!("gemv_iq4_nl_moe_f16acc"),
+        (QuantType::Iq4Xs, Accum::F32) => spv!("gemv_iq4_xs_moe"),
+        (QuantType::Iq4Xs, Accum::F16) => spv!("gemv_iq4_xs_moe_f16acc"),
+        (QuantType::Q4K, Accum::F32) => spv!("gemv_q4_k_moe"),
+        (QuantType::Q4K, Accum::F16) => spv!("gemv_q4_k_moe_f16acc"),
+        (QuantType::Q5K, Accum::F32) => spv!("gemv_q5_k_moe"),
+        (QuantType::Q5K, Accum::F16) => spv!("gemv_q5_k_moe_f16acc"),
+        (QuantType::Q6K, Accum::F32) => spv!("gemv_q6_k_moe"),
+        (QuantType::Q6K, Accum::F16) => spv!("gemv_q6_k_moe_f16acc"),
+        (QuantType::Q2_0, Accum::F32) => spv!("gemv_q2_0_moe"),
+        (QuantType::Q2_0, Accum::F16) => spv!("gemv_q2_0_moe_f16acc"),
+        (QuantType::F16, Accum::F32) => spv!("gemv_f16_moe"),
+        (QuantType::F16, Accum::F16) => spv!("gemv_f16_moe_f16acc"),
+        (QuantType::Bf16, Accum::F32) => spv!("gemv_bf16_moe"),
+        (QuantType::Bf16, Accum::F16) => spv!("gemv_bf16_moe_f16acc"),
+        (QuantType::F32, Accum::F32) => spv!("gemv_f32_moe"),
+        (QuantType::F32, Accum::F16) => spv!("gemv_f32_moe_f16acc"),
     }
 }

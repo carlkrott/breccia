@@ -17,7 +17,7 @@
 //! result can be checked against the CPU reference on real quantised data.
 
 use anyhow::{anyhow, Context, Result};
-use breccia_format::{ExpertBlock, ShardSet, TensorView};
+use breccia_format::{ExpertBlock, ExpertRole, ShardSet, TensorView};
 
 use crate::batch::{map_to_bytes, GemvBatch, XLayout};
 use crate::bench::{f32_to_bytes, read_out, BatchCell, GemvBenchOptions, RealCell, Shape};
@@ -48,18 +48,20 @@ pub fn synthetic_inputs(ty: QuantType, shape: Shape, seed: u64) -> (Vec<u8>, Vec
         for b in 0..bpr {
             let off = (r * bpr + b) * bb;
             let blk = &mut packed[off..off + bb];
-            if matches!(ty, QuantType::Bf16 | QuantType::F32) {
+            if matches!(ty, QuantType::F16 | QuantType::Bf16 | QuantType::F32) {
                 // Unquantised types have no scale field, so random payload bytes
                 // would mean random exponents (values up to 3e38 and dots that
                 // overflow). Generate plausible activations instead.
                 let words = ty.block_elems();
                 for e in 0..words {
                     let v = (rng.next_f32() - 0.5) * 8.0;
-                    if ty == QuantType::Bf16 {
-                        let hi = f32_to_f16_lossy_bits(v);
-                        blk[2 * e..2 * e + 2].copy_from_slice(&hi.to_le_bytes());
-                    } else {
-                        blk[4 * e..4 * e + 4].copy_from_slice(&v.to_le_bytes());
+                    match ty {
+                        QuantType::F16 => {
+                            blk[2 * e..2 * e + 2].copy_from_slice(&f32_to_f16(v).to_le_bytes())
+                        }
+                        QuantType::Bf16 => blk[2 * e..2 * e + 2]
+                            .copy_from_slice(&f32_to_f16_lossy_bits(v).to_le_bytes()),
+                        _ => blk[4 * e..4 * e + 4].copy_from_slice(&v.to_le_bytes()),
                     }
                 }
                 continue;
@@ -102,7 +104,7 @@ pub fn scale_offsets(ty: QuantType) -> &'static [usize] {
     match ty {
         QuantType::Q4K | QuantType::Q5K => &[0, 2],
         QuantType::Q6K => &[208],
-        QuantType::Bf16 | QuantType::F32 => &[],
+        QuantType::F16 | QuantType::Bf16 | QuantType::F32 => &[],
         _ => &[0],
     }
 }
@@ -180,6 +182,86 @@ impl XorShift64 {
     }
 }
 
+/// Where one expert's rows live inside a 3-dim expert tensor.
+///
+/// A GGUF routed-expert tensor is `[ne0, ne1, n_expert]` = `[cols, rows,
+/// experts]` and is **expert-major**: expert `e` owns the contiguous byte range
+/// `[e*per, (e+1)*per)`. That is the same layout `breccia_format`'s
+/// [`breccia_format::ExpertBlock`] uses for the pack blob, where a whole expert
+/// is `[gate | up | down]` and `blob_offsets()` gives the role boundaries: one
+/// GGUF role tensor is exactly one of those role slices, so an expert's rows in
+/// it start at `file_range().start + e * bytes_per_expert`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpertSlice {
+    /// Range inside the tensor's own bytes.
+    pub rel: std::ops::Range<usize>,
+    /// Range inside the mapped GGUF file (what a report should print).
+    pub file: std::ops::Range<u64>,
+    /// Row length of the tensor (`dims[0]`).
+    pub cols: usize,
+    /// Rows per expert (`dims[1]`).
+    pub rows: usize,
+    /// Expert count (`dims[2]`).
+    pub experts: usize,
+}
+
+/// Slice expert `expert` out of an expert-major `[cols, rows, experts]` tensor.
+pub fn expert_slice(
+    dims: &[u64],
+    n_bytes: u64,
+    file_start: u64,
+    expert: usize,
+) -> Result<ExpertSlice> {
+    if dims.len() < 3 {
+        return Err(anyhow!(
+            "--expert needs an expert tensor with 3 dims [cols, rows, experts]; \
+             this tensor has {} dim(s) — drop --expert to run the whole tensor",
+            dims.len()
+        ));
+    }
+    let experts = dims[2] as usize;
+    if experts == 0 {
+        return Err(anyhow!("tensor declares zero experts"));
+    }
+    if expert >= experts {
+        return Err(anyhow!("--expert {expert} out of range (0..{experts})"));
+    }
+    if !n_bytes.is_multiple_of(experts as u64) {
+        return Err(anyhow!(
+            "{n_bytes} tensor bytes do not split into {experts} experts"
+        ));
+    }
+    let per = (n_bytes / experts as u64) as usize;
+    let start = expert * per;
+    Ok(ExpertSlice {
+        rel: start..start + per,
+        file: file_start + start as u64..file_start + (start + per) as u64,
+        cols: dims[0] as usize,
+        rows: dims[1] as usize,
+        experts,
+    })
+}
+
+/// Row geometry the kernel can actually use.
+///
+/// GGUF stores a tensor contiguously, so a row shorter than the kernel block
+/// (the F16 `ple_conv1d` kernel is `[4, 10240]`, i.e. 4-element rows against an
+/// 8-element virtual block) is not addressable row-by-row. Folding `k` adjacent
+/// rows into one makes the row whole-block aligned without moving a byte: every
+/// element is still read exactly once, and the folded shape is reported.
+pub fn usable_shape(cols: usize, rows: usize, block_elems: usize) -> (usize, usize) {
+    if cols.is_multiple_of(block_elems) {
+        return (cols, rows);
+    }
+    for k in 2..=block_elems {
+        let c = cols * k;
+        if c.is_multiple_of(block_elems) && rows.is_multiple_of(k) {
+            return (c, rows / k);
+        }
+    }
+    (cols, rows)
+}
+
 // ---------------------------------------------------------------------------
 // Real-model runner
 // ---------------------------------------------------------------------------
@@ -201,7 +283,13 @@ pub fn run(dev: &Device, opts: &GemvBenchOptions) -> Result<Vec<RealCell>> {
         let tensor = shards
             .tensor(name)
             .ok_or_else(|| anyhow!("tensor {name} is not in {glob}"))?;
-        return run_tensor(dev, opts, tensor, None);
+        if let Some(e) = opts.real_expert {
+            verify_expert_against_pack(&shards, tensor, e)?;
+        }
+        // `--expert` applies on the `--tensor` path too: when the named tensor is
+        // one of the layer's `ffn_*_exps` tensors only that expert's rows are
+        // benchmarked (docs/phase-3/03-gaps-closed.md §3).
+        return run_tensor(dev, opts, tensor, opts.real_expert);
     }
 
     let layout = shards.layout().context("model layout")?;
@@ -215,6 +303,56 @@ pub fn run(dev: &Device, opts: &GemvBenchOptions) -> Result<Vec<RealCell>> {
         other => return Err(anyhow!("--real-role must be gate|up|down, got {other:?}")),
     };
     run_tensor(dev, opts, tensor, opts.real_expert)
+}
+
+/// Cross-check an expert slice against the pack's own `[gate|up|down]` blob
+/// geometry.
+///
+/// If the named tensor is one of a block's routed-expert role tensors, its
+/// expert-major slice must be exactly the file range `ExpertBlock::expert_ranges`
+/// computes (the pack's blob offsets are `[0, gate_end, up_end, blob]`, and one
+/// GGUF role tensor is one of those role slices). A disagreement would mean the
+/// `--expert` slice addresses different bytes than the pack layout the engine
+/// actually uses, so it is an error, not a warning.
+fn verify_expert_against_pack(
+    shards: &ShardSet,
+    tensor: TensorView<'_>,
+    expert: usize,
+) -> Result<()> {
+    if tensor.n_dims() < 3 {
+        return Ok(()); // `expert_slice` reports the real error with the shape
+    }
+    let slice = expert_slice(
+        tensor.dims(),
+        tensor.n_bytes(),
+        tensor.file_range().start,
+        expert,
+    )?;
+    let Ok(layout) = shards.layout() else {
+        return Ok(()); // not a routed-expert model: nothing to cross-check
+    };
+    for block in layout.blocks() {
+        for role in ExpertRole::ALL {
+            if block.role(role).name() != tensor.name() {
+                continue;
+            }
+            let want = &block.expert_ranges(expert)?[role.index()];
+            if *want != slice.file {
+                return Err(anyhow!(
+                    "{} expert {expert} slice 0x{:x}..0x{:x} disagrees with the pack layout \
+                     0x{:x}..0x{:x} (blob offsets {:?})",
+                    tensor.name(),
+                    slice.file.start,
+                    slice.file.end,
+                    want.start,
+                    want.end,
+                    block.blob_offsets()
+                ));
+            }
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 /// Benchmark one real tensor (one expert's slice, or the whole thing).
@@ -240,21 +378,35 @@ fn run_tensor(
     let rows_per_expert = tensor.dims()[1] as usize;
     let experts = tensor.dims().get(2).copied().unwrap_or(1) as usize;
 
-    let (range, expert_sel, rows) = match only_expert {
+    let (range, expert_sel, natural_rows, file_range) = match only_expert {
         Some(e) => {
-            if e >= experts {
-                return Err(anyhow!("--real-expert {e} out of range (0..{experts})"));
-            }
-            let per = (tensor.n_bytes() / experts as u64) as usize;
-            let start = e * per;
-            (start..start + per, Some(e), rows_per_expert)
+            let slice = expert_slice(
+                tensor.dims(),
+                tensor.n_bytes(),
+                tensor.file_range().start,
+                e,
+            )?;
+            (slice.rel, Some(e), slice.rows, Some(slice.file))
         }
         None => (
             0..tensor.n_bytes() as usize,
             None,
             rows_per_expert * experts,
+            None,
         ),
     };
+
+    // A row shorter than the kernel block (the F16 `ple_conv1d` `[4, 10240]`
+    // kernel) is not addressable row-by-row; fold adjacent rows so the shape is
+    // whole-block aligned. The bytes and the reported file range do not change.
+    // Only for a single expert/whole non-expert tensor: folding a multi-expert
+    // tensor would merge adjacent experts' rows into one row.
+    let (cols, rows) = if only_expert.is_none() && experts > 1 {
+        (cols, natural_rows)
+    } else {
+        usable_shape(cols, natural_rows, ty.block_elems())
+    };
+    let folded = rows != natural_rows;
 
     // Zero-copy view of the mapping — the only place the tensor bytes are
     // touched; the page cache / mmap does the paging, nothing is copied out.
@@ -263,12 +415,16 @@ fn run_tensor(
     let shape = Shape::new(rows, cols);
 
     let gpu = dev.gpu();
-    let gemv = Gemv::new(gpu, ty, rows, cols)?;
+    let gemv = Gemv::with_accum(gpu, ty, rows, cols, opts.accum)?;
     if gemv.weight_bytes() as usize != bytes.len() {
         return Err(anyhow!(
-            "kernel geometry disagrees with the tensor: kernel wants {} bytes, tensor slice has {}",
+            "kernel geometry disagrees with the tensor: kernel wants {} bytes, tensor slice has {} \
+             (shape {}x{}{})",
             gemv.weight_bytes(),
-            bytes.len()
+            bytes.len(),
+            rows,
+            cols,
+            if folded { ", rows folded" } else { "" }
         ));
     }
 
@@ -350,6 +506,9 @@ fn run_tensor(
         experts,
         expert: expert_sel,
         weight_bytes,
+        accum: opts.accum.name().to_string(),
+        file_range: file_range.map(|r| [r.start, r.end]),
+        folded_rows: folded,
         seconds_per_iter: best,
         seconds_per_iter_all: all_t,
         iters,
@@ -433,7 +592,7 @@ pub fn run_batch(dev: &Device, opts: &GemvBenchOptions) -> Result<Vec<BatchCell>
 
     let gpu = dev.gpu();
     let shape = Shape::new(rows_per_expert, cols);
-    let batch = GemvBatch::new(gpu, ty, rows_per_expert, cols)?;
+    let batch = GemvBatch::with_accum(gpu, ty, rows_per_expert, cols, opts.accum)?;
     let blob = batch.blob_bytes() as usize;
     if blob * available != tensor.n_bytes() as usize {
         return Err(anyhow!(
@@ -468,7 +627,7 @@ pub fn run_batch(dev: &Device, opts: &GemvBenchOptions) -> Result<Vec<BatchCell>
     let w0 = upload(gpu, &all[..blob]).context("uploading blob 0")?;
     let x0 = upload(gpu, &f32_to_bytes(&xs[0])).context("uploading x0")?;
     let out0 = alloc(gpu, (rows_per_expert * 4) as u64).context("allocating single output")?;
-    let single = Gemv::new(gpu, ty, rows_per_expert, cols)?;
+    let single = Gemv::with_accum(gpu, ty, rows_per_expert, cols, opts.accum)?;
 
     let window = if opts.quick { 0.15 } else { 0.3 };
     let repeats = if opts.quick { 2 } else { 3 };
@@ -541,6 +700,7 @@ pub fn run_batch(dev: &Device, opts: &GemvBenchOptions) -> Result<Vec<BatchCell>
             cells.push(BatchCell {
                 ty: ty.name().to_string(),
                 quant_id: ty.ggml_id(),
+                accum: opts.accum.name().to_string(),
                 shape,
                 experts,
                 blob_bytes: batch.blob_bytes(),
@@ -589,5 +749,63 @@ fn reference_for(device_id: &str) -> (Option<f64>, Option<String>) {
             Some("Radeon VII / MI50, 825 GB/s reference".into()),
         ),
         _ => (None, None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--expert` on a `--tensor` path: the slice must be the expert-major byte
+    /// range of a synthetic multi-expert tensor, and must cover the whole tensor
+    /// exactly once across all experts. No GPU involved.
+    #[test]
+    fn expert_slice_walks_a_synthetic_multi_expert_tensor() {
+        // [cols, rows, experts] as GGML stores it; F16 = 2 B/element here.
+        let dims = [16u64, 4, 3];
+        let per = 4 * 16 * 2;
+        let bytes: Vec<u8> = (0..per * 3).map(|i| (i % 251) as u8).collect();
+        let file_start = 1_000_000u64;
+
+        let mut covered = 0usize;
+        for e in 0..3usize {
+            let s = expert_slice(&dims, bytes.len() as u64, file_start, e).expect("slice");
+            assert_eq!(s.rel, e * per..(e + 1) * per, "expert {e} rel range");
+            assert_eq!(
+                s.file,
+                file_start + (e * per) as u64..file_start + ((e + 1) * per) as u64,
+                "expert {e} file range"
+            );
+            assert_eq!((s.rows, s.cols, s.experts), (4, 16, 3));
+            // The slice is that expert's own bytes, not a neighbour's.
+            assert_eq!(&bytes[s.rel.clone()], &bytes[e * per..(e + 1) * per]);
+            assert_eq!(bytes[s.rel.start], (e * per % 251) as u8);
+            covered += s.rel.len();
+        }
+        assert_eq!(covered, bytes.len(), "experts must tile the tensor");
+
+        assert!(expert_slice(&dims, bytes.len() as u64, file_start, 3).is_err());
+        // A 2-dim tensor has no experts to select.
+        assert!(expert_slice(&[4, 10240], 81920, file_start, 0).is_err());
+    }
+
+    /// The F16 `ple_conv1d` kernel is `[4, 10240]`: 4-element rows cannot be
+    /// addressed against the kernel's 8-element block, so rows fold without
+    /// moving a byte — the folded shape must still account for all 81,920 B.
+    #[test]
+    fn rows_shorter_than_a_kernel_block_fold_to_whole_blocks() {
+        assert_eq!(usable_shape(4, 10240, 8), (8, 5120));
+        let (cols, rows) = usable_shape(4, 10240, 8);
+        assert_eq!(
+            rows * cols.div_ceil(8) * 16,
+            81920,
+            "F16 byte count preserved"
+        );
+        // Already-aligned shapes are untouched (the real projections).
+        assert_eq!(usable_shape(2560, 640, 8), (2560, 640));
+        assert_eq!(usable_shape(2560, 640, 256), (2560, 640));
+        assert_eq!(usable_shape(640, 2560, 64), (640, 2560));
+        // A 256-element block needs 64 four-element rows.
+        assert_eq!(usable_shape(4, 10240, 256), (256, 160));
     }
 }

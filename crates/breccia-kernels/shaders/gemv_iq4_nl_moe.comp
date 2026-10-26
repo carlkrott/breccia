@@ -3,6 +3,9 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_EXT_control_flow_attributes : enable
+#ifdef BRECCIA_F16_ACCUM
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
 //
 // Batched multi-expert gemv for IQ4_NL — row-indirection variant of
 // gemv_iq4_nl.comp (docs/phase-3/02-expert-batching-quants.md).

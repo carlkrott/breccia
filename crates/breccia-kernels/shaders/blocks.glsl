@@ -363,10 +363,16 @@ void dequant_q2_0_unit(uint off, uint u, out float v[8]) {
     }
 }
 
-// ---- BF16 / F32  (viewed as 8-element "blocks") ---------------------------
+// ---- F16 / BF16 / F32  (viewed as 8-element "blocks") ---------------------
 
 // The tensor types are per-element in GGUF; the kernels view them as virtual
 // 8-element blocks so that every type shares one unit-of-8 decode contract.
+void dequant_f16_unit(uint off, uint u, out float v[8]) {
+    for (uint j = 0u; j < 8u; ++j) {
+        v[j] = f16_at(off + 8u * u + j);
+    }
+}
+
 void dequant_bf16_unit(uint off, uint u, out float v[8]) {
     for (uint j = 0u; j < 8u; ++j) {
         v[j] = uintBitsToFloat(u16_at(off + 8u * u + j) << 16);

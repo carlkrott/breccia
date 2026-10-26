@@ -24,8 +24,8 @@
 // Adapted from ggml-vulkan (MIT) vulkan-shaders/mul_mat_vec_iq3_s.comp (the
 // "one warp covers a super-block, per-lane 8-element unit" shape), commit
 // 6050b46. Differences: raw u16-word block views instead of typed structs,
-// fp32-only accumulation, an in-loop tail mask for cols % QK != 0, and the
-// split-K path.
+// fp32 accumulation by default (`BRECCIA_F16_ACCUM` builds the opt-in fp16
+// variant), an in-loop tail mask for cols % QK != 0, and the split-K path.
 
 #ifndef BRECCIA_GEMV_BODY_GLSL
 #define BRECCIA_GEMV_BODY_GLSL
@@ -88,8 +88,17 @@ void main() {
     const uint row_base = ROW_BASE(row);
     const uint xb = X_BASE(row); // vec4 units
 
+#ifdef BRECCIA_F16_ACCUM
+    // fp16 accumulation (opt-in, `Accum::F16`; docs/phase-3/03-gaps-closed.md).
+    // Two accumulators packed as one f16vec2 so the pair is a single packed
+    // f16 add (V_PK_ADD_F16 on gfx9/gfx10) instead of two scalar adds. Each
+    // block's 8-element partial product is still formed in f32; the running sum
+    // over the row is the part that rounds to fp16.
+    f16vec2 acc = f16vec2(float16_t(0.0), float16_t(0.0));
+#else
     float acc0 = 0.0;
     float acc1 = 0.0;
+#endif
     float v[8];
 
     for (uint b0 = b_start; b0 < b_end; b0 += STEP) {
@@ -116,19 +125,32 @@ void main() {
                 }
             }
         }
+#ifdef BRECCIA_F16_ACCUM
+        acc += ((b0 & 1u) == 0u) ? f16vec2(float16_t(s), float16_t(0.0))
+                                 : f16vec2(float16_t(0.0), float16_t(s));
+#else
         if ((b0 & 1u) == 0u) {
             acc0 += s;
         } else {
             acc1 += s;
         }
+#endif
     }
 
-    float acc = acc0 + acc1;
+#ifdef BRECCIA_F16_ACCUM
+    // Convert to f32 before the cross-lane reduce: the fp16 rounding this path
+    // measures is the per-lane running sum, and keeping the 5 shuffle-adds in
+    // f32 avoids needing 16-bit subgroup shuffles (not universally supported).
+    f16vec2 hsum = acc;
+    float facc = float(hsum.x + hsum.y);
+#else
+    float facc = acc0 + acc1;
+#endif
     [[unroll]] for (uint off = 16u; off > 0u; off >>= 1u) {
-        acc += subgroupShuffleXor(acc, off);
+        facc += subgroupShuffleXor(facc, off);
     }
     if (lane == 0u) {
-        O[sid * pc.rows + row] = acc;
+        O[sid * pc.rows + row] = facc;
     }
 }
 

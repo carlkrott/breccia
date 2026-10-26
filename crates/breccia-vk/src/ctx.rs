@@ -716,10 +716,21 @@ impl Gpu {
                 "vkCreateDescriptorSetLayout",
             )?;
 
+            // 32 bytes, not 16. The decode kernels' original four words
+            // (rows/cols/bpr/splits) exactly filled 16 bytes, so there was no
+            // room for a fifth word (accumulator selector, per-row weight base)
+            // without a second pipeline layout per shader. Every device here
+            // reports maxPushConstantsSize >= 128 (Vulkan's guaranteed minimum is
+            // also 128), so 32 costs nothing. Shaders still declare only the
+            // 16-byte prefix they read; a 32-byte range with a 16-byte block at
+            // offset 0 is backwards compatible (`cmd_push_constants` may push a
+            // prefix of the range), and a shader that needs a fifth word can now
+            // declare 20/32 bytes without touching the layout
+            // (docs/phase-3/03-gaps-closed.md).
             let pcr = vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 .offset(0)
-                .size(16);
+                .size(32);
             let layouts = [dsl];
             let pcrs = [pcr];
             let plci = vk::PipelineLayoutCreateInfo::default()

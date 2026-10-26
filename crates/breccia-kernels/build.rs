@@ -1,11 +1,18 @@
 //! Compile the GLSL compute kernels to SPIR-V at build time and validate them.
 //!
 //! Same toolchain and pattern as `crates/breccia-vk/build.rs`
-//! (docs/PROJECT-SETUP.md): `glslc -O --target-env=vulkan1.3` -> `spirv-val`.
+//! (docs/PROJECT-SETUP.md): `glslc -O --target-env=vulkan3` -> `spirv-val`.
 //! Fails the build loudly if either tool is missing or rejects a shader, and
 //! `include_str!` in the crate embeds the validated SPIR-V.
+//!
+//! Every GEMV shader is compiled **twice**: once as-is (fp32 accumulation, the
+//! default) and once with `-DBRECCIA_F16_ACCUM` (fp16 accumulation, selected by
+//! `breccia_kernels::Accum::F16`). The variant is a separate pipeline rather
+//! than a runtime push-constant branch so the default f32 pipeline is
+//! bit-identical to what the earlier phase reports measured
+//! (`docs/phase-3/03-gaps-closed.md`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// (shader stem, SPIR-V env var) — one `<stem>.comp` in `shaders/`.
@@ -21,6 +28,7 @@ const SHADERS: &[&str] = &[
     "gemv_q5_k",
     "gemv_q6_k",
     "gemv_q2_0",
+    "gemv_f16",
     "gemv_bf16",
     "gemv_f32",
     // batched multi-expert variants (one dispatch over N experts' blobs)
@@ -35,6 +43,7 @@ const SHADERS: &[&str] = &[
     "gemv_q5_k_moe",
     "gemv_q6_k_moe",
     "gemv_q2_0_moe",
+    "gemv_f16_moe",
     "gemv_bf16_moe",
     "gemv_f32_moe",
     "gemv_reduce",
@@ -49,6 +58,7 @@ const SHADERS: &[&str] = &[
     "dequant_q5_k",
     "dequant_q6_k",
     "dequant_q2_0",
+    "dequant_f16",
     "dequant_bf16",
     "dequant_f32",
 ];
@@ -61,38 +71,58 @@ fn main() {
     let glslc = std::env::var("GLSLC").unwrap_or_else(|_| "glslc".to_string());
 
     for name in SHADERS {
-        let src = format!("shaders/{name}.comp");
-        let spv = out_dir.join(format!("{name}.spv"));
-
-        let compile = Command::new(&glslc)
-            .args([
-                "-O",
-                "--target-env=vulkan1.3",
-                // `#include` support for the shared block decode / body files.
-                "-I",
-                "shaders",
-            ])
-            .arg(&src)
-            .arg("-o")
-            .arg(&spv)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to launch `{glslc}` ({e}); is shaderc installed?"));
-        if !compile.status.success() {
-            panic!(
-                "glslc failed for {src}:\n{}",
-                String::from_utf8_lossy(&compile.stderr)
+        compile(&glslc, &out_dir, name, name, &[]);
+        // fp16-accumulate variant of every fused GEMV (not the reduce pass: it
+        // sums fp32 partials by contract).
+        if name.starts_with("gemv_") && *name != "gemv_reduce" {
+            compile(
+                &glslc,
+                &out_dir,
+                name,
+                &format!("{name}_f16acc"),
+                &["BRECCIA_F16_ACCUM"],
             );
         }
+    }
+}
 
-        let validate = Command::new("spirv-val")
-            .arg(&spv)
-            .output()
-            .unwrap_or_else(|e| panic!("failed to launch `spirv-val` ({e})"));
-        if !validate.status.success() {
-            panic!(
-                "spirv-val rejected {src}:\n{}",
-                String::from_utf8_lossy(&validate.stderr)
-            );
-        }
+/// `glslc -O ... <src>.comp -o <out>.spv` followed by `spirv-val`.
+fn compile(glslc: &str, out_dir: &Path, src_stem: &str, out_stem: &str, defines: &[&str]) {
+    let src = format!("shaders/{src_stem}.comp");
+    let spv = out_dir.join(format!("{out_stem}.spv"));
+
+    let mut cmd = Command::new(glslc);
+    cmd.args([
+        "-O",
+        "--target-env=vulkan1.3",
+        // `#include` support for the shared block decode / body files.
+        "-I",
+        "shaders",
+    ]);
+    for d in defines {
+        cmd.arg(format!("-D{d}"));
+    }
+    let compile = cmd
+        .arg(&src)
+        .arg("-o")
+        .arg(&spv)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to launch `{glslc}` ({e}); is shaderc installed?"));
+    if !compile.status.success() {
+        panic!(
+            "glslc failed for {src} (defines {defines:?}):\n{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+    }
+
+    let validate = Command::new("spirv-val")
+        .arg(&spv)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to launch `spirv-val` ({e})"));
+    if !validate.status.success() {
+        panic!(
+            "spirv-val rejected {src} (defines {defines:?}):\n{}",
+            String::from_utf8_lossy(&validate.stderr)
+        );
     }
 }

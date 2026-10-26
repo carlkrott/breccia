@@ -39,9 +39,71 @@ impl GemvTiming {
     }
 }
 
+/// Accumulator precision of the fused dot product.
+///
+/// `F32` is the default and the only setting the conformance gate accepts
+/// (≤ 1e-3 relative). `F16` accumulates the per-lane running sum of a row in
+/// fp16 and converts back to f32 before the cross-lane reduce; it exists to
+/// measure what the lower precision costs and buys
+/// (`docs/phase-3/03-gaps-closed.md` §2) and is **not recommended**: the
+/// measured error is two orders of magnitude above the default bar.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Accum {
+    /// fp32 dot product, two alternating accumulators (the default, unchanged).
+    #[default]
+    F32,
+    /// fp16 per-lane accumulation (opt-in research path, `gemv_*_f16acc.spv`).
+    F16,
+}
+
+impl Accum {
+    /// Every accumulator mode the kernels implement.
+    pub const ALL: [Accum; 2] = [Accum::F32, Accum::F16];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Accum::F32 => "f32",
+            Accum::F16 => "f16",
+        }
+    }
+
+    /// Parse `f32` / `f16` (case-insensitive).
+    pub fn from_name(s: &str) -> Option<Accum> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "f32" | "fp32" => Some(Accum::F32),
+            "f16" | "fp16" => Some(Accum::F16),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Accum {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for Accum {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Accum::from_name(s).ok_or_else(|| {
+            format!(
+                "unknown accumulator {s:?}; expected one of {}",
+                Accum::ALL
+                    .iter()
+                    .map(|a| a.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+    }
+}
+
 /// A fused dequant + mat-vector multiply for one quant type and shape.
 pub struct Gemv<'g> {
     ty: QuantType,
+    accum: Accum,
     rows: usize,
     cols: usize,
     gpu: &'g Gpu,
@@ -53,15 +115,32 @@ pub struct Gemv<'g> {
 }
 
 impl<'g> Gemv<'g> {
-    /// Compile the pipeline for `ty` on `gpu`.
+    /// Compile the pipeline for `ty` on `gpu` with the default fp32 accumulator.
     pub fn new(gpu: &'g Gpu, ty: QuantType, rows: usize, cols: usize) -> Result<Gemv<'g>> {
+        Self::with_accum(gpu, ty, rows, cols, Accum::F32)
+    }
+
+    /// Compile the pipeline for `ty` on `gpu` with an explicit accumulator.
+    pub fn with_accum(
+        gpu: &'g Gpu,
+        ty: QuantType,
+        rows: usize,
+        cols: usize,
+        accum: Accum,
+    ) -> Result<Gemv<'g>> {
         if rows == 0 || cols == 0 {
             return Err(anyhow!("gemv shape must be non-empty ({rows}x{cols})"));
         }
-        let spv = gemv_spv(ty);
+        if accum == Accum::F16 && !gpu.feats.shader_float16 {
+            return Err(anyhow!(
+                "device {} does not support shaderFloat16, which fp16 accumulation requires",
+                gpu.index
+            ));
+        }
+        let spv = gemv_spv(ty, accum);
         let kernel = gpu
             .kernel(spv, 4)
-            .map_err(|e| anyhow!("creating the {ty} GEMV pipeline: {e}"))?;
+            .map_err(|e| anyhow!("creating the {ty} GEMV pipeline ({accum} accum): {e}"))?;
         let tables = match upload(gpu, &table_bytes()) {
             Ok(b) => b,
             Err(e) => {
@@ -82,6 +161,7 @@ impl<'g> Gemv<'g> {
         };
         Ok(Gemv {
             ty,
+            accum,
             rows,
             cols,
             gpu,
@@ -93,6 +173,10 @@ impl<'g> Gemv<'g> {
 
     pub fn ty(&self) -> QuantType {
         self.ty
+    }
+    /// Accumulator precision this pipeline was compiled for.
+    pub fn accum(&self) -> Accum {
+        self.accum
     }
     pub fn rows(&self) -> usize {
         self.rows
@@ -602,21 +686,36 @@ macro_rules! spv {
     };
 }
 
-fn gemv_spv(ty: QuantType) -> &'static [u8] {
-    match ty {
-        QuantType::Iq2Xxs => spv!("gemv_iq2_xxs"),
-        QuantType::Iq2Xs => spv!("gemv_iq2_xs"),
-        QuantType::Iq2S => spv!("gemv_iq2_s"),
-        QuantType::Iq3Xxs => spv!("gemv_iq3_xxs"),
-        QuantType::Iq3S => spv!("gemv_iq3_s"),
-        QuantType::Iq4Nl => spv!("gemv_iq4_nl"),
-        QuantType::Iq4Xs => spv!("gemv_iq4_xs"),
-        QuantType::Q4K => spv!("gemv_q4_k"),
-        QuantType::Q5K => spv!("gemv_q5_k"),
-        QuantType::Q6K => spv!("gemv_q6_k"),
-        QuantType::Q2_0 => spv!("gemv_q2_0"),
-        QuantType::Bf16 => spv!("gemv_bf16"),
-        QuantType::F32 => spv!("gemv_f32"),
+fn gemv_spv(ty: QuantType, accum: Accum) -> &'static [u8] {
+    match (ty, accum) {
+        (QuantType::Iq2Xxs, Accum::F32) => spv!("gemv_iq2_xxs"),
+        (QuantType::Iq2Xxs, Accum::F16) => spv!("gemv_iq2_xxs_f16acc"),
+        (QuantType::Iq2Xs, Accum::F32) => spv!("gemv_iq2_xs"),
+        (QuantType::Iq2Xs, Accum::F16) => spv!("gemv_iq2_xs_f16acc"),
+        (QuantType::Iq2S, Accum::F32) => spv!("gemv_iq2_s"),
+        (QuantType::Iq2S, Accum::F16) => spv!("gemv_iq2_s_f16acc"),
+        (QuantType::Iq3Xxs, Accum::F32) => spv!("gemv_iq3_xxs"),
+        (QuantType::Iq3Xxs, Accum::F16) => spv!("gemv_iq3_xxs_f16acc"),
+        (QuantType::Iq3S, Accum::F32) => spv!("gemv_iq3_s"),
+        (QuantType::Iq3S, Accum::F16) => spv!("gemv_iq3_s_f16acc"),
+        (QuantType::Iq4Nl, Accum::F32) => spv!("gemv_iq4_nl"),
+        (QuantType::Iq4Nl, Accum::F16) => spv!("gemv_iq4_nl_f16acc"),
+        (QuantType::Iq4Xs, Accum::F32) => spv!("gemv_iq4_xs"),
+        (QuantType::Iq4Xs, Accum::F16) => spv!("gemv_iq4_xs_f16acc"),
+        (QuantType::Q4K, Accum::F32) => spv!("gemv_q4_k"),
+        (QuantType::Q4K, Accum::F16) => spv!("gemv_q4_k_f16acc"),
+        (QuantType::Q5K, Accum::F32) => spv!("gemv_q5_k"),
+        (QuantType::Q5K, Accum::F16) => spv!("gemv_q5_k_f16acc"),
+        (QuantType::Q6K, Accum::F32) => spv!("gemv_q6_k"),
+        (QuantType::Q6K, Accum::F16) => spv!("gemv_q6_k_f16acc"),
+        (QuantType::Q2_0, Accum::F32) => spv!("gemv_q2_0"),
+        (QuantType::Q2_0, Accum::F16) => spv!("gemv_q2_0_f16acc"),
+        (QuantType::F16, Accum::F32) => spv!("gemv_f16"),
+        (QuantType::F16, Accum::F16) => spv!("gemv_f16_f16acc"),
+        (QuantType::Bf16, Accum::F32) => spv!("gemv_bf16"),
+        (QuantType::Bf16, Accum::F16) => spv!("gemv_bf16_f16acc"),
+        (QuantType::F32, Accum::F32) => spv!("gemv_f32"),
+        (QuantType::F32, Accum::F16) => spv!("gemv_f32_f16acc"),
     }
 }
 
@@ -633,6 +732,7 @@ fn dequant_spv(ty: QuantType) -> &'static [u8] {
         QuantType::Q5K => spv!("dequant_q5_k"),
         QuantType::Q6K => spv!("dequant_q6_k"),
         QuantType::Q2_0 => spv!("dequant_q2_0"),
+        QuantType::F16 => spv!("dequant_f16"),
         QuantType::Bf16 => spv!("dequant_bf16"),
         QuantType::F32 => spv!("dequant_f32"),
     }

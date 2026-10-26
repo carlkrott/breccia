@@ -189,7 +189,7 @@ fn non_finite_scales_do_not_corrupt_the_device() {
     let dev = fx.dev;
     for ty in types_under_test() {
         // BF16/F32 have no block scale, so there is nothing to poison.
-        if matches!(ty, QuantType::Bf16 | QuantType::F32) {
+        if matches!(ty, QuantType::F16 | QuantType::Bf16 | QuantType::F32) {
             continue;
         }
         // Four blocks: +inf, -inf and NaN scales, then a finite block behind
@@ -236,7 +236,7 @@ fn denormal_and_zero_scales_decode_exactly() {
     let fx = need_gpu!();
     let dev = fx.dev;
     for ty in types_under_test() {
-        if matches!(ty, QuantType::Bf16 | QuantType::F32) {
+        if matches!(ty, QuantType::F16 | QuantType::Bf16 | QuantType::F32) {
             continue; // no block scale field
         }
         let cols = ty.block_elems() * 3;
@@ -266,7 +266,7 @@ fn zero_scale_blocks_are_exactly_zero() {
     let fx = need_gpu!();
     let dev = fx.dev;
     for ty in types_under_test() {
-        if matches!(ty, QuantType::Bf16 | QuantType::F32) {
+        if matches!(ty, QuantType::F16 | QuantType::Bf16 | QuantType::F32) {
             continue; // no block scale to zero
         }
         let cols = ty.block_elems() * 2;
@@ -442,6 +442,186 @@ fn batched_experts_match_the_per_expert_loop() {
             gpu.destroy_buf(&xb);
         }
         for b in [&w, &out] {
+            gpu.destroy_buf(b);
+        }
+    }
+}
+
+/// fp16 accumulation (`Accum::F16`) is a research path: it rounds each lane's
+/// running sum of the row to fp16, which for a 2560-term decode row lands around
+/// 1e-2 relative — two orders above the 1e-3 bar the f32 path is held to. This
+/// test pins that documented behaviour down and, in the same process on the same
+/// bytes, proves the default f32 path is unchanged: `Gemv::new` (the default) and
+/// `Gemv::with_accum(.., F32)` produce bit-identical output, and both stay
+/// ≤ 1e-3 against the f64 CPU reference. The tolerance here is deliberately
+/// **not** the default one (`docs/phase-3/03-gaps-closed.md` §2).
+#[test]
+fn fp16_accumulate_has_a_documented_tolerance_and_f32_is_unchanged() {
+    let fx = need_gpu!();
+    let dev = fx.dev;
+    let gpu = dev.gpu();
+    // The two shapes the measurement in the phase report uses: the top-10
+    // expert shape and the DRAM-bound one.
+    let types: Vec<QuantType> = {
+        let wanted = ["IQ3_S", "Q6_K"];
+        let sel = types_under_test();
+        let narrowed: Vec<QuantType> = sel
+            .iter()
+            .copied()
+            .filter(|t| wanted.iter().any(|w| *w == t.name()))
+            .collect();
+        if narrowed.is_empty() {
+            // BRECCIA_QTYPE=IQ4_XS (say) asked for a type not in this list:
+            // run it anyway, the property is type-independent.
+            sel
+        } else {
+            narrowed
+        }
+    };
+    for ty in types {
+        // The top-10 routed-expert shape and one real dense projection. The
+        // DRAM-bound 248,320-row sweep is a throughput cell (bench), not an
+        // accuracy one: the CPU f64 reference over 635 M terms takes a minute in
+        // a debug test binary and adds nothing to the per-row error distribution.
+        // The same test at 248,320 rows (one run) measured a worst row of 2.5e-1.
+        for shape in [bench::Shape::new(6400, 2560), bench::Shape::new(2560, 640)] {
+            let (packed, x) = real::synthetic_inputs(ty, shape, 0xacc0);
+            let want = reference::gemv(ty, &packed, shape.rows, shape.cols, &x);
+            let want_f64: Vec<f64> = want.iter().map(|v| f64::from(*v)).collect();
+
+            let run = |accum: breccia_kernels::Accum| -> Vec<f32> {
+                let g = Gemv::with_accum(gpu, ty, shape.rows, shape.cols, accum).expect("pipeline");
+                let w = breccia_kernels::gemv::upload(gpu, &packed).expect("upload w");
+                let xb =
+                    breccia_kernels::gemv::upload(gpu, &bench::f32_to_bytes(&x)).expect("upload x");
+                let out =
+                    breccia_kernels::gemv::alloc(gpu, (shape.rows * 4) as u64).expect("alloc out");
+                g.run(&w, &xb, &out).expect("gemv");
+                let got = bench::read_out(dev, &out, shape.rows).expect("read out");
+                for b in [&w, &xb, &out] {
+                    gpu.destroy_buf(b);
+                }
+                got
+            };
+
+            let f32_out = run(breccia_kernels::Accum::F32);
+            let f16_out = run(breccia_kernels::Accum::F16);
+            let f32_err = max_rel(&f32_out, &want_f64);
+            let mut errs: Vec<f64> = f16_out
+                .iter()
+                .zip(want_f64.iter())
+                .map(|(g, w)| (f64::from(*g) - w).abs() / w.abs().max(1.0))
+                .collect();
+            errs.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in a conformance error"));
+            let median = errs[errs.len() / 2];
+            let p95 = errs[errs.len() * 95 / 100];
+            let f16_max = *errs.last().expect("rows > 0");
+
+            // The default pipeline is the f32 pipeline, byte for byte.
+            let default = Gemv::new(gpu, ty, shape.rows, shape.cols).expect("default pipeline");
+            assert_eq!(default.accum(), breccia_kernels::Accum::F32);
+            drop(default);
+
+            assert!(
+                f32_err <= 1e-3,
+                "{ty} {shape}: f32 accumulate max rel {f32_err:e} > 1e-3 (default bar)"
+            );
+            // Documented fp16 bars (docs/phase-3/03-gaps-closed.md §2): the
+            // typical row is inside 2e-2; the tail is much worse because fp16
+            // rounds the running sum *before* heavily cancelling halves of the
+            // row meet, so the error is relative to the magnitude of the terms,
+            // not to the (small) result — 6,400 Q6_K rows already show a 6.8e-1
+            // worst row and 248,320 F16 rows a 2.5e-1 one. The `max` assertion is
+            // the "the kernel still computes this dot product" bound (a row
+            // worse than 100 % is not a precision loss, it is a different
+            // answer), not an accuracy claim; the meaningful bars are median and
+            // p95.
+            assert!(
+                median <= 2e-2,
+                "{ty} {shape}: fp16 accumulate median rel {median:e} > 2e-2"
+            );
+            assert!(
+                p95 <= 2e-2,
+                "{ty} {shape}: fp16 accumulate p95 rel {p95:e} > 2e-2"
+            );
+            assert!(
+                f16_max <= 1.0,
+                "{ty} {shape}: fp16 accumulate worst-row rel {f16_max:e} > 1.0 (sanity bound)"
+            );
+            println!(
+                "accum   {ty:<8} {shape:>13} f32 max {f32_err:.2e} (bar 1e-3) · \
+                 f16 median {median:.2e} p95 {p95:.2e} max {f16_max:.2e} (f16 bars: median+p95 2e-2, max 1.0 sanity)"
+            );
+        }
+    }
+}
+
+/// The batched (`gemv_*_moe_f16acc`) path must do the same arithmetic as the
+/// single-expert fp16 path: the row indirection changes *where* a row reads, not
+/// what it computes, so two experts in one dispatch must reproduce two
+/// single-expert dispatches bit for bit. (Correctness only — fp16's accuracy is
+/// measured in `fp16_accumulate_has_a_documented_tolerance_and_f32_is_unchanged`.)
+#[test]
+fn batched_fp16_accumulate_matches_the_single_expert_path() {
+    let fx = need_gpu!();
+    let dev = fx.dev;
+    let gpu = dev.gpu();
+    let experts = 2usize;
+    for ty in types_under_test() {
+        let cols = ty.block_elems() * 3;
+        let shape = bench::Shape::new(13, cols);
+        let batch =
+            GemvBatch::with_accum(gpu, ty, shape.rows, shape.cols, breccia_kernels::Accum::F16)
+                .expect("batch f16 pipeline");
+        let single = Gemv::with_accum(gpu, ty, shape.rows, shape.cols, breccia_kernels::Accum::F16)
+            .expect("single f16 pipeline");
+        let blob = batch.blob_bytes() as usize;
+        let padded = batch.padded_cols();
+        let mut w_bytes = vec![0u8; blob * experts];
+        let mut x_all = Vec::new();
+        for e in 0..experts {
+            let (packed, x) = real::synthetic_inputs(ty, shape, 0xf16 ^ e as u64);
+            w_bytes[e * blob..(e + 1) * blob].copy_from_slice(&packed);
+            x_all.extend_from_slice(&x);
+        }
+
+        let w = breccia_kernels::gemv::upload(gpu, &w_bytes).expect("upload W");
+        let xb = breccia_kernels::gemv::upload(gpu, &bench::f32_to_bytes(&x_all)).expect("x");
+        let out =
+            breccia_kernels::gemv::alloc(gpu, (shape.rows * experts * 4) as u64).expect("out");
+        let map_host = batch.map(experts, XLayout::PerExpert);
+        let map =
+            breccia_kernels::gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map_host))
+                .expect("map");
+        batch.run(&w, &xb, &out, &map, experts).expect("batched");
+        let got = bench::read_out(dev, &out, shape.rows * experts).expect("read out");
+
+        let mut single_out = Vec::new();
+        for e in 0..experts {
+            let w_e =
+                breccia_kernels::gemv::upload(gpu, &w_bytes[e * blob..(e + 1) * blob]).expect("w");
+            let x_e = breccia_kernels::gemv::upload(
+                gpu,
+                &bench::f32_to_bytes(&x_all[e * padded..(e + 1) * padded]),
+            )
+            .expect("x_e");
+            let o = breccia_kernels::gemv::alloc(gpu, (shape.rows * 4) as u64).expect("o");
+            single.run(&w_e, &x_e, &o).expect("single");
+            single_out.extend(bench::read_out(dev, &o, shape.rows).expect("read"));
+            for b in [&w_e, &x_e, &o] {
+                gpu.destroy_buf(b);
+            }
+        }
+        let worst = max_rel(
+            &got,
+            &single_out.iter().map(|v| f64::from(*v)).collect::<Vec<_>>(),
+        );
+        assert!(
+            worst <= 1e-6,
+            "{ty} {shape} x{experts} fp16: batched vs single-expert path {worst:e}"
+        );
+        println!("batch-f16 {ty:<8} {shape:>9} x{experts} vs single-expert {worst:e}");
+        for b in [&w, &xb, &out, &map] {
             gpu.destroy_buf(b);
         }
     }
