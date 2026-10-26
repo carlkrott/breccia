@@ -2066,6 +2066,23 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
             let (d, b, t) = st.merged_prefill_budget();
             (acc.0 + d, acc.1 + b, acc.2 + t)
         });
+    // The merged pass's own breakdown has to be read here too: the counters below
+    // are zeroed for the decode window.
+    let merged_detail =
+        multi
+            .streams
+            .iter()
+            .fold((0.0, 0.0, 0u64, 0usize, 0u64, 0usize), |acc, st| {
+                let (g, f, d, gr, b, sl) = st.merged_prefill_detail();
+                (
+                    acc.0 + g,
+                    acc.1 + f,
+                    acc.2 + d,
+                    acc.3 + gr,
+                    acc.4 + b,
+                    acc.5 + sl,
+                )
+            });
     // The prompt is not part of the decode measurement (counters, probe, timers).
     for s in multi.streams.iter_mut() {
         s.reset_counters()?;
@@ -2146,13 +2163,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         );
     }
     {
-        let (gemm_s, fanin_s, dispatches, groups, bytes, slots) = multi
-            .streams
-            .iter()
-            .fold((0.0, 0.0, 0u64, 0usize, 0u64, 0usize), |acc, st| {
-                let (g, f, d, gr, b, sl) = st.merged_prefill_detail();
-                (acc.0 + g, acc.1 + f, acc.2 + d, acc.3 + gr, acc.4 + b, acc.5 + sl)
-            });
+        let (gemm_s, fanin_s, dispatches, groups, bytes, slots) = merged_detail;
         if groups > 0 {
             println!(
                 "merged   {groups} expert GEMM groups over {slots} slots: {:.1} ms of GEMM,                  {:.1} ms of fan-in, {dispatches} dispatches ({:.1} GiB read once per expert,                  {:.0} us/group)",

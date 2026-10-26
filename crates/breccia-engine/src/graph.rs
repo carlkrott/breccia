@@ -477,6 +477,7 @@ pub struct Session<'m> {
     pf_gemm_s: f64,
     pf_fanin_s: f64,
     pf_merged_dispatches: u64,
+    pf_arena_bytes: u64,
     pf_merged_experts: usize,
     pf_merged_slots: usize,
     pf_merged_chunks: usize,
@@ -807,6 +808,7 @@ impl<'m> Session<'m> {
             pf_gemm_s: 0.0,
             pf_fanin_s: 0.0,
             pf_merged_dispatches: 0,
+            pf_arena_bytes: 0,
             pf_merged_experts: 0,
             pf_merged_slots: 0,
             pf_merged_chunks: 0,
@@ -1022,6 +1024,7 @@ impl<'m> Session<'m> {
         self.pf_gemm_s = 0.0;
         self.pf_fanin_s = 0.0;
         self.pf_merged_dispatches = 0;
+        self.pf_arena_bytes = 0;
         self.pf_merged_experts = 0;
         self.pf_merged_slots = 0;
         self.pf_merged_chunks = 0;
@@ -1965,6 +1968,7 @@ impl<'m> Session<'m> {
         self.pf_fanin_s += fanin_s;
         self.pf_merged_dispatches += dispatches;
         self.pf_merged_experts += groups.len();
+        self.pf_arena_bytes += distinct as u64 * expert_bytes;
         self.pf_merged_slots += t * k;
         self.pf_distinct += distinct;
         self.pf_merged_bytes += distinct as u64 * expert_bytes;
@@ -2053,14 +2057,14 @@ impl<'m> Session<'m> {
 
     /// The merged prefill pass's cost breakdown for the last measured window:
     /// `(expert GEMM seconds, fan-in seconds, dispatches recorded, expert groups,
-    /// arena bytes read, slots)`.
+    /// arena bytes the merged pass read, slots)`.
     pub fn merged_prefill_detail(&self) -> (f64, f64, u64, usize, u64, usize) {
         (
             self.pf_gemm_s,
             self.pf_fanin_s,
             self.pf_merged_dispatches,
             self.pf_merged_experts,
-            self.pf_merged_bytes,
+            self.pf_arena_bytes,
             self.pf_merged_slots,
         )
     }

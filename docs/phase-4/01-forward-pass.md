@@ -1738,6 +1738,122 @@ What (c) needs, precisely: in `Session::prefill_block`, for a block in `m.placed
 Scratch for (2): `E_max x m x 2560` f32 (T = 128, E ~ 160, m <= 8: ~13 MB) plus
 `E_max x m x 640` for the SwiGLU intermediate — one allocation per session.
 
+### The pass is wired: measured, bit-identical, and it does not move 6.13
+
+Item (c) is done. `--prefill-merged` (default **off**) runs, for a prefill chunk of
+`t` tokens and for each **resident** block only:
+
+1. the unchanged dense chain per token, whose router ids/weights, `mixed`, shared
+   expert output and gate logit are copied into chunk buffers as it goes (five
+   device-to-device copies per token, no host round trip);
+2. one readback of the chunk's router ids (5 KiB at T = 128), bucketed on the host
+   into `(expert, group of <= USERS_MAX = 8 users)` and turned into the slot map
+   `MoeFanIn` expects — each distinct expert's users contiguous, which is exactly
+   the GEMM's `O[u * rows + row]` layout;
+3. per group, `GemmMany::run_at(gate)`, `run_at(up)`, one `SwiGlu` over its `m`
+   rows, `run_at(down)`, then one copy of the group's `m` rows into the chunk
+   scratch — three weights reads per distinct expert instead of ten per token;
+4. `MoeFanIn` over the chunk, then the chunk's per-token `HC_WRITE` (pass 2), i.e.
+   the same shape the host-lane blocks use.
+
+`GemmMany::run_at` is now **batch-aware** (it records into the open dispatch batch
+like `Pipe::run`/`GemvBatch::run`, instead of one submit+wait per dispatch), the
+chunk's batches are closed and reopened at `MERGED_BATCH_CAP = 6 000` recorded
+dispatches (a 256-token chunk records ~30 per token in pass 1 alone, against the
+pool's 8 192 sets), and the pass keeps its own counters — printed per block with
+`BRECCIA_TRACE_MERGED=1` and summarised by `bench agents` as
+
+```
+merged   {groups} expert GEMM groups over {slots} slots: {gemm} ms of GEMM,
+         {fanin} ms of fan-in, {dispatches} dispatches ({GiB} read once per expert)
+```
+
+**Bit-identity holds exactly.** In every configuration tested the merged pass
+produces the *same* tokens as the existing path — chunk 8, 9 resident blocks,
+2 agents, `--same-prompt`: **32/32 against the recorded server sequence**, and
+merged == non-merged token-for-token at chunk 16/27/32/128/256 as well (both wrong
+there, see the blocker below). That is the §8v claim (per-user GEMM bit-identical
+for every `m`, fan-in bit-identical to `MoeCombine`) doing its job end to end.
+
+**Measured cost, chunk 256, 9 resident blocks per stream** (`BRECCIA_TRACE_MERGED`,
+2 agents x 300 tokens):
+
+| per block per 256-token chunk | value |
+|---|---:|
+| distinct experts | **133-206** |
+| expert groups (`m <= 8`) | **390-456** |
+| slots (pairs) | 2 560 |
+| GPU GEMM time | **18.5-22.8 ms** (72-89 µs per group) |
+| fan-in | 0.57-0.67 ms |
+| arena bytes read once per expert | **197-367 MiB** (1.2-1.6 MiB/token) |
+| dispatches recorded | 9.5-12 k |
+
+Whole prompt (2 streams x 300 tokens, 9 blocks each): **10 018 groups, 840 ms of
+GEMM, 22 ms of fan-in, 213 k dispatches, 8.5 GiB** read out of the arena — against
+39.3 GiB if every `(token, expert)` use were touched separately. That is 1.5 % of
+the 57 s the prompt took.
+
+**And that is why it does not pay.** The merged pass replaces GEMV work that was
+*already on the device*; the 39 non-resident blocks per stream still run the
+per-token host lane and are ~98 % of prompt ingestion. Prefill tok/s/agent, 2
+agents x 300-token prefixes, RX 6950 XT + MI50 one stream each, alternating
+A/B/A inside one window:
+
+| path | tok/s per agent | runs |
+|---|---:|---:|
+| token by token (chunk 0) | **5.34** (5.07-5.50) | 6 |
+| chunked, no merge, 128 | 4.95 | 1 |
+| chunked, no merge, 256 | 5.31 | 1 |
+| **merged, 64** | **4.95** | 2 |
+| **merged, 128** | **5.15** (5.12-5.18) | 4 |
+| **merged, 256** | **5.27** (5.24-5.33) | 4 |
+
+* §8v's **6.13 baseline did not reproduce in this window**: the same binary on the
+  same path measures 5.34, decode is 9.3-11.6 tok/s aggregate against the recorded
+  20.0-20.3, and the host lane is 93-134 ms/step against §8o's ~38 — the box is
+  ~2x off its earlier state (load average 2-3, `kswapd` active, 40.9 GiB expert
+  mmap against 58 GiB of RAM). Every comparison above is therefore in-window.
+* Merged at 256 is **parity with token-by-token and +0/-1 % on it**; at 128 it is
+  +4 % over the same-size chunked path; at 64 it is 7 % *worse* (a 64-token chunk
+  has ~3-6 users per expert, so the GEMM is still m < 8 and the merge only adds
+  copies and a fan-in). The flag stays **off**.
+
+**The blocker this uncovered (pre-existing, not this pass).** Chunked prefill is
+numerically wrong for chunk >= 9 in the current tree, resident blocks or not:
+
+| `--prefill-chunk` (27-token prompt) | server match |
+|---|---:|
+| 0 / 8 | **32/32** |
+| 16 | 2/32 |
+| 27 / 32 / 64 / 96 / 128 / 256 | 0/32 |
+
+Reproduced with `--gpu-experts` empty (0 blocks) and with 9, with and without
+`--prefill-merged`, and — by `git stash` of this whole patch — **in the same tree
+without it**, so it is a regression since §8s measured chunk 32/64 as exact. The
+candidates are the commits between §8s (`f6b98b4`) and here: the lane's
+dequant-once/AVX2 change (`74593cd`) and the multi-user GEMM series (`1ec9e0c`,
+`1828c00`, `8a9b0f2`). Until it is bisected, **no chunked-prefill number in §8u,
+§8t or §8v is gate-quality**, and the merged numbers above are quoted as cost
+measurements of the work the pass does, not as validate-able throughput.
+
+Commands (one GPU process, alternating, `timeout` on every run):
+
+```bash
+./target/release/breccia bench agents --streams 2 --prefix 300 --gen 32 \
+  --devices 0000:03:00.0,0000:0e:00.0 [--prefill-chunk 256 [--prefill-merged]]
+BRECCIA_TRACE_MERGED=1 ./target/release/breccia bench token --devices 0000:0e:00.0 \
+  --prompt-ids "$(cat …/parity-server.json.ids)" --gen 32 --runs 1 \
+  --gpu-experts 0,1,2 --prefill-chunk 8 --prefill-merged      # 32/32, MI50 first
+```
+
+**Next, in order.** (1) Bisect and fix the chunk >= 9 regression — it blocks every
+chunked number in this document. (2) Point the merged pass at the **39
+non-resident blocks**: the same three GEMMs plus fan-in, with each distinct
+expert's blob streamed once per chunk (28.7 GB/s on the RX: 1.5 MiB/token/block of
+arena reads is 2-3 ms/token against the lane's ~150), which is §8u's budget and now
+needs no new kernel — only an upload path and the expert types the host blocks use.
+
+
 
 ## 9. Exact commands
 
@@ -1800,12 +1916,16 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
    registers. This is also the AVX-512 opportunity: same inner loop, wider vector.
 2. **AVX-512 on the lane** (IQ4_NL down, Q2_0 down, IQ3_S gate/up): 10-25 % of a
    decode step, and the prefill lever above is the same code path.
-3. **Keep the chunk loop**: `--prefill-chunk` is parity-correct (bit-identical
-   tokens, per-token inject slots fixed the one bug it had) and is the substrate
-   for (1); turn it on when the lane amortises.
+3. **Fix the chunk loop before quoting it**: `--prefill-chunk` is wrong for chunk
+   >= 9 in this tree (32/32 at chunk 0/8, 0/32 at 27+, resident blocks or not, and
+   reproduced without the merged patch — a regression since §8s). It is still the
+   substrate for (1), and `--prefill-merged` is wired on top of it (§8v), but no
+   chunked number is gate-quality until the regression is bisected and fixed.
 4. **Current gates**: 2 streams 20.0-20.3 tok/s decode (parity 64/64); 4 agents x
    27-prefix 20.19 aggregate; 4 agents x 300-prefix 11.1 decode with **3.14 tok/s
-   prefill** (token by token — `--prefill-chunk` is slower today).
+   prefill** (token by token — `--prefill-chunk` is slower today). Re-measured in
+   the §8v window the same path gave 5.34 tok/s/agent prefill and 9.3-11.6 decode
+   aggregate, so quote a number with its window (the box drifts ~2x).
 5. **A third card** buys 1.4x at agent lengths; **GDN's delta rule** (217 GB/s,
    2.6x off the ceiling) is the largest single kernel left and only pays once the
    cards bind.
