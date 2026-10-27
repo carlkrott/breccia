@@ -2719,6 +2719,33 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         sess.dispatches,
         sess.dispatches as f64 / sess.submits.max(1) as f64
     );
+    // Per-call record profile (docs/phase-4 §8aq): where the ~7 us/dispatch goes.
+    {
+        let p = breccia_kernels::batch_cmd::record_profile();
+        let names = [
+            "key+cache",
+            "set write",
+            "bind_pipeline",
+            "bind_set",
+            "push_const",
+            "dispatch",
+            "barrier",
+            "tracker",
+        ];
+        let n = sess.dispatches.max(1) as f64;
+        let rows: Vec<String> = names
+            .iter()
+            .zip(p.iter())
+            .map(|(name, ns)| format!("{name} {:.0} ns", *ns as f64 / n))
+            .collect();
+        let sum: u64 = p.iter().sum();
+        println!(
+            "profile  {} ns/dispatch (summed {:.2} ms; measured record {:.2} ms/token)",
+            rows.join(" · "),
+            sum as f64 / 1e6,
+            breccia_kernels::batch_cmd::record_seconds() * 1e3 / runs_n
+        );
+    }
     // Barrier accounting: `barriers + pruned` is the always-barrier shape, so the
     // pair is the per-resource tracker's own delta (docs/phase-4 §8al).
     println!(

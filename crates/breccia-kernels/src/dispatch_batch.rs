@@ -100,6 +100,10 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
     static SET_POOLS: RefCell<Vec<(ash::vk::Device, vk::DescriptorPool, ash::Device)>> =
         const { RefCell::new(Vec::new()) };
+    /// Per-phase host nanoseconds inside `record` (§8aq): descriptor key+cache,
+    /// set write, bind_pipeline, bind_descriptor_sets, push_constants, dispatch,
+    /// barrier, and our own tracker bookkeeping.
+    static PROF: [Cell<u64>; 8] = const { [const { Cell::new(0) }; 8] };
     /// Counters: sets written (cold) vs dispatches that reused one (hot).
     static SETS_NEW: Cell<u64> = const { Cell::new(0) };
     static SETS_HIT: Cell<u64> = const { Cell::new(0) };
@@ -283,6 +287,17 @@ pub fn recorded_on(gpu: &Gpu) -> u32 {
 /// always-barrier shape would have emitted (§8al).
 pub fn barriers() -> u64 {
     BARRIERS.with(|c| c.get())
+}
+
+/// Per-phase host nanoseconds inside `record`, in the order
+/// `key+cache, set write, bind_pipeline, bind_set, push_constants, dispatch,
+/// barrier, tracker`.
+pub fn record_profile() -> [u64; 8] {
+    std::array::from_fn(|i| PROF.with(|p| p[i].get()))
+}
+
+fn prof(i: usize, t0: std::time::Instant) {
+    PROF.with(|p| p[i].set(p[i].get() + t0.elapsed().as_nanos() as u64));
 }
 
 /// Descriptor sets written once (cold) and dispatches that reused one (hot). The
@@ -845,6 +860,7 @@ pub(crate) fn record(
     // is only ever written before any command buffer references it, which is the
     // rule the module docs impose on `vkUpdateDescriptorSets`; the per-batch pool's
     // fresh set was the ~3 µs/dispatch this removes.
+    let t_key = std::time::Instant::now();
     let key: (u64, Vec<vk::Buffer>) = (
         ash::vk::Handle::as_raw(kernel.pipe),
         bufs.iter().map(|b| b.buf).collect(),
@@ -894,6 +910,7 @@ pub(crate) fn record(
     if persistent.is_some() && cached.is_some() {
         SETS_HIT.with(|c| c.set(c.get() + 1));
     }
+    prof(0, t_key);
     unsafe {
         let batch_set;
         let set = match persistent {
@@ -936,8 +953,11 @@ pub(crate) fn record(
             }
         };
 
+        let t = std::time::Instant::now();
         gpu.device
             .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kernel.pipe);
+        prof(2, t);
+        let t = std::time::Instant::now();
         gpu.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -946,6 +966,7 @@ pub(crate) fn record(
             &[set],
             &[],
         );
+        prof(3, t);
         gpu.device
             .cmd_push_constants(cmd, kernel.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
         // **Per-resource dependency tracking** (`docs/phase-4` §8al, ncnn's model).
@@ -976,7 +997,9 @@ pub(crate) fn record(
             })
         };
         if need {
+            let t = std::time::Instant::now();
             gpu.barrier_compute_on(cmd);
+            prof(6, t);
             BARRIERS.with(|c| c.set(c.get() + 1));
         } else if track_disabled() {
             // A/B arm: the pre-§8al always-barrier shape.

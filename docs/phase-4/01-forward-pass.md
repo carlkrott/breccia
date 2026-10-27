@@ -3345,6 +3345,65 @@ recommended next step is **D5 with the coarse census as its meter**, since 1 719
 | `experts(host)` / `head` / `ple` / `xfer` | 12.8 / 7.0 / 1.2 / 1.1 |
 | parity (32 greedy tokens vs the HIP server) | **32/32** |
 
+## 8aq. The 7 us/dispatch was a denominator artefact again — the per-call cost is **~0.3 us**
+
+### The measurement
+
+`record` now accumulates host nanoseconds per phase (`batch_cmd::record_profile()`,
+printed as a `profile` line). One run (single stream, 30 blocks, gen 16, warm 1,
+clocks `high`):
+
+| phase | ns/dispatch | share |
+|---|---:|---:|
+| descriptor key + cache lookup | **204** | 72 % |
+| `cmd_bind_pipeline` | 43 | 15 % |
+| barrier (`sync2` COMPUTE→COMPUTE) | 36 | 13 % |
+| set write / `bind_descriptor_sets` / `push_constants` / `cmd_dispatch` / tracker | **0 (below timer resolution)** | — |
+| **total instrumented** | **~283** | |
+
+So a dispatch costs **~0.3 µs** of host recording, not 7. The `record 14.16 ms/token`
+line divides the **decode-window** record wall (reset after the prompt by
+`reset_record_seconds()`) by `runs_n`, and the per-dispatch figure derived from it
+divides by `sess.dispatches`, which is a **whole-session** count that was never reset —
+the same class of mismatch as §8ap. Proof: the profile counters, which are process-wide
+and never reset, sum to **71.9 ms over ~170 token-graphs = 0.42 ms/token**, and
+0.42 ms/token over 1 843 dispatches is 230 ns/dispatch, matching the table. The two
+accounting windows are different lengths; dividing one by the other is what produced
+6.9-7.7 us.
+
+**Consequence:** there is no 15-50x anomaly. Recording is ~0.4-0.6 ms/token of host
+time (~1 % of the token), the descriptor cache already removed the set cost (§8ao), and
+the remaining lever on recording is the 204 ns key lookup — a per-dispatch `Vec` key
+allocation in `SETS`. It is worth ~0.38 ms/token, i.e. **below the noise floor of this
+box**, so it is recorded here and not "fixed" for a number nobody can see.
+
+The lesson is the same one as §8ap, and it is worth stating in the round's own terms:
+**every per-dispatch price quoted so far (3.2 us, 6.7 us, 6.9 us) came from dividing a
+wall-clock total by a dispatch count from a different window.** The instrumented table is
+the only number that is internally consistent.
+
+### Item 2 (D5) and the rest: not done
+
+No shaders were written this round. The recommended order stands unchanged
+(D5 hyper-connection collapse -> D1 -> D3 -> D4 -> D2), with D5's meter being the
+census, which now sums but still lumps a block's work into `hc-write(ffn)`: the missing
+piece is marks *inside* `submit_block` (prelude / per-expert / ffn), which is cheap and
+is the first thing the next round should do before cutting anything.
+
+Still outstanding: head-device option (~-4 ms), adaptive arena with a display-card
+reserve, D1-D4.
+
+### State
+
+| quantity | value |
+|---|---:|
+| tok/s / ms per token | **17.23 / 58.03** |
+| dispatches/token (census) | 1 843 |
+| recorded host time | **~0.42 ms/token measured, ~0.3 us/dispatch** |
+| record / `wait-gpu` (as printed, same window mismatch) | 14.16 / 32.01 |
+| `experts(host)` / `head` / `ple` / `xfer` | 13.9 / 7.0 / 1.2 / 1.1 |
+| parity (32 greedy tokens vs the HIP server) | **32/32** |
+
 ## 9. Exact commands
 
 
