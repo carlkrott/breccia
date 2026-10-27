@@ -2719,6 +2719,66 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         sess.dispatches,
         sess.dispatches as f64 / sess.submits.max(1) as f64
     );
+    // The per-dispatch price from **one** window: `RECORD_NS` and its own dispatch
+    // counter are both reset after the prompt, so their ratio is a real number
+    // (`docs/research/11` §A6; dividing by `sess.dispatches`, a whole-session count,
+    // is what produced the historical 3-11 us figures).
+    {
+        let n = breccia_kernels::batch_cmd::recorded_dispatches().max(1) as f64;
+        println!(
+            "record   {:.0} ns/dispatch over the measured window ({} dispatches, {:.1} us each \
+             incl. submit share)",
+            breccia_kernels::batch_cmd::record_seconds() * 1e9 / n,
+            n as u64,
+            mspt * 1e3 / n
+        );
+    }
+    // **The GPU-time table** (`BRECCIA_GPU_TIME=1`): per stage, µs of GPU time per
+    // token, and the residual against the host's fence wait. Every row is a GPU
+    // interval between two stage boundaries read after the slot's fence, so `sum` is
+    // how much of `wait-gpu` was execution and the residual is launch/serialisation
+    // (`docs/research/07` §A6).
+    if let Some(rows) = sess.gpu_time_table() {
+        let names: Vec<String> = sess
+            .device_names()
+            .iter()
+            .enumerate()
+            .map(|(i, (n, pci))| format!("d{i}={n} [{pci}]"))
+            .collect();
+        println!("\ngpu time (us/token of GPU execution, decode window):");
+        println!(
+            "  tokens in window {} · forwards {}",
+            sess.forwards, sess.forwards
+        );
+        let mut sum = 0.0;
+        for row in &rows {
+            let cols: Vec<String> = row
+                .per_device
+                .iter()
+                .map(|(us, n)| format!("{us:>8.1} (n={n:>4})"))
+                .collect();
+            println!(
+                "  {:<14} {}   Σ {:>8.1}",
+                row.stage,
+                cols.join(""),
+                row.total_us
+            );
+            sum += row.total_us;
+        }
+        let wait = sess.wait_gpu_us_per_token();
+        println!("  {:<14} {}", "devices", names.join(" · "));
+        println!(
+            "  {:<14} Σ {sum:>8.1} · wait-gpu {wait:>8.1} · residual {:+.1} us/token ({:+.1} % \
+             of wait-gpu) = submit round trips, CB prologue and GPU idle waiting for the host",
+            "sum",
+            wait - sum,
+            if wait > 0.0 {
+                (wait - sum) / wait * 100.0
+            } else {
+                0.0
+            }
+        );
+    }
     // Per-call record profile (docs/phase-4 §8aq): where the ~7 us/dispatch goes.
     {
         let p = breccia_kernels::batch_cmd::record_profile();

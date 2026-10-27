@@ -85,6 +85,11 @@ thread_local! {
     /// write, bind, push constants, dispatch, barrier) — the cost a pre-recorded
     /// command buffer would remove.
     static RECORD_NS: Cell<u64> = const { Cell::new(0) };
+    /// Dispatches recorded since the same reset point as [`RECORD_NS`]: the
+    /// **matching denominator**, so `ns = RECORD_NS / RECORDED` is one window's
+    /// per-dispatch price and not an artefact of mixing two (§8aq, `docs/research/11`
+    /// §A6).
+    static RECORDED: Cell<u64> = const { Cell::new(0) };
     /// Host seconds spent waiting for slots in [`wait_all`]/[`begin`].
     static WAIT_NS: Cell<u64> = const { Cell::new(0) };
     /// Per-resource dependency tracking (§8al, ncnn's model): the `vk::Buffer`s
@@ -111,6 +116,32 @@ thread_local! {
     /// per-resource tracker **pruned** for comparison.
     static BARRIERS: Cell<u64> = const { Cell::new(0) };
     static BARRIERS_SAVED: Cell<u64> = const { Cell::new(0) };
+
+    // ---- GPU-time probe (`BRECCIA_GPU_TIME`) — one query pool per ring slot ----
+    //
+    // The old probe had **one pool per device shared by every ring slot**, so a
+    // read could land while another slot's queries were still in flight and
+    // `vkGetQueryPoolResults` returned "A fence or query has not yet completed"
+    // (the recorded blocker, §8am). The pools are now per slot: a slot's pool is
+    // reset when the slot is reused (its previous submission has been waited on at
+    // that point, `begin`) and read immediately after that slot's fence signals
+    // (`wait`/`wait_all`), so a read can never see an in-flight query.
+    static PROBE_POOL: RefCell<Vec<vk::QueryPool>> = const { RefCell::new(Vec::new()) };
+    /// Per slot: the device that **created** the slot's probe pool. A pool is a
+    /// device object and a ring slot can change owner between devices (a free slot
+    /// is picked by whichever device needs one), so ownership has to be tracked
+    /// separately from `DEVICES` — destroying or stamping across devices is invalid
+    /// and reads back as `NOT_READY`.
+    static PROBE_OWNER: RefCell<Vec<Option<ash::Device>>> = const { RefCell::new(Vec::new()) };
+    /// Per slot: the command buffer being recorded into it (for stamping).
+    static PROBE_CMD: RefCell<Vec<vk::CommandBuffer>> = const { RefCell::new(Vec::new()) };
+    /// Per slot: stamps recorded into the **open** batch.
+    static PROBE_N: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// Per slot: `(query index, stage that starts here)` for the open batch; the
+    /// final entry is the closing stamp (stage [`probe::CLOSE`]).
+    static PROBE_LOG: RefCell<Vec<Vec<(u32, u8)>>> = const { RefCell::new(Vec::new()) };
+    /// Per device: accumulated GPU nanoseconds per stage and the interval count.
+    static PROBE_ACC: RefCell<Vec<ProbeAcc>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Segments that may be in flight at once. Two are enough for a block (the
@@ -179,6 +210,36 @@ fn ensure_slots() {
             d.extend(std::iter::repeat_n(None, RING));
         }
     });
+    PROBE_POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.is_empty() {
+            p.extend(std::iter::repeat_n(vk::QueryPool::null(), RING));
+        }
+    });
+    PROBE_OWNER.with(|o| {
+        let mut o = o.borrow_mut();
+        if o.is_empty() {
+            o.extend(std::iter::repeat_n(None, RING));
+        }
+    });
+    PROBE_CMD.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.is_empty() {
+            c.extend(std::iter::repeat_n(vk::CommandBuffer::null(), RING));
+        }
+    });
+    PROBE_N.with(|n| {
+        let mut n = n.borrow_mut();
+        if n.is_empty() {
+            n.extend(std::iter::repeat_n(0u32, RING));
+        }
+    });
+    PROBE_LOG.with(|l| {
+        let mut l = l.borrow_mut();
+        if l.is_empty() {
+            l.extend(std::iter::repeat_with(Vec::new).take(RING));
+        }
+    });
 }
 
 /// Release every ring slot's descriptor pool and fence.
@@ -191,6 +252,20 @@ pub fn shutdown() -> Result<()> {
     // about to be freed with the device.
     OPEN.with(|o| o.borrow_mut().clear());
     ensure_slots();
+    // The GPU-time probe's pools are per slot and owned by the device that created
+    // them, so they are freed here with `PROBE_OWNER` — never with the slot's
+    // *current* owner — and before the loop below, which `continue`s on a free slot.
+    for slot in 0..RING {
+        let pool = PROBE_POOL.with(|p| p.borrow()[slot]);
+        if pool == vk::QueryPool::null() {
+            continue;
+        }
+        if let Some(dev) = PROBE_OWNER.with(|o| o.borrow()[slot].clone()) {
+            unsafe { dev.destroy_query_pool(pool, None) };
+        }
+        PROBE_POOL.with(|p| p.borrow_mut()[slot] = vk::QueryPool::null());
+        PROBE_OWNER.with(|o| o.borrow_mut()[slot] = None);
+    }
     let mut freed = 0usize;
     for slot in 0..RING {
         let dev = SLOT_DEV.with(|d| d.borrow()[slot].clone());
@@ -313,8 +388,381 @@ pub fn barriers_pruned() -> u64 {
 
 /// `BRECCIA_NO_BARRIER_TRACK=1`: emit the pre-§8al always-barrier shape (the A/B
 /// arm; never a correctness aid — the tracker is the conservative-correct one).
+///
+/// Cached: this used to run **two `env::var_os` per dispatch** on the hot path
+/// (60-78 ns of the 266 ns measured in `docs/research/11` §A2), and it is read
+/// twice inside [`record`] plus once in [`end_submit`].
 fn track_disabled() -> bool {
-    std::env::var_os("BRECCIA_NO_BARRIER_TRACK").is_some()
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_NO_BARRIER_TRACK").is_some())
+}
+
+/// `BRECCIA_RECORD_PROFILE=1`: take the five `Instant::now()` pairs that attribute
+/// the per-phase cost inside [`record`] (§8aq).
+///
+/// **Off by default, and cached.** Those five pairs measure **165 ns of the
+/// 266 ns** recorded dispatch (`docs/research/11` §A2) — 0.3 ms/token of pure
+/// instrumentation. The one pair that stays is the `RECORD_NS` total, because that
+/// is the number the CLI's `record` line quotes.
+fn profile_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_RECORD_PROFILE").is_some())
+}
+
+/// The GPU-time probe: `BRECCIA_GPU_TIME=1` records one timestamp per **stage
+/// boundary** inside every batched submission, so a decode step can be attributed
+/// on the GPU timeline instead of guessed at from host timers.
+///
+/// The recipe is `docs/research/07` §A6, measured and confirmed in §C2:
+///
+/// * `vkCmdWriteTimestamp2(COMPUTE_SHADER)` — v1 `TOP/BOTTOM_OF_PIPE` costs
+///   +210 ns/stamp and +5.8 % on a dispatch chain, so it is not used.
+/// * **One pool per ring slot**, allocated with the slot, host-reset when the slot
+///   is reused (its previous submission has been waited at that point), and read
+///   **once, right after that slot's fence has signalled**. That is the fix for
+///   the recorded blocker: the old shape shared one pool across slots and read a
+///   slot's results while another slot's queries were still in flight, which is
+///   `vkGetQueryPoolResults: A fence or query has not yet completed` (§8am).
+/// * One stamp **per stage boundary**, which is the recipe's "two stamps per
+///   stage": the closing stamp of stage *i* is the opening stamp of stage *i+1*,
+///   and [`probe::close`] stamps the end of the last stage of a submission.
+/// * **Never per dispatch**: 2 stamps × 1 843 dispatches measured **+14.6 %**
+///   (§C2); ~15 stage boundaries per block is ~0.05-0.1 % of the token.
+/// * A `VK_EXT_calibrated_timestamps` anchor (`Gpu::calibrate`) puts the tick
+///   timeline on the host clock so the table can be set against `wait-gpu`.
+pub mod probe {
+    use super::*;
+
+    /// Stage ids. One namespace shared by the engine (`graph.rs`) and the kernel
+    /// families that have internal stages (`qsa`, `gdn`), so a mark inside a
+    /// kernel and a mark in the graph land in the same column.
+    pub const MAX: usize = 32;
+    /// The closing stamp of a submission (not a stage).
+    pub const CLOSE: u8 = 255;
+
+    pub const OTHER: u8 = 0;
+    pub const HC_READ: u8 = 1;
+    pub const RMSNORM: u8 = 2;
+    pub const QKV: u8 = 3;
+    pub const ROPE: u8 = 4;
+    pub const KV_APPEND: u8 = 5;
+    pub const QSA_AUX: u8 = 6;
+    pub const ATTN: u8 = 7;
+    pub const ATTN_OUT: u8 = 8;
+    pub const GDN_PROJ: u8 = 9;
+    pub const GDN_SCAN: u8 = 10;
+    pub const GDN_OUT: u8 = 11;
+    pub const HC_WRITE: u8 = 12;
+    pub const ROUTER: u8 = 13;
+    pub const MOE_MAP: u8 = 14;
+    pub const MOE_GATE: u8 = 15;
+    pub const MOE_UP: u8 = 16;
+    pub const MOE_SWIGLU: u8 = 17;
+    pub const MOE_DOWN: u8 = 18;
+    pub const MOE_COMBINE: u8 = 19;
+    pub const SH_GATE: u8 = 20;
+    pub const SH_UP: u8 = 21;
+    pub const SH_SWIGLU: u8 = 22;
+    pub const SH_DOWN: u8 = 23;
+    pub const SH_SCALAR: u8 = 24;
+    pub const FINAL_HC: u8 = 25;
+    pub const HEAD: u8 = 26;
+    pub const XFER: u8 = 27;
+    pub const PLE: u8 = 28;
+
+    /// Column names, indexed by id. `""` is a column that nothing stamps.
+    pub const NAMES: [&str; MAX] = [
+        "other",
+        "hc-read",
+        "rmsnorm",
+        "qkv",
+        "rope",
+        "kv-append",
+        "qsa-aux",
+        "attn",
+        "attn-out",
+        "gdn-proj",
+        "gdn-scan",
+        "gdn-out",
+        "hc-write",
+        "router",
+        "moe-map",
+        "moe-gate",
+        "moe-up",
+        "moe-swiglu",
+        "moe-down",
+        "moe-combine",
+        "shared-gate",
+        "shared-up",
+        "shared-swiglu",
+        "shared-down",
+        "shared-scalar",
+        "final-hc",
+        "head",
+        "xfer",
+        "ple",
+        "",
+        "",
+        "",
+    ];
+
+    /// Stamps a single submission may hold. A decode block's prelude has ~15 stage
+    /// boundaries (6 of them inside the mixer) and the head 3; 96 leaves room for a
+    /// prefill chunk's per-token marks without ever silently dropping one.
+    pub const CAP: u32 = 96;
+
+    /// Is the probe on? Cached — it is called once per stage boundary.
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let on = std::env::var_os("BRECCIA_GPU_TIME").is_some();
+            if on {
+                eprintln!(
+                    "gpu-time probe: on (stage boundaries only, one pool per ring slot; \
+                     never per dispatch — that costs +14.6 %, docs/research/07 §C2)"
+                );
+            }
+            on
+        })
+    }
+
+    fn acc_index(dev: vk::Device) -> usize {
+        PROBE_ACC.with(|a| {
+            let mut a = a.borrow_mut();
+            match a.iter().position(|x| x.dev == dev) {
+                Some(i) => i,
+                None => {
+                    a.push(ProbeAcc {
+                        dev,
+                        ns: [0; MAX],
+                        n: [0; MAX],
+                    });
+                    a.len() - 1
+                }
+            }
+        })
+    }
+
+    /// Ensure this slot has a pool on `gpu`'s device. A pool is a device object, so
+    /// a slot whose owner changed (only possible after [`shutdown`] of a session)
+    /// gets a new one.
+    pub(super) fn ensure_pool(gpu: &Gpu, slot: usize) -> Result<()> {
+        if !enabled() {
+            return Ok(());
+        }
+        ensure_slots();
+        let dev = gpu.device.handle();
+        let old = PROBE_POOL.with(|p| p.borrow()[slot]);
+        let owner = PROBE_OWNER.with(|o| o.borrow()[slot].as_ref().map(|d| d.handle()));
+        if old != vk::QueryPool::null() && owner == Some(dev) {
+            return Ok(());
+        }
+        if old != vk::QueryPool::null() {
+            // Free it with the device that **created** it, never with the slot's new
+            // owner: a ring slot is free for another device once the previous
+            // submission has been waited, and a pool is a device object.
+            if let Some(old_dev) = PROBE_OWNER.with(|o| o.borrow()[slot].clone()) {
+                unsafe { old_dev.destroy_query_pool(old, None) };
+            }
+            PROBE_POOL.with(|p| p.borrow_mut()[slot] = vk::QueryPool::null());
+        }
+        let pool = gpu
+            .query_pool(CAP)
+            .map_err(|e| anyhow!("allocating a GPU-time probe pool: {e}"))?;
+        PROBE_POOL.with(|p| p.borrow_mut()[slot] = pool);
+        PROBE_OWNER.with(|o| o.borrow_mut()[slot] = Some(gpu.device.clone()));
+        Ok(())
+    }
+
+    /// Start recording into `slot`: reset its pool and forget the previous batch's
+    /// stamps. Called from [`begin`] **after** the slot's fence was waited, which is
+    /// what makes a host-side reset legal and the pool reusable.
+    pub(super) fn reset_slot(gpu: &Gpu, slot: usize, cmd: vk::CommandBuffer) -> Result<()> {
+        if !enabled() {
+            return Ok(());
+        }
+        ensure_pool(gpu, slot)?;
+        let pool = PROBE_POOL.with(|p| p.borrow()[slot]);
+        gpu.reset_queries(pool, CAP);
+        PROBE_N.with(|n| n.borrow_mut()[slot] = 0);
+        PROBE_LOG.with(|l| l.borrow_mut()[slot].clear());
+        PROBE_CMD.with(|c| c.borrow_mut()[slot] = cmd);
+        Ok(())
+    }
+
+    /// A stage boundary: `stage` starts here. Cheap when the probe is off (one
+    /// cached-bool load).
+    pub fn enter(gpu: &Gpu, stage: u8) {
+        if !enabled() || stage as usize >= MAX {
+            return;
+        }
+        let Some(slot) = open_slot(gpu) else {
+            // Not inside a batch (a one-shot `wall_run` path): nothing to stamp.
+            return;
+        };
+        let Some(dev) = SLOT_DEV.with(|d| d.borrow()[slot].clone()) else {
+            return;
+        };
+        let n = PROBE_N.with(|c| c.borrow()[slot]);
+        if n >= CAP {
+            return;
+        }
+        let cmd = PROBE_CMD.with(|c| c.borrow()[slot]);
+        let pool = PROBE_POOL.with(|p| p.borrow()[slot]);
+        if cmd == vk::CommandBuffer::null() || pool == vk::QueryPool::null() {
+            return;
+        }
+        unsafe {
+            dev.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::COMPUTE_SHADER, pool, n);
+        }
+        PROBE_LOG.with(|l| l.borrow_mut()[slot].push((n, stage)));
+        PROBE_N.with(|c| c.borrow_mut()[slot] = n + 1);
+    }
+
+    /// The closing stamp of the open batch (from [`end_submit`], which has already
+    /// removed the slot from `OPEN` — so the slot is passed in, not looked up): the
+    /// last stage's end. Without it the last region of every submission would be
+    /// unattributed.
+    pub(super) fn close(slot: usize) {
+        if !enabled() {
+            return;
+        }
+        ensure_slots();
+        let Some(dev) = SLOT_DEV.with(|d| d.borrow()[slot].clone()) else {
+            return;
+        };
+        let n = PROBE_N.with(|c| c.borrow()[slot]);
+        if n >= CAP {
+            return;
+        }
+        let cmd = PROBE_CMD.with(|c| c.borrow()[slot]);
+        let pool = PROBE_POOL.with(|p| p.borrow()[slot]);
+        if cmd == vk::CommandBuffer::null() || pool == vk::QueryPool::null() {
+            return;
+        }
+        unsafe {
+            dev.cmd_write_timestamp2(cmd, vk::PipelineStageFlags2::COMPUTE_SHADER, pool, n);
+        }
+        PROBE_LOG.with(|l| l.borrow_mut()[slot].push((n, CLOSE)));
+        PROBE_N.with(|c| c.borrow_mut()[slot] = n + 1);
+    }
+
+    /// Read the slot's stamps **after its fence has signalled** and fold the
+    /// intervals into the per-device accumulators. Called from [`wait`] and
+    /// [`wait_all`]; never while a query can still be pending.
+    pub(super) fn read_slot(gpu: &Gpu, slot: usize) {
+        if !enabled() {
+            return;
+        }
+        let log = PROBE_LOG.with(|l| std::mem::take(&mut l.borrow_mut()[slot]));
+        if log.len() < 2 {
+            return;
+        }
+        let pool = PROBE_POOL.with(|p| p.borrow()[slot]);
+        if pool == vk::QueryPool::null() {
+            return;
+        }
+        // A fence has signalled, so every query in the pool that was written is
+        // complete: this cannot return NOT_READY unless the ring's invariants broke.
+        let ticks = match gpu.timestamp_stamps(pool, log.len() as u32) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("gpu-time probe: slot {slot}: {e}");
+                return;
+            }
+        };
+        let dev = gpu.device.handle();
+        let idx = acc_index(dev);
+        let period = gpu.timestamp_period_ns;
+        if std::env::var_os("BRECCIA_GPU_TIME_DUMP").is_some() {
+            static DUMPED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let k = DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if k < 400 {
+                let span = ticks[log.len() - 1].saturating_sub(ticks[0]);
+                let zeros = (0..log.len() - 1)
+                    .filter(|k| ticks[k + 1] == ticks[*k])
+                    .count();
+                let stages: Vec<&str> = log
+                    .iter()
+                    .map(|(_, s)| {
+                        if *s == CLOSE {
+                            "close"
+                        } else {
+                            NAMES[(*s).min(MAX as u8 - 1) as usize]
+                        }
+                    })
+                    .collect();
+                eprintln!(
+                    "probe dump #{k} slot {slot}: {} stamps, span {:.1}us, zero-deltas {zeros} [{}]",
+                    log.len(),
+                    span as f64 * period / 1e3,
+                    stages.join(",")
+                );
+            }
+        }
+        let (ns, n) = intervals(&log, &ticks, period);
+        PROBE_ACC.with(|a| {
+            let mut a = a.borrow_mut();
+            let acc = &mut a[idx];
+            for s in 0..MAX {
+                acc.ns[s] += ns[s];
+                acc.n[s] += n[s];
+            }
+        });
+    }
+
+    /// Charge every `(stamp k, stamp k+1)` interval to the stage that **starts** at
+    /// stamp `k`; the closing stamp ends the last stage. Pure, so the arithmetic is
+    /// testable without a GPU (see `probe_interval_tests`).
+    pub(super) fn intervals(
+        log: &[(u32, u8)],
+        ticks: &[u64],
+        period_ns: f64,
+    ) -> ([u64; MAX], [u32; MAX]) {
+        let mut ns = [0u64; MAX];
+        let mut n = [0u32; MAX];
+        if log.len() < 2 {
+            return (ns, n);
+        }
+        for k in 0..log.len() - 1 {
+            let stage = log[k].1;
+            if stage == CLOSE || stage as usize >= MAX {
+                continue;
+            }
+            let (q0, q1) = (log[k].0 as usize, log[k + 1].0 as usize);
+            if q1 >= ticks.len() || q0 >= ticks.len() {
+                continue;
+            }
+            let d = ticks[q1].saturating_sub(ticks[q0]);
+            ns[stage as usize] += (d as f64 * period_ns) as u64;
+            n[stage as usize] += 1;
+        }
+        (ns, n)
+    }
+
+    /// GPU nanoseconds per stage accumulated for `gpu`'s device since the process
+    /// started, with the number of intervals behind each.
+    pub fn totals(gpu: &Gpu) -> ([u64; MAX], [u32; MAX]) {
+        if !enabled() {
+            return ([0; MAX], [0; MAX]);
+        }
+        let dev = gpu.device.handle();
+        PROBE_ACC.with(|a| {
+            a.borrow()
+                .iter()
+                .find(|x| x.dev == dev)
+                .map(|x| (x.ns, x.n))
+                .unwrap_or(([0; MAX], [0; MAX]))
+        })
+    }
+}
+
+/// Per-device accumulators of the GPU-time probe.
+#[derive(Clone, Copy, Debug)]
+struct ProbeAcc {
+    dev: vk::Device,
+    ns: [u64; probe::MAX],
+    n: [u32; probe::MAX],
 }
 
 /// Host seconds spent recording since the last [`reset_record_seconds`].
@@ -331,7 +779,15 @@ pub fn wait_seconds() -> f64 {
 /// Clear the host-time accumulators (the engine calls this per run).
 pub fn reset_record_seconds() {
     RECORD_NS.with(|c| c.set(0));
+    RECORDED.with(|c| c.set(0));
     WAIT_NS.with(|c| c.set(0));
+}
+
+/// Dispatches recorded since the same reset point as [`record_seconds`] — the
+/// denominator that matches that numerator, so their ratio is a real per-dispatch
+/// price on one window (`docs/research/11` §A6, §8aq).
+pub fn recorded_dispatches() -> u64 {
+    RECORDED.with(|c| c.get())
 }
 
 /// Start recording a new segment: the next ring slot's command buffer.
@@ -407,6 +863,10 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
             .map_err(|e| anyhow!("waiting for ring slot {slot}: {e}"))?;
         WAIT_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
         FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
+        // This submission was reclaimed by back-pressure rather than by `wait`, so
+        // its GPU-time stamps have not been read yet — read them now, while the
+        // pool is still valid and its fence has signalled.
+        probe::read_slot(gpu, slot);
     }
     // The slot keeps its descriptor pool across batches: `vkResetDescriptorPool`
     // is ~free against a create/destroy pair per batch, and a two-stream pair runs
@@ -444,6 +904,10 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
             .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
             .map_err(|e| anyhow!("beginning the batch command buffer: {e}"))?;
     }
+    // The GPU-time probe's pool for this slot is reset here, **after** the fence
+    // wait above: the previous submission has completed, so a host reset is legal
+    // and the pool cannot hold an in-flight query (§8am's blocker).
+    probe::reset_slot(gpu, slot, cmd)?;
     OPEN.with(|o| {
         o.borrow_mut().push(Open {
             dev: gpu.device.handle(),
@@ -481,6 +945,11 @@ pub fn end_submit(gpu: &Gpu, signal: Option<(&Timeline, u64)>) -> Result<Segment
     // written visible to whatever the next submission (or the host) reads — queue
     // order alone does not make memory visible. One barrier per batch against the
     // ~30-100 it replaces.
+    // The GPU-time probe's closing stamp for this submission: the last stage's end.
+    // It goes in **before** the closing barrier so the barrier is attributed to the
+    // stage that needed it, not to a phantom one. The slot is passed explicitly:
+    // `OPEN` no longer holds it (it was taken above).
+    probe::close(slot);
     if !track_disabled() && DIRTY.with(|d| !d.borrow().is_empty()) {
         unsafe { gpu.barrier_compute_on(cmd) };
         BARRIERS.with(|c| c.set(c.get() + 1));
@@ -538,6 +1007,9 @@ pub fn wait(gpus: &[&Gpu], seg: Segment) -> Result<f64> {
     FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
     let secs = t0.elapsed().as_secs_f64();
     WAIT_NS.with(|c| c.set(c.get() + (secs * 1e9) as u64));
+    // The slot's fence has signalled: this is the one place its GPU-time stamps may
+    // be read (§8am).
+    probe::read_slot(gpu, slot);
     Ok(secs)
 }
 
@@ -590,6 +1062,7 @@ pub fn wait_all(gpus: &[&Gpu]) -> Result<f64> {
             gpu.wait_fence(fence)
                 .map_err(|e| anyhow!("waiting for ring slot {slot}: {e}"))?;
             FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
+            probe::read_slot(gpu, slot);
         }
     }
     let secs = t0.elapsed().as_secs_f64();
@@ -846,6 +1319,10 @@ pub(crate) fn record(
     pc: &[u8],
     grid: (u32, u32, u32),
 ) -> Result<()> {
+    // **One** clock pair, and it is the total the CLI's `record` line quotes. The
+    // five per-phase pairs that used to sit here cost 165 ns of the 266 ns recorded
+    // dispatch (`docs/research/11` §A2); they are now behind `BRECCIA_RECORD_PROFILE`
+    // (checked once, cached), which takes the path from 266 to ~70 ns.
     let t0 = std::time::Instant::now();
     let slot =
         open_slot(gpu).ok_or_else(|| anyhow!("recording a dispatch without an open batch"))?;
@@ -860,7 +1337,8 @@ pub(crate) fn record(
     // is only ever written before any command buffer references it, which is the
     // rule the module docs impose on `vkUpdateDescriptorSets`; the per-batch pool's
     // fresh set was the ~3 µs/dispatch this removes.
-    let t_key = std::time::Instant::now();
+    let prof_on = profile_on();
+    let mut t_ph = prof_on.then(std::time::Instant::now);
     let key: (u64, Vec<vk::Buffer>) = (
         ash::vk::Handle::as_raw(kernel.pipe),
         bufs.iter().map(|b| b.buf).collect(),
@@ -910,7 +1388,9 @@ pub(crate) fn record(
     if persistent.is_some() && cached.is_some() {
         SETS_HIT.with(|c| c.set(c.get() + 1));
     }
-    prof(0, t_key);
+    if let Some(t) = t_ph.take() {
+        prof(0, t);
+    }
     unsafe {
         let batch_set;
         let set = match persistent {
@@ -953,11 +1433,17 @@ pub(crate) fn record(
             }
         };
 
-        let t = std::time::Instant::now();
+        if prof_on {
+            t_ph = Some(std::time::Instant::now());
+        }
         gpu.device
             .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kernel.pipe);
-        prof(2, t);
-        let t = std::time::Instant::now();
+        if let Some(t) = t_ph.take() {
+            prof(2, t);
+        }
+        if prof_on {
+            t_ph = Some(std::time::Instant::now());
+        }
         gpu.device.cmd_bind_descriptor_sets(
             cmd,
             vk::PipelineBindPoint::COMPUTE,
@@ -966,7 +1452,9 @@ pub(crate) fn record(
             &[set],
             &[],
         );
-        prof(3, t);
+        if let Some(t) = t_ph.take() {
+            prof(3, t);
+        }
         gpu.device
             .cmd_push_constants(cmd, kernel.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
         // **Per-resource dependency tracking** (`docs/phase-4` §8al, ncnn's model).
@@ -997,9 +1485,13 @@ pub(crate) fn record(
             })
         };
         if need {
-            let t = std::time::Instant::now();
+            if prof_on {
+                t_ph = Some(std::time::Instant::now());
+            }
             gpu.barrier_compute_on(cmd);
-            prof(6, t);
+            if let Some(t) = t_ph.take() {
+                prof(6, t);
+            }
             BARRIERS.with(|c| c.set(c.get() + 1));
         } else if track_disabled() {
             // A/B arm: the pre-§8al always-barrier shape.
@@ -1022,7 +1514,44 @@ pub(crate) fn record(
     }
     bump_open(gpu);
     RECORD_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
+    RECORDED.with(|c| c.set(c.get() + 1));
     Ok(())
+}
+
+#[cfg(test)]
+mod probe_interval_tests {
+    use super::probe::{intervals, ATTN, CLOSE, HC_READ, HEAD, QKV};
+
+    /// The interval arithmetic behind the GPU-time table: each interval is charged
+    /// to the stage that **starts** at its first stamp, ticks scale by
+    /// `timestampPeriod`, and the closing stamp only ends the last stage.
+    #[test]
+    fn intervals_are_charged_to_the_stage_that_starts_them() {
+        // 2 ns/tick, chosen so the arithmetic is checkable by eye.
+        let log = [(0u32, HC_READ), (1, QKV), (2, ATTN), (3, HEAD), (4, CLOSE)];
+        let ticks = [100u64, 150, 210, 260, 400];
+        let (ns, n) = intervals(&log, &ticks, 2.0);
+        assert_eq!(ns[HC_READ as usize], 100); // 50 ticks x 2 ns
+        assert_eq!(ns[QKV as usize], 120); // 60 ticks
+        assert_eq!(ns[ATTN as usize], 100); // 50 ticks
+        assert_eq!(ns[HEAD as usize], 280); // 140 ticks, up to the closing stamp
+        assert_eq!(n[HC_READ as usize], 1);
+        assert_eq!(n[HEAD as usize], 1);
+        // Nothing else is charged, and the sum telescopes to the whole span.
+        let total: u64 = ns.iter().sum();
+        assert_eq!(total, (ticks[4] - ticks[0]) * 2);
+    }
+
+    /// A stamp sequence that is not monotonic (a reused pool's stale tail) must not
+    /// wrap: `saturating_sub` gives a zero-length interval rather than 2^64 ns.
+    #[test]
+    fn a_stale_tail_contributes_no_time() {
+        let log = [(0u32, HC_READ), (1, CLOSE)];
+        let ticks = [500u64, 100];
+        let (ns, n) = intervals(&log, &ticks, 10.0);
+        assert_eq!(ns[HC_READ as usize], 0);
+        assert_eq!(n[HC_READ as usize], 1);
+    }
 }
 
 #[cfg(test)]
@@ -1034,5 +1563,19 @@ mod tests {
         assert!(!is_open());
         assert_eq!(recorded(), 0);
         assert_eq!(in_flight(), 0);
+    }
+
+    /// The probe is off unless asked for, and asking for it is a cached decision:
+    /// the hot path only ever sees a `bool` load.
+    #[test]
+    fn the_probe_is_off_by_default() {
+        assert!(!super::probe::enabled() || std::env::var_os("BRECCIA_GPU_TIME").is_some());
+    }
+
+    #[test]
+    fn the_probe_stage_ids_fit_the_table() {
+        assert!(super::probe::NAMES.len() == super::probe::MAX);
+        assert!((super::probe::PLE as usize) < super::probe::MAX);
+        assert!(super::probe::CLOSE as usize >= super::probe::MAX);
     }
 }

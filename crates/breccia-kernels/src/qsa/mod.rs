@@ -781,26 +781,35 @@ impl<'g> Qsa<'g> {
         pos0: usize,
     ) -> Result<()> {
         let t = ws.tokens;
+        let gpu = self.q_norm.gpu();
+        // GPU-time probe stage boundaries (`BRECCIA_GPU_TIME`, no-op when off).
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::QKV);
         proj.q.run(proj.w_q, x, &ws.q_full, t)?;
         proj.k.run(proj.w_k, x, &ws.k_cur, t)?;
         proj.v.run(proj.w_v, x, &ws.v_cur, t)?;
         proj.idx_q.run(proj.w_idx_q, x, &ws.idx_q, t)?;
         proj.idx_k.run(proj.w_idx_k, x, &ws.idx_k, t)?;
 
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::RMSNORM);
         self.q_norm(ws, w.q_norm)?;
         self.k_norm(ws, w.k_norm)?;
         self.idx_q_norm(ws, w.idx_q_norm)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::ROPE);
         self.rope_q(ws, state, pos0)?;
         self.rope_k(ws, state, pos0)?;
         self.rope_idx_q(ws, state, pos0)?;
 
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::KV_APPEND);
         self.kv_append(state, ws, pos0)?;
         self.idx_pool(state, ws, w.idx_k_norm, pos0)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::QSA_AUX);
         self.idx_tail(state, ws, pos0)?;
         self.idx_score(state, ws, pos0)?;
         self.topk(ws, pos0)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::ATTN);
         self.attend(state, ws, pos0)?;
         self.apply(state, ws, pos0)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::ATTN_OUT);
         proj.out.run(proj.w_out, &ws.attn_out, out, t)?;
         Ok(())
     }

@@ -390,17 +390,22 @@ impl<'g> Gdn<'g> {
         out: &Buf,
     ) -> Result<()> {
         let t = ws.tokens;
+        let gpu = self.conv.gpu();
+        // GPU-time probe stage boundaries (`BRECCIA_GPU_TIME`, no-op when off).
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_PROJ);
         // Projections (§4.2 first block).
         proj.qkv.run(proj.w_qkv, x, &ws.qkv, t)?;
         proj.z.run(proj.w_z, x, &ws.z, t)?;
         proj.beta.run(proj.w_beta, x, &ws.beta_raw, t)?;
         proj.alpha.run(proj.w_alpha, x, &ws.alpha, t)?;
 
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_SCAN);
         self.conv(state, &ws.qkv, w.conv, t)?;
         self.qk_l2_norm(&ws.qkv, t)?;
         self.beta_gate(ws, w)?;
         self.delta_step(state, ws, &ws.step)?;
         self.norm_gate(&ws.step, w.ssm_norm, &ws.z, &ws.normed)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_OUT);
         proj.out.run(proj.w_out, &ws.normed, out, t)?;
         Ok(())
     }

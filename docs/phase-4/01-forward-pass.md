@@ -3762,3 +3762,177 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 5. **A third card** buys 1.4x at agent lengths; **GDN's delta rule** (217 GB/s,
    2.6x off the ceiling) is the largest single kernel left and only pays once the
    cards bind.
+
+## 8av. The per-stage GPU-time table exists: `wait-gpu` is **execution**, and it is bandwidth-inefficient GEMV
+
+The probe that had failed twice (`vkGetQueryPoolResults: A fence or query has not yet
+completed`, §8am) works, and it re-prices every remaining decision. Two mechanisms
+were wrong before and are now fixed:
+
+1. **One query pool per ring slot**, not one per device. A pool is allocated with the
+   slot, host-reset when the slot is reused (`begin`, *after* that slot's fence has
+   been waited), and read **once, immediately after that slot's fence signals**
+   (`wait`/`wait_all`). A slot reclaimed by back-pressure reads its stamps inside
+   `begin` before the reset. A pool is also a **device object**: a ring slot can be
+   reused across the two cards, so the pool's owner is tracked separately
+   (`PROBE_OWNER`) — destroying or stamping across devices is invalid and reads back
+   as `NOT_READY` (that was the second, dual-only failure).
+2. **The legacy per-batch probe was the actual aborter.** It shares one pool per
+   device across every slot, so its read sees another slot's in-flight query. It is
+   now inert when the stage probe is on, and `gpu_busy_s()` is the stage sum instead.
+
+### What landed (`BRECCIA_GPU_TIME=1`)
+
+* a stamp at every **stage boundary** inside a batched submission
+  (`vkCmdWriteTimestamp2(COMPUTE_SHADER)`; v1 costs +210 ns and +5.8 %), plus a
+  closing stamp in `end_submit` — i.e. the recipe's two stamps per stage, shared
+  between neighbours, **never per dispatch** (+14.6 % measured);
+* one `VK_EXT_calibrated_timestamps` anchor per device per second (offset spread
+  4.7-7.3 µs declared, ~0.5 µs measured in `docs/research/07` §A3), printed as
+  `gpu-time anchor device N`, so the tick timeline can be set against the host's;
+* a table at the end of a `bench token` run: per stage, **µs of GPU time per token**,
+  one column per device with the interval count, a `sum` row, and the residual
+  against `wait-gpu`;
+* stage ids shared by the engine (`graph.rs`) and the kernel families with internal
+  stages (`qsa::forward`, `gdn::forward`), so `rmsnorm`/`qkv`/`rope`/`kv-append`/
+  `qsa-aux`/`attn`/`attn-out` and `gdn-proj`/`gdn-scan`/`gdn-out` are separate rows.
+
+### The table (single stream, dual, `--split-blocks 28,20`, 30 resident blocks, gen 16, warm 1, clocks `high`)
+
+`17.10 tok/s / 58.47 ms/token` in this window (the reference window of the round ran
+18.94/52.80; the box was shared with two other agents, so the **shares** are the
+result and the absolute level is 8-11 % high):
+
+| stage | RX µs | MI50 µs | Σ µs | n/token |
+|---|---:|---:|---:|---:|
+| hc-read (attn+ffn) | 2613.7 | 3697.2 | **6310.9** | 96 |
+| hc-write (attn+ffn) | 257.9 | 290.3 | **548.3** | 96 |
+| gdn-proj | 2205.7 | 4143.4 | **6349.1** | 36 |
+| gdn-scan | 1282.1 | 1577.3 | **2859.5** | 36 |
+| gdn-out | 1012.0 | 1956.1 | **2968.1** | 36 |
+| qkv | 665.6 | 1307.6 | **1973.2** | 12 |
+| attn | 462.3 | 575.5 | **1037.7** | 12 |
+| attn-out | 437.2 | 637.6 | **1074.9** | 12 |
+| qsa-aux (idx pool/tail/score/topk) | 89.3 | 149.5 | 238.9 | 12 |
+| rope | 64.2 | 60.0 | 124.2 | 12 |
+| kv-append | 17.0 | 21.0 | 38.1 | 12 |
+| rmsnorm | 0.4 | 0.8 | 1.2 | 12 |
+| router | 629.3 | 688.6 | **1318.0** | 48 |
+| moe-gate | 361.9 | 726.4 | **1088.3** | 30 |
+| moe-up | 435.5 | 786.6 | **1222.0** | 30 |
+| moe-down | 318.1 | 1086.4 | **1404.5** | 30 |
+| moe-combine | 118.6 | 89.5 | 208.1 | 30 |
+| moe-swiglu | 91.5 | 55.7 | 147.2 | 30 |
+| moe-map | 3.5 | 8.5 | 12.0 | 120 |
+| shared-up | 353.7 | 348.8 | 702.5 | 48 |
+| shared-down | 147.6 | 305.8 | 453.4 | 48 |
+| shared-scalar | 105.6 | 99.6 | 205.2 | 48 |
+| shared-swiglu | 40.2 | 70.4 | 110.5 | 48 |
+| shared-gate | 15.3 | 24.4 | 39.8 | 48 |
+| head | 0.0 | 4252.0 | **4252.0** | 1 |
+| final-hc | 0.0 | 76.1 | 76.1 | 1 |
+| xfer (lane readback copies) | 98.2 | 177.9 | 276.1 | 18 |
+| **sum** | | | **35 039.8** | |
+| `wait-gpu` (host fence) | | | **32 997.0** | |
+| **residual** | | | **−2 042.8 (−6.2 %)** | |
+
+Grouped: **attention/GDN 16 665 (47.6 %)** · **HC read+write 6 859 (19.6 %)** ·
+**head+final-hc 4 328 (12.4 %)** · **device MoE 4 082 (11.7 %)** ·
+**shared expert + router 2 829 (8.1 %)** · xfer 276 (0.8 %).
+
+### What it says
+
+* **`wait-gpu` is execution, not launch overhead.** The spans sum to *more* than the
+  fence wait (−6.2 %; the excess is work whose wait lands in the next token's
+  window). There is **no unexplained residual** — W ≈ 0, ≤2 ms.
+* **Nothing is bandwidth-saturated.** Implied rates: expert GEMVs 205 GB/s (RX) /
+  145 GB/s (MI50); HC projectors 281 / 142 GB/s; head **98 GB/s** on the MI50 — against
+  576 GB/s (RX HBM) and ~1 TB/s (MI50 HBM2). A single-token GEMV reads a 0.6-1 GB/s
+  -worth-of-weights tensor with one workgroup per output block and a dependent
+  barrier chain, so it is **latency- and occupancy-bound**, which is exactly what
+  §8am's A/B (barrier form, 78 % "overhead") could not see.
+* **Dispatch/barrier is inside the spans and cannot be split from execution at stage
+  granularity.** Bound it from the measured launch prices: 1 749 dispatches/token
+  (26 238 recorded over the 15-token window) × 1.1-4.4 µs of in-batch
+  dispatch+barrier = **1.9-7.7 ms**, of which the barrier term (0.81
+  barriers/dispatch, 1.1-2 µs each) is ~1.5-2.8 ms. It is *not* zero, and it is not
+  22 ms either.
+* The host stage table and the GPU table agree: `sum ≡ wall` on the host side, and
+  the GPU sum is within 6 % of `wait-gpu`, so the token is
+  `wait-gpu 33.0 + lane 13.9 + head(host) 6.4 + ple 1.2 + xfer 1.1` with nothing left
+  over.
+
+### Verdict: what the next round attacks
+
+The three largest single items are **not** the expert lane and **not** dispatch
+count: `gdn-proj` (6.35 ms) + `gdn-out` (2.97) + `head` (4.25) + the HC projectors
+(6.86) are 20.4 ms of 35.0 ms, all of them the same shape (one-token GEMV at 15-35 %
+of peak). The next attack is the **single-token GEMV pipeline**: rows-per-workgroup /
+column-blocked tiling and split-K for the 2560-wide GEMVs (the head and the GDN
+projections first), then the HC projector chain, which is 96 × ~70 µs of five
+*dependent* dispatches. T-batching the dense chain stays parked: it needs occupancy
+work first, or it will multiply a 15 %-of-peak kernel.
+
+### Non-invasiveness (probe on vs off, adjacent arms, clean window)
+
+| arm | tok/s | ms/token | `wait-gpu` ms | record ns/dispatch |
+|---|---:|---:|---:|---:|
+| probe off | 17.27 | 57.89 | 32.00 | 279 |
+| probe on | 17.10 | 58.47 | 32.96 | 303 |
+| probe off | 17.50 | 57.14 | 31.97 | 286 |
+| probe on | 16.93 | 59.08 | 33.00 | 273 |
+
+**+1.6 % on the GPU timeline (+0.99 ms), −1.9 % on wall**, i.e. ~2 %: 958 stamps/token
+× 1.03 µs/stamp, inside the 0.3-2.1 µs/stamp range of `docs/research/07` §C2. The
+table is therefore **indicative at the 2 % level** — its shares are safe, its
+absolute rows carry ±2 %.
+
+Parity is untouched: **32/32 at chunk 8/16/32/128 with the probe on *and* off**, top-1
+`13.170561` everywhere. One `--warm 1 --gen 32` arm produced a different first token
+(`248046`, not `110563`) during the heaviest memory-pressure minute of the window
+(19 GB of swap in use by three concurrent 30 GiB processes); it did not reproduce in
+24 further arms, and 8 alternating probe-on/off arms were all correct. Recorded
+rather than dismissed: if it recurs, it is a latent race, not the probe's stamps.
+
+### Item 2: the in-path profiler is gated, `420 → 258 ns/dispatch`
+
+`record()`'s five `Instant::now()` pairs are behind a cached `BRECCIA_RECORD_PROFILE`
+flag and `track_disabled()`'s two `env::var_os` behind a `OnceLock`. A/B (4 adjacent
+pairs, gen 8): **416-432 → 254-275 ns/dispatch**, i.e. **−162 ns/dispatch (−39 %)**,
+0.28 ms/token at 1 749 dispatches — matching `docs/research/11`'s 165 ns for the pairs.
+The remaining 258 ns is exactly what that report predicted is left: `key + cache`
+130 ns (the `(u64, Vec<Buffer>)` allocation, R3 — **not** taken this round), binds
+85 ns, barrier 34 ns. The CLI now prints a windowed
+`record N ns/dispatch` line (numerator and denominator both reset after the prompt),
+so this number no longer depends on `sess.dispatches`.
+
+### Commands
+
+```bash
+# the table (one probe run; the numbers above)
+timeout 300 env BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts \
+  "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,28,29,30,31,32,33,34,35,36,37,38,39,40,41" \
+  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --gen 16 --runs 1 --threads 16 --warm 1
+# probe overhead: alternate BRECCIA_GPU_TIME=1 with it unset, same command
+# timer strip: alternate BRECCIA_RECORD_PROFILE=1 with it unset, --gen 8 --warm 0
+# parity (single card: chunked prefill needs one device), 8 arms, all 32/32
+timeout 400 env BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
+  --devices 0000:03:00.0 --prefill-chunk 32 --gen 32 --runs 1 --threads 16 --warm 1 \
+  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --json /var/tmp/users/korphaus/tmp/opencode/probe-gate/one-on-32.json
+```
+
+Safety: no shader was touched and no new dispatch shape was dispatched. All runs were
+`timeout`-bounded, `power_dpm_force_performance_level` read `high` before and after
+(and after every arm), and `journalctl -k` shows **no `amdgpu` page fault, ring timeout
+or reset during this round's window**. (It does show one at **00:43**, ~3.8 h before
+this round's runs — an RX GFX-hub page fault → `ring gfx_0.0.0 timeout` → ring reset →
+"device wedged, but recovered", from whatever ran then, not from this round. It is on
+the *display* card, which is now the RX per the corrected `AGENTS.md`; it is recorded
+here because it is the most recent reset on the box and the next reader should know it
+happened.) The box was shared with two other agents' benchmarks for most of the
+window; each arm's log/grep records whether another `breccia bench` was alive, and the
+table above quotes arms whose neighbours were, while the probe-overhead A/B/A/B quotes
+the one clean stretch (`pgrep` = this process only).

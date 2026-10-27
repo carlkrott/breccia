@@ -458,6 +458,9 @@ pub struct Gpu {
     pub pipeline_barrier2: Option<PipelineBarrier2Fn>,
     /// Scope the compute→compute dispatch barrier uses: see [`BarrierScope`].
     pub barrier_scope: BarrierScope,
+    /// `vkGetCalibratedTimestampsEXT`, when the device advertises
+    /// `VK_EXT_calibrated_timestamps` (both cards here do, rev 2).
+    pub calibrated: Option<CalibratedTimestampsFn>,
 }
 
 /// `vkCmdPipelineBarrier2` with the lifetime erased.
@@ -497,6 +500,46 @@ fn wait_fence_bounded(d: &ash::Device, fence: vk::Fence, what: &str) -> bool {
             eprintln!("breccia: waiting on {what}: {e}");
             false
         }
+    }
+}
+
+/// `vkGetCalibratedTimestampsEXT` with the lifetime erased (an ABI-level function
+/// pointer; the info array it points at is borrowed only for the call).
+///
+/// **Unit trap** (`docs/research/07` §A3): the *calibrated* value for
+/// `VK_CLOCK_ID_DEVICE` on RADV is already **nanoseconds**, while a query-pool
+/// timestamp is the raw `timestampPeriod` tick. Never mix them without the
+/// period; that mistake is a silent 10× error on the RX and 40× on the MI50.
+pub type CalibratedTimestampsFn = unsafe extern "system" fn(
+    device: vk::Device,
+    count: u32,
+    infos: *const vk::CalibratedTimestampInfoEXT<'static>,
+    timestamps: *mut u64,
+    max_deviation: *mut u64,
+) -> vk::Result;
+
+/// One calibrated sample: the device clock and the host clock at (nearly) the
+/// same instant, plus the driver's own declared maximum deviation.
+#[derive(Clone, Copy, Debug)]
+pub struct Calibration {
+    /// Device-domain clock, **nanoseconds** (already ns — do not multiply by
+    /// `timestamp_period_ns`).
+    pub device_ns: u64,
+    /// `CLOCK_MONOTONIC`, nanoseconds.
+    pub host_ns: u64,
+    /// The driver's declared `maxDeviation` for this sample, nanoseconds.
+    pub max_dev_ns: u64,
+}
+
+impl Calibration {
+    /// Host nanoseconds of a GPU query tick: `tick × period + offset`.
+    ///
+    /// The offset is `host_ns − device_ns`, so a tick that is older than the
+    /// sample lands proportionally earlier on the host clock. This is the only
+    /// supported way to put a query-pool stamp on the host timeline.
+    pub fn host_ns_of(&self, tick: u64, timestamp_period_ns: f64) -> i128 {
+        (tick as f64 * timestamp_period_ns) as i128
+            + (self.host_ns as i128 - self.device_ns as i128)
     }
 }
 
@@ -632,6 +675,13 @@ impl Gpu {
         if robustness2 {
             enabled_exts.push("VK_EXT_robustness2".to_string());
         }
+        // `VK_EXT_calibrated_timestamps`: the GPU-time probe's anchor (§A3 of
+        // `docs/research/07`). No feature bits and no behaviour change when it is
+        // not called; enabled whenever the device advertises it so a probe run does
+        // not need a different device.
+        if dev.has_ext("VK_EXT_calibrated_timestamps") {
+            enabled_exts.push("VK_EXT_calibrated_timestamps".to_string());
+        }
 
         // NOTE: Vulkan12Features already carries shaderFloat16/shaderInt8/atomic64/
         // timeline/hostQueryReset — validation forbids also chaining the promoted
@@ -757,6 +807,26 @@ impl Gpu {
             Ok("none") => BarrierScope::None,
             _ => BarrierScope::Sync2,
         };
+        // `vkGetCalibratedTimestampsEXT` by its extension name (loaded only when the
+        // extension was enabled above).
+        let calibrated: Option<CalibratedTimestampsFn> = if enabled_exts
+            .iter()
+            .any(|e| e == "VK_EXT_calibrated_timestamps")
+        {
+            let name = c"vkGetCalibratedTimestampsEXT";
+            let fp = unsafe { instance.get_device_proc_addr(device.handle(), name.as_ptr()) };
+            if fp.is_none() {
+                None
+            } else {
+                // SAFETY: the loader returned a non-null pointer for the extension's
+                // one entry point; the signature is Vulkan's own.
+                Some(unsafe {
+                    std::mem::transmute::<vk::PFN_vkVoidFunction, CalibratedTimestampsFn>(fp)
+                })
+            }
+        } else {
+            None
+        };
         Ok(Gpu {
             index,
             device,
@@ -783,6 +853,7 @@ impl Gpu {
             queue_submit2,
             pipeline_barrier2,
             barrier_scope,
+            calibrated,
         })
     }
 
@@ -1463,6 +1534,64 @@ impl Gpu {
     /// every device here).
     pub fn reset_queries(&self, pool: vk::QueryPool, n: u32) {
         unsafe { self.device.reset_query_pool(pool, 0, n) };
+    }
+
+    /// The first `n` timestamps of `pool` as **raw ticks** (`vkGetQueryPoolResults`
+    /// without `WAIT`, single query per element).
+    ///
+    /// Deliberately *not* [`Gpu::timestamps`]: that one reads `2n` values in
+    /// `(start, end)` pairs and scales them. The GPU-time probe records a stamp at
+    /// each stage **boundary** (one stamp, two per stage — the end of one is the
+    /// start of the next), so it needs a flat array plus its own scale.
+    ///
+    /// The caller **must** have waited for the submission that wrote them: a
+    /// `WAIT` on an unwritten query blocks forever, and no-`WAIT` on an in-flight
+    /// one returns `NOT_READY` (this is exactly what made the old single-pool probe
+    /// abort, §8am).
+    pub fn timestamp_stamps(&self, pool: vk::QueryPool, n: u32) -> R<Vec<u64>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut ticks = vec![0u64; n as usize];
+        let r = unsafe {
+            self.device
+                .get_query_pool_results(pool, 0, &mut ticks, vk::QueryResultFlags::TYPE_64)
+        };
+        if let Err(e) = r {
+            return Err(format!("vkGetQueryPoolResults: {e}"));
+        }
+        Ok(ticks)
+    }
+
+    /// One `VK_EXT_calibrated_timestamps` sample: device ns and host ns at the same
+    /// instant. `None` when the extension is unavailable (the probe then reports
+    /// raw GPU time only and says so).
+    pub fn calibrate(&self) -> Option<Calibration> {
+        let f = self.calibrated?;
+        let infos = [
+            vk::CalibratedTimestampInfoEXT::default().time_domain(vk::TimeDomainEXT::DEVICE),
+            vk::CalibratedTimestampInfoEXT::default()
+                .time_domain(vk::TimeDomainEXT::CLOCK_MONOTONIC),
+        ];
+        let mut ts = [0u64; 2];
+        let mut dev = 0u64;
+        let r = unsafe {
+            f(
+                self.device.handle(),
+                2,
+                infos.as_ptr(),
+                ts.as_mut_ptr(),
+                &mut dev,
+            )
+        };
+        if r != vk::Result::SUCCESS {
+            return None;
+        }
+        Some(Calibration {
+            device_ns: ts[0],
+            host_ns: ts[1],
+            max_dev_ns: dev,
+        })
     }
 
     pub fn destroy(self) {
