@@ -4113,6 +4113,83 @@ refused OK**, one process discarded because a co-tenant appeared during it (the 
 job, and the first time it has been able to say so). The two assertions (stability across
 processes + the crossing request refused) are unchanged.
 
+## 8az. Per-generation state is now fully reset — and the quiet-gated gate says the co-tenant story is **not** the whole story
+
+### The state list (checkable, not implied)
+
+`Session::reset` is the only place a new request can start from a clean slate, so the list
+lives in its doc comment and here. Every per-sequence buffer:
+
+| state | where | reset |
+|---|---|---|
+| GDN conv history + delta-rule state (36 blocks) | `gdn_state[b]` | `GdnState::reset` (pre-existing) |
+| QSA paged K/V pools (12 blocks) | `qsa_state[b].k_pool/v_pool` | **`QsaState::reset` (new)** |
+| QSA raw indexer tail (last incomplete block) | `qsa_state[b].idx_tail` | **new** — was *uninitialised VRAM* |
+| QSA pooled indexer keys | `qsa_state[b].idx_pooled` | **new** — same |
+| QSA page + position tables | `qsa_state[b]` | **new**, re-uploaded as an invariant check |
+| QSA per-call shape scalars (`n_blocks`, `max_ids`, `slots`) | `qsa_ws[b]` | rewritten by `run_qsa` every call — nothing to do |
+| PLE rolling n-gram window + conv history | `ple` | `PleHost::reset` (pre-existing) |
+| expert bytes / forwards / head traffic / timers | `Session` | zeroed in `reset` (pre-existing) |
+| `pos`, `cur_tok` | `Session` | set by `begin_token` every token |
+| staging ring contents | `stagings` | `flush()` inside `reset`; every read is fence-ordered |
+| sampler RNG | `sampler` | **deliberately not reset**: draws are seeded per call, so a reset would change the sequence rather than restore it |
+
+`idx_tail`/`idx_pooled` being *uninitialised* in a fresh process was the sharper half of the
+finding: the engine has always depended on masking to keep those bytes out of the logits.
+
+### The deterministic test (`scripts/session-reset-test.sh`)
+
+Four arms, no intermittency: (A) the same prompt twice in one process, (B) a **second prompt
+in the same process** (`--then-prompt-ids`, a new flag) versus a fresh process, with the second
+prompt shorter, longer and equal, and (C) the reason the paper gap was harmless.
+
+**A, B1, B2, B3 were already green before the fix, and are green after** — the same prompt
+twice is identical, and a reused session reproduces a fresh process's tokens exactly for all
+three length relations. So the missing resets were missing *on paper only*, and the reason is
+**C**: with every mutable QSA buffer poisoned to NaN after construction
+(`BRECCIA_FAULT_POISON_QSA=1`), the logits are **bit-identical** to the clean run (same tokens,
+same top-1, same min) — nothing reads a cell past the current position, because
+`qsa_idx_pool.comp` only reads slots it has just written and `qsa_idx_score`/`qsa_topk` mask on
+`n_blocks = (pos+1)/4`. The resets are kept anyway: they turn a "protected by masking" invariant
+into "protected by construction", and they cost one pass over ~6 MiB per request (~0.2 ms), not
+per token.
+
+### The quiet-gated gate: **RED**, and the co-tenant entry on `main` needs revising
+
+`BRECCIA_REQUIRE_QUIET=1 RACE_ARENA=auto RACE_PROMPT=parity PROCS=8 RUNS=2 GEN=32 WARM=1`,
+run in a verified quiet window (07:05, `pgrep -x breccia` empty, both clocks `high`):
+
+```
+UNSTABLE proc 3 run 0: step 0 ours 1049 expected 110563
+UNSTABLE proc 3 run 1: step 0 ours 1049 expected 110563
+RACE: 16 generations over 8 exclusive processes, crossing refused OK -> RED
+```
+
+`BRECCIA_REQUIRE_QUIET=1` makes the engine abort on a co-tenant, the run aborted zero times,
+and the failing process logged **no WARNING** — so this is *not* a co-tenant artefact, and the
+explanation recorded in §8ay is at best part of the story. The failure shape is unchanged from
+§8ax: step 0, `logits[110563]` 13.17 → 12.61, top-1 still a plausible token, **both runs
+identical**, and the same arena set as the two clean processes next to it (269 MiB/token).
+
+The one difference that still separates every failure from every clean run: the failing process
+is one whose **warm pass faulted expert/PLE pages in** (`0.88 GiB storage read`; clean neighbours
+0.03 and 0.43 GiB). That points at the lane's cold-mmap path under a first-generation load, not
+at session state — but the amounts overlap (0.43 GiB was clean), so "cold" is a correlate with a
+threshold, not a mechanism.
+
+### What is left, in the order the evidence puts it
+
+1. **`--inbatch-read true`** is in *every* failing configuration (all five historical failures
+   and this one); every `--inbatch-read false` trace run (10 processes, §8ax) was clean. That is
+   now the single flag that separates them, and it is a 1-hour test: pin `--inbatch-read false`
+   at `PROCS=16 RUNS=2 GEN=32 WARM=1`, then compare with `true` in the same window.
+2. If that holds, the suspect inside it is the staging **block region** reuse: each block's five
+   readback copies land at the same offsets `[0, BLOCK_REGION)` and are read from the mapping
+   after the fence. A per-block offset (or a per-slot staging buffer) would make the reuse
+   impossible by construction.
+3. Cold-page timing of the lane (`0.88 GiB` in the failing process) as the *trigger* on top of
+   (1): a first-generation lane read that is slower than a warm one is the only other correlate.
+
 ## 9. Exact commands
 
 
