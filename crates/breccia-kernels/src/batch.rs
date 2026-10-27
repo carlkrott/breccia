@@ -90,6 +90,12 @@ pub struct GemvBatch<'g> {
 }
 
 impl<'g> GemvBatch<'g> {
+    /// The quant table buffer this pipeline binds (binding 3). Read by the fused
+    /// HC `up` variant (§8az), which is this same GEMV with an epilogue.
+    pub fn tables(&self) -> &Buf {
+        &self.tables
+    }
+
     /// Compile the batched pipeline for `ty` on `gpu` (fp32 accumulation).
     pub fn new(gpu: &'g Gpu, ty: QuantType, rows_per_expert: usize, cols: usize) -> Result<Self> {
         Self::with_accum(gpu, ty, rows_per_expert, cols, Accum::F32)

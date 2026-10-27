@@ -1,4 +1,6 @@
 #version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
 //
 // HC_WRITE: the per-stream gated residual combine.
 //
@@ -57,17 +59,56 @@ void main() {
     if (t >= pc.tokens) {
         return;
     }
-    if (tid < pc.hc && tid < 32u) {
-        float inj;
-        if (pc.chunks == 0u) {
-            inj = INJ[t * pc.hc + tid];
-        } else {
-            inj = 0.0;
-            for (uint k = 0u; k < pc.chunks; ++k) {
-                inj += INJ[(t * pc.hc + tid) * pc.chunks + k];
+    // `chunks` is either the 256-element fold (`n_embd/256`, the incumbent shape) or,
+    // when the fused `up`+gated-mean variant wrote them (§8az), one partial per
+    // workgroup of that kernel (`n_embd/2`). The small case keeps the original
+    // serial order bit for bit; the large one is summed by a **fixed 32-lane
+    // strided tree**, which is deterministic (no atomics, no scheduling dependence)
+    // but a different grouping — the reason the fused path's `inject` differs from
+    // the incumbent by rounding only.
+    if (pc.chunks <= 32u) {
+        if (tid < pc.hc && tid < 32u) {
+            float inj;
+            if (pc.chunks == 0u) {
+                inj = INJ[t * pc.hc + tid];
+            } else {
+                inj = 0.0;
+                for (uint k = 0u; k < pc.chunks; ++k) {
+                    inj += INJ[(t * pc.hc + tid) * pc.chunks + k];
+                }
+            }
+            s_w[tid] = 2.0 * breccia_sigmoid(inj / float(pc.hc));
+        }
+    } else {
+        uint lane = tid % 32u;
+        uint c = tid / 32u;
+        if (c < pc.hc) {
+            // Four independent accumulators: a single dependent `+=` chain over
+            // ~40 global loads is latency-bound (measured 15.7 us per call against
+            // 5.5 us for the 10-chunk serial form), four chains hide it.
+            float a0 = 0.0;
+            float a1 = 0.0;
+            float a2 = 0.0;
+            float a3 = 0.0;
+            const uint base = (t * pc.hc + c) * pc.chunks;
+            uint k = lane;
+            for (; k + 96u < pc.chunks; k += 128u) {
+                a0 += INJ[base + k];
+                a1 += INJ[base + k + 32u];
+                a2 += INJ[base + k + 64u];
+                a3 += INJ[base + k + 96u];
+            }
+            for (; k < pc.chunks; k += 32u) {
+                a0 += INJ[base + k];
+            }
+            float inj = (a0 + a1) + (a2 + a3);
+            [[unroll]] for (uint off = 16u; off > 0u; off >>= 1u) {
+                inj += subgroupShuffleXor(inj, off);
+            }
+            if (lane == 0u) {
+                s_w[c] = 2.0 * breccia_sigmoid(inj / float(pc.hc));
             }
         }
-        s_w[tid] = 2.0 * breccia_sigmoid(inj / float(pc.hc));
     }
     barrier();
 

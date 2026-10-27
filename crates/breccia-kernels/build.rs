@@ -186,6 +186,18 @@ fn main() {
         // just before it is stored. A separate pipeline rather than a runtime
         // branch, so the default pipeline keeps byte-identical SPIR-V (the
         // sanctioned shape for a wired kernel change, `AGENTS.md`).
+        // The fused HC `up` + gated-mean build (§8az): the GEMV with the
+        // column-blocked row mapping and the gated-mean/inject epilogue. A
+        // separate pipeline, so the default build keeps byte-identical SPIR-V.
+        if *name == "gemv_bf16" {
+            compile(
+                &glslc,
+                &out_dir,
+                name,
+                "gemv_bf16_hcgate",
+                &["BRECCIA_HC_GATED_EPILOGUE"],
+            );
+        }
         // The **coalesced-dequant** build (§8ax): the same GEMV with the
         // per-element byte loads in the decode unit replaced by one wide load per
         // half-unit. Over the whole block the arithmetic and the values are
