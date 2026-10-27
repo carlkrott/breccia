@@ -276,7 +276,7 @@ measured recommendation: `docs/research/01`–`12`. The most consequential:
 | # | Item | Expected | State |
 |---|---|---|---|
 | 1 | ~~Defer the placed-block waits~~ | **DONE, and it closed the question**: `wait-gpu` −67 %, token unchanged ⇒ the engine is GPU-execution-bound; fences were never the problem | done |
-| 1b | **`gdn-scan` anomaly** — 2 860 µs/token (36 blocks × ~79 µs) for a per-position state update over `S=128, hv=48`, i.e. a few thousand elements, versus `moe-gate`'s 1 088 µs moving millions of bytes. At T=1 there is no position loop; this should be one fused pass | ~2.5 ms if the anomaly is what it looks like — the largest single identifiable win left | **in flight when work stopped** |
+| 1b | **`gdn-scan` — DIAGNOSED, fix open.** The state is **3.15 MB per layer** (`S×h_v×S` = 786,432 floats), so 36 blocks × 9.44 MB = **340 MB/token**; at the measured 2,768 µs that is **119 GB/s = 14 % of the MI50's 825**, against a **275 µs one-pass floor**. Cause: 48 workgroups = **1.6 wave64 per CU**, i.e. **MLP-starved**, not arithmetic-bound (the update itself is ~13 µs of FMA). The structural fix is 32 lanes per column with the column in registers, one read + one write, 1,536 workgroups — measured **1.4–1.8× faster (2,768 → 1,547–1,920 µs)** but **it produced wrong logits and was reverted**. It is **not bit-identical** (reduction tree changes summation order), needs an accuracy contract + parity + the 8-process gate, and the prime suspect for the wrong result is the 32-lane xor reduce crossing a **Wave64 boundary**. §8bi. | 275 µs floor ⇒ up to ~2.3 ms | open, with a known-wrong fast version to debug |
 | 1c | Then the other small-but-expensive kernels: `hc-norm`/`hc-gated` elementwise, `final-hc`, `moe-swiglu`, `rope`, `kv-append`, `router` | each needs the arithmetic-first diagnosis the head got | queued |
 | 2 | **IQ3_S / Q5_K word-level** dequant (dependency depth, not opcodes) | stage-dependent, bit-identical | planned |
 | 3 | ~~**V-q8_0 KV**~~ | **landed**: 932 → 764 MiB/agent ⇒ 4 agents (capacity, not speed) | done |
@@ -337,13 +337,15 @@ Diagnostic env switches: `BRECCIA_REQUIRE_QUIET`, `BRECCIA_DUMP_LAYOUT`,
 
 ## 14. Handover state (work stopped here, 2026-10-27)
 
-- `main` is **clean, green and pushed** at `e77b95a`; `./scripts/verify.sh` passes.
-- **One round was in flight when work stopped** and is *not* on main: the `gdn-scan` /
-  tiny-kernel round, in worktree `~/.local/share/opencode/worktree/afb070/gpu-time-probe`
-  on branch `gpu-time-table` (3 files dirty at handover). Check it before starting anything:
-  it may contain a partial fix worth keeping or discarding, and it is the only loose work.
-- Worktrees that are **fully merged** and can be pruned: `hc-epilogue-fusion` (detached),
-  `head-device-arena` (`3ec0c95`), `kv-q8v` (detached, `d855841`). Their commits are on main.
+- `main` is **clean, green and pushed** at `808920a`; `./scripts/verify.sh` passes.
+- **Nothing is in flight and nothing is loose.** The `gdn-scan` round was halted and tidied:
+  its notes are merged (§8bi), its **wrong-but-fast** 32-lane kernel was **reverted and the
+  shader deleted** (it was flag-on by default and produced wrong logits — correctly not left
+  in the tree), and its branch `gpu-time-table` (`dff848e`) is trees-clean with nothing
+  outstanding.
+- Worktrees whose commits are all on main and can be pruned: `gpu-time-probe`
+  (`gpu-time-table`, `dff848e`), `hc-epilogue-fusion` (detached, `1bca85e`),
+  `head-device-arena` (`3ec0c95`), `kv-q8v` (detached, `d855841`).
 - `wip/four-gemms-crash-20261026` is historical (the 2026-10-26 reboot) — keep, don't merge.
 - The brief, the plan and the coverage audit are the three docs to read first:
   `docs/BRIEF.md` (this), `docs/plan/BRECCIA-PLAN.md`, `docs/plan/PDF-GAP-ANALYSIS.md`.
