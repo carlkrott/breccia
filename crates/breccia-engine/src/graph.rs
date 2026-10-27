@@ -2435,6 +2435,26 @@ impl<'m> Session<'m> {
                     t * k,
                     distinct as f64 / t as f64
                 );
+                if let Some(path) = std::env::var_os("BRECCIA_TRACE_ROUTE_FILE") {
+                    use std::io::Write;
+                    let path = std::path::PathBuf::from(path);
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                        .with_context(|| format!("opening route trace {}", path.display()))?;
+                    for i in 0..t {
+                        write!(file, "{} {}", pos0 + i, b)
+                            .with_context(|| format!("writing route trace {}", path.display()))?;
+                        for (&expert, &weight) in self.pf_ids[i].iter().zip(&self.pf_weights[i]) {
+                            write!(file, " {expert}:{weight:.9}").with_context(|| {
+                                format!("writing route trace {}", path.display())
+                            })?;
+                        }
+                        writeln!(file)
+                            .with_context(|| format!("writing route trace {}", path.display()))?;
+                    }
+                }
             }
             self.pf_merged_bytes += (distinct as u64) * m.layers[b].experts.expert_bytes() as u64;
         }
