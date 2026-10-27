@@ -3500,6 +3500,58 @@ are attributed separately; (2) D5 with the incumbent HC path kept behind
 | parity (32 greedy tokens vs the HIP server) | **32/32** |
 | `sum · wall · residual` | 0.02-0.03 ms/token |
 
+## 8at. D5 does not exist as "14 -> 1": the 14 are 5 dependent stages x 2 reads + 2 writes
+
+No code this round; the deliverable is the correction below, because the premise's
+arithmetic and the shader structure disagree and the disagreement decides whether D5 is
+a fusion or a mega-kernel.
+
+### What the 14 dispatches actually are
+
+`HcMixer::read` is five **dependent** dispatches (`ops/mod.rs:1824`):
+
+```
+RmsNorm(r) -> GemvBatch/down (hc_lr rows) -> Act (bottleneck, hc_lr) -> GemvBatch/up (hc rows) -> HcGatedMean
+```
+
+and `HcMixer::write` is one (`HcWrite`). Per block: attn READ 5 + attn WRITE 1 + ffn READ
+5 + ffn WRITE 1 = **12**, plus the inject partials (`inject_chunks()`, 0 or more) = the
+**14** research 10 counted. The "four streams" are the *width* of every one of those
+kernels (`[hc*T, n_embd]`), not four dispatches — so "all four streams in one dispatch"
+was never the shape, and 14 -> 1 in one dispatch would be a **mega-kernel**, which
+`docs/research/10` disqualifies outright (no cooperative launch, no forward-progress
+guarantee; a deadlock is a ring timeout -> BACO reset). That is not a safety opinion this
+round — it is the same disqualification the research recorded.
+
+### What is fusable, and what it is worth
+
+Two elementwise stages sit immediately after a GEMV over the *same* rows, so folding them
+into that GEMV's epilogue is a **wired** change to an existing shader (the lowest-risk
+class in `AGENTS.md` § "Adding a kernel"):
+
+| fusion | saves | per token |
+|---|---|---:|
+| `down` GEMV + `Act` (bottleneck activation, epilogue) | 1 dispatch per HC_READ | -96 |
+| `up` GEMV + `HcGatedMean` (gated mean, epilogue) | 1 dispatch per HC_READ | -96 |
+| `RmsNorm` into `down` prologue | **not** fusable bit-identically (a separable two-pass norm would have to be recomputed per workgroup) | 0 |
+
+So the honest D5 ceiling is **-192 dispatches/token** (1 843 -> 1 651), not -290…-380, and
+each of the two needs its own entry point, its own RX validation run and its own parity
+run. `HcWrite` is already 1 dispatch per call and cannot be reduced further.
+
+### Why nothing landed
+
+Writing either entry point means editing `ops_hc_*`/the GEMV epilogue, adding a
+specialisation constant, re-deriving the push-constant layout, running the RX validation
+pass (one shape per process, `timeout 90`, validation on) and then the parity set. With
+no budget left in this round the choice was between a half-written shader in the tree and
+this note; the note is the deliverable the parent asked for when a shader at least
+*fails* — here it has not even been attempted, which is stated plainly rather than
+dressed up.
+
+**Next round's first commit, in this order:** `down+Act` fused epilogue behind
+`BRECCIA_NO_HC_FUSED` -> parity -> measure; then `up+HcGatedMean`.
+
 ## 9. Exact commands
 
 
