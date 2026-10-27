@@ -1138,6 +1138,13 @@ fn w(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<W> {
     Ok(W { buf, key })
 }
 
+/// Pick which streamed blocks get imported: the longest in-order prefix of
+/// `(block, bytes)` whose total fits `cap`.
+// shortcut: stub mirrors 0f7610d (no cap); real impl lands in the next commit.
+fn select_import_blocks(sizes: &[(usize, u64)], _cap: u64) -> Vec<usize> {
+    sizes.iter().map(|s| s.0).collect()
+}
+
 /// D4c: lock a host arena covering the routed experts of every block not
 /// resident in VRAM and fill it from the shard files. Blob order is (block,
 /// role) with roles gate/up/down, so block b's expert bytes start at slot
@@ -1677,5 +1684,16 @@ mod tests {
     #[test]
     fn host_expert_import_is_off_by_default() {
         assert!(!LoadOptions::default().host_expert_import);
+    }
+
+    /// D6a2 defect: the arena used to cover every streamed block (~37 GiB anon
+    /// on the 40 GiB IQ3_XXS model). The selection must respect a byte cap.
+    #[test]
+    fn import_selection_respects_cap() {
+        const G: u64 = 1 << 30;
+        let sizes: Vec<(usize, u64)> = (0..10).map(|b| (b, 4 * G)).collect();
+        assert_eq!(select_import_blocks(&sizes, 16 * G), vec![0, 1, 2, 3]);
+        assert!(select_import_blocks(&sizes, 3 * G).is_empty());
+        assert_eq!(select_import_blocks(&sizes, 100 * G).len(), 10);
     }
 }
