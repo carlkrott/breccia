@@ -5766,3 +5766,55 @@ the *restructure*, not the wait count. Recorded rather than attempted with no bu
 Still the honest prediction from §8bc — IQ3_S's grid lookups already run at ~100 % of the
 instruction model, so the extraction win is smaller than IQ4_XS's — but it is
 **unmeasured**, and this round's numbers do not stand in for it.
+
+## 8bi. `gdn-scan` diagnosed and **handed over** — the fix was started, measured fast, and found *wrong*, so it is reverted
+
+**Handover note (6 lines).** (1) *Changed*: nothing in the tree — the `gdn_step_par`
+32-lane-per-column kernel and its wiring were written, measured, and then **reverted**
+(`git checkout -- .` + the new shader deleted); the tree carries this note only.
+(2) *Verified*: the arithmetic below (state size, traffic, workgroups, implied GB/s,
+floor) and the two measured arms — the parallel kernel is **1.4–1.8× faster**
+(`gdn-scan` 2 768 → 1 547–1 920 µs/token) but produces **wrong logits** (`top-1` 1812 /
+7061 against the reference's 110563), so the speed is unverified and not usable.
+(3) *Reverted*: the kernel, its build entry and the `Gdn` wiring/flag (it was
+flag-**on** by default, which is why it could not be left in the tree).
+(4) *Not started*: the tiny-stage sweep (`hc-norm`/`hc-gated`/`final-hc`/`moe-swiglu`/
+`rope`/`kv-append`/`router`) and IQ3_S word-level.
+(5) *Next command*:
+`BRECCIA_GPU_TIME=1 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids --gen 16 --runs 1 --threads 16 --warm 1`
+(the incumbent `gdn-scan` row is 2 768 µs/token; anything above ~1 500 is a regression).
+(6) *Suspects in the reverted kernel, in order*: the `v_base + j` read (it must be the
+same `j` and the same `h_v` stride as the serial kernel), the `q_base`/`k_base` `gh`
+pairing, and the `subgroupShuffleXor` reduction crossing a 32-lane group on Wave64 — that
+last one is the most likely, since a wrong `sk`/`acc` sum on part of the columns would
+give exactly this "fast but wrong" signature.
+
+### The arithmetic (this is the finding that survives)
+
+`gdn-scan` = `Gdn::delta_step` (`shaders/gdn_step.comp`), 36 GDN blocks/token:
+
+| quantity | value |
+|---|---:|
+| state per layer | `S × h_v × S = 128 × 48 × 128` = **786 432 floats = 3.15 MB** |
+| columns (one invocation each) | `h_v × S` = 6 144 |
+| workgroups (128 threads) | **48** |
+| occupancy | **1.6 wave64 per CU** on the MI50 (2.4 wave32 on the RX) |
+| traffic per layer | **9.44 MB** (two read passes over the state + one write) |
+| traffic per token (36 blocks) | **340 MB** in 2 768 µs = **119 GB/s** (14 % of 825) |
+| one-pass floor (read + write only) | 226 MB → **275 µs/token** at 825 GB/s |
+
+So the stage is **7–10× off its floor**, and the cause is not arithmetic — the state
+update is 2.4 M FMAs per layer (≈13 µs/token at 6.6 TFLOP/s) — it is **memory-level
+parallelism**: 48 workgroups on 60 CUs cannot keep 3 MB in flight, and the kernel reads
+the state twice because the `sk` dot must finish before `d` can be formed. The fix is
+therefore structural (32 lanes per column, column held in registers, one read + one
+write, 1 536 workgroups = 51 waves/CU), which is exactly what was measured at 1.4–1.8× —
+and it is **not bit-identical by construction** (a reduction tree is a different
+summation order than the serial 128-term loop), so whoever lands it owes the accuracy
+contract from §8bb/§8bh *and* a `to_bits()`-or-bound conformance test, plus parity at
+every chunk and the 8-process gate. That is why the wrong-logit result was not papered
+over: at that stage there was no way to tell a reduction-order difference from a bug,
+and the next agent must fix the bug first.
+
+**State of the tree at handover**: `git status` clean on branch `gpu-time-table`
+(merge `0fb148e` of main, i.e. everything through §8bh merged). `verify.sh` PASS.
