@@ -3290,6 +3290,61 @@ descriptor cache); they must be split into two flags before the next measurement
 3. The four fusions, the head-device option (~−4 ms), the adaptive arena
    (measured-free-VRAM rule with a display-card reserve), zero-copy host-memory experts.
 
+## 8ap. The denominator: **1 843 dispatches/token**, and what that re-prices
+
+### The counter was right, the division was wrong
+
+`Session::dispatches` is a **run total**, and the CLI prints it before dividing by
+`runs_n` (runs, not tokens). Dividing 313 790 by "60-ish token-graphs" gave 5 167; the
+run actually contains **170** token-graphs: `--warm 1` (one full generation: 27 prompt
++ 32 decode) + the two prompt passes of the measured run (2 x 27) + its 32 forwards
+= 58 + 54 + 32 + ... = 170. 313 790 / 170 = **1 845**, which the fixed census confirms
+independently: **1 843 dispatches/token** (`ple 78 · hc-write(ffn) 1 719 · handoff 39 ·
+final-hc 7`). The static estimate of ~1 650 (32/block x 48 + head) is the same number to
+within the 190 non-block dispatches.
+
+So the true prices, at ~19 ms/token of recording: **~10 µs per dispatch** (not 3.2),
+and 1 511 barriers/token (0.82/dispatch) account for ~12 ms of the 32.5 ms `wait-gpu`
+— i.e. barriers are ~38 % of the fence wait, and **recording itself (~19 ms, ~33 % of
+the token) is the larger of the two.** Both are per-dispatch, which is why every fusion
+in `docs/research/10` is worth more than its dispatch count suggests.
+
+### Census repaired (Item 2)
+
+`Timers` now remembers the stage a batch was **opened** in (`open_batch` in
+`ensure_batch`) and attributes the batch's whole dispatch count there
+(`count_batch` from the batch's own `recorded()`), instead of the broken
+global-mark arithmetic. `BRECCIA_TRACE_DISPATCH=1` now prints a table that **sums to
+the total** (1 843), verified over 50+ consecutive tokens. The split is still coarse —
+1 719 of them land in `hc-write(ffn)` because a block opens its batch at that mark —
+so a per-phase split needs marks *inside* `submit_block`; that is the next census step
+and it is what D5's delta will be measured against.
+
+### Item 1 (static-graph replay): deliberately **not** pursued
+
+Per `docs/research/10` §3: after the fusions a frozen decode graph is worth 0.8-1.1 ms
+(it lands in `vkQueueSubmit`, not the record loop) and **every fusion invalidates it**.
+Nothing was written for it this round, and the flag-free code stands. Order agreed:
+D5 (hyper-connection collapse, 14 of a block's 32 dispatches) -> D1 -> D3 -> D4 -> D2,
+then replay last, if ever.
+
+### Not done this round
+
+D5/D1/D3/D4/D2 (no new shaders: a shader round needs the GPU-safety window — RX first,
+one shape per invocation, validation on), head-device option, adaptive arena. The
+recommended next step is **D5 with the coarse census as its meter**, since 1 719 of
+1 843 dispatches are block work and HC is 44 % of a block's static count.
+
+### State
+
+| quantity | value |
+|---|---:|
+| tok/s / ms per token | **17.48 / 57.19** |
+| dispatches/token (census) | **1 843** |
+| record / `wait-gpu` | 22.8 (contended window) / 32.4 |
+| `experts(host)` / `head` / `ple` / `xfer` | 12.8 / 7.0 / 1.2 / 1.1 |
+| parity (32 greedy tokens vs the HIP server) | **32/32** |
+
 ## 9. Exact commands
 
 

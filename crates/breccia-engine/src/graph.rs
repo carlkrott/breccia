@@ -114,8 +114,11 @@ pub struct Timers {
     last: Option<std::time::Instant>,
     #[serde(skip)]
     stage: usize,
+    /// The stage that was current when the **open batch** was started. A batch's
+    /// dispatches belong to it: everything recorded into one command buffer is one
+    /// stage's work by construction here (§8ap).
     #[serde(skip)]
-    dispatch_mark: u32,
+    batch_stage: Option<usize>,
 }
 
 impl Timers {
@@ -136,17 +139,25 @@ impl Timers {
         }
         self.last = Some(now);
         self.stage = stage;
-        // Dispatches recorded so far belong to the stage we are leaving.
-        self.dispatch_mark = batch_cmd::recorded();
         let _ = stage;
     }
 
-    /// Account the dispatches recorded since the previous mark to `stage`.
-    fn count_dispatches(&mut self, stage: usize, total: u32) {
+    /// Note the stage a batch was opened in, so its dispatch count lands there.
+    fn open_batch(&mut self) {
+        if self.on {
+            self.batch_stage = Some(self.stage);
+        }
+    }
+
+    /// Account one closed batch's dispatches to the stage it was opened in. `total`
+    /// is the batch's own dispatch count (`batch_cmd::recorded()` at `end_submit`),
+    /// so the per-stage table sums to the run's dispatch total by construction.
+    fn count_batch(&mut self, total: u32) {
         if !self.on {
             return;
         }
-        self.dispatches[stage] += total.saturating_sub(self.dispatch_mark);
+        let stage = self.batch_stage.take().unwrap_or(self.stage);
+        self.dispatches[stage] += total;
     }
     fn stop(&mut self) {
         if !self.on {
@@ -161,7 +172,7 @@ impl Timers {
         self.dispatches = [0; STAGES.len()];
         self.last = None;
         self.stage = 0;
-        self.dispatch_mark = 0;
+        self.batch_stage = None;
     }
 
     /// `(stage, dispatches per token)` for the report.
@@ -1005,8 +1016,7 @@ impl<'m> Session<'m> {
     fn flush(&mut self) -> Result<()> {
         if let Some(d) = self.pending_batch.take() {
             let rec = batch_cmd::recorded();
-            let stage = self.timers.stage;
-            self.timers.count_dispatches(stage, rec);
+            self.timers.count_batch(rec);
             let gpu = self.model.devices[d].gpu();
             self.probe_stamp(d, true)?;
             let seg = batch_cmd::end_submit(gpu, None)
@@ -1048,8 +1058,7 @@ impl<'m> Session<'m> {
         };
         let gpu = self.model.devices[d].gpu();
         let rec = batch_cmd::recorded();
-        let stage = self.timers.stage;
-        self.timers.count_dispatches(stage, rec);
+        self.timers.count_batch(rec);
         self.probe_stamp(d, true)?;
         let seg = batch_cmd::end_submit(gpu, None)
             .map_err(|e| anyhow!("submitting the block on device {d}: {e}"))?;
@@ -1082,6 +1091,7 @@ impl<'m> Session<'m> {
         self.flush()?;
         batch_cmd::begin(self.model.devices[dev].gpu())
             .map_err(|e| anyhow!("opening a dispatch batch on device {dev}: {e}"))?;
+        self.timers.open_batch();
         self.pending_batch = Some(dev);
         self.probe_stamp(dev, false)?;
         Ok(())
@@ -1225,6 +1235,7 @@ impl<'m> Session<'m> {
                 rows.join(" · "),
                 self.timers.dispatches.iter().sum::<u32>()
             );
+            self.timers.dispatches = [0; STAGES.len()];
         }
         if std::env::var_os("BRECCIA_GPU_TIME_VERBOSE").is_some() {
             for (i, s) in self.gpu_busy_s.iter().enumerate() {
