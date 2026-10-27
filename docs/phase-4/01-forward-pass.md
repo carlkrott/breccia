@@ -2599,6 +2599,76 @@ the run without it, as expected (it changes fault behaviour, not arithmetic). Th
 <=1 % cost is the research's measurement; this round was too contended to claim a
 quiet-window delta, so it is quoted, not measured.
 
+## 8af. The 21 ms drain is 4 800 dispatches x 4.3 us — measured, and neither item landed
+
+No implementation landed this round. What did land is the decomposition the two items
+were aimed at, and it changes which of them is worth doing first.
+
+### Dispatch and submit counts (the numbers Item 1 asked for)
+
+`bench token`, 64-token prompt, RX, one chunk (so 48 block-chunks) against the
+token-by-token path over the same prompt:
+
+| | dispatches | submits | per block per chunk | per token per block |
+|---|---:|---:|---:|---:|
+| chunk 64 | 307 029 | 654 (469 per submit) | **6 396** | **100** |
+| token by token | 308 352 | 9 947 (31 per submit) | 206 | 3.2 |
+
+So chunking already does what it was built for — **15x fewer submits per token** (0.21
+submits per block-token against 3.2) — and the *dispatch* count per token is
+**unchanged** (100 vs 100): the chunk path records the same ~4 800 dispatches per token
+(48 blocks x 100), it just records them into ~14 batches instead of ~155.
+
+Two things that surprised this round and are worth keeping:
+
+* **13.6 submits per block-chunk, not 2.** The passes are 2; the rest are PLE: block 1
+  runs `ple_step` per token, which flushes twice and then *records GPU work with no
+  batch open*, so each of those dispatches becomes its own submit (469 per submit is
+  the batch size of the passes, and 654 - 96 is PLE and the head). Batching PLE
+  (§8z/§8ad design) would remove ~550 submits per prefill — real, but submits are not
+  the cost, as the next row shows.
+* **The drain is not the submits.** 21.1 ms/token of `wait-gpu` over 4 800
+  dispatches/token = **4.4 us per dispatch of GPU-side latency**, which matches the
+  research's 3.43 us per *dependent* barrier plus ~1 us of dispatch: the GPU is
+  serialised at roughly one dispatch per 4.4 us, exactly as if every dispatch were
+  fenced against the last (it is).
+
+### What that decides
+
+| lever | effect on the 21 ms/token | verdict |
+|---|---|---|
+| fewer submits (one per pass) | ~0 — already 2 per pass, and 13.6 with PLE | cheap to do, small |
+| **per-resource barrier tracking** (~1 100 of ~4 800 barriers are unneeded) | **~3.8 ms/token** at 3.43 us each | **first** |
+| **T-batched dense chain** (dispatch count / T) | up to ~4 800/T -> hundreds per token, i.e. the largest single lever | second, and it is *shader* work, see below |
+| fused gate+up+SwiGLU | ~1.6 % of the drain | with the barrier work |
+
+**Why Item 1 (T-batched dense chain) did not land.** Of the dense stages, the ones that
+already accept `T > 1` are `HcMixer::read`/`write` (the batched-GEMV form is documented
+in `ops/mod.rs` and takes `ws.tokens`), `RmsNorm` (`hc * t` rows) and `SwiGlu`
+(elementwise over `n`). The ones that **cannot** take `T` without a new kernel are the
+token mixers: **GDN** (a sequential conv + delta-rule state advance per token) and
+**QSA** (per-position KV append, rope and selection). So a T-batched dense chain is
+~40 % restructure (the HC/RMSNorm half, which needs a chunk-residual layout, i.e. the
+`r_chunk` stack the prefill already builds) and ~60 % new shader work for the mixers.
+That is a milestone, not a round item, and it should be sequenced *after* the barrier
+work because the barrier work multiplies its payoff.
+
+**Why Item 2 (async prefetch of expert `e+1`) did not land.** It is the one item that
+needs the transfer queue to overlap with compute (semaphores per ring slot), and the
+engine's copy path is synchronous by construction (`record_copies` inside the compute
+batch). The measured split it was meant to fix is still §8x's: streamed groups cost
+429-530 us against 67-84 us resident, and the *host lane* (48.1 ms/token) still does
+the 39 non-resident blocks. Until a prefetch overlaps, the honest choice between
+"streamed with prefetch" and "more GPU-resident coverage" is untested — and coverage is
+the cheaper experiment (a `--gpu-experts` list, no code).
+
+### State
+
+Parity unchanged (chunk 128 + merged 32/32, top-1 13.170561), no decode path touched,
+canonical gate stands at 20.3 +- 1 / lane 40-43 ms/step. Prefill at 64-token chunk in
+this window: `experts(host)` 48.1, `wait-gpu` 20.6, `ple` 1.4, `mixer` 7.2, everything
+else <= 0.2 ms/token.
+
 ## 9. Exact commands
 
 
