@@ -287,6 +287,11 @@ pub struct Model {
     pub ple: Option<PleRaw>,
     /// Blocks whose routed experts live in VRAM, keyed by block.
     pub placed: std::collections::BTreeMap<usize, PlacedExperts>,
+    /// D4c: when `--host-expert-import` is ON, the locked host arena holding the
+    /// host-lane routed-expert blobs, built once at load. The blobs are laid out
+    /// in block order (block b starts at 3×b expert slots); a later stage binds
+    /// the arena base as an imported VkBuffer via `VK_EXT_external_memory_host`.
+    pub imported_experts: Option<crate::host_arena::HostArena>,
     /// The arena decision (rule, budget source, chosen set) for the report.
     pub arena: Option<ArenaReport>,
     pub stats: LoadStats,
@@ -743,6 +748,23 @@ impl Model {
         }
 
         let upload_seconds: f64 = per_device_upload.iter().sum();
+
+        // D4c: build the locked host arena once at load when the consumer flag is
+        // ON — one blob per expert-role tensor (gate/up/down) of every block that
+        // stayed on the host lane, filled from the shard files by pread. An
+        // mlock failure degrades OFF (streaming lane continues), never aborts.
+        let imported_experts = if opts.host_expert_import {
+            match build_imported_experts(&shards, &placed, cfg.n_layers) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    eprintln!("breccia: host-expert-import off: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let dense_bytes: u64 = layers.iter().map(|l| l.bytes).sum::<u64>()
             + out_hc_norm.size
             + out_hc_down.buf.size
@@ -910,6 +932,7 @@ impl Model {
             out_hc_up,
             ple,
             placed,
+            imported_experts,
             arena: arena_report,
             stats,
             keys,
@@ -1113,6 +1136,64 @@ fn w(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<W> {
     let key = PipeKey::of(&t)?;
     let buf = upload_tensor(gpu, name, &t)?;
     Ok(W { buf, key })
+}
+
+/// D4c: lock a host arena covering the routed experts of every block not
+/// resident in VRAM and fill it from the shard files. Blob order is (block,
+/// role) with roles gate/up/down, so block b's expert bytes start at slot
+/// 3·b and its blob for role r is `blob(3b + r)` — a later binding stage
+/// derives offsets from `arena.blobs()` directly.
+fn build_imported_experts(
+    shards: &ShardSet,
+    placed: &std::collections::BTreeMap<usize, PlacedExperts>,
+    n_layers: usize,
+) -> std::result::Result<crate::host_arena::HostArena, String> {
+    use crate::host_arena::{BlobSource, HostArena};
+    use std::fs::File;
+    use std::sync::{Arc, Mutex};
+
+    const ROLES: [&str; 3] = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
+
+    // Enumerate sources first so the arena can be sized exactly.
+    let mut srcs: Vec<BlobSource> = Vec::new();
+    for b in 0..n_layers {
+        if placed.contains_key(&b) {
+            continue;
+        }
+        for role in ROLES {
+            let name = format!("blk.{b}.{role}.weight");
+            let i = shards
+                .shard_of(&name)
+                .ok_or_else(|| format!("missing tensor `{name}`"))?;
+            let t = shards
+                .tensor(&name)
+                .ok_or_else(|| format!("missing tensor `{name}`"))?;
+            let r = t.file_range();
+            srcs.push(BlobSource {
+                file: i,
+                offset: r.start,
+                len: r.end - r.start,
+            });
+        }
+    }
+    if srcs.is_empty() {
+        return Err("every block is VRAM-resident; nothing to import".into());
+    }
+    let total: u64 = srcs.iter().map(|s| s.len).sum();
+
+    // One open handle per shard, indexed by BlobSource.file.
+    let mut files: Vec<Arc<Mutex<File>>> = Vec::with_capacity(shards.parts().len());
+    for p in shards.parts() {
+        files.push(Arc::new(Mutex::new(
+            File::open(p.path()).map_err(|e| format!("open {}: {e}", p.path().display()))?,
+        )));
+    }
+
+    let mut arena = HostArena::new(total).map_err(|e| format!("host expert arena: {e}"))?;
+    arena
+        .fill(&srcs, &files)
+        .map_err(|e| format!("fill host expert arena: {e}"))?;
+    Ok(arena)
 }
 
 /// Several tensors of the **same quant type and column count**, concatenated along

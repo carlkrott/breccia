@@ -203,6 +203,11 @@ impl ShardSet {
         &self.shards
     }
 
+    /// The shard (index into `parts()`) holding `name`, if present.
+    pub fn shard_of(&self, name: &str) -> Option<usize> {
+        self.index.get(name).map(|&(si, _)| si as usize)
+    }
+
     /// Shard 0: carries the model metadata (67 KVs for this model).
     pub fn primary(&self) -> &Gguf {
         &self.shards[0]
