@@ -3720,9 +3720,11 @@ window (both clocks `high` in every run header), parity **32/32** in every quote
 ### 1. The head moves, and the residual hands over through the block hand-off
 
 `head` used to run on `placement.device_of(n_layers-1)`, i.e. always the card that owns
-block 47 — under every contiguous split, the MI50. `--head-device N` (an ordinal into
-`--devices`) now decides where the 416 MiB `output.weight`, `output_hc_{norm,down,up}`
-and the `logits` row live; `Session::submit_head` moves the residual across with the
+block 47 — under every contiguous split, the MI50. `--head-device` now decides where the
+416 MiB `output.weight`, `output_hc_{norm,down,up}` and the `logits` row live. **Numbers
+in this section were taken with `--devices 0000:03:00.0,0000:0e:00.0`, so ordinal `0` is
+the RX here**; §8aw replaces the ordinal in the tables with the PCI address, because that
+label is what made the flag misreadable. `Session::submit_head` moves the residual across with the
 **existing** [`Staging`] read/write pair that the block-to-block hand-off uses — one
 40 KiB round trip per token, `handoff` 0.33 -> 0.54 ms.
 
@@ -3765,11 +3767,11 @@ Measured (27-token parity prompt, gen 32, `--warm 1 --threads 16`, `--split-bloc
 | config | arena | blocks | bytes/token | lane | `head` | `wait-gpu` | tok/s | ms/token |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | list 30, head on MI50 (baseline) | 24.9 GiB | 30 | 301 MiB | 13.73 | 6.95 | 32.38 | 17.18 | 58.21 |
-| list 30, `--head-device 0` | 24.9 GiB | 30 | 301 MiB | 13.80 | **4.22** | 32.43 | **17.93** | **55.76** |
+| list 30, head on `0000:03:00.0` | 24.9 GiB | 30 | 301 MiB | 13.80 | **4.22** | 32.43 | **17.93** | **55.76** |
 | `auto`, head on MI50 | 26.5 GiB | 29 | 269 MiB | 13.22 | 7.34 | 32.52 | 17.18 | 58.22 |
-| `auto --head-device 0` | 26.7 GiB | 29 | 265 MiB | **12.95** | **4.21** | 32.84 | **17.98-18.03** | **55.48-55.61** |
+| `auto`, head on `0000:03:00.0` | 26.7 GiB | 29 | 265 MiB | **12.95** | **4.21** | 32.84 | **17.98-18.03** | **55.48-55.61** |
 
-The rule's set at the default reserves (`auto --head-device 0`, two runs):
+The rule's set at the default reserves (`auto`, head on the RX, two runs):
 `0,2,4,5,8,12,15,17,18,20,21,22,23,24,26` on the RX (15 blocks, 12 587 MiB of its
 12 891 MiB budget) and `28,29,30,31,32,34,35,37,38,42,43,44,46,47` on the MI50
 (14 blocks, 14 725 MiB of 14 733) — i.e. **one block fewer than the hand-tuned list but
@@ -3816,13 +3818,229 @@ timeout 700 ./target/release/breccia bench token \
   --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$L" \
   --prompt-ids-file $P --gen 32 --runs 1 --threads 16 --warm 1
 timeout 700 ./target/release/breccia bench token \
-  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts auto --head-device 0 \
-  --prompt-ids-file $P --gen 32 --runs 1 --threads 16 --warm 1 --json out.json
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts auto \
+  --head-device 0000:03:00.0 --prompt-ids-file $P --gen 32 --runs 1 --threads 16 --warm 1 \
+  --json out.json
 # the residual-by-residual diff (works around the --debug-layers bug above)
 timeout 400 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 \
-  --split-blocks 28,20 --head-device 0 --gpu-experts "$L" --inbatch-read false \
+  --split-blocks 28,20 --head-device 0000:03:00.0 --gpu-experts "$L" --inbatch-read false \
   --prompt-ids "760,13017" --gen 8 --runs 1 --threads 16 --debug-layers
 ```
+
+## 8aw. The head is placed by **role**, the ordinal trap is closed, and `--head-device 0` was not the bug
+
+Follow-up round on §8av/§8at (merged main first: the HC epilogue fusion and the
+display-card correction). Three things: an accusation that did not survive measurement, a
+real usability defect, and the default the engine needed.
+
+### `--head-device 0` at 1.35 tok/s: not reproducible, and the mechanism is visible
+
+The claim was 738.84 ms/token with `head` ≈ 676 ms, i.e. something large moving per token
+on the explicit-first-device path. Four runs of that exact shape in a quiet window
+(`--devices 0000:0e:00.0,0000:03:00.0 --split-blocks 28,20`, head on the MI50 = ordinal 0
+there) give **16.32 / 16.91 tok/s, `head` 6.930 / 6.908 ms** — the arm is simply the
+head-on-MI50 arm, worth −3.1 ms against the RX (`head` 3.76-3.88) and nothing worse.
+
+What *does* reproduce those numbers is a **window with another agent's process on the same
+two cards** (the `gpu-time-probe` round was mid-run): the same command then reports
+`head` 152.6 ms, `ple` 22.4 ms, `wait-gpu` 119.3 ms and 3.19 tok/s — a *whole-card*
+slowdown (every stage on that card inflates ~15x), not a head path. Both cards were also
+thrashing 68 GiB of model mapping through a 58 GiB page cache during it. Recorded with the
+numbers because the accusation was reasonable: `--head-device` does move 40 KiB per token,
+and the only way to tell that from 416 MiB is to measure it.
+
+**The guards that were asked for and now exist:**
+
+* `Session::head_traffic_ok(forwards)` asserts, on **every** bench run, that the head path
+  moves at most one residual up (`4 × hc_dim × 4` bytes/token, 160 KiB) and one residual +
+  the logits row down; a per-token weight upload fails the run instead of printing a number
+  nobody reads. The bench prints the measured figure:
+  `head  device 0 of 2 · path traffic 40.0 KiB up + 1010.0 KiB down per token`.
+  With no hand-off the up-link must be exactly 0.
+* `head::handoff_bytes(hc_dim)` is the single source of truth for that cost (40 KiB), and a
+  unit test asserts it is three orders of magnitude below the 416 MiB head — so a
+  regression that re-uploads the weights cannot hide inside the path's own budget.
+* The write half now **rides the head's own batch** (`Staging::record_upload`) instead of
+  being a submission of its own. One submit + fence cheaper per token (`handoff` 0.63 ->
+  0.47 ms), and the copy and the `final_hc` dispatch that reads it are neighbours in one
+  command buffer, so the dependency is a recorded barrier rather than submission order
+  across two submissions.
+
+### The ordinal was the real defect: `--head-device` now takes a PCI address or a role
+
+`--head-device 0` means "the first `--devices` entry", so with `--devices 0e,03` it is the
+**MI50** — and a report that called it "the RX arm" was reading the numbers from the other
+device order. That is a flag that cannot be read safely, so:
+
+* a **PCI address** (`--head-device 0000:03:00.0`, or `03:00.0`, or `pci:03:00.0`) is
+  resolved by *identity*, independent of `--devices` order;
+* **`auto`** (now the default) resolves by *role*: the hardware profile's
+  `streaming_compute` device, tie-broken by measured fp32 GFLOPs, matched to the opened
+  devices by PCI address; no profile covering these cards ⇒ the device that owns block 47
+  (the old behaviour) and the banner says which rule fired;
+* an out-of-range ordinal or an unknown PCI address is an **error that lists every opened
+  device**, rather than a silent fallback.
+
+Eight unit tests pin the semantics, including the trap itself
+(`the_ordinal_is_the_devices_order_and_says_so`), PCI resolution in both device orders
+(`a_pci_address_does_not_depend_on_the_devices_order`), and `auto` picking the same *card*
+whichever order `--devices` is written in (`auto_picks_the_profiles_compute_role`).
+
+### The default is now the rule, and it costs nothing here
+
+`--gpu-experts auto` + head `auto`, quiet window, 27-token parity prompt, gen 32,
+`--warm 1`, `--split-blocks 28,20`, clocks `high`, A/B interleaved:
+
+| config | arena | lane | `head` | `wait-gpu` | tok/s | ms/token | parity |
+|---|---|---:|---:|---:|---:|---:|---:|
+| tuned list (30 blocks), head on RX | 24.9 GiB | 13.49 | 3.94 | 32.16 | 18.26 | 54.77 | 32/32 |
+| **default** (`auto` + role), head on RX | 26.7 GiB | 13.15-13.43 | 3.90-3.95 | 32.56-32.58 | **18.11-18.44** | **54.24-55.21** | 32/32 (4/4) |
+
+The default matches the hand-tuned list within noise here (mean 18.22 vs 18.26 tok/s,
+54.88 vs 54.77 ms) because the rule holds 1.8 GiB **more** bytes than the list — the list
+buys two extra blocks, the rule buys more resident bytes, and `lane` ends up slightly
+lower (13.3 vs 13.5). In the earlier window the same comparison was 18.19 vs 18.82 (3 % for
+the list); the difference between those two statements is the window, not the code, and
+the honest summary is **the portable default is within ~1-3 % of the tuned list and is the
+faster arm in this one**.
+
+`sum · wall` residual stays +0.29 to +0.32 ms/token on every run in the table.
+
+### Bit-identical (the requested check), and one open anomaly
+
+`--dump-logits` of the prompt's last-token row, head on the RX vs head on the MI50
+(default arm, 3-token prompt): **same 32 ids in the same order**, max |Δlogit| **1.6e-5**,
+greedy output identical (32/32 both arms). The hand-off itself moves bytes and cannot
+reorder them, so that residual is the head GEMV's own accumulation order (Wave32 vs
+Wave64); the coordinator's 2-token `cmp` is clean where the two cards' sums happen to agree
+to the printed precision.
+
+**Open (not resolved, recorded for the next window):** two runs out of ~15 on the
+*hand-off* arm produced **1/32** parity — top-1 tilted to 1049 (12.61) instead of 110563
+(13.17), the whole row compressed by ~0.2-0.6 logit, *both prompt passes bit-identical
+within the process*, i.e. a persistent wrong state for that process and not a transient
+race. Ten runs of the *same* configurations without the hand-off are all 32/32, and all
+**eight** runs since the in-batch copy landed are 32/32, so the in-batch change is the
+running hypothesis (a cross-submission memory dependency) but **not proven**. A dedicated
+quiet window with `--debug-layers --inbatch-read false` on the anomalous arm is the next
+step; treat 1/32 as possible until then.
+
+### Commands
+
+```bash
+P=/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids
+L="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,28,29,30,31,32,33,34,35,36,37,38,39,40,41"
+# the default: arena by rule, head by role (PCI address shown for the same card)
+timeout 500 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 \
+  --split-blocks 28,20 --gpu-experts auto --prompt-ids-file $P \
+  --gen 32 --runs 1 --threads 16 --warm 1 --json default.json
+# the tuned best, same window, head pinned by identity instead of ordinal
+timeout 500 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 \
+  --split-blocks 28,20 --gpu-experts "$L" --head-device 0000:03:00.0 \
+  --prompt-ids-file $P --gen 32 --runs 1 --threads 16 --warm 1
+# the head on the other card, for the bit-identical logits diff
+timeout 400 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 \
+  --split-blocks 28,20 --gpu-experts auto --head-device 0000:0e:00.0 \
+  --prompt-ids "760,13017,1433" --gen 2 --runs 1 --threads 16 --warm 1 \
+  --dump-logits mi50.txt --top-logits 32
+```
+
+## 8ax. The crossing hand-off is **removed**: the harness reproduces it, and the defect is not the hand-off
+
+The follow-up round was scoped to the hand-off race and nothing else. It ends with the
+crossing path deleted and — the more useful result — **the failure reproduced on the arm
+that does not cross at all**, so the defect that was attributed to `--head-device` lives in
+the base path and is still open.
+
+### The harness (the acceptance gate, and now a regression test)
+
+`scripts/head-handoff-race.sh`: `--procs` processes × `--runs` generations of the same
+configuration, every sequence compared with the first, plus (with `RACE_PROMPT=parity`) the
+reference's first `--gen` tokens, and the crossing arm asserted **refused**. It refuses to
+measure while a co-tenant holds the cards (`pgrep -x breccia`, VRAM > 1.5 GiB) and discards
+any process a co-tenant appears *during* — a contended window reproduces a 15× slowdown
+(same command: `head` 152.6 vs 3.9 ms, 3.19 vs 18 tok/s) and would otherwise be reported as
+a bug.
+
+Cheap enough for every round: `RACE_PROCS=8 RACE_RUNS=4` (no arena) is ~2 min;
+`RACE_ARENA=auto RACE_PROMPT=parity RACE_RUNS=1 RACE_GEN=32 RACE_WARM=1 RACE_PROCS=8` (the
+shipped configuration) is ~8 min.
+
+**Red on the code as merged** (`ba86db2`, head crossing to the RX), quiet window, 16
+exclusive processes:
+
+```
+CROSSING-FAIL proc 1 run 0: step 0/32 ours 1049 expected 110563
+CROSSING-FAIL proc 14 run 0: step 0/32 ours 1049 expected 110563
+RACE: 16 control + 16 crossing generations, 2 mismatch(es) -> RED
+```
+
+### What the failure is, and what it is not
+
+* **It is not a torn read.** Inside a failing process both prompt passes are
+  bit-identical (`max |Δlogit| 0.000e0`) and the wrong sequence repeats across generations
+  (`--runs 2`: 31/32 mismatches in *both* runs, identical). The head's row is perturbed
+  smoothly — `logits[110563]` 13.1705 → 12.8037, `min` −11.065 → −11.506, top-1 still
+  right — and the generated sequence is the reference **with one token dropped**, then it
+  re-syncs. That is a one-position-stale residual feeding the head, not garbage.
+* **It is not the residual hand-off's write.** A read-back compare
+  (`BRECCIA_HEAD_VERIFY=1`: re-read `venues[head_dev].r` off the head device after the
+  batch was waited and compare it with the bytes uploaded) was clean in
+  8 processes × 2 runs, including the failing one.
+* **It is not the arena set.** The `auto` set vs the hand-tuned 30-block list, same window,
+  `--dump-logits`: identical top-16 ids in the same order, max |Δlogit| **7.4e-5**. Two
+  arena choices are numerically interchangeable; a set difference cannot move a logit by
+  0.37.
+* **It is not the crossing.** The harness then flagged the *shipped* arm — head on block
+  47's device, no hand-off at all:
+
+```
+UNSTABLE proc 8 run 0: step 0 ours 1049 expected 110563
+RACE: 8 generations over 8 exclusive processes, crossing refused OK -> RED
+```
+
+  Rate so far: ~2 of 16 crossing processes and ~1 of 8 shipped-arm processes, i.e. **~10 %
+  of processes, either arm**. The earlier "3 of 17 with the hand-off vs 0 of 20 without"
+  was a small sample in a window where the *other* arm was mostly run with a hot page cache.
+* The one correlate that has held every time: **the failing process is one whose warm
+  generation had to fault expert/PLE pages in** (`warm 0 … 0.98 GiB storage read` in the
+  failing process, `0.00 GiB` in the passing ones — but cold reads alone are not
+  sufficient: several cold processes are correct). That is the thread the next round should
+  pull: the lane and the PLE gather read the mmap *while* the same pages are being faulted
+  in by the other device's work, and one token's residual ends up one position stale.
+
+### The removal
+
+`head::gate` now refuses any head device that is not the device owning the last block, with
+the reason and the workaround in the message; `auto` keeps the head where it must be and
+says what the profile *would* have preferred and how to give that card the last block
+(list it last in `--devices`). `submit_head` has one path again (a `debug_assert` pins it),
+the in-batch residual upload is gone, and `session.head_traffic_ok` now simply asserts the
+up-link is 0 on every bench run. The flag still parses an ordinal, a PCI address or a role,
+and the tests that pinned those semantics stay (they are what makes the refusal readable).
+
+**Accepted cost:** the legal single-stream best is the head on block 47's device,
+`head` 7.37-7.42 ms, **17.29-17.37 tok/s / 57.6-57.8 ms**; the removed arm reached
+18.26 / 54.77. So this round gives back ~1 tok/s (5 %) rather than ship an opt-in path that
+is wrong in ~10 % of processes.
+
+### Arena rule vs the tuned list, same window, interleaved (parity 32/32 in all four)
+
+| arm | lane | `head` | `wait-gpu` | tok/s | ms/token |
+|---|---:|---:|---:|---:|---:|
+| tuned list (30 blocks) | 13.03 / 13.25 | 7.38 | 32.20 | 17.34 / 17.29 | 57.66 / 57.82 |
+| **default** (`--gpu-experts auto`) | 12.88 / 15.93 | 7.36-7.42 | 32.26 | **17.37** / 16.26 | **57.56** / 61.51 |
+
+The default's second run is the cold-cache outlier (its warm pass faulted 1.41 GiB in);
+hot-cache it is `lane` 12.88 vs 13.03 and 17.37 vs 17.34 tok/s — i.e. **the rule costs
+nothing against the tuned list** and it holds 1.8 GiB more resident bytes.
+
+### Open
+
+The ~10 %/process wrong-sequence bug itself. It is not the head, not the hand-off, not the
+arena; the harness reproduces it on the shipped arm and is the gate for whoever takes it.
+Until then, quote parity from **many processes**, never from one run: a single
+`--dump-logits` comparison in this same round would have certified the removed arm.
 
 ## 9. Exact commands
 
