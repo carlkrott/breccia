@@ -1,6 +1,7 @@
 #version 450
 //
-// The gated delta-rule recurrence, one invocation per state column.
+// The gated delta-rule recurrence, **32 lanes per state column, the column held
+// in registers**, so the state is read once and written once per call.
 //
 //   dec   = exp(gate[h])                                    scalar per v-head
 //   sk[j] = sum_i S[i][h][j] * dec * k[h % h_k][i]
@@ -11,31 +12,56 @@
 // (`docs/specs/qwen4exp-architecture.md` §5.2; `delta-net-base.cpp:349-366`;
 //  `ST/include/strata/kernels/gdn.hpp:12-57`.)
 //
-// # State layout (spec open question Q3 — this is the choice)
+// # State layout
 //
-// **`(S, h_v, S)` = `(i, h, j)` with `j` fastest**: flat index
-// `(i * h_v + h) * S + j`. That is strata's layout (`gdn.hpp:13-18`), picked over
-// llama.cpp's `(S, S, H_v)` because for a fixed `i` a warp walking consecutive
-// `j` reads contiguous memory — and `j` is the axis the output and the state
-// update both stream along. A mismatch between the two layouts is silent (same
-// three numbers), so the CPU reference in `src/gdn/cpu.rs` indexes the same
-// formula and the conformance test pins it.
+// `(i, h, j)` with `j` fastest: flat index `(i * h_v + h) * S + j`, i.e.
+// `h*S + j + i*(h_v*S)`. Same layout as `src/gdn/cpu.rs` (which pins it) and the
+// layout §8bi established.
 //
-// # Why this is parallel at all
+// # Why the shape changed (§8bi: 7-10x off the memory floor)
 //
-// Every line above touches only the (j, h) column: the decay is one scalar per
-// head, `sk` is a dot over `i` for fixed `j`, and the rank-1 update writes the
-// same column. Nothing couples one column to another, so one invocation owns a
-// column for the whole step and **no barrier appears anywhere in the kernel**.
+// One invocation per column gave 6 144 invocations = **48 workgroups** on 60 CUs
+// (1.6 wave64/CU) and had to read the state **twice** per token, because the `sk`
+// dot must finish before `d` exists: 9.44 MB/layer/token at 14 % of peak
+// bandwidth. Both limits are structural, so:
+//
+//   * **32 lanes per column**, each lane owning the four rows `i = lane + 32*r`
+//     in registers (`st0..st3`). Four columns per 128-thread workgroup =>
+//     1 536 workgroups, i.e. 51 waves/CU, and the 3.15 MB state streams in once
+//     and out once (6.3 MB/layer/token) for **any** `T`, because it never
+//     round-trips through memory between tokens of one call.
+//   * Thread order puts **consecutive threads on consecutive `j`**
+//     (`c = lid % 4`, `lane = lid / 4`), so a wave reads contiguous 16 B
+//     segments along the axis the output and the update both stream along.
+//
+// # The reduction is plain shared memory, on purpose
+//
+// `sk` and `acc` are 128-term dots; with 4 rows per lane they need a 32-lane
+// reduction. This uses **no `subgroupShuffle*`**: the reverted §8bi kernel's most
+// likely defect was a shuffle reduction crossing a 32-lane group on **Wave64**
+// (gfx906, the MI50), and a wrong `sk` on part of the columns gives exactly its
+// "fast but wrong" signature. A fixed-order shared-memory sum is correct on
+// Wave32 and Wave64 alike, and deterministic.
+//
+// The sum order is therefore **not** bit-identical to the serial kernel's
+// 128-term sequential loop (4-row partials, then 32 of them in lane order). That
+// is the accuracy contract §8bi/§8bb owes: a bound, not `to_bits()`, and the
+// conformance test holds both the output and the carried state to 1e-5 rel
+// against the f64 reference.
+//
+// # Geometry
+//
+// `h_v * S` must be a multiple of `COLS` (48 * 128 = 6 144 ✓) and `S` must be
+// `LANES * 4` = 128 — the model's own constants, taken from the push constants.
 //
 // # T > 1
 //
-// The invocation walks the T tokens of the call in order, carrying the state in
-// place, so a prefill chunk is "the decode kernel applied T times" — the same
-// equality `ST/include/strata/core/verify.hpp:3-11` asserts between strata's
-// chunked and single-token GDN paths. Cost is linear in T (the state is
-// re-read per token); the chunked/UT-transform formulation that makes prefill
-// sublinear in T is `docs/phase-3/06-attention-gdn.md` §open items.
+// The invocation walks the T tokens of the call in order, carrying the column in
+// registers, so a prefill chunk is "the decode step applied T times". The state
+// is written back once at the end, which is the same final state the serial
+// kernel left: nothing reads it between tokens of one dispatch. `T == 0`
+// therefore stores back exactly the bytes it loaded, which the bit-stability
+// test asserts.
 //
 // `q` arrives ALREADY L2-normalised and scaled by 1/S (`gdn_qk_l2.comp`), `v`
 // is raw, and `gate` is the pre-exp value.
@@ -60,15 +86,23 @@ layout(push_constant) uniform Params {
 } pc;
 
 #define WG_X_MAX 65535u
+#define LANES 32u
+#define COLS 4u
+
+// `part`: one 4-row partial per lane per column. `sk`/`acc`: the reduced scalars.
+// Two slots, so a reduction never overwrites a value another warp has yet to
+// read — the hazard a single reused slot would need an extra barrier for.
+shared float part[LANES][COLS];
+shared float sk[COLS];
+shared float acc[COLS];
 
 void main() {
-    // unit = (h, j): one state column.
+    uint lid = gl_LocalInvocationID.x;
     uint unit = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
-    uint per_wg = 128u;
-    uint col = unit * per_wg + gl_LocalInvocationID.x;
-    if (col >= pc.h_v * pc.S) {
-        return;
-    }
+    uint c = lid % COLS;      // which of the group's four columns
+    uint lane = lid / COLS;   // which of the 32 row-groups: i = lane + 32*r
+    uint col = unit * COLS + c;
+
     uint h = col / pc.S;
     uint j = col - h * pc.S;
     uint gh = h % pc.h_k; // MODULO pairing (§5.2, spec Q2)
@@ -77,24 +111,64 @@ void main() {
     uint k_base = pc.h_k * pc.S + gh * pc.S;
     uint v_base = 2u * pc.h_k * pc.S + h * pc.S;
 
+    uint sb = h * pc.S + j;     // flat index of row 0 of this column
+    uint ss = pc.h_v * pc.S;    // stride between rows `i`
+
+    float st0 = ST[sb + (lane + 0u) * ss];
+    float st1 = ST[sb + (lane + 32u) * ss];
+    float st2 = ST[sb + (lane + 64u) * ss];
+    float st3 = ST[sb + (lane + 96u) * ss];
+
     for (uint t = 0u; t < pc.tokens; ++t) {
         uint at = t * pc.channels;
         float dec = exp(GATE[t * pc.h_v + h]);
         float beta = BETA[t * pc.h_v + h];
 
-        float sk = 0.0;
-        for (uint i = 0u; i < pc.S; ++i) {
-            sk += ST[(i * pc.h_v + h) * pc.S + j] * QKV[at + k_base + i];
-        }
-        float d = (QKV[at + v_base + j] - sk * dec) * beta;
+        float k0 = QKV[at + k_base + lane];
+        float k1 = QKV[at + k_base + lane + 32u];
+        float k2 = QKV[at + k_base + lane + 64u];
+        float k3 = QKV[at + k_base + lane + 96u];
 
-        float acc = 0.0;
-        for (uint i = 0u; i < pc.S; ++i) {
-            uint idx = (i * pc.h_v + h) * pc.S + j;
-            float st = ST[idx] * dec + QKV[at + k_base + i] * d;
-            ST[idx] = st;
-            acc += st * QKV[at + q_base + i];
+        // ---- sk: 4-row partial per lane, then lane-ordered sum ---------------
+        part[lane][c] = st0 * k0 + st1 * k1 + st2 * k2 + st3 * k3;
+        barrier();
+        if (lane == 0u) {
+            float s = 0.0;
+            for (uint l = 0u; l < LANES; ++l) {
+                s += part[l][c];
+            }
+            sk[c] = s;
         }
-        O[t * (pc.h_v * pc.S) + h * pc.S + j] = acc;
+        barrier();
+        float d = (QKV[at + v_base + j] - sk[c] * dec) * beta;
+
+        // ---- the rank-1 update stays in registers ---------------------------
+        st0 = st0 * dec + k0 * d;
+        st1 = st1 * dec + k1 * d;
+        st2 = st2 * dec + k2 * d;
+        st3 = st3 * dec + k3 * d;
+
+        // ---- o[h][j] from the *updated* state ------------------------------
+        part[lane][c] = st0 * QKV[at + q_base + lane] +
+                        st1 * QKV[at + q_base + lane + 32u] +
+                        st2 * QKV[at + q_base + lane + 64u] +
+                        st3 * QKV[at + q_base + lane + 96u];
+        barrier();
+        if (lane == 0u) {
+            float s = 0.0;
+            for (uint l = 0u; l < LANES; ++l) {
+                s += part[l][c];
+            }
+            acc[c] = s;
+        }
+        barrier();
+        if (lane == 0u) {
+            O[t * (pc.h_v * pc.S) + h * pc.S + j] = acc[c];
+        }
     }
+
+    ST[sb + (lane + 0u) * ss] = st0;
+    ST[sb + (lane + 32u) * ss] = st1;
+    ST[sb + (lane + 64u) * ss] = st2;
+    ST[sb + (lane + 96u) * ss] = st3;
 }
