@@ -34,7 +34,13 @@ A from-scratch Rust inference engine (`breccia`) plus its Phase-0 measurement ha
 Per-invocation rules, mandatory once a test touches GPU memory:
 
 1. **Wrap every GPU run in `timeout 90`** — a driver hang must not outlive the command.
-2. **Risky/new kernel paths run on the RX 6950 XT FIRST — it is the HEADLESS card.** The **Radeon VII/MI50 (`0000:0e:00.0`) drives the displays** (DP-0, DP-1, HDMI-A-0 per Xorg) — a GPU reset there froze the box on 2026-10-26 (see incident log below). Resolve devices by PCI identity, never by enumeration ordinal. Only run risky code on the MI50 after the RX passes, and never with an unvalidated dispatch shape.
+2. **Risky/new kernel paths run on the Radeon VII/MI50 (`0000:0e:00.0`) FIRST — it is the HEADLESS card.** The **RX 6950 XT (`0000:03:00.0`) drives the displays** (DP-1, DP-2, HDMI-A-1 connected, `boot_vga=1`) — a reset there loses the desktop. Resolve devices by PCI identity, never by enumeration ordinal. Only run risky code on the RX after the MI50 passes.
+   **Determine the display card from sysfs, never from an Xorg log** (a stale log line naming "AMDGPU(0): Radeon VII" misled us for a day):
+   ```bash
+   for c in /sys/class/drm/card[0-9]; do echo "$c $(cat $c/device/uevent | grep PCI_SLOT_NAME) boot_vga=$(cat $c/device/boot_vga)"; done
+   for s in /sys/class/drm/card*-*/status; do [ "$(cat $s)" = connected ] && echo "$s"; done
+   ```
+   Note the corollary from the 2026-10-26 incident: the reboot happened on the *headless* card, so display loss is **not** the only hazard — a watchdog BACO reset can take the whole box down regardless of which card faults. Bounded waits + `VK_EXT_robustness2` remain the primary mitigation.
 3. **One GPU process at a time.** No parallel benches, no benches during agent work on the same card.
 4. Enable `VK_LAYER_KHRONOS_validation` for first runs of new shader code and record any VU messages; RADV page faults on illegal command streams are otherwise silent until the box freezes.
 5. Conformance: run **one quant type per invocation** so a fault is attributable; never sweep all types in one go after touching shader includes. GPU tests are opt-in by explicit device: `cargo test` skips them unless `BRECCIA_KERNEL_DEVICE` is set. Safe first run:
@@ -121,9 +127,9 @@ event — not adding one out of caution is the costlier mistake.
 | Date | Process | Card | Symptom | Cause / fix |
 |---|---|---|---|---|
 | 2026-10-25 22:09 | `conformance` (`non_finite_scal`) | RX | illegal opcode + coredump, machine hung | zero-slack allocation + unbounded table index → TAIL_PAD + masked accessors |
-| 2026-10-26 23:44 | `gemm_many` (`multi_user_gemm`) | **MI50 (display)** | ring gfx timeout → BACO reset → **machine rebooted** | **not a kernel defect**: all four new GEMMs later validated bit-identical on both cards, one type per invocation. The reset correlated with the *sweep shape* — up to **24 fresh dispatch shapes in one process** (a cap raised from 6) on the display card. New rule: ≤4 fresh shapes per test process, `BRECCIA_GEMM_TYPE` honoured, and pipeline pre-warm before sweeps. WIP preserved on `wip/four-gemms-crash-20261026`. |
+| 2026-10-26 23:44 | `gemm_many` (`multi_user_gemm`) | **MI50 (headless)** | ring gfx timeout → BACO reset → **machine rebooted** | **not a kernel defect**: all four new GEMMs later validated bit-identical on both cards, one type per invocation. The reset correlated with the *sweep shape* — up to **24 fresh dispatch shapes in one process** (a cap raised from 6) on the display card. New rule: ≤4 fresh shapes per test process, `BRECCIA_GEMM_TYPE` honoured, and pipeline pre-warm before sweeps. WIP preserved on `wip/four-gemms-crash-20261026`. |
 
-Lesson recorded: the display GPU is the MI50, so "test on MI50 first" was the wrong order; test on the RX, and treat any reset as a stop-the-line event.
+Lesson recorded (corrected 2026-10-27): the display GPU is the **RX 6950 XT**, the MI50 is headless — and the 23:44 reset that rebooted the box happened on the **headless** card, so card choice is *not* sufficient protection. Bounded waits, `VK_EXT_robustness2`, ≤4 dispatched shapes per process and stop-the-line on any reset are the real mitigations. An earlier note in this file had the two cards swapped because it trusted an Xorg log line instead of sysfs.
 
 ## Git
 

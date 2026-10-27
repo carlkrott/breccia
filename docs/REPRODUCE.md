@@ -1,6 +1,6 @@
 # Reproducing the measurements
 
-Every number in `docs/` came from a command in this file or its phase report. All GPU runs follow the safety rules in `AGENTS.md` (timeout, one process at a time, and **new/risky kernels on the RX 6950 XT first — it is the headless card; the Radeon VII/MI50 drives the displays**).
+Every number in `docs/` came from a command in this file or its phase report. All GPU runs follow the safety rules in `AGENTS.md` (timeout, one process at a time, and **new/risky kernels on the Radeon VII/MI50 first — it is the headless card (`0000:0e:00.0`); the RX 6950 XT (`0000:03:00.0`, `boot_vga=1`) drives DP-1/DP-2/HDMI-A-1**).
 
 Reference hardware (measurements do not transfer verbatim to other systems): Ryzen 9 7950X, 58 GB DDR5, RX 6950 XT (gfx1030, 16 GB GDDR6, Infinity Cache) + Radeon VII/MI50 (gfx906, 16 GB HBM2), Mesa RADV 26.2.4, ROCm 7.2, Linux 6.18.
 
