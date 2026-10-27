@@ -2504,6 +2504,37 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// D4d: the three role byte-slices for streamed block `b` expert `expert`,
+    /// read out of the imported host arena instead of the mmap. `placed_before`
+    /// is the number of VRAM-resident blocks with a lower index — the builder
+    /// enumerated only non-placed blocks in (block, gate/up/down) order, so
+    /// streamed block `b` lands at blob `3·(b − placed_before) + role`.
+    fn imported_role_slices<'a>(
+        arena: &'a crate::host_arena::HostArena,
+        placed_before: usize,
+        expert: usize,
+        gate_len: usize,
+        up_len: usize,
+        down_len: usize,
+    ) -> Result<[&'a [u8]; 3]> {
+        let want = [gate_len, up_len, down_len];
+        let mut out: [&'a [u8]; 3] = [&[]; 3];
+        for (r, ln) in want.iter().enumerate() {
+            let blob = arena
+                .blob(3 * placed_before + r)
+                .map_err(|e| anyhow!("imported expert arena: {e}"))?;
+            let (a, z) = (expert * ln, (expert + 1) * ln);
+            if z > blob.len() {
+                bail!(
+                    "imported role blob {r} holds {} bytes, expert {expert} needs [{a}, {z})",
+                    blob.len()
+                );
+            }
+            out[r] = &blob[a..z];
+        }
+        Ok(out)
+    }
+
     /// Copy expert `e` of block `b` out of the mmap into streamed slot `slot`.
     ///
     /// This is the whole replacement for the host lane's per-token work: the lane
@@ -2520,6 +2551,27 @@ impl<'m> Session<'m> {
             .experts
             .slices(&m.shards, expert)
             .with_context(|| format!("streaming blk.{b} expert {expert}"))?;
+        // D4d: with the host expert arena imported, the copy source is the
+        // live host mapping, not the mmap staging copy. Blob i holds the
+        // (b, r) pair at i = 3·(b − placed_before) + r, matching the builder.
+        let imported = {
+            let (g, u, d) = (
+                slices.gate.len() as u64,
+                slices.up.len() as u64,
+                slices.down.len() as u64,
+            );
+            m.imported_experts.as_ref().map(|arena| {
+                let placed_before = m.placed.range(..b).count();
+                Self::imported_role_slices(
+                    arena,
+                    placed_before,
+                    expert,
+                    g as usize,
+                    u as usize,
+                    d as usize,
+                )
+            })
+        };
         let total = {
             let pf = self.venues[dev]
                 .pf
@@ -2539,9 +2591,19 @@ impl<'m> Session<'m> {
                     slices.down.len()
                 );
             }
-            pf.stream.write_at(off, slices.gate)?;
-            pf.stream.write_at(off + g, slices.up)?;
-            pf.stream.write_at(off + g + u, slices.down)?;
+            match &imported {
+                Some(Ok([g_s, u_s, d_s])) => {
+                    pf.stream.write_at(off, g_s)?;
+                    pf.stream.write_at(off + g, u_s)?;
+                    pf.stream.write_at(off + g + u, d_s)?;
+                }
+                Some(Err(e)) => bail!("imported expert read: {e}"),
+                None => {
+                    pf.stream.write_at(off, slices.gate)?;
+                    pf.stream.write_at(off + g, slices.up)?;
+                    pf.stream.write_at(off + g + u, slices.down)?;
+                }
+            }
             slices.gate.len() + slices.up.len() + slices.down.len()
         };
         self.pf_stream_bytes += total as u64;
@@ -4245,5 +4307,88 @@ mod tests {
         // `0` stays token by token, which is the caller's fallback.
         assert!(super::prefill_plan(132, 0).is_empty());
         assert!(super::prefill_plan(0, 64).is_empty());
+    }
+
+    /// D4d: `imported_role_slices` must resolve the blob index the same way
+    /// `build_imported_experts` enumerates it: only non-placed blocks get blobs,
+    /// in (block, role gate/up/down) order. With block 0 placed, streamed
+    /// block 1 must read blob 0, not blob 3 — the defect the first D4d candidate
+    /// shipped (hardcoded 3·b).
+    #[test]
+    fn imported_role_slices_skip_placed_blocks() {
+        use crate::host_arena::{BlobSource, HostArena};
+        use std::fs::File;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        // Real content, not zeros: blob i is `len` bytes of pattern (i+1).
+        let dir = std::env::temp_dir().join("breccia-graph-import-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shard0.bin");
+        {
+            let mut f = File::create(&path).unwrap();
+            for i in 0..4 {
+                f.write_all(&vec![2 * i as u8 + 7; 3072]).unwrap();
+            }
+        }
+        let files = vec![Arc::new(Mutex::new(File::open(&path).unwrap()))];
+        let src: Vec<BlobSource> = (0..4)
+            .map(|i| BlobSource {
+                file: 0,
+                offset: i * 3072,
+                len: 3072,
+            })
+            .collect();
+        let mut arena = HostArena::new(4 * 3072).expect("mlock under limit");
+        arena.fill(&src, &files).expect("pread fill");
+
+        // Mixed case mirroring the builder: block 0 placed, blocks 1..2 streamed
+        // (4 blobs = gate/up/down per streamed block), e.g. 16 experts × 64 B/role.
+        const EXPERTS: usize = 3;
+        const ROLE: usize = 3072;
+        let placed_before_1 = 1; // block 0 is placed
+        let placed_before_2 = 1; // block 1 streamed, nothing extra placed
+
+        // Streamed block 1: blob base 0. Its expert 2 must read blob role bytes
+        // [2*64, 3*64) — the file's own pattern of blob 0, not blob 3's.
+        let want = arena.blob(0).unwrap()[2 * ROLE / EXPERTS..3 * ROLE / EXPERTS].to_vec();
+        let got = super::Session::imported_role_slices(
+            &arena,
+            placed_before_1,
+            2,
+            ROLE / EXPERTS,
+            ROLE / EXPERTS,
+            ROLE / EXPERTS,
+        )
+        .unwrap();
+        assert_eq!(got[0].to_vec(), want, "streamed blk1 gate reads blob 0");
+        for r in 0..3 {
+            let want = arena.blob(r).unwrap()[2 * 1024..3 * 1024].to_vec();
+            assert_eq!(got[r].to_vec(), want, "role {r}");
+        }
+
+        // Streamed block 2: blob base 3. Without the placed-skip it would read
+        // blob 6 (past the end) or the wrong bytes.
+        let got2 = super::Session::imported_role_slices(
+            &arena,
+            placed_before_2,
+            0,
+            ROLE / EXPERTS,
+            ROLE / EXPERTS,
+            ROLE / EXPERTS,
+        )
+        .unwrap();
+        for r in 0..3 {
+            let want = arena.blob(3 + r).unwrap()[0..1024].to_vec();
+            assert_eq!(got2[r].to_vec(), want, "blk2 role {r} reads blob {}", 3 + r);
+        }
+
+        // Distinct patterns prove cross-blob separation: blob r and 3+r differ to
+        // the byte.
+        assert_ne!(arena.blob(0).unwrap(), arena.blob(3).unwrap());
+        // Out-of-range role index is a clean error, not silent shift.
+        assert!(
+            super::Session::imported_role_slices(&arena, 4, 0, EXPERTS, EXPERTS, EXPERTS).is_err()
+        );
     }
 }
