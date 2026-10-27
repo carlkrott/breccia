@@ -81,6 +81,16 @@ Small changes are measured in **seconds, not tens of minutes**. Every sweep is t
 - **Kill and conclude**: if a sweep shows the same sign after ~2 minutes of data, stop it and act. A negative result already visible does not need more cells.
 - New bench modes must offer short forms and print a per-phase summary so a run can be abandoned early with usable data.
 
+## Measurement traps (learned the hard way)
+
+| Trap | Symptom | Rule |
+|---|---|---|
+| **GPU DPM idles at 500 MHz** | the RX measured **3.54 tok/s** single-device; with `power_dpm_force_performance_level=high` it is **15.41 tok/s** (4.4×). The MI50 was already pinned high, which is why the "slower" card kept winning per block. | **Pin both cards to `high` before any benchmark** (`gpu-clocks-high.service` does this at boot); verify by reading `power_dpm_force_performance_level` and `pp_dpm_sclk`; never compare per-card numbers across clock states. |
+| `MESA_VK_DEVICE_SELECT` filter | both discrete GPUs hidden from Vulkan | strip it for every Vulkan run |
+| tail chunk | 4-token tail costs 658 vs 88 ms/token (~13% of a run) | dynamic chunk sizing |
+| `bench agents` rate | prefills streams sequentially then divides by n, so "per agent" is 2× the per-stream wall | quote the in-session table, not the bench rate |
+| per-dispatch pricing | cost is per **submit/boundary**, not per dispatch | price changes in submits |
+
 ## Incident log — GPU crashes
 
 | Date | Process | Card | Symptom | Cause / fix |
