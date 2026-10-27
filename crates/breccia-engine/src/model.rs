@@ -1138,11 +1138,24 @@ fn w(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<W> {
     Ok(W { buf, key })
 }
 
+/// Cap on the locked anonymous host arena. D6a2 (0f7610d) imported every
+/// streamed block (~37 GiB anon on the 40 GiB IQ3_XXS model) and was OOM-killed.
+// shortcut: fixed 16 GiB, not a CLI/env knob; make it a LoadOptions field when tuned.
+const HOST_IMPORT_CAP_BYTES: u64 = 16 << 30;
+
 /// Pick which streamed blocks get imported: the longest in-order prefix of
-/// `(block, bytes)` whose total fits `cap`.
-// shortcut: stub mirrors 0f7610d (no cap); real impl lands in the next commit.
-fn select_import_blocks(sizes: &[(usize, u64)], _cap: u64) -> Vec<usize> {
-    sizes.iter().map(|s| s.0).collect()
+/// `(block, bytes)` whose total fits `cap`. A prefix keeps the blob ordinal
+/// `3·streamed_before + role` valid; later blocks keep streaming from the mmap.
+fn select_import_blocks(sizes: &[(usize, u64)], cap: u64) -> Vec<usize> {
+    let mut used = 0u64;
+    sizes
+        .iter()
+        .take_while(|s| {
+            used += s.1;
+            used <= cap
+        })
+        .map(|s| s.0)
+        .collect()
 }
 
 /// D4c: lock a host arena covering the routed experts of every block not
@@ -1162,11 +1175,12 @@ fn build_imported_experts(
     const ROLES: [&str; 3] = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
 
     // Enumerate sources first so the arena can be sized exactly.
-    let mut srcs: Vec<BlobSource> = Vec::new();
+    let mut per_block: Vec<(usize, Vec<BlobSource>)> = Vec::new();
     for b in 0..n_layers {
         if placed.contains_key(&b) {
             continue;
         }
+        let mut v = Vec::with_capacity(3);
         for role in ROLES {
             let name = format!("blk.{b}.{role}.weight");
             let i = shards
@@ -1176,15 +1190,22 @@ fn build_imported_experts(
                 .tensor(&name)
                 .ok_or_else(|| format!("missing tensor `{name}`"))?;
             let r = t.file_range();
-            srcs.push(BlobSource {
+            v.push(BlobSource {
                 file: i,
                 offset: r.start,
                 len: r.end - r.start,
             });
         }
+        per_block.push((b, v));
     }
+    let sizes: Vec<(usize, u64)> = per_block
+        .iter()
+        .map(|(b, v)| (*b, v.iter().map(|s| s.len).sum()))
+        .collect();
+    let keep = select_import_blocks(&sizes, HOST_IMPORT_CAP_BYTES).len();
+    let srcs: Vec<BlobSource> = per_block.into_iter().take(keep).flat_map(|x| x.1).collect();
     if srcs.is_empty() {
-        return Err("every block is VRAM-resident; nothing to import".into());
+        return Err("no streamed block fits the host import cap; nothing to import".into());
     }
     let total: u64 = srcs.iter().map(|s| s.len).sum();
 

@@ -2560,18 +2560,23 @@ impl<'m> Session<'m> {
                 slices.up.len() as u64,
                 slices.down.len() as u64,
             );
-            m.imported_experts.as_ref().map(|arena| {
+            m.imported_experts.as_ref().and_then(|arena| {
                 // Blob order skips VRAM-resident blocks: the ordinal is b minus
                 // every placed block below it.
                 let streamed_before = b - m.placed.range(..b).count();
-                Self::imported_role_slices(
+                // The arena is a capped prefix of the streamed blocks; later ones
+                // keep streaming from the mmap.
+                if 3 * streamed_before + 3 > arena.blobs().len() {
+                    return None;
+                }
+                Some(Self::imported_role_slices(
                     arena,
                     streamed_before,
                     expert,
                     g as usize,
                     u as usize,
                     d as usize,
-                )
+                ))
             })
         };
         let total = {
