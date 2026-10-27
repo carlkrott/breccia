@@ -4190,6 +4190,85 @@ threshold, not a mechanism.
 3. Cold-page timing of the lane (`0.88 GiB` in the failing process) as the *trigger* on top of
    (1): a first-generation lane read that is slower than a warm one is the only other correlate.
 
+## 8ba. The in-batch readback is fenced — the instrument says so, and the gate is green at 32 generations
+
+This round tested the last named suspect: that `Staging::read_block` — a bare slice of the
+host-coherent mapping with no synchronisation of its own — is read **before** the copies that
+fill it have been fenced, giving the host the *previous* token's `mixed`/router/shared-expert
+values. That predicts every observation (step 0, worse with a cold warm pass, `--inbatch-read`
+only, deterministic within a process).
+
+### The instrument (`readbacks_unfenced`)
+
+`finish_block` now records, per in-batch readback, whether the segment it waited for is the
+one **this block** submitted (`block_seg` captured in `submit_block`, compared with
+`pending_seg` before the wait), and counts the case where it is not. Every bench run prints:
+
+```
+readback 618 in-batch readback(s) of which 0 were read without a waited submission
+```
+
+**Result: 0 in every process measured — 16 processes x 32 generations x 618 readbacks.**
+So the ordering hole is not there: `read_block` runs after the fence of the exact submission
+that carries its copies, in the decode path. (`read_block` is also used by the chunked-prefill
+readback at `graph.rs:2243`, which is the same shape and is covered by the same counter on the
+paths this engine runs.) The suspected mechanism is **not confirmed**, and the counter is now
+permanent so no future change can introduce it silently.
+
+### The gate, at the bar that was asked for
+
+`BRECCIA_REQUIRE_QUIET=1 RACE_ARENA=auto RACE_PROMPT=parity PROCS=16 RUNS=2 GEN=32 WARM=1`,
+verified quiet window (07:17, `pgrep -x breccia` empty, clocks `high`):
+
+```
+RACE: 32 generations over 16 exclusive processes, crossing refused OK -> GREEN
+```
+
+One process was discarded because a co-tenant appeared during it (after its load, which is why
+`BRECCIA_REQUIRE_QUIET` did not abort it) — the guard working as intended, and the reason the
+count is "16 exclusive" out of 17 attempted.
+
+**And the same window, `--inbatch-read false`, N=16 (the arm that was supposed to be clean):**
+
+```
+UNSTABLE proc 9 run 0: step 0 ours 1049 expected 110563
+UNSTABLE proc 15 run 0: step 0 ours 1049 expected 110563
+RACE: 16 generations over 16 exclusive processes, crossing refused OK -> RED
+```
+
+**So the flag is not the discriminator either: 0 of 16 with `--inbatch-read true`, 2 of 16
+without, same window, same signature, zero co-tenants, zero unfenced readbacks.** The earlier
+"10 of 10 clean without the flag" was a sampling artefact of a low-rate window — exactly the
+trap this file keeps re-learning.
+
+**What is left standing after this round, all excluded by measurement rather than by argument:**
+the readback ordering (fenced, instrumented, 0/16 × 32 generations), the QSA/GDN/PLE state
+(poisoned QSA is bit-identical), the arena set (7.4e-5), the head placement (crossing removed),
+and co-tenants (`BRECCIA_REQUIRE_QUIET=1` aborted zero times). The failure is a single-step
+deviation at **step 0** that both generations inside a process reproduce identically, i.e. the
+27-token prompt pass computes a slightly different row in ~5-10 % of processes and that
+difference is *persistent for the process*. That is the shape of a load-time difference, not a
+per-token race — the remaining candidates are the arena/weight upload path (26 GiB read from the
+mmap and DMA'd per process; `upload_tensor` checks *length*, not *content*) and the pipeline
+selection, and the next instrument is a per-tensor checksum of the uploaded buffers compared
+across processes (`breccia bench token --verify-weights`), which is cheap and would settle it.
+
+This branch does **not** claim the family fixed.
+
+### Kept, and why nobody should "optimise" it away
+
+* **The QSA per-generation resets** (`QsaState::reset`, §8az). The poison test proved they are
+  *not* load-bearing for correctness today (NaN-filled pools, tail and pooled keys produce
+  bit-identical logits, because every read is position-masked). They stay because they convert
+  "protected by masking" into "protected by construction", and because the alternative — leaving
+  two buffers holding *uninitialised* VRAM in a fresh process — is a latent bug waiting for the
+  first kernel that reads a cell past the cursor. Cost: one ~6 MiB pass per request, ~0.2 ms.
+* **`scripts/session-reset-test.sh`** (same prompt twice; second prompt shorter/longer/equal in
+  the same process; poisoned-QSA arm). It is the deterministic test for the state class.
+* **`upload_tensor`'s truncation refusal** and **`co_tenant_check`** (`BRECCIA_REQUIRE_QUIET=1`).
+  The co-tenant warning fired zero times in the quiet windows this round and the run aborted
+  zero times, which is the only reason the numbers above mean anything.
+
 ## 9. Exact commands
 
 

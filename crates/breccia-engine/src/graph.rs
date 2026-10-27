@@ -594,6 +594,15 @@ pub struct Session<'m> {
     /// (`docs/phase-4/01-forward-pass.md` §8aw).
     pub head_up: u64,
     pub head_down: u64,
+    /// In-batch readbacks (`--inbatch-read`) whose staging region was read **without**
+    /// having waited for a submission of this session first. That is the ordering hole
+    /// `docs/phase-4/01-forward-pass.md` §8ba instruments: `Staging::read_block` is a
+    /// bare slice of the mapping, so it is only correct if the copies that fill it have
+    /// been fenced. Must be 0 on every run.
+    pub readbacks_unfenced: u64,
+    /// The segment the block that is currently being finished submitted, so
+    /// `finish_block` can prove it waited for **that** one and not a neighbour's.
+    block_seg: Option<breccia_kernels::batch_cmd::Segment>,
     /// `(Σ down, Σ up)` over every staging buffer when the head path started.
     #[allow(clippy::type_complexity)]
     head_traffic0: (u64, u64),
@@ -1037,6 +1046,8 @@ impl<'m> Session<'m> {
             host_blocks: model.cfg.n_layers - model.placed.len(),
             head_up: 0,
             head_down: 0,
+            readbacks_unfenced: 0,
+            block_seg: None,
             head_traffic0: (0, 0),
             dev_blocks: {
                 let mut v = vec![0usize; model.devices.len()];
@@ -1816,6 +1827,7 @@ impl<'m> Session<'m> {
         // The host block's submission ends here: the readback is
         // [`Session::finish_block`]'s job, after the wait.
         self.submit_batch()?;
+        self.block_seg = self.pending_seg;
         Ok(digests)
     }
 
@@ -2848,6 +2860,10 @@ impl<'m> Session<'m> {
 
         // ---- wait for this block's segment ----------------------------------
         self.timers.mark(WAIT_GPU);
+        // The segment `submit_block` created for **this** block (None for a block that
+        // submitted nothing, which cannot have an in-batch readback either).
+        let mine = self.block_seg.take();
+        let had_segment = mine.is_some() && mine == self.pending_seg;
         if let Some(seg) = self.pending_seg.take() {
             let d = self.pending_dev.take().unwrap_or(dev);
             let wait = {
@@ -2893,6 +2909,13 @@ impl<'m> Session<'m> {
             .expect("the session's hc workspace")
             .mixed;
         let raw = if self.inbatch_read {
+            // `read_block` is a bare slice of the mapping: it is correct only because
+            // the five copies that fill this region were recorded into the batch whose
+            // fence was just waited. Count the case where that did not happen — it is
+            // the only way a *stale* (previous-token) readback can reach the lane.
+            if !had_segment {
+                self.readbacks_unfenced += 1;
+            }
             let offs = lane_offsets(mc.n_embd, k);
             let st = &self.stagings[dev];
             vec![
