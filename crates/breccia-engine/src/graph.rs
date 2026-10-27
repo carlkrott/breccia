@@ -600,6 +600,10 @@ pub struct Session<'m> {
     /// bare slice of the mapping, so it is only correct if the copies that fill it have
     /// been fenced. Must be 0 on every run.
     pub readbacks_unfenced: u64,
+    /// Indices of the logits row that still held the poison after the head ran, at the
+    /// first check (`BRECCIA_FAULT_POISON_LOGITS`). `Some(0)` = the head wrote every
+    /// entry; `Some(n > 0)` = `n` entries were never written.
+    pub logits_unwritten: Option<usize>,
     /// The segment the block that is currently being finished submitted, so
     /// `finish_block` can prove it waited for **that** one and not a neighbour's.
     block_seg: Option<breccia_kernels::batch_cmd::Segment>,
@@ -705,10 +709,49 @@ impl<'m> Session<'m> {
             let ple_value_out = alloc(n * 4, "PLE value")?;
             let ple_emb = alloc(mc.n_embd as u64 * 4, "PLE embed")?;
             let logits = if head_dev == i {
-                Some(alloc(mc.vocab as u64 * 4, "logits")?)
+                let buf = alloc(mc.vocab as u64 * 4, "logits")?;
+                // `BRECCIA_FAULT_POISON_LOGITS=1`: fill the row with a sentinel before
+                // the first forward, so a head that does not write every one of the
+                // `vocab` entries leaves the sentinel behind and `finish_head` says so.
+                // A never-written row is the one failure that is invisible to every
+                // ordering/state test and shows up exactly as "step 0 is wrong, the rest
+                // is fine, and the same way every time in that process"
+                // (docs/phase-4/01-forward-pass.md §8bb).
+                if std::env::var_os("BRECCIA_FAULT_POISON_LOGITS").is_some() {
+                    let pat = Self::logits_sentinel().to_bits();
+                    let fill: Vec<u32> = vec![pat; mc.vocab];
+                    breccia_kernels::gemv::upload_into(
+                        gpu,
+                        &buf,
+                        &breccia_kernels::ops::u32_to_bytes(&fill),
+                    )
+                    .context("poisoning the logits row")?;
+                }
+                Some(buf)
             } else {
                 None
             };
+            // …and the five buffers the lane's readback consumes, because a buffer that
+            // is *never written* on the first token is the same failure with a different
+            // address (`docs/phase-4/01-forward-pass.md` §8bb).
+            let poisoned = hc_ws.as_ref().map(|ws| &ws.mixed).into_iter().chain([
+                &router_ids,
+                &router_w,
+                &sh,
+                &sh_gate_logit,
+            ]);
+            for buf in poisoned {
+                if std::env::var_os("BRECCIA_FAULT_POISON_LOGITS").is_some() {
+                    let pat = Self::logits_sentinel().to_bits();
+                    let fill: Vec<u32> = vec![pat; (buf.size / 4) as usize];
+                    breccia_kernels::gemv::upload_into(
+                        gpu,
+                        buf,
+                        &breccia_kernels::ops::u32_to_bytes(&fill),
+                    )
+                    .context("poisoning the lane scratch")?;
+                }
+            }
             // Device-resident MoE scratch (unused unless `--gpu-experts` places a
             // block on this device, but allocated once so the path has no
             // per-token allocation).
@@ -1047,6 +1090,7 @@ impl<'m> Session<'m> {
             head_up: 0,
             head_down: 0,
             readbacks_unfenced: 0,
+            logits_unwritten: None,
             block_seg: None,
             head_traffic0: (0, 0),
             dev_blocks: {
@@ -1490,6 +1534,13 @@ impl<'m> Session<'m> {
     /// The device this session's block `b` runs on (for per-card reporting).
     pub fn device_of(&self, b: usize) -> usize {
         self.model.device_of(b)
+    }
+
+    /// The poison value for `BRECCIA_FAULT_POISON_LOGITS`: a finite f32 no real logit can
+    /// equal bit-for-bit (so a survivor is unambiguous) but which is also *finite*, so it
+    /// loses an argmax to any real logit instead of winning it with +inf.
+    pub fn logits_sentinel() -> f32 {
+        -3.0e38
     }
 
     /// `(name, pci address)` of each of this session's devices.
@@ -2938,6 +2989,34 @@ impl<'m> Session<'m> {
             )?
         };
         self.dev_down[dev] += (mc.n_embd * 2 + k * 8 + 4) as u64;
+        if std::env::var_os("BRECCIA_FAULT_POISON_LOGITS").is_some()
+            && self.logits_unwritten.is_none()
+        {
+            let pat = Self::logits_sentinel().to_bits();
+            let names = ["mixed", "router_ids", "router_w", "sh", "sh_gate_logit"];
+            let mut bad = Vec::new();
+            for (name, bytes) in names.iter().zip(raw.iter()) {
+                let left = bytes
+                    .chunks_exact(4)
+                    .filter(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) == pat)
+                    .count();
+                if left > 0 {
+                    bad.push(format!("{name}: {left} of {} entries", bytes.len() / 4));
+                }
+            }
+            if bad.is_empty() {
+                eprintln!(
+                    "breccia: lane scratch coverage OK: mixed, router ids/weights, sh and its \
+                     gate were all written on the first readback"
+                );
+            } else {
+                eprintln!(
+                    "breccia: FAULT INJECTION: lane scratch never written on the first \
+                     readback — {}",
+                    bad.join(", ")
+                );
+            }
+        }
         let mixed = f32_from_bytes(&raw[0]);
         let ids: Vec<usize> = raw[1]
             .chunks_exact(4)
@@ -3093,6 +3172,27 @@ impl<'m> Session<'m> {
             .ok_or_else(|| anyhow!("device {head_dev} has no logits buffer"))?;
         let raw = self.stagings[head_dev]
             .read_batch(m.devices[head_dev].gpu(), &[(logits_buf, 0, mc.vocab * 4)])?;
+        if std::env::var_os("BRECCIA_FAULT_POISON_LOGITS").is_some()
+            && self.logits_unwritten.is_none()
+        {
+            let pat = Self::logits_sentinel().to_bits();
+            let values = f32_from_bytes(&raw[0]);
+            let left = values.iter().filter(|v| v.to_bits() == pat).count();
+            self.logits_unwritten = Some(left);
+            if left > 0 {
+                let first = values.iter().position(|v| v.to_bits() == pat).unwrap_or(0);
+                eprintln!(
+                    "breccia: FAULT INJECTION: {} of {} logits were never written (first at                      index {first}) — the head does not cover [0, vocab)",
+                    left,
+                    mc.vocab
+                );
+            } else {
+                eprintln!(
+                    "breccia: head coverage OK: all {} logits were written",
+                    mc.vocab
+                );
+            }
+        }
         let (down1, up1) = self.staging_traffic();
         self.head_down += down1.saturating_sub(self.head_traffic0.0);
         self.head_up += up1.saturating_sub(self.head_traffic0.1);

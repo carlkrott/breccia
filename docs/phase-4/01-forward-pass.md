@@ -4269,6 +4269,57 @@ This branch does **not** claim the family fixed.
   The co-tenant warning fired zero times in the quiet windows this round and the run aborted
   zero times, which is the only reason the numbers above mean anything.
 
+## 8bb. The logits tail **is** written, the lane scratch **is** written — two deterministic refutations of the step-0 signature
+
+The hypothesis: the head's GEMV tiles the vocabulary, the last tile is skipped, so the
+248 320-entry row is never fully written; at step 0 the row is freshly allocated and its
+unwritten suffix holds whatever VRAM had before, which can win the argmax (wrong first token),
+while from step 1 the same suffix holds stale-but-plausible logits (harmless). That would explain
+step 0 only, deterministic per process, independent of every flag and state, rare.
+
+It is testable deterministically, so it did not need the 10 % intermittency:
+
+* `BRECCIA_FAULT_POISON_LOGITS=1` fills the logits row with a sentinel (`-3e38`, finite so it
+  loses rather than wins an argmax, and bit-exact so a survivor is unambiguous) **at
+  allocation**, before any forward, and `finish_head` — which reads the row back anyway —
+  counts the survivors of the *first* check.
+  **Result: `head coverage OK: all 248320 logits were written` — 0 survivors.**
+* The same flag poisons the five buffers the lane's readback consumes (`hc.mixed`,
+  `router_ids`, `router_w`, `sh`, `sh_gate_logit`) at venue construction and counts survivors on
+  the first readback of the first token.
+  **Result: `lane scratch coverage OK` on every readback — 0 survivors** (2 processes raised by
+  hand; the check is structural, so contention cannot change its verdict).
+
+So neither the logits row nor the per-token lane scratch is ever consumed unwritten, and the
+"never written on the first token" class is excluded for both. Note what this *does* rule out
+that the earlier instruments could not: a missing store does not have to be a race, and this test
+finds it in one run instead of ~1-in-8 processes.
+
+**Kept, all of them, with the reason each stays:**
+
+| guard | why it stays |
+|---|---|
+| `readbacks_unfenced` (§8ba) | 0 in 618 x 16 x 32, but it is the only thing standing between a future edit and a *silent* stale readback; it costs a comparison per block |
+| `BRECCIA_FAULT_POISON_LOGITS` (§8bb) | the deterministic coverage test for the two buffer classes above; one run, no GPU-load luck |
+| `--inbatch-read` (still the default) | exonerated: 0/16 processes with it, 2/16 without, same window |
+| QSA per-generation resets (§8az) | not load-bearing today (poisoned QSA is bit-identical), but they remove two *uninitialised-VRAM* buffers and turn a mask into construction; ~0.2 ms per request |
+| `upload_tensor` truncation refusal | release-grade guard for a class that used to be silent |
+| `co_tenant_check` / `BRECCIA_REQUIRE_QUIET=1` | it fired for real in this round's windows (RX held by another process, 2365-4224 MiB) and would have made every number below meaningless |
+| `scripts/session-reset-test.sh`, `scripts/head-handoff-race.sh` | the deterministic test for the state class and the gate for the head placement |
+
+### Where the bug stands
+
+Five instruments, five exclusions, no cause: the readback fence, the QSA/GDN/PLE state, the
+arena set, the head placement, co-tenants, the logits tail, the lane scratch. The remaining
+sharp fact is unchanged and now better isolated: **a single-step deviation at step 0 whose value
+is fixed for the life of the process**, with the *warm* pass as its trigger. The next two probes,
+in order, are the ones §8ba/§8bb did not cover: the **allocator layout** (offset of each buffer
+per device, failing process next to a clean one — if they differ, a positional/offset or
+`robustness2`-zeroing bug in a buffer whose index is computed from a *position* is the prime
+suspect, and the sentinel test can be pointed at any single buffer), and the **per-tensor
+content checksum** of the uploaded weights across processes (the uploads are length-checked, not
+content-checked, and they are the only thing that differs per process at load besides layout).
+
 ## 9. Exact commands
 
 
