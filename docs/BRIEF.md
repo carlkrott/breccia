@@ -73,7 +73,7 @@ fmt, reference-clone hygiene, no-weights-tracked).
 | **Single stream, both cards** | **18.59 tok/s · 53.78 ms/token** (89 % of the 20.79 baseline) |
 | **2 streams, both cards** | **22.8–23.7 tok/s aggregate** |
 | 2 streams at a 32K context | **23.74 tok/s aggregate** (11.87/stream, 84.2 ms/token) |
-| Agents at 32K | **3** today; **4** with a q8_0 V cache (~765 MiB/agent); 6 with K+V |
+| Agents at 32K | **4** with the q8_0 V cache (764 MiB/agent, implemented); 6 with K+V |
 | Parity | **32/32 greedy tokens, top-1 13.170510** at chunk 8/16/32/128 |
 | Per-card single (diagnostic) | RX 13.3–15.4 tok/s, MI50 9.3–10.4 |
 | Expert residency | **30 of 48 blocks** in a **26.7 GiB** arena; the other 18 stream through the host lane at **301 MiB/token** |
@@ -159,6 +159,7 @@ or the matching research doc.
 | Head Q5_K "wide" decode (contiguous unit walk) | head 4,254 → **1,772 µs**; 96 → 433 GB/s |
 | IQ4_XS word-level nibbles + LDS codebook | **2.02×** (MI50) / 1.38× (RX), bit-identical, +5.1 % single-stream |
 | Adaptive expert arena from `VK_EXT_memory_budget` | matches the hand-tuned list within 3 %, with a sysfs-driven display reserve and refuse-not-OOM |
+| **q8_0 V cache** (quantise on write, dequantise in registers) | 932 → **764 MiB/agent** at 32K (−168) ⇒ **4 agents**; top-1 stable, greedy 32/32 unchanged; conformance 2.8e-6 vs a 1e-5 bar. **Capacity only** — attention is latency-bound at ~13 GB/s, so it buys no speed (−1.0 %) |
 | `--head-device` (flagged, then removed) | head 6.95 → 3.82 ms, but see below |
 | GPU-time probe with one query pool per ring slot | the per-stage table above; `sum ≈ wait-gpu` |
 
@@ -179,6 +180,7 @@ or the matching research doc.
 | **Device-crossing head handoff** | 2 of 16 processes produced a wrong sequence; the crossing path was **removed** |
 | **int8 (dp4a) weights+activations** | 1.18× (MI50) / 1.11× (RX) but **accuracy fails**: 6.2e-3 per element, logits 0.51 off, greedy changes. Cause is the `q8_1` activation, not the dot. Flag stays off with a recorded ledger |
 | **Pre-dequantised f16 weight cache** | DRAM-bound at 405–413 M el/ms (slower than the int8 path) and needs 17 GiB against 16 GiB/card |
+| **Expecting a speedup from KV quantisation** | attention is **latency-bound at ~13 GB/s** at T=1, so cutting V bytes to 0.56× cannot be spent: 32.5 → 32.3 ms (−1.0 %). q8_0 KV is a *capacity* feature only |
 | **Push descriptors** | 150 ns vs 39 ns for a bind — worse here |
 | **Layer-pipeline split across the cards** | MI50 is gen3×4 (~2.9 GB/s): activation shipping dominates |
 | **Pipeline-"storm" theory** for the crash | pipeline creation is host-side ACO compilation with zero GPU submissions |
@@ -268,8 +270,9 @@ measured recommendation: `docs/research/01`–`12`. The most consequential:
 |---|---|---|---|
 | 1 | **Fewer fence-waited submits** (33.2 µs each vs 8.6 queued) | ~1.3–2 ms/token | in progress |
 | 2 | **IQ3_S / Q5_K word-level** dequant (dependency depth, not opcodes) | stage-dependent, bit-identical | planned |
-| 3 | **V-q8_0 KV** (32×i8 + f32 scale, dequant in registers) | 933 → 765 MiB/agent ⇒ **4 agents at 32K** | in progress |
-| 4 | **K-q8_0** on top | 728 MiB/agent ⇒ 5–6 agents | after 3 |
+| 3 | ~~**V-q8_0 KV**~~ | **landed**: 932 → 764 MiB/agent ⇒ 4 agents (capacity, not speed) | done |
+| 4 | **K-q8_0** on top | 728 MiB/agent ⇒ 5–6 agents | next |
+| 4b | **32K-context prefill** — a real 32K run is **NVMe-streaming-bound** (~13 tok/s, ~9 s per 128-token chunk; two attempts died at the 900 s / 600 s timeouts) | this, not decode, gates long-context agents; makes radix prefix sharing essential rather than optional | newly found |
 | 5 | **Zero-copy host-resident experts** (`external_memory_host`) | removes the CPU lane's serial section | priced, not wired |
 | 6 | **Radix/prompt prefix sharing** | agent workloads share a large system prompt | open |
 | 7 | **MTP / speculative drafting** | needs the cache fixed first (earlier: 0.60×) | open |
