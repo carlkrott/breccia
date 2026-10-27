@@ -2505,13 +2505,13 @@ impl<'m> Session<'m> {
     }
 
     /// D4d: the three role byte-slices for streamed block `b` expert `expert`,
-    /// read out of the imported host arena instead of the mmap. `placed_before`
-    /// is the number of VRAM-resident blocks with a lower index — the builder
-    /// enumerated only non-placed blocks in (block, gate/up/down) order, so
-    /// streamed block `b` lands at blob `3·(b − placed_before) + role`.
+    /// read out of the imported host arena instead of the mmap. `streamed_before`
+    /// is how many *streamed* (non-placed) blocks come before this one — the
+    /// builder enumerated only non-placed blocks in (block, gate/up/down) order,
+    /// so streamed block `b` lands at blob `3·streamed_before + role`.
     fn imported_role_slices<'a>(
         arena: &'a crate::host_arena::HostArena,
-        placed_before: usize,
+        streamed_before: usize,
         expert: usize,
         gate_len: usize,
         up_len: usize,
@@ -2521,7 +2521,7 @@ impl<'m> Session<'m> {
         let mut out: [&'a [u8]; 3] = [&[]; 3];
         for (r, ln) in want.iter().enumerate() {
             let blob = arena
-                .blob(3 * placed_before + r)
+                .blob(3 * streamed_before + r)
                 .map_err(|e| anyhow!("imported expert arena: {e}"))?;
             let (a, z) = (expert * ln, (expert + 1) * ln);
             if z > blob.len() {
@@ -2561,10 +2561,12 @@ impl<'m> Session<'m> {
                 slices.down.len() as u64,
             );
             m.imported_experts.as_ref().map(|arena| {
-                let placed_before = m.placed.range(..b).count();
+                // Blob order skips VRAM-resident blocks: the ordinal is b minus
+                // every placed block below it.
+                let streamed_before = b - m.placed.range(..b).count();
                 Self::imported_role_slices(
                     arena,
-                    placed_before,
+                    streamed_before,
                     expert,
                     g as usize,
                     u as usize,
@@ -4327,34 +4329,34 @@ mod tests {
         let path = dir.join("shard0.bin");
         {
             let mut f = File::create(&path).unwrap();
-            for i in 0..4 {
+            for i in 0..6 {
                 f.write_all(&vec![2 * i as u8 + 7; 3072]).unwrap();
             }
         }
         let files = vec![Arc::new(Mutex::new(File::open(&path).unwrap()))];
-        let src: Vec<BlobSource> = (0..4)
+        let src: Vec<BlobSource> = (0..6)
             .map(|i| BlobSource {
                 file: 0,
                 offset: i * 3072,
                 len: 3072,
             })
             .collect();
-        let mut arena = HostArena::new(4 * 3072).expect("mlock under limit");
+        let mut arena = HostArena::new(6 * 3072).expect("mlock under limit");
         arena.fill(&src, &files).expect("pread fill");
 
         // Mixed case mirroring the builder: block 0 placed, blocks 1..2 streamed
-        // (4 blobs = gate/up/down per streamed block), e.g. 16 experts × 64 B/role.
+        // (3 blobs = gate/up/down per streamed block), e.g. 3 experts × 1 KiB/role.
         const EXPERTS: usize = 3;
         const ROLE: usize = 3072;
-        let placed_before_1 = 1; // block 0 is placed
-        let placed_before_2 = 1; // block 1 streamed, nothing extra placed
+        let streamed_before_1 = 0; // block 0 is placed, so block 1 is the 1st streamed
+        let streamed_before_2 = 1; // block 2 is the 2nd streamed
 
         // Streamed block 1: blob base 0. Its expert 2 must read blob role bytes
         // [2*64, 3*64) — the file's own pattern of blob 0, not blob 3's.
         let want = arena.blob(0).unwrap()[2 * ROLE / EXPERTS..3 * ROLE / EXPERTS].to_vec();
         let got = super::Session::imported_role_slices(
             &arena,
-            placed_before_1,
+            streamed_before_1,
             2,
             ROLE / EXPERTS,
             ROLE / EXPERTS,
@@ -4371,7 +4373,7 @@ mod tests {
         // blob 6 (past the end) or the wrong bytes.
         let got2 = super::Session::imported_role_slices(
             &arena,
-            placed_before_2,
+            streamed_before_2,
             0,
             ROLE / EXPERTS,
             ROLE / EXPERTS,
