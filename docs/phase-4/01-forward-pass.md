@@ -3605,7 +3605,9 @@ timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
 validation message is the pre-existing `VUID-VkPhysicalDeviceRobustness2FeaturesKHR-...-04000`
 device-creation notice), `power_dpm_force_performance_level` = `high` before and after, no
 reset. The whole `ops_conformance` HC suite matches its CPU reference to the same
-`1.98e-7` **with the flag on and off**.
+`1.98e-7` **with the flag on and off**. Last, per `AGENTS.md`: the same bit-identity test
+on the **display card** (`BRECCIA_KERNEL_DEVICE=0000:0e:00.0`, Radeon VII/gfx906 Wave64) —
+**bit-identical** there too, clocks still `high`, no reset.
 
 ### Parity (the gate): 32/32 at every chunk, top-1 unchanged
 
