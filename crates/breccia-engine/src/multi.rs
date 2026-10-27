@@ -123,12 +123,18 @@ impl MultiGeneration {
 /// last stream's block-*b* lane, instead of each stream submitting its own right
 /// after its lane. The lanes then read block *b*'s expert blob back to back with
 /// no fresh GPU submission (and no *b+1* dense weights) in between — the shape
-/// that hypothesis wants (§2 of the Vulkan levers assessment). Off by default,
-/// and the schedule it changes touches no numerics: block *b*'s dependency chain
+/// the shape that hypothesis wants (§2 of the Vulkan levers assessment). Off unless
+/// the variable is exactly `1` (any other value, incl. `0`/empty, is OFF) — an
+/// OFF|ON|OFF plateau script must not have its OFF arm silently run ON. The
+/// schedule it changes touches no numerics: block *b*'s dependency chain
 /// is unchanged, only *when* the next block is handed to the queue. Cached.
+fn block_major_env_on(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 fn block_major_order() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BRECCIA_BLOCK_MAJOR").is_some())
+    *ON.get_or_init(|| block_major_env_on(std::env::var("BRECCIA_BLOCK_MAJOR").ok().as_deref()))
 }
 
 /// When block *b+1* is recorded, relative to the lanes of block *b*.
@@ -329,7 +335,18 @@ impl<'m> Multi<'m> {
 
 #[cfg(test)]
 mod tests {
-    use super::{submit_plan, Submit};
+    use super::{block_major_env_on, submit_plan, Submit};
+
+    /// Only the literal `1` enables: `0`, empty and anything else must read as
+    /// OFF, or an OFF|ON|OFF plateau's OFF arm would silently run ON.
+    #[test]
+    fn block_major_env_gate_is_exactly_one() {
+        assert!(block_major_env_on(Some("1")));
+        assert!(!block_major_env_on(None));
+        for off in ["0", "", "true", "01", "1 ", "on"] {
+            assert!(!block_major_env_on(Some(off)), "{off:?} must be OFF");
+        }
+    }
 
     /// Unset (`block_major = false`) must keep the stream-major shape exactly:
     /// each stream records its own *b+1* right after its own lane.
