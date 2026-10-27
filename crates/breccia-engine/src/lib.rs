@@ -46,6 +46,7 @@
 pub mod arena;
 pub mod config;
 pub mod graph;
+pub mod head;
 pub mod model;
 pub mod multi;
 pub mod placement;
@@ -58,6 +59,7 @@ pub mod xfer;
 pub use arena::{ArenaChoice, ArenaOpts, ArenaReport, ArenaSpec};
 pub use config::{LayerKind, ModelConfig};
 pub use graph::{prefill_cap, prefill_plan, Generation, Session, SessionCfg, Timers, STAGES};
+pub use head::{HeadChoice, HeadSpec};
 
 pub use model::{LoadOptions, LoadStats, Model};
 pub use multi::{Multi, MultiGeneration, StreamReport};

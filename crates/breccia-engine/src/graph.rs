@@ -562,6 +562,17 @@ pub struct Session<'m> {
     pub dev_down: Vec<u64>,
     pub dev_up: Vec<u64>,
     pub dev_blocks: Vec<usize>,
+    /// Host↔device bytes the **head path** moved: the residual hand-off when the
+    /// head lives on another device, plus the logits row readback. Counted every
+    /// token, so a regression that re-uploads the head's 416 MiB per token is
+    /// visible in the report *and* caught by `head_traffic_ok` — the failure mode
+    /// `--head-device 0` was first (wrongly) accused of
+    /// (`docs/phase-4/01-forward-pass.md` §8aw).
+    pub head_up: u64,
+    pub head_down: u64,
+    /// `(Σ down, Σ up)` over every staging buffer when the head path started.
+    #[allow(clippy::type_complexity)]
+    head_traffic0: (u64, u64),
     /// Blocks whose experts ran on a device this run (for the report).
     pub placed_blocks: usize,
     pub host_blocks: usize,
@@ -988,6 +999,9 @@ impl<'m> Session<'m> {
             dev_up: vec![0; model.devices.len()],
             placed_blocks: model.placed.len(),
             host_blocks: model.cfg.n_layers - model.placed.len(),
+            head_up: 0,
+            head_down: 0,
+            head_traffic0: (0, 0),
             dev_blocks: {
                 let mut v = vec![0usize; model.devices.len()];
                 for b in 0..model.cfg.n_layers {
@@ -1208,6 +1222,8 @@ impl<'m> Session<'m> {
         self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
         self.dev_down.iter_mut().for_each(|x| *x = 0);
         self.dev_up.iter_mut().for_each(|x| *x = 0);
+        self.head_up = 0;
+        self.head_down = 0;
         self.timers.clear();
         self.reset_gpu_busy()
     }
@@ -1307,8 +1323,68 @@ impl<'m> Session<'m> {
         self.flush()?;
         self.expert_bytes = 0;
         self.forwards = 0;
+        self.head_up = 0;
+        self.head_down = 0;
         self.timers.clear();
         Ok(())
+    }
+
+    /// `(Σ device→host, Σ host→device)` bytes over every staging buffer.
+    fn staging_traffic(&self) -> (u64, u64) {
+        self.stagings
+            .iter()
+            .fold((0, 0), |(d, u), s| (d + s.bytes_down, u + s.bytes_up))
+    }
+
+    /// The head path's per-token host traffic, and whether it is what it should be.
+    ///
+    /// The *only* thing that may travel towards the head device is the residual
+    /// stack (`hc_dim` floats), and the only thing that may come back is that plus
+    /// the logits row (`vocab` floats). Anything else would mean the 416 MiB of head
+    /// weights — or worse, the whole residual stack per block — is being re-sent
+    /// every token, which is the "738 ms/token" failure mode
+    /// `--head-device 0` was first accused of (`docs/phase-4/01-forward-pass.md`
+    /// §8aw: it did not reproduce; the window had a foreign GPU process on the
+    /// cards). This is the assertion a slow path has to fail.
+    pub fn head_traffic_ok(&self, forwards: usize) -> Result<(f64, f64)> {
+        if self.head_device() == self.model.device_of(self.model.cfg.n_layers - 1) {
+            // No hand-off: the head owns the residual, so nothing should cross at all
+            // beyond the logits row.
+            if self.head_up != 0 {
+                bail!(
+                    "the head path uploaded {} bytes with no hand-off (expected 0)",
+                    self.head_up
+                );
+            }
+        }
+        let n = forwards.max(1) as f64;
+        let up = self.head_up as f64 / n;
+        let down = self.head_down as f64 / n;
+        let mc = &self.model.cfg;
+        let resid = crate::head::handoff_bytes(mc.hc_dim()) as f64;
+        // 4x slack: one residual up, and up to one residual + the logits row down.
+        if up > 4.0 * resid {
+            bail!(
+                "the head path uploaded {:.1} MiB/token towards device {} for a {:.0} KiB                  residual — the head's weights must not move per token",
+                up / (1 << 20) as f64,
+                self.head_device(),
+                resid / 1024.0
+            );
+        }
+        if down > resid + (mc.vocab * 4) as f64 {
+            bail!(
+                "the head path read back {:.1} MiB/token (residual {:.0} KiB + logits {:.0} KiB                  expected)",
+                down / (1 << 20) as f64,
+                resid / 1024.0,
+                (mc.vocab * 4) as f64 / 1024.0
+            );
+        }
+        Ok((up, down))
+    }
+
+    /// The device the head runs on (for the report).
+    pub fn head_device(&self) -> usize {
+        self.model.head_device()
     }
 
     /// What each card actually did: blocks, fence-wait time, host traffic.
@@ -2734,22 +2810,40 @@ impl<'m> Session<'m> {
         self.timers.mark(FINAL_HC);
         let last = m.device_of(mc.n_layers - 1);
         let head_dev = m.head_device();
-        if head_dev != last {
-            // The residual is final once the last block's submission has completed,
-            // which `flush` has waited for. 40 KiB each way: one round trip a token.
-            self.timers.mark(HANDOFF);
+        // Cross-check for the per-token cost of the head *path*: only the residual
+        // may ever cross this way. The counters accumulate per measured window
+        // (`reset` / the post-prompt clear in `generate`), not per token.
+        self.head_traffic0 = self.staging_traffic();
+        // The residual is final once the last block's submission has completed,
+        // which `flush` has waited for. 40 KiB each way: one round trip a token.
+        //
+        // The **write half rides the head's own batch** (`record_upload`) rather
+        // than being a submission of its own. That is not only one submit + fence
+        // cheaper: it makes the copy and the `final_hc` dispatch that reads it
+        // neighbours *inside one command buffer*, so the dependency is a barrier
+        // the batch records instead of submission order across two submissions
+        // (which orders execution but is not, by itself, a memory dependency).
+        self.timers.mark(HANDOFF);
+        let moved = if head_dev != last {
+            let n = crate::head::handoff_bytes(mc.hc_dim());
             let bytes = self.stagings[last].read_batch(
                 m.devices[last].gpu(),
-                &[(&self.venues[last].r, 0, mc.hc_dim() * 4)],
+                &[(&self.venues[last].r, 0, n as usize)],
             )?;
-            self.stagings[head_dev].write(
+            Some(bytes)
+        } else {
+            None
+        };
+        self.ensure_batch(head_dev)?;
+        if let Some(bytes) = moved {
+            self.stagings[head_dev].record_upload(
                 m.devices[head_dev].gpu(),
                 &self.venues[head_dev].r,
+                0,
                 &bytes[0],
             )?;
-            self.timers.mark(FINAL_HC);
         }
-        self.ensure_batch(head_dev)?;
+        self.timers.mark(FINAL_HC);
         {
             let v = &self.venues[head_dev];
             let hw = HcWeights {
@@ -2783,6 +2877,9 @@ impl<'m> Session<'m> {
             .ok_or_else(|| anyhow!("device {head_dev} has no logits buffer"))?;
         let raw = self.stagings[head_dev]
             .read_batch(m.devices[head_dev].gpu(), &[(logits_buf, 0, mc.vocab * 4)])?;
+        let (down1, up1) = self.staging_traffic();
+        self.head_down += down1.saturating_sub(self.head_traffic0.0);
+        self.head_up += up1.saturating_sub(self.head_traffic0.1);
         self.timers.stop();
         self.probe_report()?;
         self.forwards += 1;
@@ -3304,6 +3401,8 @@ impl<'m> Session<'m> {
         self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
         self.dev_down.iter_mut().for_each(|x| *x = 0);
         self.dev_up.iter_mut().for_each(|x| *x = 0);
+        self.head_up = 0;
+        self.head_down = 0;
 
         let mut out = Vec::with_capacity(n);
         let mut first_step_logits = Vec::new();

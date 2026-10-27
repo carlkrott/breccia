@@ -317,11 +317,13 @@ enum BenchKind {
         /// `0,1,2,4,8,18,20,22,23,24,35`
         #[arg(long, value_name = "auto|N[,N]")]
         gpu_experts: Option<String>,
-        /// The device the LM head + final mixer live on: an ordinal into
-        /// `--devices` (`0` = the first). Default: the device that owns block 47,
-        /// which under a contiguous split is always the last one.
-        #[arg(long, value_name = "N")]
-        head_device: Option<usize>,
+        /// Where the LM head + final mixer live: `auto` (default — the hardware
+        /// profile's compute-role device, else the device that owns block 47), an
+        /// **ordinal into `--devices`** (`0` = the *first* `--devices` entry, so
+        /// `--head-device 0` with `--devices 0e,03` is the MI50), or a **PCI
+        /// address** (`0000:03:00.0`), which cannot be misread.
+        #[arg(long, value_name = "auto|N|PCI")]
+        head_device: Option<String>,
         /// `--gpu-experts auto`: bytes kept free on a device that currently drives
         /// a display (read from sysfs, not assumed)
         #[arg(long, default_value_t = 768, value_name = "MIB")]
@@ -1554,7 +1556,7 @@ struct TokenArgs {
     batching: bool,
     split_blocks: Option<String>,
     gpu_experts: Option<String>,
-    head_device: Option<usize>,
+    head_device: Option<String>,
     arena_display_reserve_mib: u64,
     arena_headroom_mib: u64,
     streams: usize,
@@ -1678,7 +1680,8 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 devices: vec![dev.clone()],
                 ctx_capacity: a.ctx,
                 blocks: None,
-                head_device: None,
+                head_device: breccia_engine::HeadSpec::Auto,
+                profile: None,
                 arena: breccia_engine::ArenaSpec::List(expert_sets[s].clone()),
                 verbose: s == 0,
             },
@@ -1993,7 +1996,8 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
                 devices: vec![dev.clone()],
                 ctx_capacity: 512,
                 blocks: None,
-                head_device: None,
+                head_device: breccia_engine::HeadSpec::Auto,
+                profile: None,
                 arena: breccia_engine::ArenaSpec::List(groups[s].clone()),
                 verbose: s == 0,
             },
@@ -2451,7 +2455,11 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                     .filter_map(|t| t.trim().parse::<usize>().ok())
                     .collect()
             }),
-            head_device: a.head_device,
+            head_device: match a.head_device.as_deref() {
+                None => breccia_engine::HeadSpec::Auto,
+                Some(v) => breccia_engine::HeadSpec::parse(v)?,
+            },
+            profile: None,
             arena,
             verbose: true,
         },
@@ -2791,6 +2799,22 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             / runs_n,
         breccia_kernels::batch_cmd::barriers() as f64 / sess.dispatches.max(1) as f64
     );
+    // The head path's traffic is asserted, not just printed: a per-token weight
+    // re-upload turns a 53 ms token into a 700 ms one, and a number in a log is
+    // exactly what nobody reads (`docs/phase-4/01-forward-pass.md` §8aw).
+    match sess.head_traffic_ok(forwards) {
+        Ok((up, down)) => println!(
+            "\nhead     device {} of {} · path traffic {:.1} KiB up + {:.1} KiB down per token \
+             (residual {:.1} KiB, logits {:.0} KiB)",
+            sess.head_device(),
+            model.devices.len(),
+            up / 1024.0,
+            down / 1024.0,
+            (model.cfg.hc_dim() * 4) as f64 / 1024.0,
+            (model.cfg.vocab * 4) as f64 / 1024.0,
+        ),
+        Err(e) => return Err(e).context("the head path moved far more than a residual per token"),
+    }
     println!("\nper device (per generated token):");
     for line in sess.per_device(forwards / runs_n.max(1.0).floor() as usize) {
         println!("  {line}");

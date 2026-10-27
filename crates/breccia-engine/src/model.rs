@@ -31,6 +31,7 @@ use crate::arena::{
     self, ArenaBlock, ArenaOpts, ArenaReport, ArenaSpec, BudgetSource, DeviceArenaRow, DeviceBudget,
 };
 use crate::config::{LayerKind, ModelConfig};
+use crate::head::{self, HeadCandidate, HeadSpec};
 use crate::placement::{self, Placement};
 /// The identity of a projection: one compiled pipeline per distinct triple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -298,10 +299,15 @@ pub struct LoadOptions {
     /// Explicit block counts per device (`--split-blocks 21,27`). `None` = balance
     /// the dense bytes evenly.
     pub blocks: Option<Vec<usize>>,
-    /// The device the LM head lives on (`--head-device N`, an ordinal into
-    /// `devices`). `None` = the device that owns the last block, which is the
-    /// historical (and the single-device) behaviour.
-    pub head_device: Option<usize>,
+    /// Where the LM head lives (`--head-device`): `Auto` (the default) resolves to
+    /// the profile's compute-role device, falling back to the device that owns the
+    /// last block; an ordinal into `devices`; or a PCI address. See [`crate::head`].
+    pub head_device: HeadSpec,
+    /// The hardware profile the `Auto` rule reads. `None` = the default path
+    /// (`breccia_profile::default_profile_path()`), so a machine that ran
+    /// `breccia profile` gets the measured roles and one that never did keeps the
+    /// historical placement.
+    pub profile: Option<std::path::PathBuf>,
     /// Where the routed-expert arena comes from: nothing, an explicit block list
     /// (`--gpu-experts 0,1,…`, each on the device that owns the block), or the
     /// measured-free-VRAM rule (`--gpu-experts auto`, [`crate::arena`]).
@@ -315,7 +321,8 @@ impl Default for LoadOptions {
             devices: Vec::new(),
             ctx_capacity: 256,
             blocks: None,
-            head_device: None,
+            head_device: HeadSpec::Auto,
+            profile: None,
             arena: ArenaSpec::Off,
             verbose: true,
         }
@@ -400,13 +407,16 @@ impl Model {
         // --- head device (`--head-device`) -----------------------------------
         // The head is 416 MiB and its GEMV is the second-largest single item of a
         // token; where it runs is a placement decision, not a consequence of the
-        // last block's. Default: the device that owns block 47.
+        // last block's. `Auto` reads the profile's compute role (see `crate::head`),
+        // an ordinal indexes `--devices`, and a PCI address indexes identity.
         let last_dev = placement.device_of(cfg.n_layers - 1);
-        let head_dev = opts.head_device.unwrap_or(last_dev);
-        if head_dev >= devices.len() {
-            bail!(
-                "--head-device {head_dev} is out of range for {} device(s)",
-                devices.len()
+        let candidates = head_candidates(&devices, opts.profile.as_deref(), opts.verbose);
+        let head_choice = head::resolve(&opts.head_device, &candidates, last_dev)?;
+        let head_dev = head_choice.device;
+        if opts.verbose {
+            eprintln!(
+                "breccia: head: device {head_dev} ({}) — {}",
+                devices[head_dev].info.name, head_choice.reason
             );
         }
         // The capacity check must charge the tail (head + final mixer) to the device
@@ -1089,6 +1099,58 @@ fn hc_weights(gpu: &Gpu, shards: &ShardSet, block: usize, half: &str) -> Result<
             &format!("blk.{block}.hc_{half}_inject.weight"),
         )?),
     })
+}
+
+/// The devices of this placement, annotated with whatever the hardware profile
+/// measured about them.
+///
+/// Matching is by **PCI address**, never by enumeration ordinal: the profile's
+/// index is its own backend's, and this engine's device order is whatever
+/// `--devices` said. A card the profile does not cover keeps `role: None`, which
+/// makes the `auto` rule fall back to the historical answer instead of guessing.
+fn head_candidates(
+    devices: &[Device],
+    profile: Option<&std::path::Path>,
+    verbose: bool,
+) -> Vec<HeadCandidate> {
+    let path = match profile {
+        Some(p) => Some(p.to_path_buf()),
+        None => Some(breccia_profile::default_profile_path()),
+    };
+    let loaded = path.as_deref().and_then(|p| {
+        breccia_profile::load_profile(p).unwrap_or_else(|e| {
+            if verbose {
+                eprintln!("breccia: head: ignoring {} ({e:#})", p.display());
+            }
+            None
+        })
+    });
+    devices
+        .iter()
+        .map(|d| {
+            let want = breccia_vk::pci::normalize_address(&d.info.pci_address);
+            let entry = loaded.as_ref().and_then(|p| {
+                p.devices.iter().find(|e| {
+                    !e.identity.pci_address.is_empty()
+                        && breccia_vk::pci::normalize_address(&e.identity.pci_address) == want
+                })
+            });
+            if verbose && entry.is_none() && loaded.is_some() {
+                eprintln!(
+                    "breccia: head: {} ({}) is not in the hardware profile",
+                    d.info.name, d.info.pci_address
+                );
+            }
+            HeadCandidate {
+                pci: d.info.pci_address.clone(),
+                name: d.info.name.clone(),
+                role: entry.map(|e| e.role),
+                fp32_gflops: entry
+                    .and_then(|e| e.measurements.compute.as_ref())
+                    .map(|c| c.fp32_gflops),
+            }
+        })
+        .collect()
 }
 
 /// Measure each device's free VRAM and turn it into an arena budget.
