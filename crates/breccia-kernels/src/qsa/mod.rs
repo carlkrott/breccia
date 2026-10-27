@@ -1140,6 +1140,14 @@ impl Qsa<'_> {
     /// dispatches, and the layer total is the sum. `attend` includes the softmax
     /// dispatch and `apply` the output gate, because those are the two composite
     /// stages the graph will issue as one unit.
+    ///
+    /// `seed_selection` replaces the top-k's output with a full `max_ids` selection
+    /// after the top-k dispatch. It exists for the benchmark's long-context decode
+    /// cell: there the cache is zero-filled, every indexer score ties, `counts`
+    /// comes out 0 and the two attention stages time an empty selection (launch
+    /// overhead). The bench passes `true` for that cell only, for both V layouts, so
+    /// the f16/q8_0 ratio is comparable. `false` is the previous behaviour, bit for
+    /// bit.
     #[allow(clippy::too_many_arguments)]
     pub fn stage_timings(
         &self,
@@ -1151,6 +1159,7 @@ impl Qsa<'_> {
         out: &Buf,
         pos0: usize,
         target_s: f64,
+        seed_selection: bool,
     ) -> Result<[crate::GemvTiming; 19]> {
         let t = ws.tokens;
         let q = proj.q.run_timed(proj.w_q, x, &ws.q_full, t, target_s)?;
@@ -1310,6 +1319,24 @@ impl Qsa<'_> {
             (tgx2, tgy2, 1),
             target_s,
         )?;
+        // `seed_selection`: give the attention stages a full selection instead of
+        // whatever a zero-filled cache's top-k produced. The bench's cache holds no
+        // real keys, so every indexer score ties and `counts` comes out 0 — which
+        // made the long-context decode cell time *launch overhead* (2.29 us) rather
+        // than the 2051-cell window it exists to measure. Both V layouts run the
+        // same seeded selection, so the f16/q8_0 ratio is comparable.
+        if seed_selection {
+            let blocks = ws.max_ids.min(ws.n_blocks);
+            let ids: Vec<u32> = (0..ws.max_ids)
+                .map(|i| (i % ws.n_blocks.max(1)) as u32)
+                .collect();
+            crate::gemv::upload_into(self.q_norm.gpu(), &ws.ids, &crate::ops::u32_to_bytes(&ids))?;
+            crate::gemv::upload_into(
+                self.q_norm.gpu(),
+                &ws.counts,
+                &crate::ops::u32_to_bytes(&[blocks as u32]),
+            )?;
+        }
 
         let pc_at = Pc::new()
             .u(t as u32)

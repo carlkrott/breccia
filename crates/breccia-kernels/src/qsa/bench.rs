@@ -152,12 +152,40 @@ pub fn qsa_cells(
                 w_out: &b_w_out,
             },
         };
+        // The long-context decode cell (T=1 at the sparse budget) would otherwise
+        // time an **empty** selection: the bench's cache is zero-filled, so the
+        // indexer's scores are all equal and the top-k leaves `counts` at 0 — the
+        // old 2.29 us "apply" cell was launch overhead, not work. `stage_timings`
+        // seeds a full 513-block selection after its own top-k for this cell, so
+        // both attention stages measure the budget they exist for (applies to
+        // every variant equally, so the f16/q8_0 ratio is apples-to-apples).
+        let seed_selection = t == 1 && pos0 > 0 && ws.n_blocks > 0;
         // Warm up, then measure each stage.
-        let _ = qsa.stage_timings(&state, &ws, &wg, &proj, &b_x, &b_out, pos0, 0.02)?;
+        let _ = qsa.stage_timings(
+            &state,
+            &ws,
+            &wg,
+            &proj,
+            &b_x,
+            &b_out,
+            pos0,
+            0.02,
+            seed_selection,
+        )?;
         let mut stage_windows: Vec<Vec<f64>> = vec![Vec::new(); super::STAGES.len()];
         for _ in 0..repeats {
             for (i, tm) in qsa
-                .stage_timings(&state, &ws, &wg, &proj, &b_x, &b_out, pos0, window)?
+                .stage_timings(
+                    &state,
+                    &ws,
+                    &wg,
+                    &proj,
+                    &b_x,
+                    &b_out,
+                    pos0,
+                    window,
+                    seed_selection,
+                )?
                 .iter()
                 .enumerate()
             {

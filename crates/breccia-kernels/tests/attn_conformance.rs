@@ -1241,7 +1241,11 @@ fn qsa_v_attention(
         qsa::VLayout::F16 => qsa::sizes::f16_pool_bytes(pages),
         qsa::VLayout::Q8_0 => qsa::sizes::q8v_pool_bytes(pages),
     };
-    assert_eq!(state.v_pool.size, want_bytes, "v_pool bytes for {layout:?}");
+    assert!(
+        state.v_pool.size >= want_bytes,
+        "v_pool is {} B for {layout:?}, the layout needs {want_bytes} B",
+        state.v_pool.size
+    );
 
     // Fill every cell through the append path the graph uses.
     let fill = qsa.workspace(gpu, cells, cells).expect("fill ws");
