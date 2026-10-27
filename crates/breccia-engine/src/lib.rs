@@ -47,6 +47,7 @@ pub mod arena;
 pub mod config;
 pub mod graph;
 pub mod head;
+pub mod host_arena;
 pub mod model;
 pub mod multi;
 pub mod placement;

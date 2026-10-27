@@ -142,6 +142,8 @@ dependencies = [
  "breccia-kernels",
  "breccia-profile",
  "breccia-vk",
+ "libc",
+ "memmap2",
  "serde",
  "serde_json",
  "thiserror",
