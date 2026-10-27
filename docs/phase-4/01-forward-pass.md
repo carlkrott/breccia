@@ -4580,6 +4580,159 @@ top-1 named.
 one quiet window; this round's windows were refused three times by `BRECCIA_REQUIRE_QUIET`
 (a foreign process held 14 GiB of the RX), so no new throughput number is quoted.
 
+## 8bg. The q8_0 **V** cache landed: two kernels, the quality numbers, and a byte win that the attention loop cannot spend
+
+§8bf stopped at the sizing. This round is the kernel, and the numbers below are the ones the
+previous two rounds said were owed.
+
+### What landed
+
+`BRECCIA_KV_Q8V=1` selects the q8_0 **V** layout; f16 stays the default and the reference. Both
+kernels are **wired variants** of the existing sources (`-D BRECCIA_KV_Q8V`, same bindings, same
+push constants), so the f16 SPIR-V is **byte-identical** to before this commit — verified by
+compiling `HEAD`'s sources and `cmp`-ing the `.spv`, not asserted:
+
+* `qsa_kv_append` q8_0 build — one invocation per (token, kv_head, 32-element block): `amax` over
+  the block, `scale = amax/127`, `q = round(x/scale)`, written as one f32 scale word + 8 packed i8
+  words (`9 words = 36 B` per 32 elements, 288 B per 256-element row). K stays f16 in the same
+  invocation. One invocation per block, not per element, because the scale is a max over the block.
+* `qsa_attn_apply` q8_0 build — reads V as q8_0 and **dequantises in registers inside the
+  accumulate loop** (`acc += p * float(bitfieldExtract(word, shift, 8)) * scale`); no pass over the
+  cache, so the exllamav2 shape that makes a quantised cache slower (research 11) is not here.
+  Consecutive lanes share the same i8 word and all 32 share the scale word, so the coalesced fetch
+  is 36 B per block against f16's 64 B.
+
+Sizing is `qsa::sizes`, and `QsaState::with_layout` now asserts **both** pool layouts against
+`pool_rows(pages)` (the row count the kernels index) instead of trusting a byte count;
+`qsa::tests` pins the 32K arithmetic from the same functions.
+
+### Conformance, MI50 first
+
+`BRECCIA_OP=q8v … VK_LAYER_KHRONOS_validation`, one geometry (64 cells), the headless card first
+then the RX:
+
+| card | q8_0 vs `qsa::cpu::to_q8_0` reference | f16 path (control) | q8_0 vs f16 (kernel) |
+|---|---:|---:|---:|
+| MI50 `0000:0e:00.0` | **2.80e-6** (bar 1e-5) | 2.74e-6 | 1.09e-2 rel / 1.14e-2 abs |
+| RX 6950 XT `0000:03:00.0` | **3.00e-6** | 2.88e-6 | 1.09e-2 rel / 1.14e-2 abs |
+
+The reference quantises with the same rule in Rust, so this holds the *layout* (9-word blocks,
+sign-extended i8, per-block scale) to the arithmetic; the lossy part is the last column. The one
+validation message seen is **pre-existing** and on `vkCreateDevice`
+(`VUID-VkPhysicalDeviceRobustness2FeaturesKHR-…-04000`: robustness2 without robustBufferAccess),
+not from either kernel.
+
+### Quality on the model (parity prompt, chunk 32, RX)
+
+Same command, flag off and on, `--top-logits 248320` (the whole vocab):
+
+| measure | value |
+|---|---|
+| logits `max|Δ|` vs f16, 248 320 ids | **4.13** (p99.9 1.82, median 0.32) |
+| top-1 p delta | **−0.0256** (0.1281 → 0.1025); top-1 **id unchanged** (110563) |
+| top-logit shift | 13.1705 → 12.7589 (−0.412); top-2 changed 1049 → 220 |
+| total variation between the two distributions | 0.192 |
+| greedy agreement, 32 tokens | **32/32**, first divergence: none |
+
+So: the same 32 tokens, a visibly shifted distribution. Reported, not judged — the numbers say
+greedy survives and sampling would not be identical. **No 32K-context quality cell exists**: see
+"what did not happen" below. The 8-process gate is not re-run this round.
+
+### Attention ms/token, and why the byte win is only 5 %
+
+The bench's long-context decode cell (T=1, 2052 slots) was **measuring launch overhead**: the
+bench's cache is zero-filled, so every indexer score ties, the top-k writes `counts = 0`, and
+`apply` returned in 2.29 µs (the old cell implied 44 TB/s). `Qsa::stage_timings` now takes
+`seed_selection` and the bench passes it for that cell only — a full 513-block / 2051-cell
+selection, identically for both layouts, with `false` preserving the previous behaviour bit for
+bit. RX, alternating f16/q8_0, two reps, best:
+
+| stage (T=1, 2051 cells) | f16 | V-q8_0 | ratio |
+|---|---:|---:|---:|
+| `attn-apply+gate` (reads V) | 649.0 µs | **622.4 µs** | **0.949** |
+| `attn-scores+softmax` (reads K only) | 1945.1 µs | 1948.1 µs | 1.002 (unchanged, as expected) |
+| QSA layer total | 2707.8 µs | 2693.9 µs | **0.990** |
+| ×12 layers → **attention per token** | **32.5 ms** | **32.3 ms** | **0.990** |
+| short cell (T=1, 4 slots), unchanged | 122.97 µs | 127.07 µs | — |
+
+`apply` moves 0.95×, not 0.56×, and that is the finding: this loop is **latency-bound, not
+bandwidth-bound** — 8.4 MB of unique V per layer at 2051 cells against 649 µs is 13 GB/s, and the
+24 heads re-reading 2 KV heads' rows at 12× redundancy add instruction and L2 pressure on top.
+Removing 44 % of the bytes cannot pay while the loop is waiting on a dependent scalar load chain.
+The next lever is not a smaller cache: it is blocking the `d` loop (4 elements per lane, one
+`vec4` of the 4 int8 already packed in a word), which is where the q8_0 layout would finally be
+paid for. The write side costs `kv-append` 2.11 → 6.29 µs (3.0×, +4.2 µs per layer per token ≈
+0.05 ms/token over 12 layers) — measured, not hidden.
+
+### Capacity, measured at 32K, and 4 streams
+
+| configuration (`--ctx 32768`) | state + scratch per stream | 4 streams |
+|---|---:|---:|
+| f16 V (default) | **932 MiB** (measured) | 3.64 GiB |
+| V q8_0 (`BRECCIA_KV_Q8V=1`) | **764 MiB** (measured) | **2.98 GiB** |
+
+Exactly the −168 MiB §8bf predicted per agent, and 4 streams at `--ctx 32768` **load and run**:
+`BRECCIA_REQUIRE_QUIET=1` passed, 26.10 tok/s aggregate (f16) and 25.48 (q8_0), every stream
+generating the same 8 tokens in both. That is the **capacity milestone**, not a 32K-context
+throughput claim: the prompt is 27 ids, so the KV is allocated at 32K and the decode is short-
+context. The q8_0 aggregate being 2 % lower is the noise of a stream-bound window, not a signal.
+
+### What did not happen (and the exact blocker)
+
+**No 32K-context run.** Two attempts, both `timeout`-bounded and both killed at the wall:
+`--ctx 32768` with a 32 000-id prompt died at **900 s** with no token generated, and `--ctx 8192`
+with an 8 000-id prompt plus a 9-block arena died at **600 s**. Prefill on this box is
+NVMe-streaming-bound (~9 s per 128-token chunk at 8K: 39 of 48 blocks' experts are re-read per
+chunk), i.e. **~13 tok/s of prefill**, so a 32K prefill needs 35-40 minutes plus 4 model loads for
+the 4-stream case. That is not a window this round could buy. So the honesty of the numbers above:
+attention ms/token is measured at the *full 2051-cell selection* the 32K context would use (the
+selection budget saturates at 8192 cells ≈ 8K context, so this is the 32K attention cost), the
+capacity is measured at 32K, and the 32K **quality** and **4-stream-at-32K-context throughput**
+cells remain owed.
+
+### Safety
+
+Every GPU command was `timeout`-bounded and run one process at a time; the new kernels ran on the
+MI50 first with `VK_LAYER_KHRONOS_validation` and only then on the RX; `power_dpm_force_performance_level`
+reads `high` on both cards before and after the round, and `journalctl -k` over the window shows no
+`amdgpu` page fault, ring timeout or reset. (The other agent's benches on the same box were between
+windows, not concurrent: `pgrep -c -x breccia` was 0 before each run in this round's cells.)
+
+Commands:
+
+```bash
+D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+O=/var/tmp/users/korphaus/tmp/opencode/kvq8v
+
+# the new kernels, headless card first, validation on, one geometry per process
+timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+  BRECCIA_KERNEL_DEVICE=0000:0e:00.0 BRECCIA_OP=q8v \
+  cargo test -p breccia-kernels --test attn_conformance -- --test-threads=1 --nocapture
+# then the same with BRECCIA_KERNEL_DEVICE=0000:03:00.0
+
+# the f16 reference parity gate (unchanged path), chunk 8/16/32/128
+for c in 8 16 32 128; do timeout 400 ./target/release/breccia bench token \
+  --devices 0000:03:00.0 --prefill-chunk $c --gen 32 --runs 1 --threads 16 --warm 1 \
+  --prompt-ids-file $D/parity-server.json.ids --json $O/f16-chunk$c.json; done
+
+# the q8_0 quality cell (same command, both flags), full-vocab logits
+timeout 400 env BRECCIA_KV_Q8V=1 ./target/release/breccia bench token \
+  --devices 0000:03:00.0 --prefill-chunk 32 --gen 32 --runs 1 --threads 16 --warm 1 \
+  --prompt-ids-file $D/parity-server.json.ids --json $O/q8-chunk32.json \
+  --top-logits 248320 --dump-logits $O/q8-chunk32.logits
+
+# attention ms/token, alternating, two reps each (the seeded 2051-cell cell)
+for v in f16 q8; do for rep in 1 2; do
+  timeout 300 env ${v/f16/}${v/q8/BRECCIA_KV_Q8V=1} ./target/release/breccia bench ops \
+    --op qsa --device 0000:03:00.0 --json $O/ops2-$v-$rep.json; done; done
+
+# 4 streams at a 32K allocation, quiet window required
+timeout 600 env BRECCIA_REQUIRE_QUIET=1 BRECCIA_KV_Q8V=1 ./target/release/breccia bench token \
+  --streams 4 --ctx 32768 --devices 0000:03:00.0,0000:0e:00.0 \
+  --prompt-ids-file $D/parity-server.json.ids --gen 8 --runs 1 --threads 32 \
+  --json $O/s4-32k-q8.json
+```
+
 ## 9. Exact commands
 
 
