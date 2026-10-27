@@ -43,6 +43,7 @@
 //! # }
 //! ```
 
+pub mod arena;
 pub mod config;
 pub mod graph;
 pub mod model;
@@ -54,6 +55,7 @@ pub mod sampler;
 pub mod stats;
 pub mod xfer;
 
+pub use arena::{ArenaChoice, ArenaOpts, ArenaReport, ArenaSpec};
 pub use config::{LayerKind, ModelConfig};
 pub use graph::{prefill_cap, prefill_plan, Generation, Session, SessionCfg, Timers, STAGES};
 

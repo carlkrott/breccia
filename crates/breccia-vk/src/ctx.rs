@@ -316,6 +316,26 @@ pub struct Buf {
     pub size: u64,
 }
 
+/// `VK_EXT_memory_budget`'s numbers for one device, summed over its
+/// `DEVICE_LOCAL` heaps.
+///
+/// `budget` is what this process may allocate (net of other processes' *current*
+/// use), `usage` is what it already holds. `budget - usage` is the free-for-us
+/// figure the adaptive expert arena sizes itself from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemBudget {
+    pub heap_bytes: u64,
+    pub budget: u64,
+    pub usage: u64,
+}
+
+impl MemBudget {
+    /// Bytes this process can still allocate.
+    pub fn free_for_us(&self) -> u64 {
+        self.budget.saturating_sub(self.usage)
+    }
+}
+
 pub struct Kernel {
     pub pipe: vk::Pipeline,
     pub layout: vk::PipelineLayout,
@@ -415,11 +435,18 @@ impl Timeline {
 pub struct Gpu {
     pub index: u32,
     pub device: ash::Device,
+    /// The physical device this logical device came from (needed for the
+    /// physical-device queries that are not properties: memory budget, sysfs
+    /// identity).
+    pub pdev: vk::PhysicalDevice,
     /// Handle copy of the owning instance (extension function-pointer loading).
     /// The [`Host`] still owns instance destruction.
     pub instance: ash::Instance,
     /// `VK_EXT_external_memory_host` was advertised **and** enabled on this device.
     pub external_memory_host: bool,
+    /// `VK_EXT_memory_budget` advertised (and enabled): [`Gpu::mem_budget`] is
+    /// then the driver's own account of what this process may still allocate.
+    pub memory_budget: bool,
     pub mem: vk::PhysicalDeviceMemoryProperties,
     pub timestamp_period_ns: f64,
     pub feats: Feats,
@@ -632,6 +659,14 @@ impl Gpu {
         if robustness2 {
             enabled_exts.push("VK_EXT_robustness2".to_string());
         }
+        // `VK_EXT_memory_budget` (the adaptive arena's sizing source): the driver
+        // reports, per heap, what this process may still allocate. Cheap to enable
+        // and advertised by RADV on both cards here; without it the arena falls
+        // back to the driver's sysfs counters (`mem_info_vram_*`) and says so.
+        let memory_budget = dev.has_ext("VK_EXT_memory_budget");
+        if memory_budget {
+            enabled_exts.push("VK_EXT_memory_budget".to_string());
+        }
 
         // NOTE: Vulkan12Features already carries shaderFloat16/shaderInt8/atomic64/
         // timeline/hostQueryReset — validation forbids also chaining the promoted
@@ -760,8 +795,10 @@ impl Gpu {
         Ok(Gpu {
             index,
             device,
+            pdev: dev.pdev,
             instance: instance.clone(),
             external_memory_host,
+            memory_budget,
             mem: dev.mem,
             timestamp_period_ns: dev.timestamp_period_ns as f64,
             feats: dev.feats,
@@ -783,6 +820,47 @@ impl Gpu {
             queue_submit2,
             pipeline_barrier2,
             barrier_scope,
+        })
+    }
+
+    /// The driver's own account of the DEVICE_LOCAL heap this process can still
+    /// use, from `VK_EXT_memory_budget`. `None` when the extension is absent —
+    /// the caller must then fall back to a source that says so (`pci::vram_used`)
+    /// rather than guessing.
+    ///
+    /// `heap_budget` is what *this process* may allocate (already net of other
+    /// processes) and `heap_usage` is what it holds, so `budget - usage` is the
+    /// free-for-us number. Heaps are summed over `DEVICE_LOCAL`, which is the one
+    /// that holds weights on both cards here.
+    pub fn mem_budget(&self) -> Option<MemBudget> {
+        if !self.memory_budget {
+            return None;
+        }
+        let mut b = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+        let mut p2 = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut b);
+        unsafe {
+            self.instance
+                .get_physical_device_memory_properties2(self.pdev, &mut p2);
+        }
+        let mut heap_bytes = 0u64;
+        let mut budget = 0u64;
+        let mut usage = 0u64;
+        for i in 0..self.mem.memory_heap_count as usize {
+            let h = self.mem.memory_heaps[i];
+            if !h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                continue;
+            }
+            heap_bytes += h.size;
+            budget += b.heap_budget[i];
+            usage += b.heap_usage[i];
+        }
+        if budget == 0 || heap_bytes == 0 {
+            return None;
+        }
+        Some(MemBudget {
+            heap_bytes,
+            budget,
+            usage,
         })
     }
 

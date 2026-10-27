@@ -3688,6 +3688,119 @@ That is the next shader round, not this one.
 | tok/s | 18.89 vs 19.17 — inside the window's noise, not a result |
 | `cargo test --workspace` / clippy / fmt / `verify.sh` | all clean |
 
+||||||| cbb0929
+## 8av. `--head-device` (**-2.5 ms**) and an expert arena that is a rule, not a list
+
+Two items off the "not done" list, both measured on the dual configuration in one quiet
+window (both clocks `high` in every run header), parity **32/32** in every quoted run.
+
+### 1. The head moves, and the residual hands over through the block hand-off
+
+`head` used to run on `placement.device_of(n_layers-1)`, i.e. always the card that owns
+block 47 — under every contiguous split, the MI50. `--head-device N` (an ordinal into
+`--devices`) now decides where the 416 MiB `output.weight`, `output_hc_{norm,down,up}`
+and the `logits` row live; `Session::submit_head` moves the residual across with the
+**existing** [`Staging`] read/write pair that the block-to-block hand-off uses — one
+40 KiB round trip per token, `handoff` 0.33 -> 0.54 ms.
+
+The relocation is not free of accounting: `Placement::check_capacity_of` now charges the
+tail (head + final mixer) to the device that will *hold* it, not to the last block's
+device, and the plan line says `[+ head + final mixer, moved by --head-device]`.
+
+**The saving is −2.5 ms, not the predicted −4.** The head is a 416 MiB GEMV, so it is
+memory-bound: the RX's 576 GB/s GDDR6 is *worse* than the MI50's 826 GB/s HBM, and the RX
+wins only on clocks/occupancy. Measured `head` stage 6.95-7.34 -> 3.81-4.22 ms (1.65-1.8x);
+the doc's 1.43x card-level figure under-predicts it and the "−4 ms" guess over-predicted
+the total, because the GEMV is only 6.6 of the 7.0 ms (`finish_head`'s 993 KiB logits
+readback is the other 0.34 ms on the MI50's gen3 x4 link, and it *does* shrink to 0.03).
+
+### 2. The arena is a rule (probe -> reserve -> byte budget -> largest-first)
+
+`--gpu-experts auto` replaces the hand-tuned list with:
+
+* **probe** — `VK_EXT_memory_budget`'s `heapBudget - heapUsage` (RADV advertises it on both
+  cards: `enabled optional extensions=[..., VK_EXT_memory_budget]`), taken **after** the
+  dense weights, head and PLE uploads, so it measures what the arena may still take;
+* **fallback** — amdgpu's `mem_info_vram_{total,used}` when the extension is absent, printed
+  as a *different source* because it is system-wide; when neither answers the load **fails**
+  instead of guessing;
+* **reserve** — a display reserve on any device that drives a **connected** output
+  (768 MiB default) and a headroom elsewhere (256 MiB: the session's own scratch is
+  ~120 MiB and is allocated *after* the weights);
+* **select** — the routed-expert bytes are known per block (they are the three role
+  tensors × 512 experts, 637 MiB IQ2_XXS … 1 137 MiB IQ3_S here), and a resident block
+  removes `n_expert_used/n_expert` = 1.95 % of its own arena from the lane every token, so
+  **per-byte efficiency is uniform across blocks** and the optimum is the set that holds the
+  most bytes in the budget: first-fit decreasing, largest arena first, lowest block index on
+  a tie. That tie-break is what reproduces `0..15,28..41` when the arenas are uniform.
+* **degrade** — a block that does not fit is not resident (printed with its reason); an
+  allocation that still fails is dropped and the load continues. `VK_ERROR_OUT_OF_DEVICE_MEMORY`
+  is not reachable from the arena.
+
+Measured (27-token parity prompt, gen 32, `--warm 1 --threads 16`, `--split-blocks 28,20`):
+
+| config | arena | blocks | bytes/token | lane | `head` | `wait-gpu` | tok/s | ms/token |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| list 30, head on MI50 (baseline) | 24.9 GiB | 30 | 301 MiB | 13.73 | 6.95 | 32.38 | 17.18 | 58.21 |
+| list 30, `--head-device 0` | 24.9 GiB | 30 | 301 MiB | 13.80 | **4.22** | 32.43 | **17.93** | **55.76** |
+| `auto`, head on MI50 | 26.5 GiB | 29 | 269 MiB | 13.22 | 7.34 | 32.52 | 17.18 | 58.22 |
+| `auto --head-device 0` | 26.7 GiB | 29 | 265 MiB | **12.95** | **4.21** | 32.84 | **17.98-18.03** | **55.48-55.61** |
+
+The rule's set at the default reserves (`auto --head-device 0`, two runs):
+`0,2,4,5,8,12,15,17,18,20,21,22,23,24,26` on the RX (15 blocks, 12 587 MiB of its
+12 891 MiB budget) and `28,29,30,31,32,34,35,37,38,42,43,44,46,47` on the MI50
+(14 blocks, 14 725 MiB of 14 733) — i.e. **one block fewer than the hand-tuned list but
+2.5 GiB more resident**, because the list left 2.6 GiB of the RX unused while packing the
+MI50 to 265 MiB. The rule is *measurement-driven*, so a ~50 MiB swing in the desktop's
+footprint between runs flips the last block (the first run took block 9 instead of 31):
+the set is reproducible in size and bytes, not in identity block-for-block. The result
+reproduces the hand-tuned rate and beats it slightly (18.0 vs 17.93 tok/s, lane −0.85 ms,
+36 MiB/token less traffic); the deltas of the two items are independent and additive
+(−2.5 ms head, −0.3 ms lane).
+
+### Findings that outlive the round
+
+1. **The display card on this box is the RX 6950 XT, not the MI50.** `/sys/class/drm`:
+   `card1-DP-1`, `card1-DP-2`, `card1-HDMI-A-1` are `connected` and `card1` is
+   `0000:03:00.0`; every connector on `card0` (`0000:0e:00.0`) reads `disconnected`, and
+   `boot_vga=1` is the RX. `AGENTS.md`'s GPU-safety text and the "display reserve on the
+   MI50" premise are stale (the Xorg override that made the iGPU primary was disabled on
+   2026-08-29). Nothing in the arena depends on it any more — the reserve is keyed on
+   `pci::drives_a_display`, which reads the live sysfs fact — but the *risk* order in
+   `AGENTS.md` ("risky work on the RX first, it is headless") should be re-decided by the
+   coordinator.
+2. **One anomalous parity run.** The first `--head-device 0` run in this set reported
+   1/32 (its first-token top-1 was 248 046 at 12.67 instead of 110 563 at 13.17 — a
+   ~0.2-logit tilt of the whole row, not garbage), in a window where **another agent's
+   process was running on the same two cards**. It did not reproduce: two later runs of
+   the same command are 32/32, and two 27-token prompt passes with the same two configs
+   are bit-identical over all 48 block residuals and all 64 top logits (max |Δ| 2e-6).
+   Recorded rather than dismissed: a second GPU process on the same card is the only
+   distinguishing feature of that window, and re-checking it in a dedicated window is
+   outstanding.
+3. **`--debug-layers` with the default `--inbatch-read` is broken** (pre-existing, both
+   configurations): the trace's checksum readback uses the one-shot command buffer in the
+   middle of an open batch and the next `record_copy` fails with *"record_copy without an
+   open batch"*. `--inbatch-read false --debug-layers` works and is how the residual
+   diffs above were taken.
+
+### Commands
+
+```bash
+L="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,28,29,30,31,32,33,34,35,36,37,38,39,40,41"
+P=/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids
+timeout 700 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$L" \
+  --prompt-ids-file $P --gen 32 --runs 1 --threads 16 --warm 1
+timeout 700 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts auto --head-device 0 \
+  --prompt-ids-file $P --gen 32 --runs 1 --threads 16 --warm 1 --json out.json
+# the residual-by-residual diff (works around the --debug-layers bug above)
+timeout 400 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 \
+  --split-blocks 28,20 --head-device 0 --gpu-experts "$L" --inbatch-read false \
+  --prompt-ids "760,13017" --gen 8 --runs 1 --threads 16 --debug-layers
+```
+
 ## 9. Exact commands
 
 
@@ -3762,3 +3875,6 @@ Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual
 5. **A third card** buys 1.4x at agent lengths; **GDN's delta rule** (217 GB/s,
    2.6x off the ceiling) is the largest single kernel left and only pays once the
    cards bind.
+6. **`wait-gpu` (32.4 ms, 56-59 %) is untouched by §8ar** — the head and arena items
+   moved the *other* 3 ms. Fusions (D5/D1/D3) remain the only lever on the fence
+   wait, in the order `docs/research/10` sets.

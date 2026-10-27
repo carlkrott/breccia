@@ -27,9 +27,11 @@ use breccia_kernels::cpu::LayerPlan;
 use breccia_kernels::{Device, Gemv, QuantType};
 use breccia_vk::ctx::{Buf, Gpu};
 
+use crate::arena::{
+    self, ArenaBlock, ArenaOpts, ArenaReport, ArenaSpec, BudgetSource, DeviceArenaRow, DeviceBudget,
+};
 use crate::config::{LayerKind, ModelConfig};
 use crate::placement::{self, Placement};
-
 /// The identity of a projection: one compiled pipeline per distinct triple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PipeKey {
@@ -268,6 +270,10 @@ pub struct Model {
     pub placement: Placement,
     pub devices: Vec<Device>,
     pub layers: Vec<LayerWeights>,
+    /// The device the LM head (and the final mixer) lives on. **Not** necessarily
+    /// the device of the last block: `--head-device` moves it, and `submit_head`
+    /// hands the residual over when they differ (`docs/phase-4` §8ar).
+    pub head_device: usize,
     pub head: W,
     pub out_hc_norm: Buf,
     pub out_hc_down: W,
@@ -275,6 +281,8 @@ pub struct Model {
     pub ple: Option<PleRaw>,
     /// Blocks whose routed experts live in VRAM, keyed by block.
     pub placed: std::collections::BTreeMap<usize, PlacedExperts>,
+    /// The arena decision (rule, budget source, chosen set) for the report.
+    pub arena: Option<ArenaReport>,
     pub stats: LoadStats,
     /// Distinct pipelines the graph will need, discovered at load.
     pub keys: BTreeSet<PipeKey>,
@@ -290,9 +298,14 @@ pub struct LoadOptions {
     /// Explicit block counts per device (`--split-blocks 21,27`). `None` = balance
     /// the dense bytes evenly.
     pub blocks: Option<Vec<usize>>,
-    /// Blocks whose experts go to VRAM (`--gpu-experts 0,1,2,4,8,18,20,22,23,24,35`),
-    /// each on the device that owns the block.
-    pub gpu_experts: Vec<usize>,
+    /// The device the LM head lives on (`--head-device N`, an ordinal into
+    /// `devices`). `None` = the device that owns the last block, which is the
+    /// historical (and the single-device) behaviour.
+    pub head_device: Option<usize>,
+    /// Where the routed-expert arena comes from: nothing, an explicit block list
+    /// (`--gpu-experts 0,1,…`, each on the device that owns the block), or the
+    /// measured-free-VRAM rule (`--gpu-experts auto`, [`crate::arena`]).
+    pub arena: ArenaSpec,
     pub verbose: bool,
 }
 
@@ -302,7 +315,8 @@ impl Default for LoadOptions {
             devices: Vec::new(),
             ctx_capacity: 256,
             blocks: None,
-            gpu_experts: Vec::new(),
+            head_device: None,
+            arena: ArenaSpec::Off,
             verbose: true,
         }
     }
@@ -382,7 +396,27 @@ impl Model {
             );
         }
         let caps: Vec<u64> = devices.iter().map(|d| vram_bytes(d.gpu())).collect();
-        placement.check_capacity(&caps)?;
+
+        // --- head device (`--head-device`) -----------------------------------
+        // The head is 416 MiB and its GEMV is the second-largest single item of a
+        // token; where it runs is a placement decision, not a consequence of the
+        // last block's. Default: the device that owns block 47.
+        let last_dev = placement.device_of(cfg.n_layers - 1);
+        let head_dev = opts.head_device.unwrap_or(last_dev);
+        if head_dev >= devices.len() {
+            bail!(
+                "--head-device {head_dev} is out of range for {} device(s)",
+                devices.len()
+            );
+        }
+        // The capacity check must charge the tail (head + final mixer) to the device
+        // that will actually hold it, not to the last block's device.
+        let mut planned = placement.bytes.clone();
+        if head_dev != last_dev {
+            planned[last_dev] = planned[last_dev].saturating_sub(tail_bytes);
+            planned[head_dev] += tail_bytes;
+        }
+        placement.check_capacity_of(&planned, &caps)?;
 
         // --- weights ---------------------------------------------------------
         let mut per_device_upload = vec![0f64; devices.len()];
@@ -504,7 +538,6 @@ impl Model {
         }
 
         // --- head + final mixer ---------------------------------------------
-        let head_dev = placement.device_of(cfg.n_layers - 1);
         let gpu = devices[head_dev].gpu();
         let t0 = std::time::Instant::now();
         let head = w(gpu, &shards, "output.weight")?;
@@ -541,31 +574,119 @@ impl Model {
         };
 
         // --- routed experts that live in VRAM (`-ot`) -------------------------
-        let mut placed = std::collections::BTreeMap::new();
-        for &b in &opts.gpu_experts {
-            if b >= cfg.n_layers {
-                bail!("--gpu-experts lists block {b} of {}", cfg.n_layers);
+        //
+        // Two sources: an explicit block list (the hand-tuned override, kept
+        // working verbatim) or the measured-free-VRAM rule (crate::arena). Both
+        // end in the same upload loop, so the resident path is identical.
+        //
+        // Arena size per block, measured from the three role tensors' real bytes
+        // (they differ by quant type: 637 MiB IQ2_XXS … 1137 MiB IQ3_S here).
+        // `RolePlan::bytes()` is **one expert**; the arena holds all `n_experts`.
+        let arena_sizes: Vec<u64> = layers
+            .iter()
+            .map(|l| {
+                let e = &l.experts;
+                let per = e.gate.bytes() as u64 + e.up.bytes() as u64 + e.down.bytes() as u64;
+                per * e.n_experts as u64
+            })
+            .collect();
+        let candidates: Vec<ArenaBlock> = (0..cfg.n_layers)
+            .map(|b| ArenaBlock {
+                block: b,
+                device: placement.device_of(b),
+                bytes: arena_sizes[b],
+            })
+            .collect();
+        let (arena_choice, arena_report) = match &opts.arena {
+            ArenaSpec::Off => (arena::ArenaChoice::default(), None),
+            ArenaSpec::List(list) => {
+                let mut blocks = Vec::with_capacity(list.len());
+                for &b in list {
+                    if b >= cfg.n_layers {
+                        bail!("--gpu-experts lists block {b} of {}", cfg.n_layers);
+                    }
+                    if blocks.iter().any(|x: &ArenaBlock| x.block == b) {
+                        continue;
+                    }
+                    blocks.push(candidates[b]);
+                }
+                blocks.sort_by_key(|x| x.block);
+                (
+                    arena::ArenaChoice {
+                        blocks,
+                        ..Default::default()
+                    },
+                    None,
+                )
             }
-            let dev = placement.device_of(b);
+            ArenaSpec::Auto(aopts) => {
+                let budgets = probe_budgets(&devices, *aopts, opts.verbose)?;
+                let choice = arena::select(&candidates, &budgets);
+                let report = arena_report_of(&choice, &devices);
+                (choice, Some(report))
+            }
+        };
+        let mut placed = std::collections::BTreeMap::new();
+        // A block whose allocation fails is *dropped* (it stays on the host lane,
+        // which is the default path) instead of aborting the load — the rule's
+        // arithmetic should prevent it, and this is the belt to that brace.
+        let mut dropped: Vec<usize> = Vec::new();
+        for ab in &arena_choice.blocks {
+            let b = ab.block;
+            let dev = ab.device;
             let gpu = devices[dev].gpu();
             let t0 = std::time::Instant::now();
-            let gate = w(gpu, &shards, &format!("blk.{b}.ffn_gate_exps.weight"))?;
-            let up = w(gpu, &shards, &format!("blk.{b}.ffn_up_exps.weight"))?;
-            let down = w(gpu, &shards, &format!("blk.{b}.ffn_down_exps.weight"))?;
-            keys.insert(gate.key);
-            keys.insert(up.key);
-            keys.insert(down.key);
-            per_device_upload[dev] += t0.elapsed().as_secs_f64();
-            placed.insert(
-                b,
-                PlacedExperts {
-                    block: b,
-                    device: dev,
-                    gate,
-                    up,
-                    down,
-                },
-            );
+            let got: Result<(W, W, W)> = (|| {
+                let gate = w(gpu, &shards, &format!("blk.{b}.ffn_gate_exps.weight"))?;
+                let up = w(gpu, &shards, &format!("blk.{b}.ffn_up_exps.weight"))?;
+                let down = w(gpu, &shards, &format!("blk.{b}.ffn_down_exps.weight"))?;
+                Ok((gate, up, down))
+            })();
+            match got {
+                Ok((gate, up, down)) => {
+                    keys.insert(gate.key);
+                    keys.insert(up.key);
+                    keys.insert(down.key);
+                    per_device_upload[dev] += t0.elapsed().as_secs_f64();
+                    placed.insert(
+                        b,
+                        PlacedExperts {
+                            block: b,
+                            device: dev,
+                            gate,
+                            up,
+                            down,
+                        },
+                    );
+                }
+                Err(e) => {
+                    eprintln!("breccia: arena: blk.{b} dropped, staying on the host lane: {e:#}");
+                    dropped.push(b);
+                }
+            }
+        }
+        let mut arena_report = arena_report;
+        if let Some(r) = arena_report.as_mut() {
+            for b in &dropped {
+                if let Some(i) = r.blocks.iter().position(|x| x == b) {
+                    r.blocks.remove(i);
+                }
+                r.skipped
+                    .push(format!("{b}: {}", arena::Skip::UploadFailed.as_str()));
+            }
+            r.blocks.sort_unstable();
+            r.bytes = r.blocks.iter().map(|&b| arena_sizes[b]).sum();
+            for row in r.devices.iter_mut() {
+                let mine: Vec<usize> = r
+                    .blocks
+                    .iter()
+                    .copied()
+                    .filter(|&b| placement.device_of(b) == row.device)
+                    .collect();
+                row.chosen = mine.len();
+                row.bytes = mine.iter().map(|&b| arena_sizes[b]).sum();
+                row.left_bytes = row.budget_bytes.saturating_sub(row.bytes);
+            }
         }
 
         let upload_seconds: f64 = per_device_upload.iter().sum();
@@ -620,7 +741,11 @@ impl Model {
                 st >> 20,
                 caps[i] >> 20,
                 if has_head {
-                    "  [+ head + final mixer]"
+                    if head_dev == last_dev {
+                        "  [+ head + final mixer]"
+                    } else {
+                        "  [+ head + final mixer, moved by --head-device]"
+                    }
                 } else {
                     ""
                 }
@@ -645,6 +770,50 @@ impl Model {
                 pe.device,
                 pe.bytes() >> 20,
                 pe.gate.key.ty.name()
+            ));
+        }
+        // The arena decision, as a rule with numbers rather than a block list: one
+        // line per device (free → reserve → budget → spent) plus the chosen set.
+        if let Some(r) = &arena_report {
+            for row in &r.devices {
+                plan.push(format!(
+                    "arena   device {} {}  free {:>6} MiB - {} {:>4} MiB = {:>6} MiB -> {} blocks, \
+                     {:>6} MiB  ({:>4} MiB left)  [{}]",
+                    row.device,
+                    if row.display { "display" } else { "headless" },
+                    row.free_bytes >> 20,
+                    if row.display { "display reserve" } else { "headroom" },
+                    row.reserve_bytes >> 20,
+                    row.budget_bytes >> 20,
+                    row.chosen,
+                    row.bytes >> 20,
+                    row.left_bytes >> 20,
+                    row.source,
+                ));
+            }
+            plan.push(format!(
+                "arena   rule=auto: {} of {} blocks resident ({:.1} GiB); the host lane keeps {}",
+                r.blocks.len(),
+                cfg.n_layers,
+                r.bytes as f64 / (1u64 << 30) as f64,
+                cfg.n_layers - r.blocks.len()
+            ));
+            plan.push(format!(
+                "arena   blocks {}",
+                r.blocks
+                    .iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            if !r.skipped.is_empty() {
+                plan.push(format!("arena   not resident: {}", r.skipped.join(", ")));
+            }
+        } else if !placed.is_empty() {
+            plan.push(format!(
+                "arena   rule=list (--gpu-experts): {} of {} blocks resident",
+                placed.len(),
+                cfg.n_layers
             ));
         }
         plan.push(format!(
@@ -681,12 +850,14 @@ impl Model {
             placement,
             devices,
             layers,
+            head_device: head_dev,
             head,
             out_hc_norm,
             out_hc_down,
             out_hc_up,
             ple,
             placed,
+            arena: arena_report,
             stats,
             keys,
         })
@@ -695,6 +866,12 @@ impl Model {
     /// The device a block runs on.
     pub fn device_of(&self, block: usize) -> usize {
         self.placement.device_of(block)
+    }
+
+    /// The device the LM head and the final mixer live on (`--head-device`, else
+    /// the device that owns the last block).
+    pub fn head_device(&self) -> usize {
+        self.head_device
     }
 
     /// The output width (`token_embd.ne1`).
@@ -732,7 +909,7 @@ impl Drop for Model {
         for l in &self.layers {
             l.release(self.devices[l.device].gpu());
         }
-        let head_dev = self.placement.device_of(self.cfg.n_layers - 1);
+        let head_dev = self.head_device;
         {
             let gpu = self.devices[head_dev].gpu();
             gpu.destroy_buf(&self.head.buf);
@@ -912,6 +1089,104 @@ fn hc_weights(gpu: &Gpu, shards: &ShardSet, block: usize, half: &str) -> Result<
             &format!("blk.{block}.hc_{half}_inject.weight"),
         )?),
     })
+}
+
+/// Measure each device's free VRAM and turn it into an arena budget.
+///
+/// Called **after** the dense weights, the head and the PLE projections are
+/// uploaded — those are part of the model, not the arena, and charging them to the
+/// arena budget would be double counting. The source is stated per device
+/// ([`BudgetSource`]): `VK_EXT_memory_budget` when advertised, amdgpu's sysfs
+/// counters otherwise. When neither answers, this **fails** rather than guessing a
+/// number — a wrong budget here is an `VK_ERROR_OUT_OF_DEVICE_MEMORY` at best and a
+/// starved display card at worst.
+fn probe_budgets(devices: &[Device], opts: ArenaOpts, verbose: bool) -> Result<Vec<DeviceBudget>> {
+    let mut out = Vec::with_capacity(devices.len());
+    for (i, dev) in devices.iter().enumerate() {
+        let gpu = dev.gpu();
+        let pci = &dev.info.pci_address;
+        let (free, source) = match gpu.mem_budget() {
+            Some(b) => (b.free_for_us(), BudgetSource::MemoryBudget),
+            None => match breccia_vk::pci::vram_used(pci) {
+                Some((total, used)) => (total.saturating_sub(used), BudgetSource::DriverSysfs),
+                None => bail!(
+                    "arena: device {i} ({pci}) advertises neither VK_EXT_memory_budget nor \
+                     amdgpu's mem_info_vram_* — refusing to guess a VRAM budget. Pass an \
+                     explicit --gpu-experts block list, or a driver that reports one"
+                ),
+            },
+        };
+        // A device that currently drives a display gets the bigger reserve; the
+        // fact is read from sysfs (see `pci::drives_a_display`), never assumed.
+        // `unknown` is treated as a display: the safe direction.
+        let display = breccia_vk::pci::drives_a_display(pci).unwrap_or(true);
+        let reserve = if display {
+            opts.display_reserve
+        } else {
+            opts.headroom
+        };
+        if verbose {
+            eprintln!(
+                "breccia: arena: device {i} {} free {} MiB ({}) - {} {} MiB = {} MiB",
+                if display {
+                    "drives a display"
+                } else {
+                    "headless"
+                },
+                free >> 20,
+                source.as_str(),
+                if display {
+                    "display reserve"
+                } else {
+                    "headroom"
+                },
+                reserve >> 20,
+                free.saturating_sub(reserve) >> 20
+            );
+        }
+        out.push(DeviceBudget {
+            device: i,
+            label: dev.info.pci_address.clone(),
+            display,
+            free,
+            reserve,
+            source,
+        });
+    }
+    Ok(out)
+}
+
+/// The serialisable summary of an [`arena::ArenaChoice`], for the banner + JSON.
+fn arena_report_of(choice: &arena::ArenaChoice, devices: &[Device]) -> ArenaReport {
+    let mut skipped: Vec<String> = choice
+        .skipped
+        .iter()
+        .map(|(b, why)| format!("{}: {}", b.block, why.as_str()))
+        .collect();
+    skipped.sort();
+    ArenaReport {
+        rule: "auto".to_string(),
+        blocks: choice.blocks.iter().map(|b| b.block).collect(),
+        bytes: choice.bytes(),
+        devices: choice
+            .devices
+            .iter()
+            .map(|s| DeviceArenaRow {
+                device: s.budget.device,
+                label: s.budget.label.clone(),
+                name: devices[s.budget.device].info.name.clone(),
+                display: s.budget.display,
+                source: s.budget.source.as_str().to_string(),
+                free_bytes: s.budget.free,
+                reserve_bytes: s.budget.reserve,
+                budget_bytes: s.budget.budget(),
+                chosen: s.chosen,
+                bytes: s.bytes,
+                left_bytes: s.left(),
+            })
+            .collect(),
+        skipped,
+    }
 }
 
 /// The DEVICE_LOCAL heap size of a device, in bytes.

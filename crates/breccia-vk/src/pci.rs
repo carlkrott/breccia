@@ -88,6 +88,86 @@ fn read_trimmed(path: String) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// The driver's own VRAM counters (the `VK_EXT_memory_budget` fallback)
+// ---------------------------------------------------------------------------
+
+/// amdgpu's `mem_info_vram_total` / `mem_info_vram_used` for `address`, in bytes.
+///
+/// This is the *driver's* figure, not a guess: it is the same number
+/// `amdgpu_top`/`radeontop` show, and it is system-wide (every process). Use it
+/// only when `VK_EXT_memory_budget` is absent, and say so in the report — the
+/// arena's reserve then has to cover other processes' current use as well.
+pub fn vram_used(address: &str) -> Option<(u64, u64)> {
+    let dev = format!("{SYS_PCI}/{}", normalize_address(address));
+    let total: u64 = read_trimmed(format!("{dev}/mem_info_vram_total"))?
+        .parse()
+        .ok()?;
+    let used: u64 = read_trimmed(format!("{dev}/mem_info_vram_used"))?
+        .parse()
+        .ok()?;
+    Some((total, used))
+}
+
+/// Does `address` currently drive a display?
+///
+/// Read from sysfs: any `card*-<connector>/status` **whose DRM card belongs to
+/// `address`** reading `connected`. This is the fact the expert arena's *display
+/// reserve* keys on — hard-coding a PCI address in the reserve rule is exactly the
+/// host-specific assumption that made the arena a block list in the first place
+/// (and it is already stale on this box: the connected outputs are on
+/// `0000:03:00.0`, while the plan text in `AGENTS.md` says the MI50).
+///
+/// The connector directories live under `/sys/class/drm/`, **not** under the PCI
+/// device's own `drm/` node (that one holds only `cardN`/`renderD*`), so the match
+/// is made by canonicalising — the kernel's connector path goes through the PCI
+/// device, and that is the identity we want.
+///
+/// `None` when sysfs cannot answer (no DRM nodes at all): the caller must then
+/// treat the reserve conservatively and say it could not verify.
+pub fn drives_a_display(address: &str) -> Option<bool> {
+    let want = fs::canonicalize(format!("{SYS_PCI}/{}", normalize_address(address))).ok()?;
+    let entries = fs::read_dir("/sys/class/drm").ok()?;
+    let mut saw_connector = false;
+    let mut saw_card = false;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("card") {
+            continue;
+        }
+        if !name.contains('-') {
+            saw_card = true;
+            continue; // the `cardN` node itself
+        }
+        if name.contains("Writeback") {
+            continue; // not an output
+        }
+        let Ok(real) = fs::canonicalize(e.path()) else {
+            continue;
+        };
+        if !real.starts_with(&want) {
+            continue; // another card's connector
+        }
+        saw_connector = true;
+        let status = read_trimmed(format!("{}/status", e.path().display())).unwrap_or_default();
+        if status == "connected" {
+            return Some(true);
+        }
+    }
+    if saw_card {
+        // A card with no connector *subdirectory* at all is an unknown, not a
+        // "headless" answer: some kernels only expose connectors for cards that
+        // have a display controller bound.
+        if saw_connector {
+            Some(false)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +215,25 @@ mod tests {
             !topo.contains("max=? x?"),
             "topology facts unreadable: {topo}"
         );
+    }
+
+    /// The arena's display reserve is keyed on this: every discrete card must be
+    /// *answerable* (Some), because `unknown` falls back to the display reserve.
+    /// Which one is connected is a live fact (and it is not the card the plan text
+    /// assumes), so it is printed rather than asserted.
+    #[test]
+    fn the_display_fact_is_answerable_per_card() {
+        for (vid, did) in [(0x1002u32, 0x73a5u32), (0x1002, 0x66af)] {
+            let Some(addr) = find_address_by_ids(vid, did) else {
+                continue; // the artifact is host-specific; skip what is absent
+            };
+            let d = drives_a_display(&addr);
+            println!("{addr} drives_a_display={d:?} vram={:?}", vram_used(&addr));
+            assert!(d.is_some(), "{addr}: no connector information at all");
+            assert!(
+                vram_used(&addr).is_some(),
+                "{addr}: no amdgpu vram counters"
+            );
+        }
     }
 }

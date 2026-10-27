@@ -311,10 +311,25 @@ enum BenchKind {
         #[arg(long, value_name = "N[,N]")]
         split_blocks: Option<String>,
         /// Blocks whose routed experts live in VRAM (`-ot`-equivalent), each on
-        /// the device that owns the block. Production mapping:
+        /// the device that owns the block. `auto` sizes the arena from measured
+        /// free VRAM instead (a display reserve on a card that drives an output,
+        /// a smaller headroom elsewhere). Production mapping:
         /// `0,1,2,4,8,18,20,22,23,24,35`
-        #[arg(long, value_name = "N[,N]")]
+        #[arg(long, value_name = "auto|N[,N]")]
         gpu_experts: Option<String>,
+        /// The device the LM head + final mixer live on: an ordinal into
+        /// `--devices` (`0` = the first). Default: the device that owns block 47,
+        /// which under a contiguous split is always the last one.
+        #[arg(long, value_name = "N")]
+        head_device: Option<usize>,
+        /// `--gpu-experts auto`: bytes kept free on a device that currently drives
+        /// a display (read from sysfs, not assumed)
+        #[arg(long, default_value_t = 768, value_name = "MIB")]
+        arena_display_reserve_mib: u64,
+        /// `--gpu-experts auto`: bytes kept free on a headless device (session
+        /// scratch ~120 MiB + allocator slack)
+        #[arg(long, default_value_t = 256, value_name = "MIB")]
+        arena_headroom_mib: u64,
         /// Independent sequences decoded in lockstep, one per device: `2` puts
         /// one sequence on each card and interleaves them at the block level so
         /// each expert lane runs under the other stream's GPU phase. `1` is the
@@ -513,6 +528,9 @@ fn run(cli: Cli) -> Result<()> {
                     batching,
                     split_blocks,
                     gpu_experts,
+                    head_device,
+                    arena_display_reserve_mib,
+                    arena_headroom_mib,
                     streams,
                     inbatch_read,
                     prefill_chunk,
@@ -537,6 +555,9 @@ fn run(cli: Cli) -> Result<()> {
             batching,
             split_blocks,
             gpu_experts,
+            head_device,
+            arena_display_reserve_mib,
+            arena_headroom_mib,
             streams,
             inbatch_read,
             prefill_chunk,
@@ -1533,6 +1554,9 @@ struct TokenArgs {
     batching: bool,
     split_blocks: Option<String>,
     gpu_experts: Option<String>,
+    head_device: Option<usize>,
+    arena_display_reserve_mib: u64,
+    arena_headroom_mib: u64,
     streams: usize,
     inbatch_read: bool,
     prefill_chunk: usize,
@@ -1654,7 +1678,8 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 devices: vec![dev.clone()],
                 ctx_capacity: a.ctx,
                 blocks: None,
-                gpu_experts: expert_sets[s].clone(),
+                head_device: None,
+                arena: breccia_engine::ArenaSpec::List(expert_sets[s].clone()),
                 verbose: s == 0,
             },
         )
@@ -1968,7 +1993,8 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
                 devices: vec![dev.clone()],
                 ctx_capacity: 512,
                 blocks: None,
-                gpu_experts: groups[s].clone(),
+                head_device: None,
+                arena: breccia_engine::ArenaSpec::List(groups[s].clone()),
                 verbose: s == 0,
             },
         )
@@ -2402,6 +2428,19 @@ fn bench_token(a: TokenArgs) -> Result<()> {
     );
 
     // ---- load -------------------------------------------------------------
+    // `--gpu-experts` is `auto`, an explicit block list, or absent (no arena).
+    let arena = match a.gpu_experts.as_deref() {
+        None => breccia_engine::ArenaSpec::Off,
+        Some(list) => match breccia_engine::ArenaSpec::parse(list) {
+            breccia_engine::ArenaSpec::Auto(_) => {
+                breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
+                    display_reserve: a.arena_display_reserve_mib << 20,
+                    headroom: a.arena_headroom_mib << 20,
+                })
+            }
+            other => other,
+        },
+    };
     let model = breccia_engine::Model::load(
         &glob,
         &breccia_engine::LoadOptions {
@@ -2412,15 +2451,8 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                     .filter_map(|t| t.trim().parse::<usize>().ok())
                     .collect()
             }),
-            gpu_experts: a
-                .gpu_experts
-                .as_ref()
-                .map(|s| {
-                    s.split(',')
-                        .filter_map(|t| t.trim().parse::<usize>().ok())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            head_device: a.head_device,
+            arena,
             verbose: true,
         },
     )
