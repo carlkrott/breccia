@@ -37,7 +37,13 @@ display card (Radeon VII / MI50, `0000:0e:00.0`).
    host−GPU)**. Any stage whose `host − GPU` exceeds ~70 µs contains a submit+fence;
    `s.submits` per token is already counted, so the boundary count is one division
    away.
-5. **Ollama** is now a Go supervisor over a `llama-server` subprocess per model
+5. **The relaunch (Part C) found that the *next* puzzle was not an attribution problem.**
+   The "~95–105 ms of a 155–166 ms agent-token is unattributed" claim does not survive
+   measurement: `sum ≡ wall` to ≤0.13 ms on six chunk traces, and the 155–166 ms is
+   **2 × the mean per-stream prefill wall** (`bench agents` prefills the streams
+   sequentially and divides by `n`) plus a tail chunk that runs at 8× the per-token cost.
+   Read **C1** before instrumenting anything, and **C2** for the re-priced tool table.
+6. **Ollama** is now a Go supervisor over a `llama-server` subprocess per model
    (77 MB shallow clone at `6c15b26`). Everything about *kernels* is
    llama.cpp-inherited; what Ollama adds is a **runner scheduler** (ref-counted
    runners, keep-alive expiry, LRU eviction, max 3 models/GPU), a **fit-then-degrade
@@ -473,3 +479,229 @@ published analogue to our standing dual-GPU placement policy (which card holds w
 resident block), whereas exllamav2's remaining surface (bits_prop, CUDA graphs) was
 already priced as non-portable in `docs/research/03`. Keep exllamav2 as a follow-up
 if a KV-quantisation path ever becomes admissible.
+
+---
+
+# Part C — relaunch addendum (second pass of round 7, same day)
+
+The first pass (Part A/B above) answered "what can attribute GPU time here". This pass
+was relaunched against a **different, live puzzle** — *"the chunked-prefill stage table
+accounts for only ~60 ms of a ~155–166 ms agent-token; ~95–105 ms is unattributed"* — and
+re-measured the same tools independently from a second harness
+(`/var/tmp/users/korphaus/tmp/opencode/research-harnesses/rl7-attrib`, own crate, copies
+`harnesses/vk-probe/src/ctx.rs` verbatim). Same box, same card, same discipline.
+
+It adds three things and confirms one:
+
+* **C1 — the ~95–105 ms is a denominator artefact, not missing work.** The host stage
+  table is complete to ≤0.13 ms; the 155–166 ms figure is 2× the mean per-stream wall
+  because the bench prefills the streams sequentially, plus tail-chunk inflation.
+* **C2 — an independent re-measurement of the tool costs**, and a reconciliation with
+  A2's 306 ns/stamp (a stamp is a *dependency edge*: its marginal cost tracks the work in
+  flight, 0.3 µs dense → 2.1 µs after a real dispatch).
+* **C3 — what else is free here** (`gpu_busy_percent` as a 20–40 ms per-card duty-cycle)
+  and what is not even packaged (`umr`, `rgp`, `amdtop`).
+* **C4 — four Ollama details** that Part B's B4 did not name.
+
+## C1. The live puzzle: `sum ≡ wall`, so the missing time is in the denominator
+
+### C1.1 Measured: the coarse stage table has no residual
+
+`BRECCIA_TRACE_PREFILL=1` already prints `sum · wall · residual` per chunk
+(`graph.rs`, end of `prefill()`). Six chunk traces, two cards, warm and cold, `t=64` and
+`t=4`:
+
+| run | stream | chunk `t` | stage sum | wall | residual (ms/token) |
+|---|---|---:|---:|---:|---:|
+| `--streams 1`, RX | 0 | 27 | 84.03 | (first chunk) | — (0 % needed a 2nd chunk) |
+| `--streams 2`, prefix 132 | 0 (RX) | 64 | 87.68 | 87.71 | **+0.03** |
+| | 1 (MI50) | 64 | 107.06 | 106.93 | **−0.13** |
+| | 0 (RX) | 4 | 660.87 | 658.20 | −2.67 (0.4 %, the tail chunk) |
+| | 0 (RX, warm) | 64 | 167.59 | 167.61 | **+0.01** |
+| | 1 (MI50) | 64 | 178.84 | 178.71 | **−0.13** |
+| `--streams 2`, prefix 64 | 0 (RX) | 64 | 67.62 | 67.65 | **+0.03** |
+| | 1 (MI50) | 64 | 316.50 | 316.51 | **+0.01** |
+
+`sum ≡ wall` to 0.01–0.13 ms. Every stage mark is on the critical path and every
+millisecond of the chunk lands in a stage. There is no hidden ~100 ms of host work in the
+record path.
+
+### C1.2 Mechanism: the bench divides by `n` over a *sequential* prefill
+
+```rust
+// crates/breccia-cli/src/main.rs:2080 — stream 0's whole prompt, then stream 1's
+if a.prefill_chunk > 0 {
+    for (s, sess) in multi.streams.iter_mut().enumerate() {
+        for part in padded[s].chunks(a.prefill_chunk) { logits[s] = sess.prefill(part, pos)?; }
+    }
+}
+// main.rs:2234 — and then:
+"... {:.2} tok/s per agent", prompt_tokens as f64 / prompt_seconds / n as f64
+```
+
+The two prefills never overlap, so the reported per-agent rate is **half** the
+single-stream rate, i.e. **per-agent ms/token = 2 × mean per-stream wall**. Measured on
+one run (`--streams 2 --prefix 64 --prefill-chunk 64`, one chunk each):
+
+```
+stream 0 (RX)    67.62 ms/token      stream 1 (MI50)   316.50 ms/token
+reported         2.60 tok/s per agent  →  385 ms/agent-token
+check            (67.65 + 316.51)/2 × 2 = 384                      ✓
+```
+
+### C1.3 Second contributor: the tail chunk is 8× the per-token cost
+
+`prefix mod chunk` tokens pay the chunk's *fixed* cost (48 blocks × PLE, cold rows, one
+drain each) divided by a tiny `t`:
+
+| chunk | t | stage sum (ms/token) | dominant stages |
+|---|---:|---:|---|
+| 1st | 64 | 87.68 | `experts(host)` 61.8, `wait-gpu` 15.9 |
+| 2nd | 64 | 107.06 | `experts(host)` 81.6 |
+| **tail** | **4** | **660.87** | `experts(host)` 569.3, `wait-gpu` 73.1, `ple` 9.7 |
+
+`132 = 64 + 64 + 4`, so the default gate prefix hits it every run: 4 × 0.66 s = 2.6 s of
+a ~20 s prompt (**13 %**) at 8× the per-token rate.
+
+**So**: 60 ms own + ~60–100 ms the other stream (serialised, in the denominator) + tail
+inflation = 155–166 ms. No engine defect, and **nothing for the attribution tooling to
+find** — which is exactly why three previous rounds of "the table must be lying" produced
+nothing.
+
+### C1.4 If a residual ever does appear, look here first
+
+1. The one un-instrumented `flush()` per chunk: `wall0` is taken *before*
+   `self.flush()` and `timers.start()` *after* it (`graph.rs:1588-1595`), so one pass-1
+   drain per chunk is in `wall` and in no stage.
+2. `timers.clear()` at the end of a traced chunk — a per-token average can mix windows.
+3. **GPU idle *inside* a batch** (host recording slower than the GPU executes). This is
+   the only place a batched submission can hide time, it is 0.3 % in the synthetic case
+   (C2.2), and it needs the timestamp + calibration recipe to see at all.
+
+### C1.5 The three experiments this decides
+
+1. **Interleave the two streams' chunked prefill** — the same block-pair interleave the
+   decode path already uses (`multi.rs::token_all`). Today the RX's host lane (38–48
+   ms/token) runs with the RX GPU idle *and* the MI50 prefill not yet started. Overlap of
+   stream A's lane/PLE with stream B's GPU is worth up to `min(lane, gpu)` per block-pair,
+   and it makes the per-agent metric honest. ~40 lines in the CLI bench.
+2. **Print `gpu_busy` per chunk.** The probe (`BRECCIA_GPU_TIME`) is reset after the
+   prompt and only reported once a token in decode (`graph.rs:1145 probe_report`), so
+   **prefill has no GPU-side number at all**. Without it, "4.4 µs per dispatch of drain"
+   (§8af) is `wall / dispatches`, an inference; with it, GPU-busy vs wall *per pass*
+   separates "the GPU is executing 1 900 dispatches" from "the GPU is waiting for the
+   host to record them" — opposite fixes (barrier pruning vs T-batching).
+3. **Kill the tail chunk**: chunk sizes that divide the prefix, or append the tail rows to
+   the previous chunk. Free, and it removes 13 % of a 132-token run.
+
+## C2. Independent re-measurement of the tools (same card, second harness)
+
+### C2.1 What works, one measured example each
+
+Device: `RX 6950 XT (RADV NAVI21)`, radv 26.2.4, Vulkan 1.4, `timestampPeriod 10.0 ns`,
+`timestampValidBits 64` on both compute families (0 on decode/sparse-only).
+
+| tool | status here | measured example | verdict |
+|---|---|---|---|
+| `vkCmdWriteTimestamp2`, 1 per region | **works** | 20 regions / 600 dependent dispatches, 1 submit: **17.72 ms** vs **17.65 ms** with no queries = **+0.36 %** | use it — backbone of the recipe |
+| `vkCmdWriteTimestamp` v1 | works, same | 4.303 ms vs 4.292 ms (`WriteTimestamp2`) vs 4.293 (stage `NONE`) for 258 stamps | keep v1 only for compatibility |
+| per-dispatch stamps (2 × 600) | works, **expensive** | **20.22 ms** = **+14.6 %** over 17.65 ms; marginal **2.10 µs/stamp** | **no** |
+| stamp resolution | 40 ns between back-to-back stamps (p50, max 240 ns over 64) | tick 10 ns | fine for 100 µs stages |
+| `VK_AMD_buffer_marker` | advertised + enabled | 256 markers **4.328 ms** vs 258 stamps **4.348 ms** (+0.5 %) | works, **no advantage** on one queue; the only option for a second device's timeline |
+| `VK_EXT/KHR_calibrated_timestamps` | enabled; domains `DEVICE`, `CLOCK_MONOTONIC`, `CLOCK_MONOTONIC_RAW` | host−GPU offset spread **4.9–5.1 µs over 0.45 s** (unpinned sampler; A3's anchored figure is 521 ns) | use it — this is what puts host marks on the GPU timeline |
+| `VK_KHR_performance_query` | advertised, 17 counters, **crashes** | enumerates (`GPU active cycles` CYCLES, `Waves`, `Instructions`, `VALU/SALU Busy`, `LDS/SMEM/VMEM`, `VRAM read/write size`, `L0/L1/L2 hit ratio`, all `COMMAND` scope, `CONCURRENTLY_IMPACTED`), then **SIGSEGV at `libvulkan_radeon.so+0x12d0b3`** — 6/6, five of them from A7's `perfq2` | **do not use** (independent confirmation of A5) |
+| `gpu_busy_percent` (sysfs) | **free, no install** | 69 189 reads/s (0.01 ms/read); during a run the value changed **82× in 0.79 s ≈ every 20–40 ms**, spanning 0→99 % | the only zero-cost per-card sampler; 20–40 ms resolution |
+| validation layer | installed | first run: one VU about un-reset queries (harness bug, fixed), **no** VU for `stage NONE` stamps or markers | keep first-running under it |
+
+Availability, checked rather than assumed (`pacman -Ss`, no installs): `radeontop 1.4`,
+`perf 7.2`, `sysprof 51`, `apitrace 14`, `renderdoc 1.46` are packaged; **`umr`, `rgp`,
+`amdtop`, `rocm-smi`, `gfxreconstruct` are not in any configured repo**, and no RGP or
+Perfetto capture layer is installed (`/usr/share/vulkan/explicit_layer.d` = validation
+only; implicit = MangoHud, gamescope, anti-lag, device-select).
+
+### C2.2 The engine-shaped recipe, priced end to end
+
+20 stages × 30 dependent dispatches (barrier after each — a block-chunk's shape), A/B/A,
+best of 3. Whole sweep: **0.79 s**.
+
+| variant | wall | vs reference | GPU span sum | host/record residual |
+|---|---:|---:|---:|---:|
+| A untimed, one submit+fence per stage (today's engine) | 18.41 ms | — | — | — |
+| B 20 GPU regions, still 20 submits | 18.43 ms | **+0.09 % vs A** | 17.66 | 0.77 ms (4 %) |
+| C0 one submit, no queries | 17.65 ms | reference | — | — |
+| **C 20 GPU regions, one submit** | **17.72 ms** | **+0.36 % vs C0** | 17.66 | **0.059 ms (0.3 %)** |
+| D 1 200 queries, per dispatch | 20.22 ms | **+14.6 %** | — | — |
+
+Consequences beyond A6: **batching submissions is worth more than the instrumentation**
+(B → C0 = −4.2 %, i.e. **39 µs of host time per stage boundary**), and **once a pass is one
+submit, `wall − GPU busy` is a trustworthy 0.3 % measurement**. Query budget is pure
+arithmetic: `queries × 2.1 µs` — 40/token = 84 µs (0.06 % of 150 ms), 192/token (2 per
+pass per block) = 0.4 ms (0.26 %), 4 800/token = 10 ms (**7 %**).
+
+### C2.3 Reconciling 306 ns with 2.1 µs (both are right)
+
+A2 measured 306 ns/stamp in a dense run; C2 measured 2.10 µs/stamp when each stamp sits
+after a 2 000-FMA dispatch plus a barrier. A stamp is a **pipeline-flush edge**, so its
+marginal cost grows with the work in flight in front of it — the same footprint law round
+6a found for dependent barriers (1.6 µs at `bpr=2`, 5.6 µs at `bpr=10`). Budget rule that
+covers both: **0.3 µs (floor) to 2.1 µs (worst case)**, and price *your* stamp density
+with one 20-line A/B before adopting a per-stage table.
+
+## C3. Ollama: four details Part B did not name
+
+Same clone (`6c15b26`), same conclusion (Go supervisor over `llama-server` per model,
+`llm/llama_server.go:365`). Additions to B4:
+
+1. **A bypass queue, not just a scheduler** (`server/sched.go:518 useLoadedRunner`): a
+   request whose model is *already loaded* never enters the pending queue — `refCount++`,
+   stop the expire timer, hand back the runner. For 6 agents on one model this is the
+   difference between "no head-of-line blocking" and "every turn queues behind a load".
+2. **The admission threshold is a number: 80 % of free VRAM**, checked *before* spawning
+   (`sched.go:576-600`), with the ladder `num_ctx` 256k→32k→4k (`nextLowerAutoNumCtx`),
+   then `num_batch` tier (`generationBatchForContext`), then **one** evict-all retry
+   (`oomRetryAttempted`) and fail fast.
+3. **The ledger is scraped from the child, not predicted**: `memoryParsingWriter`
+   (`llama_server.go:2862-2980`) parses the child's own `model buffer size / KV buffer
+   size / compute buffer size` lines *and per-device free memory*, then uses those numbers
+   for the next placement. B4's item 3 said "emit one line per allocation"; Ollama shows
+   the stronger form — **read the runtime's own report back into the planner**.
+4. **`num_parallel` is hard-forced to 1** for `qwen3next/qwen35moe/mllama/…`
+   (`sched.go:546-552`) because those families have sequential state, and context is
+   `-c = numCtx × numParallel` (`llama_server.go:393`) — per-slot context, never shared.
+   Independent confirmation of §8af: our GDN/QSA state is sequential, so **slots buy
+   nothing and the batching win must come from the chunk dimension** (T-batched dense
+   chain), which is the item already parked behind barrier pruning.
+
+## C4. Top-3 for the next implementation round (this pass's ranking)
+
+1. **Interleave chunked prefill across streams** (C1.5-1) — the only change that both
+   improves throughput *and* repairs the metric, on the path the gate already exercises.
+2. **`gpu_busy` per chunk + calibrated-timestamp anchoring** (C1.5-2), then choose barrier
+   pruning vs T-batching from the *measured* GPU-idle fraction.
+3. **Chunk-size shaping** (C1.5-3) and a re-baseline: `132 → 64+68` (or `192 → 64×3`), and
+   re-read every prefill number in §8z–§8ag for tail contamination before quoting it.
+
+## C5. Safety log (this pass)
+
+* One crash: `rl7-attrib perf` **SIGSEGV in `libvulkan_radeon.so+0x12d0b3`** on the
+  `VK_KHR_performance_query` path, deterministic (five prior `perfq2` segfaults at the
+  same offset in `journalctl -k`). **No `amdgpu` ring/reset/page-fault lines**, both cards
+  idle at 0 % afterwards. Driver bug, not a kernel defect. This is the *third* independent
+  reproduction; treat the extension as unusable on mesa 26.2.4.
+* All harness runs on the **RX (`0000:03:00.0`)**, one process at a time, under
+  `timeout`, first run with `VK_LAYER_KHRONOS_validation`.
+* `bench agents --streams 2` (MI50 as the second stream) is the shipped gate path: two
+  runs, ~25 s and ~40 s, no faults.
+
+```bash
+# C2 numbers (0.79 s per full sweep)
+cd /var/tmp/users/korphaus/tmp/opencode/research-harnesses/rl7-attrib
+timeout 120 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ./target/release/rl7-attrib tools
+timeout 90 ./target/release/rl7-attrib perf        # CRASHES by design of the driver bug
+
+# C1 numbers
+BRECCIA_TRACE_PREFILL=1 timeout 300 ./target/release/breccia bench agents \
+  --streams 2 --devices 0000:03:00.0,0000:0e:00.0 --prefix 64 --prefill-chunk 64 --gen 1 --warm 1
+BRECCIA_TRACE_PREFILL=1 BRECCIA_TRACE_SHARED=1 timeout 300 ./target/release/breccia bench agents \
+  --streams 1 --devices 0000:03:00.0 --prefix 132 --prefill-chunk 64 --gen 1 --warm 1
+```
