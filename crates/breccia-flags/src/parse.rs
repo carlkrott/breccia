@@ -174,6 +174,10 @@ pub fn parse_llama_server_args(argv: &[String]) -> Result<LaunchPlan, FlagError>
                 seen.mark("no_host", name, position)?;
                 plan.no_host = frame.bool_flag()?;
             }
+            "--host-expert-import" => {
+                seen.mark("host_expert_import", name, position)?;
+                plan.host_expert_import = frame.bool_flag()?;
+            }
 
             // ---- context / KV ---------------------------------------------------
             "-c" | "--ctx-size" => {
@@ -687,6 +691,18 @@ mod tests {
         let plan = parse_llama_server_args(&argv(&["-fa", "--metrics"])).unwrap();
         assert_eq!(plan.flash_attn, Some(Switch::On));
         assert!(plan.metrics);
+    }
+
+    #[test]
+    fn host_expert_import_flag_parses_and_renders() {
+        assert!(!parse_str("").unwrap().host_expert_import); // default OFF
+        let plan = parse_str("--host-expert-import").unwrap();
+        assert!(plan.host_expert_import);
+        assert!(plan.render_args().contains(&"--host-expert-import".to_string()));
+        let plan = parse_str("--host-expert-import=false").unwrap();
+        assert!(!plan.host_expert_import);
+        let err = parse_str("--host-expert-import --host-expert-import").unwrap_err();
+        assert!(err.to_string().contains("duplicates"), "{err}");
     }
 
     #[test]

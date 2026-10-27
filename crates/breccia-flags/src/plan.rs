@@ -67,6 +67,10 @@ pub struct LaunchPlan {
     /// `--no-host` — do not keep host (CPU) copies of offloaded weights.
     pub no_host: bool,
 
+    /// `--host-expert-import` — zero-copy host expert import via
+    /// `VK_EXT_external_memory_host` (D4). Default OFF; no engine consumer yet.
+    pub host_expert_import: bool,
+
     /// `-c` — context size in tokens.
     pub ctx_size: Option<u32>,
 
@@ -280,6 +284,9 @@ impl LaunchPlan {
         }
         if self.no_host {
             out.push("--no-host".to_string());
+        }
+        if self.host_expert_import {
+            out.push("--host-expert-import".to_string());
         }
         if let Some(ctx) = self.ctx_size {
             push_pair(&mut out, "-c", &ctx.to_string());
@@ -522,6 +529,7 @@ mod tests {
             lzm: Some(Switch::On),
             lm: Some("none".to_string()),
             no_host: true,
+            host_expert_import: true,
             ctx_size: Some(200_000),
             kv_unified: true,
             parallel: Some(1),
@@ -570,6 +578,7 @@ mod tests {
             "-lm",
             "none",
             "--no-host",
+            "--host-expert-import",
             "-c",
             "200000",
             "-kvu",
