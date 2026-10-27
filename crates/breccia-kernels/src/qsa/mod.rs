@@ -120,6 +120,61 @@ pub struct QsaState {
     pub max_pos: usize,
 }
 
+/// **Every** byte of QSA state, from a function, because three silent wrong-value
+/// bugs this week came from a size written as a literal
+/// (`docs/phase-4/01-forward-pass.md` §8bc/§8bf).
+pub mod sizes {
+    use super::{IDX_BLOCK, IDX_DIM, MODEL_HEAD_DIM, MODEL_N_KV_HEAD, PAGE_CELLS};
+
+    /// Bytes of one f16 K/V pool for `pages` pages (`2 f16 per u32 word`).
+    pub fn f16_pool_bytes(pages: usize) -> u64 {
+        (pages * MODEL_N_KV_HEAD * PAGE_CELLS * MODEL_HEAD_DIM * 2) as u64
+    }
+
+    /// Elements per q8_0 block and bytes per block (`Q8_0`: 32 x i8 + one f32 scale).
+    pub const Q8_BLOCK_ELEMS: usize = 32;
+    /// `32 x i8 + f32 scale`.
+    pub const Q8_BLOCK_BYTES: usize = Q8_BLOCK_ELEMS + 4;
+
+    /// q8_0 blocks per KV row (`head_dim / 32` = 8, exact by construction).
+    pub fn q8_blocks_per_row() -> usize {
+        assert_eq!(
+            MODEL_HEAD_DIM % Q8_BLOCK_ELEMS,
+            0,
+            "the q8_0 V layout requires head_dim to be a multiple of the block size"
+        );
+        MODEL_HEAD_DIM / Q8_BLOCK_ELEMS
+    }
+
+    /// Bytes of the **q8_0 V pool**: every row is `q8_blocks_per_row()` blocks of
+    /// `32 x i8 + f32 scale`, versus `2 B` per element for f16.
+    pub fn q8v_pool_bytes(pages: usize) -> u64 {
+        (pages * MODEL_N_KV_HEAD * PAGE_CELLS * q8_blocks_per_row() * Q8_BLOCK_BYTES) as u64
+    }
+
+    /// The ratio a q8_0 **V** pool holds against f16 — the number the capacity
+    /// argument in §8bf turns on.
+    pub fn q8v_vs_f16() -> f64 {
+        q8v_pool_bytes(1) as f64 / f16_pool_bytes(1) as f64
+    }
+
+    /// Bytes of the indexer's pooled keys, from the block count they are indexed by.
+    pub fn pooled_idx_bytes(blocks: usize) -> u64 {
+        (blocks * IDX_DIM * 4) as u64
+    }
+
+    /// Bytes of the indexer raw tail: `(idx_block - 1)` rows, because the completing
+    /// cell arrives in registers (`qsa_idx_tail.comp`).
+    pub fn idx_tail_bytes() -> u64 {
+        ((IDX_BLOCK - 1) * IDX_DIM * 4) as u64
+    }
+
+    /// Blocks the pooled-key cache needs for `cells` cells.
+    pub fn pooled_blocks(cells: usize) -> usize {
+        cells / IDX_BLOCK + 1
+    }
+}
+
 impl QsaState {
     /// Allocate for `capacity_cells` cells (rounded up to whole pages) and a rope
     /// table of `max_pos` positions.
@@ -131,15 +186,15 @@ impl QsaState {
         }
         let pages = capacity_cells.div_ceil(PAGE_CELLS);
         let cells = pages * PAGE_CELLS;
-        let pool_words = (pages * MODEL_N_KV_HEAD * PAGE_CELLS * MODEL_HEAD_DIM / 2) as u64;
-        let max_blocks = cells / IDX_BLOCK + 1;
+        let pool_words = sizes::f16_pool_bytes(pages) / 4;
+        let max_blocks = sizes::pooled_blocks(cells);
 
         let sizes = [
-            (pool_words * 4, "kv k_pool"),
-            (pool_words * 4, "kv v_pool"),
+            (sizes::f16_pool_bytes(pages), "kv k_pool"),
+            (sizes::f16_pool_bytes(pages), "kv v_pool"),
             (pages as u64 * 4, "kv page_table"),
-            (((IDX_BLOCK - 1) * IDX_DIM * 4) as u64, "indexer tail"),
-            ((max_blocks * IDX_DIM * 4) as u64, "indexer pooled"),
+            (sizes::idx_tail_bytes(), "indexer tail"),
+            (sizes::pooled_idx_bytes(max_blocks), "indexer pooled"),
             (max_pos as u64 * 4, "position table"),
         ];
         assert_eq!(
@@ -1169,6 +1224,56 @@ impl Qsa<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::sizes::*;
+
+    /// The capacity argument of §8bf turns on these two numbers, so they are pinned:
+    /// a q8_0 **V** pool is ~0.56x the f16 pair's V half, and the pair of pools is
+    /// `2 x f16_pool_bytes` exactly.
+    #[test]
+    fn the_q8v_pool_is_the_ratio_the_capacity_argument_uses() {
+        // 32 x i8 + f32 scale = 36 B per 32 elements vs 64 B for f16
+        assert_eq!(Q8_BLOCK_BYTES, 36);
+        assert_eq!(q8_blocks_per_row(), 8);
+        let pages = 8;
+        // `f16_pool_bytes(pages)` is **one** pool (K or V): 16 KiB per page.
+        let f16_v = f16_pool_bytes(pages);
+        let q8v = q8v_pool_bytes(pages);
+        assert!(q8v < f16_v, "q8_0 V must be smaller: {q8v} vs {f16_v}");
+        let r = q8v_vs_f16();
+        assert!((0.56..0.57).contains(&r), "V ratio {r}");
+        // The whole-pool (K+V) ratio is what the agent count sees: K f16 + V q8_0.
+        let pair = (f16_v + q8v) as f64 / (2 * f16_v) as f64;
+        assert!((0.78..0.79).contains(&pair), "K+V ratio {pair}");
+        // And the per-agent arithmetic at 32K that §8bf quotes: V saves 14 MiB per block,
+        // 12 blocks -> 168 MiB/agent, 933 -> 765 MiB (4 x 765 = 3.06 GiB beside 3.3).
+        let pages_32k = 32768 / PAGE_CELLS;
+        let save_mib =
+            (f16_pool_bytes(pages_32k) - q8v_pool_bytes(pages_32k)) as f64 / (1 << 20) as f64;
+        assert!(
+            (13.9..14.1).contains(&save_mib),
+            "per-block V saving {save_mib} MiB"
+        );
+        assert!(
+            (167.0..169.0).contains(&(save_mib * 12.0)),
+            "per-agent V saving"
+        );
+    }
+
+    /// Positional lists are checked against the index counts they are consumed by.
+    #[test]
+    fn the_indexer_sizes_follow_their_index_counts() {
+        assert_eq!(idx_tail_bytes(), ((IDX_BLOCK - 1) * IDX_DIM * 4) as u64);
+        let cells = 32768;
+        let blocks = pooled_blocks(cells);
+        assert_eq!(blocks, cells / 4 + 1);
+        assert_eq!(pooled_idx_bytes(blocks), (blocks * 128 * 4) as u64);
+    }
+
+    #[test]
+    fn a_head_dim_that_is_not_a_block_multiple_is_refused() {
+        assert_eq!(MODEL_HEAD_DIM % Q8_BLOCK_ELEMS, 0);
+    }
+
     use super::*;
 
     #[test]
