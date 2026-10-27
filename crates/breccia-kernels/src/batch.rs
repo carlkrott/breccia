@@ -82,6 +82,11 @@ pub struct GemvBatch<'g> {
     gpu: &'g Gpu,
     kernel: breccia_vk::ctx::Kernel,
     tables: Buf,
+    /// `Some(s)` when the `silu_div` epilogue is fused (see
+    /// [`GemvBatch::with_epilogue`]): `s` is the divisor.
+    epilogue: Option<f32>,
+    /// The `_hcact` build of [`GemvBatch::kernel`].
+    ep_kernel: Option<breccia_vk::ctx::Kernel>,
 }
 
 impl<'g> GemvBatch<'g> {
@@ -128,7 +133,43 @@ impl<'g> GemvBatch<'g> {
             gpu,
             kernel,
             tables,
+            epilogue: None,
+            ep_kernel: None,
         })
+    }
+
+    /// Fuse the HC bottleneck activation (`ActMode::SiluDiv`; §4.1) into the
+    /// batched projection's epilogue: `out[r] = silu(acc[r] / s)`, applied after
+    /// full accumulation, so it is bit-identical to the separate `Act` dispatch
+    /// it replaces (see [`crate::Gemv::with_epilogue`]).
+    ///
+    /// `Err` when this `{type, accumulator}` has no `_hcact` build.
+    pub fn with_epilogue(mut self, s: f32) -> Result<Self> {
+        if !s.is_finite() || s == 0.0 {
+            return Err(anyhow!("the epilogue divisor must be finite and non-zero"));
+        }
+        let spv = gemv_moe_hcact_spv(self.ty, self.accum).ok_or_else(|| {
+            anyhow!(
+                "no `_hcact` batched GEMV build for {} ({} accum); the epilogue \
+                 fusion is compiled for BF16 and F32 only",
+                self.ty,
+                self.accum
+            )
+        })?;
+        let k = self.gpu.kernel(spv, 5).map_err(|e| {
+            anyhow!(
+                "creating the {} batched GEMV epilogue pipeline: {e}",
+                self.ty
+            )
+        })?;
+        self.ep_kernel = Some(k);
+        self.epilogue = Some(s);
+        Ok(self)
+    }
+
+    /// The divisor of the fused `silu_div` epilogue (`None` = separate `Act`).
+    pub fn epilogue(&self) -> Option<f32> {
+        self.epilogue
     }
 
     pub fn ty(&self) -> QuantType {
@@ -214,12 +255,42 @@ impl<'g> GemvBatch<'g> {
 
     /// Bind the five buffers of a batched dispatch.
     pub fn bind(&self, w: &Buf, x: &Buf, out: &Buf, map: &Buf) -> Result<()> {
+        let bufs = [w.buf, x.buf, out.buf, self.tables.buf, map.buf];
         self.gpu
-            .bind_kernel(
-                &self.kernel,
-                &[w.buf, x.buf, out.buf, self.tables.buf, map.buf],
-            )
-            .map_err(|e| anyhow!("{e}"))
+            .bind_kernel(&self.kernel, &bufs)
+            .map_err(|e| anyhow!("{e}"))?;
+        if let Some(k) = &self.ep_kernel {
+            self.gpu.bind_kernel(k, &bufs).map_err(|e| anyhow!("{e}"))?;
+        }
+        Ok(())
+    }
+
+    /// The push constants the kernels read: the 16-byte prefix, extended to 24
+    /// (word 5 `ep`) for the `_hcact` build. Returns what to push.
+    fn pc(&self, rows: usize) -> [u8; 24] {
+        let mut pc = [0u8; 24];
+        pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
+        pc[4..8].copy_from_slice(&(self.cols as u32).to_le_bytes());
+        pc[8..12].copy_from_slice(&(self.blocks_per_row() as u32).to_le_bytes());
+        pc[12..16].copy_from_slice(&1u32.to_le_bytes()); // splits = 1
+        if let Some(s) = self.epilogue {
+            pc[20..24].copy_from_slice(&s.to_le_bytes());
+        }
+        pc
+    }
+
+    /// Bytes of [`GemvBatch::pc`] to push (24 with the epilogue, else 16).
+    fn pc_len(&self) -> usize {
+        if self.epilogue.is_some() {
+            24
+        } else {
+            16
+        }
+    }
+
+    /// The pipeline that writes `O` (with the activation wired in when fused).
+    fn out_kernel(&self) -> &breccia_vk::ctx::Kernel {
+        self.ep_kernel.as_ref().unwrap_or(&self.kernel)
     }
 
     /// Record one batched dispatch. `pub(crate)` so the HC mixer
@@ -231,27 +302,24 @@ impl<'g> GemvBatch<'g> {
         let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
         let gx = groups.min(WG_X_MAX);
         let gy = groups.div_ceil(WG_X_MAX);
-        let mut pc = [0u8; 16];
-        pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
-        pc[4..8].copy_from_slice(&(self.cols as u32).to_le_bytes());
-        pc[8..12].copy_from_slice(&(self.blocks_per_row() as u32).to_le_bytes());
-        pc[12..16].copy_from_slice(&1u32.to_le_bytes()); // splits = 1
+        let pc = self.pc(rows);
+        let k = self.out_kernel();
         unsafe {
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.kernel.pipe);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipe);
             d.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                self.kernel.layout,
+                k.layout,
                 0,
-                &[self.kernel.set],
+                &[k.set],
                 &[],
             );
             d.cmd_push_constants(
                 cmd,
-                self.kernel.layout,
+                k.layout,
                 vk::ShaderStageFlags::COMPUTE,
                 0,
-                &pc,
+                &pc[..self.pc_len()],
             );
             d.cmd_dispatch(cmd, gx, gy, 1);
         }
@@ -267,16 +335,12 @@ impl<'g> GemvBatch<'g> {
             let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
             let gx = groups.min(WG_X_MAX);
             let gy = groups.div_ceil(WG_X_MAX);
-            let mut pc = [0u8; 16];
-            pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
-            pc[4..8].copy_from_slice(&(self.cols as u32).to_le_bytes());
-            pc[8..12].copy_from_slice(&(self.blocks_per_row() as u32).to_le_bytes());
-            pc[12..16].copy_from_slice(&1u32.to_le_bytes());
+            let pc = self.pc(rows);
             return crate::dispatch_batch::record(
                 self.gpu,
-                &self.kernel,
+                self.out_kernel(),
                 &[w, x, out, &self.tables, map],
-                &pc,
+                &pc[..self.pc_len()],
                 (gx, gy, 1),
             );
         }
@@ -320,6 +384,9 @@ impl<'g> GemvBatch<'g> {
 
 impl Drop for GemvBatch<'_> {
     fn drop(&mut self) {
+        if let Some(k) = &self.ep_kernel {
+            self.gpu.destroy_kernel(k);
+        }
         self.gpu.destroy_kernel(&self.kernel);
         self.gpu.destroy_buf(&self.tables);
     }
@@ -352,6 +419,17 @@ macro_rules! spv {
     ($stem:literal) => {
         include_bytes!(concat!(env!("OUT_DIR"), "/", $stem, ".spv"))
     };
+}
+
+/// The `_hcact` build of the batched GEMV (`silu_div` in the epilogue), or
+/// `None` when this type has none — `build.rs::EPILOGUE_SHADERS` covers BF16 and
+/// F32, i.e. the artifact's `hc_*` type and the conformance suite.
+fn gemv_moe_hcact_spv(ty: QuantType, accum: Accum) -> Option<&'static [u8]> {
+    match (ty, accum) {
+        (QuantType::Bf16, Accum::F32) => Some(spv!("gemv_bf16_moe_hcact")),
+        (QuantType::F32, Accum::F32) => Some(spv!("gemv_f32_moe_hcact")),
+        _ => None,
+    }
 }
 
 fn gemv_moe_spv(ty: QuantType, accum: Accum) -> &'static [u8] {

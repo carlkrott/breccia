@@ -30,6 +30,10 @@
 #ifndef BRECCIA_GEMV_BODY_GLSL
 #define BRECCIA_GEMV_BODY_GLSL
 
+#ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV
+#include "ops_math.glsl"
+#endif
+
 layout(local_size_x = 256) in;
 
 #define LANES 32u
@@ -150,6 +154,14 @@ void main() {
         facc += subgroupShuffleXor(facc, off);
     }
     if (lane == 0u) {
+#ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV
+        // The bottleneck activation as the GEMV's epilogue: `silu(acc / s)` on
+        // exactly the value a separate `ops_act.comp` dispatch would read back
+        // (`s` = the stream count), after the full accumulation and the
+        // cross-lane reduce. Bit-identical by construction — same arithmetic,
+        // same order, one fewer dispatch per call.
+        facc = breccia_silu(facc / pc.ep);
+#endif
         O[sid * pc.rows + row] = facc;
     }
 }

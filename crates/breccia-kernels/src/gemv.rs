@@ -112,6 +112,14 @@ pub struct Gemv<'g> {
     tables: Buf,
     /// Split-K reduction pipeline (`shaders/gemv_reduce.comp`).
     reduce: breccia_vk::ctx::Kernel,
+    /// `Some(s)` when the `silu_div` epilogue is fused (see
+    /// [`Gemv::with_epilogue`]): `s` is the divisor.
+    epilogue: Option<f32>,
+    /// The `_hcact` build of [`Gemv::kernel`] (used when `splits == 1`).
+    ep_kernel: Option<breccia_vk::ctx::Kernel>,
+    /// The `_hcact` build of [`Gemv::reduce`] (used when `splits > 1`: the
+    /// partials have to stay raw, so the activation moves into the sum).
+    ep_reduce: Option<breccia_vk::ctx::Kernel>,
 }
 
 impl<'g> Gemv<'g> {
@@ -168,7 +176,60 @@ impl<'g> Gemv<'g> {
             kernel,
             tables,
             reduce,
+            epilogue: None,
+            ep_kernel: None,
+            ep_reduce: None,
         })
+    }
+
+    /// Fuse the HC bottleneck activation (`ActMode::SiluDiv`, `docs/specs/
+    /// qwen4exp-architecture.md` §4.1) into this projection's epilogue:
+    /// `out = silu(acc / s)`.
+    ///
+    /// `s` is the divisor the separate [`crate::ops::Act`] dispatch would apply,
+    /// so the fused result is **bit-identical by construction**: the epilogue runs
+    /// on the fully accumulated row value, in the same order, with the same
+    /// `breccia_silu`. With `splits > 1` the partial products must stay raw, so the
+    /// activation rides in the reduce pass instead of the main kernel — either way
+    /// the value in `out` is what `Act` would have written.
+    ///
+    /// `Err` when this `{type, accumulator}` has no `_hcact` build (see
+    /// [`has_hc_epilogue`]).
+    pub fn with_epilogue(mut self, s: f32) -> Result<Self> {
+        if !s.is_finite() || s == 0.0 {
+            return Err(anyhow!("the epilogue divisor must be finite and non-zero"));
+        }
+        let spv = gemv_hcact_spv(self.ty, self.accum).ok_or_else(|| {
+            anyhow!(
+                "no `_hcact` GEMV build for {} ({} accum); the epilogue fusion \
+                 is compiled for BF16 and F32 only",
+                self.ty,
+                self.accum
+            )
+        })?;
+        let ep = self
+            .gpu
+            .kernel(spv, 4)
+            .map_err(|e| anyhow!("creating the {} GEMV epilogue pipeline: {e}", self.ty))?;
+        let ep_reduce = match self.gpu.kernel(
+            include_bytes!(concat!(env!("OUT_DIR"), "/gemv_reduce_hcact.spv")),
+            2,
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                self.gpu.destroy_kernel(&ep);
+                return Err(anyhow!("creating the epilogue reduce pipeline: {e}"));
+            }
+        };
+        self.ep_kernel = Some(ep);
+        self.ep_reduce = Some(ep_reduce);
+        self.epilogue = Some(s);
+        Ok(self)
+    }
+
+    /// The divisor of the fused `silu_div` epilogue (`None` = separate `Act`).
+    pub fn epilogue(&self) -> Option<f32> {
+        self.epilogue
     }
 
     pub fn ty(&self) -> QuantType {
@@ -209,6 +270,39 @@ impl<'g> Gemv<'g> {
         pc
     }
 
+    /// The push constants a pipeline reads: the 16-byte prefix every GEMV build
+    /// declares, extended to 24 bytes (word 5 `ep`) for the `_hcact` builds.
+    /// Returns the length to push.
+    fn fill_pc(&self, out: &mut [u8; 24], splits: u32, ep: Option<f32>) -> usize {
+        out[..16].copy_from_slice(&self.push_constants(splits));
+        match ep {
+            None => 16,
+            Some(s) => {
+                out[20..24].copy_from_slice(&s.to_le_bytes());
+                24
+            }
+        }
+    }
+
+    /// The pipeline that writes `O`, and the epilogue it applies: the main
+    /// kernel with the activation wired in when there is no split-K, otherwise
+    /// the plain one (its output is raw partials).
+    fn out_kernel(&self, splits: u32) -> (&breccia_vk::ctx::Kernel, Option<f32>) {
+        match (&self.ep_kernel, self.epilogue) {
+            (Some(k), Some(s)) if splits.max(1) == 1 => (k, Some(s)),
+            _ => (&self.kernel, None),
+        }
+    }
+
+    /// The pipeline that sums the split-K partials into `O`, and the epilogue it
+    /// applies (`Some` for the `_hcact` reduce build).
+    fn sum_kernel(&self) -> (&breccia_vk::ctx::Kernel, Option<f32>) {
+        match (&self.ep_reduce, self.epilogue) {
+            (Some(k), Some(s)) => (k, Some(s)),
+            _ => (&self.reduce, None),
+        }
+    }
+
     /// Row-group workgroups split over `(x, y)` so `x` never exceeds the
     /// guaranteed `maxComputeWorkGroupCount[0]` of 65535 (see `gemv_body.glsl`).
     fn grid_for(&self, rows_per_wg: usize) -> (u32, u32) {
@@ -219,49 +313,41 @@ impl<'g> Gemv<'g> {
     }
 
     fn dispatch_split(&self, d: &ash::Device, cmd: vk::CommandBuffer, splits: u32) {
+        let (k, ep) = self.out_kernel(splits);
+        let mut pc = [0u8; 24];
+        let n = self.fill_pc(&mut pc, splits, ep);
         let (gx, gy) = self.grid_for(ROWS_PER_WG);
-        let push = self.push_constants(splits);
         unsafe {
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.kernel.pipe);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipe);
             d.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                self.kernel.layout,
+                k.layout,
                 0,
-                &[self.kernel.set],
+                &[k.set],
                 &[],
             );
-            d.cmd_push_constants(
-                cmd,
-                self.kernel.layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                &push,
-            );
+            d.cmd_push_constants(cmd, k.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc[..n]);
             d.cmd_dispatch(cmd, gx, gy, splits.max(1));
         }
     }
 
     fn dispatch_reduce(&self, d: &ash::Device, cmd: vk::CommandBuffer, splits: u32) {
+        let (k, ep) = self.sum_kernel();
+        let mut pc = [0u8; 24];
+        let n = self.fill_pc(&mut pc, splits, ep);
         let (gx, gy) = self.grid_for(256);
-        let push = self.push_constants(splits);
         unsafe {
-            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.reduce.pipe);
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipe);
             d.cmd_bind_descriptor_sets(
                 cmd,
                 vk::PipelineBindPoint::COMPUTE,
-                self.reduce.layout,
+                k.layout,
                 0,
-                &[self.reduce.set],
+                &[k.set],
                 &[],
             );
-            d.cmd_push_constants(
-                cmd,
-                self.reduce.layout,
-                vk::ShaderStageFlags::COMPUTE,
-                0,
-                &push,
-            );
+            d.cmd_push_constants(cmd, k.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc[..n]);
             d.cmd_dispatch(cmd, gx, gy, 1);
         }
     }
@@ -307,7 +393,15 @@ impl<'g> Gemv<'g> {
     pub fn bind(&self, w: &Buf, x: &Buf, out: &Buf) -> Result<()> {
         self.gpu
             .bind_kernel(&self.kernel, &[w.buf, x.buf, out.buf, self.tables.buf])
-            .map_err(|e| anyhow!("{e}"))
+            .map_err(|e| anyhow!("{e}"))?;
+        // The epilogue build is a pipeline of its own, hence a descriptor set of
+        // its own; binding it here keeps `run` a single wall_run.
+        if let Some(k) = &self.ep_kernel {
+            self.gpu
+                .bind_kernel(k, &[w.buf, x.buf, out.buf, self.tables.buf])
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+        Ok(())
     }
 
     /// The table buffer this pipeline binds (for callers that bind manually).
@@ -341,13 +435,18 @@ impl<'g> Gemv<'g> {
         bufs: &[&Buf],
         reduce_bufs: Option<&[&Buf]>,
     ) -> Result<()> {
-        let pc = self.push_constants(splits);
+        let (k, ep) = self.out_kernel(splits);
+        let mut pc = [0u8; 24];
+        let n = self.fill_pc(&mut pc, splits, ep);
         let (gx, gy) = self.grid_for(ROWS_PER_WG);
-        crate::dispatch_batch::record(gpu, &self.kernel, bufs, &pc, (gx, gy, splits.max(1)))?;
+        crate::dispatch_batch::record(gpu, k, bufs, &pc[..n], (gx, gy, splits.max(1)))?;
         if splits > 1 {
+            let (rk, rep) = self.sum_kernel();
+            let mut rpc = [0u8; 24];
+            let rn = self.fill_pc(&mut rpc, splits, rep);
             let (rx, ry) = self.grid_for(256);
             if let Some(rb) = reduce_bufs {
-                crate::dispatch_batch::record(gpu, &self.reduce, rb, &pc, (rx, ry, 1))?;
+                crate::dispatch_batch::record(gpu, rk, rb, &rpc[..rn], (rx, ry, 1))?;
             }
         }
         Ok(())
@@ -375,7 +474,7 @@ impl<'g> Gemv<'g> {
         }
         self.bind(w, x, partials)?;
         self.gpu
-            .bind_kernel(&self.reduce, &[partials.buf, out.buf])
+            .bind_kernel(self.sum_kernel().0, &[partials.buf, out.buf])
             .map_err(|e| anyhow!("{e}"))?;
         self.gpu
             .wall_run(Qc::C, |d, cmd| {
@@ -400,7 +499,7 @@ impl<'g> Gemv<'g> {
         let splits = splits.max(1);
         self.bind(w, x, partials)?;
         self.gpu
-            .bind_kernel(&self.reduce, &[partials.buf, out.buf])
+            .bind_kernel(self.sum_kernel().0, &[partials.buf, out.buf])
             .map_err(|e| anyhow!("{e}"))?;
         let t = self
             .gpu
@@ -474,7 +573,7 @@ impl<'g> Gemv<'g> {
         let splits = splits.max(1);
         self.bind(w, x, partials)?;
         self.gpu
-            .bind_kernel(&self.reduce, &[partials.buf, out.buf])
+            .bind_kernel(self.sum_kernel().0, &[partials.buf, out.buf])
             .map_err(|e| anyhow!("{e}"))?;
         let reps = reps.max(1) as u32;
         let t = self
@@ -524,6 +623,12 @@ impl<'g> Gemv<'g> {
 
 impl Drop for Gemv<'_> {
     fn drop(&mut self) {
+        if let Some(k) = &self.ep_reduce {
+            self.gpu.destroy_kernel(k);
+        }
+        if let Some(k) = &self.ep_kernel {
+            self.gpu.destroy_kernel(k);
+        }
         self.gpu.destroy_kernel(&self.reduce);
         self.gpu.destroy_kernel(&self.kernel);
         self.gpu.destroy_buf(&self.tables);
@@ -750,6 +855,23 @@ fn gemv_spv(ty: QuantType, accum: Accum) -> &'static [u8] {
         (QuantType::F32, Accum::F32) => spv!("gemv_f32"),
         (QuantType::F32, Accum::F16) => spv!("gemv_f32_f16acc"),
     }
+}
+
+/// The `_hcact` (epilogue-fused) build of the GEMV for `{ty, accum}`, or `None`
+/// when this type has none — `build.rs::EPILOGUE_SHADERS` compiles BF16 and F32
+/// only, which covers the artifact's `hc_*` type and the conformance suite.
+pub fn gemv_hcact_spv(ty: QuantType, accum: Accum) -> Option<&'static [u8]> {
+    match (ty, accum) {
+        (QuantType::Bf16, Accum::F32) => Some(spv!("gemv_bf16_hcact")),
+        (QuantType::F32, Accum::F32) => Some(spv!("gemv_f32_hcact")),
+        _ => None,
+    }
+}
+
+/// `true` when [`Gemv::with_epilogue`] can be used for `ty` — the predicate the
+/// HC mixer uses to decide whether the `down` GEMV can carry the `Act`.
+pub fn has_hc_epilogue(ty: QuantType) -> bool {
+    gemv_hcact_spv(ty, Accum::F32).is_some()
 }
 
 fn dequant_spv(ty: QuantType) -> &'static [u8] {

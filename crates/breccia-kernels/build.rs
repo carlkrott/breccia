@@ -121,6 +121,13 @@ const SHADERS: &[&str] = &[
     "moe_combine",
 ];
 
+/// GEMV stems that get the `silu_div` epilogue build (`_hcact`), i.e. the ones
+/// the HC mixer's `down` projection can be constructed with: the artifact ships
+/// BF16 `hc_*` weights (§14) and the conformance suite uses F32, in both the
+/// batched (multi-token) and the single-expert split-K (one token) shape.
+/// `breccia_kernels::gemv::has_hc_epilogue` mirrors this list.
+const EPILOGUE_SHADERS: &[&str] = &["gemv_bf16", "gemv_bf16_moe", "gemv_f32", "gemv_f32_moe"];
+
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=GLSLC");
@@ -139,6 +146,20 @@ fn main() {
                 name,
                 &format!("{name}_f16acc"),
                 &["BRECCIA_F16_ACCUM"],
+            );
+        }
+        // The `down`-GEMV + `Act` epilogue build (HC mixer, `docs/phase-4/01`
+        // §8at): the same shader with `silu(acc / s)` applied to the row value
+        // just before it is stored. A separate pipeline rather than a runtime
+        // branch, so the default pipeline keeps byte-identical SPIR-V (the
+        // sanctioned shape for a wired kernel change, `AGENTS.md`).
+        if EPILOGUE_SHADERS.contains(name) || *name == "gemv_reduce" {
+            compile(
+                &glslc,
+                &out_dir,
+                name,
+                &format!("{name}_hcact"),
+                &["BRECCIA_GEMV_EPILOGUE_SILU_DIV"],
             );
         }
     }

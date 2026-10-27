@@ -10,6 +10,10 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
 
+#ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV
+#include "ops_math.glsl"
+#endif
+
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer Partials { float P[]; };
@@ -20,6 +24,10 @@ layout(push_constant) uniform Params {
     uint cols;   // unused (same 16-byte layout as the GEMV kernels)
     uint bpr;    // unused
     uint splits;
+#ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV
+    uint base;   // unused (the shared word-5 slot, see blocks.glsl)
+    float ep;    // the `silu_div` divisor, applied after the sum
+#endif
 } pc;
 
 // grid.x is capped at the guaranteed 65535 workgroups (see gemv_body.glsl), so
@@ -37,5 +45,10 @@ void main() {
     for (uint s = 0u; s < n; ++s) {
         acc += P[s * pc.rows + row];
     }
+#ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV
+    // With split-K the partials must stay raw, so the epilogue lands here: the
+    // same `silu(acc / s)` a separate `Act` dispatch would apply to `O`.
+    acc = breccia_silu(acc / pc.ep);
+#endif
     O[row] = acc;
 }

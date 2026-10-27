@@ -3552,6 +3552,140 @@ dressed up.
 **Next round's first commit, in this order:** `down+Act` fused epilogue behind
 `BRECCIA_NO_HC_FUSED` -> parity -> measure; then `up+HcGatedMean`.
 
+## 8au. `down`+`Act` landed as a GEMV epilogue: **-97 dispatches/token**, parity 32/32
+
+The first of §8at's two fusions is in and on by default: the HC bottleneck activation
+(`silu(x / hc)`, §4.1) is now the **epilogue of the `down` GEMV** instead of a dispatch of
+its own. One switch reverts it: **`BRECCIA_NO_HC_EPILOGUE=1`**.
+
+### What changed (a *wired* change, the lowest-risk class)
+
+Same bindings, same resources, same accumulation order — the activation is applied to the
+accumulated row value just before it is stored:
+
+* `shaders/blocks.glsl`: a sixth push-constant word `ep` behind
+  `#ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV` (the GEMV builds push 16 bytes, the `_hcact`
+  builds 24; the pipeline layout's range was already 32).
+* `shaders/gemv_body.glsl` / `shaders/gemv_reduce.comp`: `facc = breccia_silu(facc / pc.ep)`
+  inside the `lane == 0` store — and in the **reduce** kernel too, because with split-K the
+  partial products must stay raw, so there the activation follows the sum.
+* `build.rs`: sibling builds, same pattern as the `_f16acc` variants —
+  `gemv_{bf16,f32}{,_moe}_hcact` +
+  `gemv_reduce_hcact` (5 extra `glslc` runs). A separate pipeline, not a runtime branch, so
+  the default pipelines keep byte-identical SPIR-V — the same reason `BRECCIA_F16_ACCUM`
+  is a build variant.
+* `src/gemv.rs`, `src/batch.rs`: `Gemv::with_epilogue(s)` / `GemvBatch::with_epilogue(s)`;
+  the epilogue pipelines carry their own descriptor sets, so `bind` binds both and `run`
+  stays a single `wall_run`.
+* `src/ops/mod.rs` (`HcMixer::new`, `read`, `run_down`, `stage_timings`): the fused `down`
+  writes **`ws.lo`** directly (the activated value) and `read` skips the `act.run`;
+  `stage_timings` reports a zero `act` slot and its cost inside `down`.
+
+### It is bit-identical, and that is a test, not a claim
+
+`conformance::hc_epilogue_matches_a_separate_act_bit_for_bit` builds the incumbent path
+(`Gemv`/`GemvBatch` **+ `Act`**) and the fused one on the real `hc_down` shape
+(320x10240, BF16) and compares `to_bits()`, on all three shapes the mixer uses:
+
+| path | result |
+|---|---|
+| single-expert **split-K** (`T = 1`, splits 4, activation in the reduce pass) | bit-identical |
+| single-expert **unsplit** (splits 1, activation in the GEMV) | bit-identical |
+| **batched** (`T > 1`, 2 experts, `PerExpert` x) | bit-identical |
+
+RX 6950 XT validation run (first run of the new shader, `AGENTS.md` procedure):
+
+```bash
+timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+  BRECCIA_KERNEL_DEVICE=0000:03:00.0 \
+  cargo test -p breccia-kernels --test conformance hc_epilogue -- --test-threads=1 --nocapture
+```
+
+`spirv-val` clean at build time, **no VU message from the new pipelines** (the only
+validation message is the pre-existing `VUID-VkPhysicalDeviceRobustness2FeaturesKHR-...-04000`
+device-creation notice), `power_dpm_force_performance_level` = `high` before and after, no
+reset. The whole `ops_conformance` HC suite matches its CPU reference to the same
+`1.98e-7` **with the flag on and off**.
+
+### Parity (the gate): 32/32 at every chunk, top-1 unchanged
+
+`bench token --devices 0000:03:00.0 --prompt-ids <27-token reference> --gen 32`, 32 greedy
+tokens compared against `/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json`:
+
+| `--prefill-chunk` | 8 | 16 | 32 | 128 |
+|---|---|---|---|---|
+| tokens matched | **32/32** | **32/32** | **32/32** | **32/32** |
+| top-1 logit | 13.1706 | 13.1706 | 13.1706 | 13.1706 |
+
+Both arms of every A/B generate the reference ids; the `repeat: max |Δlogit| 0.000e0` line
+is unchanged too.
+
+### Dispatches: **-97 per token**, and why it is 97 and not 96
+
+Census (`BRECCIA_TRACE_DISPATCH=1`, the modal per-token total over 23 consecutive tokens,
+each configuration):
+
+| configuration | flag off | flag on | delta |
+|---|---:|---:|---:|
+| 48 blocks on the host lane, chunk 8 | 1 603 | **1 506** | **-97** |
+| 11 resident expert blocks, chunk 32 | 1 691 | **1 594** | **-97** |
+
+The -97 is exact: **48 blocks x 2 HC_READs + the final mixer's 1 = 97** calls per token.
+§8at's arithmetic said 96 because it counted only the 96 block reads; the final mixer
+(`final_hc`, `HcMixer::read` with `with_inject = false`) is the 97th, and its own census
+line drops 7 -> 6. Scaled to §8ap's 1 843-dispatch token the same constant shift gives
+**1 843 -> 1 746**, not 1 747. Barriers fall with it: 145 066 -> 134 274 emitted per run
+(0.81 -> 0.80 per dispatch).
+
+### `wait-gpu` / `lane` / tok/s: 0.4 % at best, and not resolvable in this window
+
+Warm paired A/B/A at chunk 32 with 11 resident blocks (`--warm 1`):
+
+| arm | tok/s | ms/token | `wait-gpu` | barriers/dispatch |
+|---|---:|---:|---:|---:|
+| fused | 18.85 | 53.05 | 22.102 | 0.80 |
+| flag off | 19.17 | 52.16 | 22.186 | 0.81 |
+| fused | 18.93 | 52.82 | 22.092 | 0.80 |
+
+`wait-gpu` moves by **-0.09 ms/token (-0.4 %, the right sign, three runs)**; tok/s moves
+-1.5 %, which is *inside this window's own spread*: identical commands produced 11.98 and
+17.73 tok/s in the same arm minutes apart, and `experts(host)` (the host lane, 42 % of the
+token) varies by 20 % between runs. Per `docs/REPRODUCE.md` §0b that is a contaminated
+window, not a regression: 97 dispatches at ~0.3 us of recording is 30 us of a 52 ms token.
+**The dispatch count is the round's measurable deliverable; the wall-clock effect of this
+one fusion is below the noise floor of a host-lane-bound run** and needs a GPU-bound,
+quiet window (resident blocks and an idle box) to be quoted.
+
+### `up` + `HcGatedMean` is **not** a wired epilogue (and was not attempted)
+
+§8at lists it beside `down`+`Act`, but the shapes do not line up, so it is not the
+lowest-risk class and would be a new kernel:
+
+* `ops/mod.rs:1930` — the `up` GEMV emits `gate[c][d]`, one **row per output element**, and
+  a workgroup owns 8 *consecutive* rows (`ROWS_PER_WG`), i.e. 8 consecutive `d` of **one**
+  stream `c` (`gate` is `[n_embd, hc, T]`, so consecutive rows are consecutive `d` within a
+  stream).
+* `ops_hc_gated_mean.comp` — `mixed[d] = (1/hc) sum_c xn[c][d] * sigmoid(gate[c][d])` needs
+  **all `hc` streams at one `d`**, and those values live `n_embd` rows apart.
+
+A workgroup that owns 8 rows of `up` therefore cannot see the other three streams, so an
+epilogue cannot form `mixed`. The fusion needs `up` **blocked by column** (one workgroup
+owning a `d`-range across all `hc` rows) — a different tiling, a different x stride and a
+different output order: a new kernel with its own parity run, not a push-constant word.
+That is the next shader round, not this one.
+
+### State
+
+| quantity | value |
+|---|---:|
+| `down`+`Act` | **landed, on by default** (`BRECCIA_NO_HC_EPILOGUE=1` reverts) |
+| dispatches/token | **1 594** resident / **1 506** host-lane (was 1 691 / 1 603) |
+| parity (32 greedy tokens vs the HIP server) | **32/32** at chunk 8/16/32/128 |
+| top-1 logit | 13.1706 (13.170561) |
+| `wait-gpu` | 22.09-22.10 vs 22.19 ms/token (-0.4 %) |
+| tok/s | 18.89 vs 19.17 — inside the window's noise, not a result |
+| `cargo test --workspace` / clippy / fmt / `verify.sh` | all clean |
+
 ## 9. Exact commands
 
 

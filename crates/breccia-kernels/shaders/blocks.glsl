@@ -81,6 +81,15 @@ layout(push_constant) uniform Params {
     // resident arena, in 16-bit words. The GEMV dispatches push 16 bytes and never
     // read it; the multi-user GEMM pushes 20.
     uint base;
+#ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV
+    // 6th word, the `_hcact` GEMV builds only: the `silu_div` divisor `s` of the
+    // activation applied to the accumulated row value before it is stored (the
+    // HC mixer's bottleneck activation, `ops_act.comp` mode `SiluDiv`). Those
+    // builds push 24 bytes. It is a *wired* addition — same bindings, same
+    // resources, same accumulation order — so the value the kernel stores is
+    // bit-identical to what a separate `Act` dispatch reads back and rewrites.
+    float ep;
+#endif
 } pc;
 #endif
 

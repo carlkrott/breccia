@@ -653,3 +653,141 @@ fn large_dispatch_wraps_over_grid_y() {
         4_194_304u64 / 64
     );
 }
+
+/// The `down` GEMV + `Act` fusion (`docs/phase-4/01` §8at) must be
+/// **bit-identical** to the two dispatches it replaces — that is the whole
+/// claim, and it is checked here on the three shapes the HC mixer uses rather
+/// than asserted in a comment:
+///
+/// * the single-expert **split-K** path (`T = 1`, the decode shape): the
+///   partials stay raw and the activation moves into the reduce pass;
+/// * the **unsplit** single-expert path (`splits == 1`): the activation is the
+///   GEMV's own epilogue;
+/// * the **batched** path (`T > 1`): each row's scalar gets the same epilogue.
+///
+/// The reference on every line is literally `Gemv`/`GemvBatch` + `Act`, i.e. the
+/// incumbent two-dispatch path, so a pass here is a proof, not a tolerance.
+#[test]
+fn hc_epilogue_matches_a_separate_act_bit_for_bit() {
+    use breccia_kernels::ops::{Act, ActMode};
+
+    let fx = need_gpu!();
+    let dev = fx.dev;
+    let gpu = dev.gpu();
+    let s = 4.0f32; // the HC stream count: `silu(x / hc)`
+    let act = Act::new(gpu, ActMode::SiluDiv).expect("act pipeline");
+    // The artifact's `hc_*` type (§14) and the real `hc_down` shape.
+    let ty = QuantType::Bf16;
+    let rows = 320usize;
+    let cols = 4 * 2560usize;
+    let shape = bench::Shape::new(rows, cols);
+    let (packed, x) = real::synthetic_inputs(ty, shape, 0x7a17);
+
+    let w = breccia_kernels::gemv::upload(gpu, &packed).expect("upload w");
+    let xb = breccia_kernels::gemv::upload(gpu, &bench::f32_to_bytes(&x)).expect("upload x");
+    let raw = breccia_kernels::gemv::alloc(gpu, (rows * 4) as u64).expect("raw");
+    let want_buf = breccia_kernels::gemv::alloc(gpu, (rows * 4) as u64).expect("want");
+    let got_buf = breccia_kernels::gemv::alloc(gpu, (rows * 4) as u64).expect("got");
+
+    // ---- (a) split-K: partials raw, activation in the reduce pass ----------
+    let splits = 4u32;
+    let part = breccia_kernels::gemv::alloc(gpu, {
+        let g = Gemv::new(gpu, ty, rows, cols).expect("plain gemv");
+        g.partial_bytes(splits)
+    })
+    .expect("partials");
+    let plain = Gemv::new(gpu, ty, rows, cols).expect("plain gemv");
+    let fused = Gemv::new(gpu, ty, rows, cols)
+        .expect("plain gemv")
+        .with_epilogue(s)
+        .expect("epilogue gemv");
+    plain
+        .run_split(&w, &xb, &part, &raw, splits)
+        .expect("plain split gemv");
+    act.run(&raw, &want_buf, rows, s).expect("act");
+    fused
+        .run_split(&w, &xb, &part, &got_buf, splits)
+        .expect("fused split gemv");
+    let want = bench::read_out(dev, &want_buf, rows).expect("read want");
+    let got = bench::read_out(dev, &got_buf, rows).expect("read got");
+    assert_bits_equal(&got, &want, &format!("split-K splits={splits}"));
+    gpu.destroy_buf(&part);
+    drop(plain);
+    drop(fused);
+
+    // ---- (b) unsplit: the activation is the GEMV's own epilogue ------------
+    let plain = Gemv::new(gpu, ty, rows, cols).expect("plain gemv");
+    let fused = Gemv::new(gpu, ty, rows, cols)
+        .expect("plain gemv")
+        .with_epilogue(s)
+        .expect("epilogue gemv");
+    plain.run(&w, &xb, &raw).expect("plain gemv");
+    act.run(&raw, &want_buf, rows, s).expect("act");
+    fused.run(&w, &xb, &got_buf).expect("fused gemv");
+    let want = bench::read_out(dev, &want_buf, rows).expect("read want");
+    let got = bench::read_out(dev, &got_buf, rows).expect("read got");
+    assert_bits_equal(&got, &want, "unsplit splits=1");
+    drop(plain);
+    drop(fused);
+
+    // ---- (c) batched (T > 1): one dispatch, every row's own epilogue -------
+    let experts = 2usize;
+    let total = rows * experts;
+    let all_w = vec![0u8; packed.len() * experts];
+    let mut all_w = all_w;
+    for e in 0..experts {
+        all_w[e * packed.len()..(e + 1) * packed.len()].copy_from_slice(&packed);
+    }
+    let ew = breccia_kernels::gemv::upload(gpu, &all_w).expect("upload batch w");
+    let mut all_x = Vec::with_capacity(x.len() * experts);
+    for _ in 0..experts {
+        all_x.extend_from_slice(&x);
+    }
+    let exb = breccia_kernels::gemv::upload(gpu, &bench::f32_to_bytes(&all_x)).expect("upload x");
+    let plain = GemvBatch::new(gpu, ty, rows, cols).expect("plain batch");
+    let fused = GemvBatch::new(gpu, ty, rows, cols)
+        .expect("plain batch")
+        .with_epilogue(s)
+        .expect("epilogue batch");
+    let map_host = plain.map_for_blobs(&[0, plain.blob_words()], XLayout::PerExpert);
+    let map = breccia_kernels::gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map_host))
+        .expect("map");
+    let braw = breccia_kernels::gemv::alloc(gpu, (total * 4) as u64).expect("braw");
+    let bwant = breccia_kernels::gemv::alloc(gpu, (total * 4) as u64).expect("bwant");
+    let bgot = breccia_kernels::gemv::alloc(gpu, (total * 4) as u64).expect("bgot");
+    plain
+        .run(&ew, &exb, &braw, &map, experts)
+        .expect("plain batch");
+    act.run(&braw, &bwant, total, s).expect("act");
+    fused
+        .run(&ew, &exb, &bgot, &map, experts)
+        .expect("fused batch");
+    let want = bench::read_out(dev, &bwant, total).expect("read want");
+    let got = bench::read_out(dev, &bgot, total).expect("read got");
+    assert_bits_equal(&got, &want, &format!("batched x{experts}"));
+
+    for b in [
+        &w, &xb, &raw, &want_buf, &got_buf, &ew, &exb, &map, &braw, &bwant, &bgot,
+    ] {
+        gpu.destroy_buf(b);
+    }
+    println!("hc epilogue: split-K, unsplit and batched paths are bit-identical to Gemv+Act");
+}
+
+/// Bit-for-bit comparison (not a tolerance): the fusion claims identity.
+fn assert_bits_equal(got: &[f32], want: &[f32], what: &str) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    let bad = got
+        .iter()
+        .zip(want.iter())
+        .position(|(g, w)| g.to_bits() != w.to_bits());
+    if let Some(i) = bad {
+        panic!(
+            "{what}: row {i} differs — fused {:#010x} ({}) vs gemv+act {:#010x} ({})",
+            got[i].to_bits(),
+            got[i],
+            want[i].to_bits(),
+            want[i]
+        );
+    }
+}

@@ -1607,6 +1607,9 @@ pub struct HcMixer<'g> {
     up: crate::GemvBatch<'g>,
     /// `true` when the `inject` projection is folded into the gated-mean pass.
     fused_inject: bool,
+    /// `true` when `Act` rides in the `down` GEMV's epilogue — one dispatch
+    /// fewer per HC_READ (`BRECCIA_NO_HC_EPILOGUE=1` restores the separate act).
+    fused_act: bool,
     /// Bound as the gated-mean's inject weight when the mixer has no `inject`
     /// (every declared binding must be bound).
     no_weight: Buf,
@@ -1646,8 +1649,25 @@ impl<'g> HcMixer<'g> {
             HcGatedMean::new(gpu, n_embd, hc)?
         };
         let write = HcWrite::new(gpu, n_embd, hc)?;
-        let down = crate::GemvBatch::new(gpu, ty, hc_lr, hc * n_embd)?;
-        let down_split = crate::Gemv::new(gpu, ty, hc_lr, hc * n_embd)?;
+        // The bottleneck activation as `down`'s epilogue (§8at): `Act` becomes a
+        // wired epilogue in the GEMV that produces `lo_raw`, removing one
+        // dispatch per HC_READ. It is bit-identical by construction (the
+        // activation runs on the fully accumulated row value, same `silu`), but
+        // the A/B and the revert are one env var:
+        // `BRECCIA_NO_HC_EPILOGUE=1`.
+        let fused_act = std::env::var_os("BRECCIA_NO_HC_EPILOGUE").is_none()
+            && crate::gemv::has_hc_epilogue(ty);
+        let (down, down_split) = if fused_act {
+            (
+                crate::GemvBatch::new(gpu, ty, hc_lr, hc * n_embd)?.with_epilogue(hc as f32)?,
+                crate::Gemv::new(gpu, ty, hc_lr, hc * n_embd)?.with_epilogue(hc as f32)?,
+            )
+        } else {
+            (
+                crate::GemvBatch::new(gpu, ty, hc_lr, hc * n_embd)?,
+                crate::Gemv::new(gpu, ty, hc_lr, hc * n_embd)?,
+            )
+        };
         let up = crate::GemvBatch::new(gpu, ty, hc * n_embd, hc_lr)?;
         let no_weight = empty_buf(gpu, "hc inject weight")?;
         Ok(HcMixer {
@@ -1662,6 +1682,7 @@ impl<'g> HcMixer<'g> {
             down_split,
             up,
             fused_inject: with_inject,
+            fused_act,
             no_weight,
         })
     }
@@ -1682,6 +1703,11 @@ impl<'g> HcMixer<'g> {
     }
     pub fn has_inject(&self) -> bool {
         self.fused_inject
+    }
+    /// `true` when `Act` is fused into the `down` GEMV's epilogue (the default;
+    /// `BRECCIA_NO_HC_EPILOGUE=1` or a type with no `_hcact` build turns it off).
+    pub fn fused_act(&self) -> bool {
+        self.fused_act
     }
     /// Splits the `T = 1` `down` GEMV uses (1 = no split).
     pub fn down_splits(&self) -> u32 {
@@ -1819,14 +1845,19 @@ impl<'g> HcMixer<'g> {
     /// HC_READ for `ws.tokens` tokens: fills `ws.xn`, `ws.mixed` and (when the
     /// mixer has one) `ws.inject`. `r` is `[n_embd, hc, T]`.
     ///
-    /// Five dispatches with the fold (norm, down, act, up, gated+inject) instead
-    /// of six: the projection that used to be a 4-row GEMV is inside the last one.
+    /// **Four** dispatches with the fold and the `down`+`Act` epilogue (norm,
+    /// down+act, up, gated+inject) instead of six: the projection that used to be
+    /// a 4-row GEMV is inside the last one, and the bottleneck activation is the
+    /// `down` GEMV's epilogue (§8at). With `BRECCIA_NO_HC_EPILOGUE=1` it is five
+    /// again — the A/B arm, `ws.lo_raw` holds the raw projection.
     pub fn read(&self, ws: &HcWorkspace, r: &Buf, w: &HcWeights<'_>) -> Result<()> {
         let t = ws.tokens;
         self.norm.run(r, Some(w.norm), &ws.xn, self.hc * t)?;
         self.run_down(ws, w)?;
-        self.act
-            .run(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32)?;
+        if !self.fused_act {
+            self.act
+                .run(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32)?;
+        }
         self.up.run(w.up, &ws.lo, &ws.gate, &ws.map_up, t)?;
         let winj = w.inject.unwrap_or(&self.no_weight);
         self.gated
@@ -1838,7 +1869,9 @@ impl<'g> HcMixer<'g> {
     ///
     /// The chain total says how much a layer's mixer costs; this says *which*
     /// stage it is. With the fold there is no separate `inject` stage any more —
-    /// its cost is inside `gated` (`docs/phase-3/06` §HC).
+    /// its cost is inside `gated` (`docs/phase-3/06` §HC). With the `down`+`Act`
+    /// epilogue the `act` slot is **zero** and its cost is inside `down`, because
+    /// there is no `act` dispatch to time.
     pub fn stage_timings(
         &self,
         ws: &HcWorkspace,
@@ -1850,22 +1883,27 @@ impl<'g> HcMixer<'g> {
         let norm = self
             .norm
             .run_timed(r, Some(w.norm), &ws.xn, self.hc * t, target_s)?;
+        // The fused `down` writes the activated value, so it targets `lo`.
+        let lo_out = if self.fused_act { &ws.lo } else { &ws.lo_raw };
         let down = if t == 1 && self.down_splits() > 1 {
             self.down_split.run_split_timed(
                 w.down,
                 &ws.xn,
                 &ws.down_partials,
-                &ws.lo_raw,
+                lo_out,
                 self.down_splits(),
                 target_s,
             )?
         } else {
             self.down
-                .run_timed(w.down, &ws.xn, &ws.lo_raw, &ws.map_down, t, target_s)?
+                .run_timed(w.down, &ws.xn, lo_out, &ws.map_down, t, target_s)?
         };
-        let act =
+        let act = if self.fused_act {
+            GemvTiming::default()
+        } else {
             self.act
-                .run_timed(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32, target_s)?;
+                .run_timed(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32, target_s)?
+        };
         let up = self
             .up
             .run_timed(w.up, &ws.lo, &ws.gate, &ws.map_up, t, target_s)?;
@@ -1880,20 +1918,18 @@ impl<'g> HcMixer<'g> {
     pub const STAGES: [&'static str; 5] = ["norm", "down", "act", "up", "gated"];
 
     /// The `down` projection: split-K for a single token (where `hc_lr` rows is
-    /// 40 workgroups), the batched GEMV otherwise.
+    /// 40 workgroups), the batched GEMV otherwise. With the epilogue fused the
+    /// result is the *activated* value and lands in `ws.lo`; without it the raw
+    /// projection lands in `ws.lo_raw` for [`Act`] to read.
     fn run_down(&self, ws: &HcWorkspace, w: &HcWeights<'_>) -> Result<()> {
+        let out = if self.fused_act { &ws.lo } else { &ws.lo_raw };
         let splits = self.down_splits();
         if ws.tokens == 1 && splits > 1 {
-            return self.down_split.run_split(
-                w.down,
-                &ws.xn,
-                &ws.down_partials,
-                &ws.lo_raw,
-                splits,
-            );
+            return self
+                .down_split
+                .run_split(w.down, &ws.xn, &ws.down_partials, out, splits);
         }
-        self.down
-            .run(w.down, &ws.xn, &ws.lo_raw, &ws.map_down, ws.tokens)
+        self.down.run(w.down, &ws.xn, out, &ws.map_down, ws.tokens)
     }
 
     /// HC_WRITE: `out[c] = r[c] + block * 2*sigmoid(inject[c]/hc)` for
