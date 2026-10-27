@@ -221,8 +221,9 @@ after a correctness change is **32 generations, zero wrong**.
 
 ## 9. Safety rules (binding — see `AGENTS.md`)
 
-1. Every GPU run in `timeout 90`; one GPU process at a time.
-2. **Risky/new kernels on the MI50 (headless) first**; RX only after it passes. Determine the
+1. Every GPU run in `timeout 90`; one GPU process at a time, and that process uses **both** cards
+   (default run shape in `AGENTS.md` "Dual-GPU first"; single-device only for a named reason).
+2. **A new shader's first conformance run on the MI50 (headless)**; everything after it runs dual. Determine the
    display card from sysfs.
 3. Validation layer on for first runs of new shader code; `spirv-val` at build.
 4. **One quant type per invocation; ≤4 fresh dispatched shapes per process**; pipeline

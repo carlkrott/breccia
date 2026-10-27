@@ -34,14 +34,14 @@ A from-scratch Rust inference engine (`breccia`) plus its Phase-0 measurement ha
 Per-invocation rules, mandatory once a test touches GPU memory:
 
 1. **Wrap every GPU run in `timeout 90`** — a driver hang must not outlive the command.
-2. **Risky/new kernel paths run on the Radeon VII/MI50 (`0000:0e:00.0`) FIRST — it is the HEADLESS card.** The **RX 6950 XT (`0000:03:00.0`) drives the displays** (DP-1, DP-2, HDMI-A-1 connected, `boot_vga=1`) — a reset there loses the desktop. Resolve devices by PCI identity, never by enumeration ordinal. Only run risky code on the RX after the MI50 passes.
+2. **A new shader's first conformance run (≤4 shapes) goes on the Radeon VII/MI50 (`0000:0e:00.0`) FIRST — it is the HEADLESS card.** This is the only standing single-device step; everything after it runs dual (see "Dual-GPU first"). The **RX 6950 XT (`0000:03:00.0`) drives the displays** (DP-1, DP-2, HDMI-A-1 connected, `boot_vga=1`) — a reset there loses the desktop. Resolve devices by PCI identity, never by enumeration ordinal. Only run risky code on the RX after the MI50 passes.
    **Determine the display card from sysfs, never from an Xorg log** (a stale log line naming "AMDGPU(0): Radeon VII" misled us for a day):
    ```bash
    for c in /sys/class/drm/card[0-9]; do echo "$c $(cat $c/device/uevent | grep PCI_SLOT_NAME) boot_vga=$(cat $c/device/boot_vga)"; done
    for s in /sys/class/drm/card*-*/status; do [ "$(cat $s)" = connected ] && echo "$s"; done
    ```
    Note the corollary from the 2026-10-26 incident: the reboot happened on the *headless* card, so display loss is **not** the only hazard — a watchdog BACO reset can take the whole box down regardless of which card faults. Bounded waits + `VK_EXT_robustness2` remain the primary mitigation.
-3. **One GPU process at a time.** No parallel benches, no benches during agent work on the same card.
+3. **One GPU process at a time — and that process uses BOTH cards.** No parallel benches, no benches during agent work on the same card. "One process" is never "one card": parallelism comes from streams (`--streams N` / `-np N`) inside the one dual-GPU process, not from extra GPU processes.
 4. Enable `VK_LAYER_KHRONOS_validation` for first runs of new shader code and record any VU messages; RADV page faults on illegal command streams are otherwise silent until the box freezes.
 5. Conformance: run **one quant type per invocation** so a fault is attributable; never sweep all types in one go after touching shader includes. GPU tests are opt-in by explicit device: `cargo test` skips them unless `BRECCIA_KERNEL_DEVICE` is set. Safe first run:
    `timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation BRECCIA_KERNEL_DEVICE=0000:0e:00.0 BRECCIA_QTYPE=IQ3_S cargo test -p breccia-kernels --test conformance`
@@ -59,6 +59,14 @@ The project goal is **proper dual-GPU usage** (RX 6950 XT + Radeon VII/MI50), no
   MI50 = resident expert/weight blocks and bandwidth-bound GEMV (826 GB/s HBM, but PCIe gen3x4 and
   per-block round trips matter).
 - A single-card number is a diagnostic, never a target or a gate.
+- **Default run shape (binding, 2026-10-27)**: every bench, sweep, A/B, parity run, `serve` and live
+  smoke uses `--devices 0000:0e:00.0 --devices 0000:03:00.0` (by PCI identity; never the iGPU), both
+  cards at `power_dpm_force_performance_level=high` before and after (a ring reset silently drops it to
+  `auto`), the most streams the KV budget allows, the longest context the budget allows, and the
+  host-RAM budget (~30 GB) used rather than left free.
+- **A single-device run needs a named reason on its card**, one of: (a) a new shader's first conformance
+  run (rule 2 above), (b) a repro or bisect of a failure seen on one device, (c) a double-check of a
+  failed dual result. Anything else is re-run dual and its single-card number is not reported.
 
 ## Paired research (standing rule, 2026-10-26)
 
@@ -96,14 +104,14 @@ it and proceed.
    host process — it never reaches the GPU.
 2. **Land it behind a flag, default off**, and keep the incumbent path intact so an A/B and a revert
    are both one flag.
-3. **Validation run on the RX 6950 XT (`0000:03:00.0`, headless)**: one new shader per process,
+3. **First validation run on the MI50 (`0000:0e:00.0`, headless)**: one new shader per process,
    ≤4 fresh dispatched shapes per process, `timeout 90`, `VK_LAYER_KHRONOS_validation` enabled,
-   `power_dpm_force_performance_level=high` verified first (and re-checked after — a ring reset drops
+   `power_dpm_force_performance_level=high` verified first on both cards (and re-checked after — a ring reset drops
    it to `auto` silently).
 4. **Parity first, benchmarks second**: the new path must be bit-identical on the parity set
    (32/32 tokens, top-1 13.170561 at chunk 8/16/32/128) or state a documented ≤1e-6 difference and why.
-5. **Only then** enable by default, measure, and — last — repeat on the MI50 (the **display** card),
-   one type per process.
+5. **Only then** enable by default and measure on the **dual configuration** (RX 6950 XT `0000:03:00.0`,
+   the **display** card, + MI50), one type per process.
 6. **A reset is a stop-the-line event**: stop, capture `journalctl -b -1`, save the evidence, report.
    Do not re-run to "see if it happens again".
 
