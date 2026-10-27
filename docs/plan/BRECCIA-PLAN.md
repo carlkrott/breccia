@@ -55,6 +55,13 @@ PagedAttention (FP16 tail + compressed body, K at higher bits than V), radix-tre
 
 **Gate G (acceptance)** → 4–6 concurrent agents at usable speed without OOM/thrash, solo ≥ 85 tok/s.
 
+## Coverage audit
+
+`docs/plan/PDF-GAP-ANALYSIS.md` maps every proposal in the originating design conversation
+(19-page Gemini plan, 2026-10-25) to its current state — BUILT / PARTIAL / OPEN / DEFERRED /
+REJECTED — with evidence, plus a queue ranked by measured value. Update it whenever an item
+changes state; it is the record that keeps this phase plan honest about what was scoped.
+
 ## Standing rules
 
 - `qwen-dual` / `strata-rx` are gpu-manager-owned; benchmark windows restore prior state and are logged in the phase report. `d1-mi50` stop/restart is pre-authorized.
