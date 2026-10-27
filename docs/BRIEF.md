@@ -340,10 +340,8 @@ Diagnostic env switches: `BRECCIA_REQUIRE_QUIET`, `BRECCIA_DUMP_LAYOUT`,
 - `main` is **clean, green and pushed** at `e77b95a`; `./scripts/verify.sh` passes.
 - **One round was in flight when work stopped** and is *not* on main: the `gdn-scan` /
   tiny-kernel round, in worktree `~/.local/share/opencode/worktree/afb070/gpu-time-probe`
-  on branch `gpu-time-table` (3 files dirty at handover). Check it before starting anything —
-  it may contain a par
-
-tial fix worth keeping or discarding, and its uncommitted state is the only loose work.
+  on branch `gpu-time-table` (3 files dirty at handover). Check it before starting anything:
+  it may contain a partial fix worth keeping or discarding, and it is the only loose work.
 - Worktrees that are **fully merged** and can be pruned: `hc-epilogue-fusion` (detached),
   `head-device-arena` (`3ec0c95`), `kv-q8v` (detached, `d855841`). Their commits are on main.
 - `wip/four-gemms-crash-20261026` is historical (the 2026-10-26 reboot) — keep, don't merge.
