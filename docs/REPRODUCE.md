@@ -1,6 +1,6 @@
 # Reproducing the measurements
 
-Every number in `docs/` came from a command in this file or its phase report. All GPU runs follow the safety rules in `AGENTS.md` (timeout, one process, MI50 first for new code).
+Every number in `docs/` came from a command in this file or its phase report. All GPU runs follow the safety rules in `AGENTS.md` (timeout, one process at a time, and **new/risky kernels on the RX 6950 XT first — it is the headless card; the Radeon VII/MI50 drives the displays**).
 
 Reference hardware (measurements do not transfer verbatim to other systems): Ryzen 9 7950X, 58 GB DDR5, RX 6950 XT (gfx1030, 16 GB GDDR6, Infinity Cache) + Radeon VII/MI50 (gfx906, 16 GB HBM2), Mesa RADV 26.2.4, ROCm 7.2, Linux 6.18.
 
@@ -22,7 +22,28 @@ for b in /sys/class/bdi/btrfs-*/; do echo "$(basename $b)=$(cat $b/read_ahead_kb
 Measured effect (`docs/research/03-io-and-exllamav2.md`): cold expert reads **0.7–1.1 → 4.7–5.4
 GB/s**, read amplification **9× → 1.05×**, cold model load 28 s → 4 s. Do **not** use `O_DIRECT`
 (5.9 GB/s cold but throws away the 58 GB/s warm page cache), `FADV_RANDOM` (ignored by btrfs) or
-`MADV_RANDOM` (1.4–2× worse). Persist via a udev/systemd rule if the box reboots often.
+`MADV_RANDOM` (1.4–2× worse). **It regresses silently** (found back at 8192 KiB on 10-27), so it is
+re-applied every 5 minutes by `breccia-io-tune.timer` — check the value before any cold-read claim.
+
+## 0b. Units discipline — read this before quoting any derived cost
+
+Three separate conclusions were wrong between 2026-10-26 and 10-27 because a **rate was divided by
+the wrong denominator**. All three are cheap to avoid:
+
+| Trap | Symptom | Rule |
+|---|---|---|
+| **Mixed windows** | `record` printed 6.9 µs/dispatch when the true cost is **0.28 µs** | a counter reset per window (`reset_record_seconds`, the decode window) must be divided by a counter that resets with it. `Session::dispatches` is a **whole-session** total and is never reset. |
+| **Run total vs per token** | dispatch count read 5 167/token; the true figure is **1 843** | `--warm 1` adds a whole generation, so a run holds more token-graphs than `--gen`. Divide by token-graphs, not by `runs_n`. |
+| **Per chunk vs per token** | a "34 ms" submit saving was really **0.29 ms** | state the unit in the label: `ms/token`, `ms/block-chunk`, `dispatches/token`. |
+
+Two invariants the engine now prints, and which every claim should show: the **`sum · wall · residual`**
+line for a prefill chunk (must be ≈0), and the **per-stage dispatch census** whose total must equal the
+run's dispatch count. If a table doesn't sum, the table is wrong — not the model.
+
+Clock state belongs in every run header as well: `power_dpm_force_performance_level` must read `high` on
+**both** cards (`gpu-clocks-high.service` + `gpu-clocks-high.timer` re-assert it every 60 s, because a
+ring reset silently drops the RX back to `auto`, which measures **4.4× slower**). `breccia-io-tune.timer`
+re-applies the btrfs read-ahead below on the same cadence.
 
 ## 1. Baselines (llama.cpp HIP, the number to beat)
 
