@@ -201,6 +201,21 @@ impl QsaState {
                 return Err(anyhow!("zeroing {what}: {e}"));
             }
         }
+        // `BRECCIA_FAULT_POISON_QSA=1`: fill every mutable buffer with NaN after
+        // construction. A fresh process's K/V pools start zeroed but its indexer tail
+        // and pooled keys start as whatever the allocator left; poisoning all four
+        // proves that *nothing* reads a cell past the current position (a leak shows
+        // up as NaN logits), which is the argument for why `QsaState::reset` closes a
+        // gap on paper without changing a token (docs/phase-4/01-forward-pass.md §8az).
+        if std::env::var_os("BRECCIA_FAULT_POISON_QSA").is_some() {
+            let nan = f32::NAN.to_bits();
+            let words = |b: &Buf| (b.size / 4) as usize;
+            for dst in [&k_pool, &v_pool, &idx_tail, &idx_pooled] {
+                let poison: Vec<u32> = vec![nan; words(dst)];
+                crate::gemv::upload_into(gpu, dst, &crate::ops::u32_to_bytes(&poison))
+                    .map_err(|e| anyhow!("poisoning the QSA state: {e}"))?;
+            }
+        }
         Ok(QsaState {
             k_pool,
             v_pool,
@@ -211,6 +226,41 @@ impl QsaState {
             capacity_cells: cells,
             max_pos,
         })
+    }
+
+    /// Return every **mutable** QSA buffer to its construction-time contents.
+    ///
+    /// A session is reused across requests (`Session::reset`), so this is what makes
+    /// generation N+1 see exactly what a fresh process would: the paged K/V pools,
+    /// the raw indexer tail (the last, incomplete block's keys) and the pooled
+    /// indexer keys are all per-sequence state. `page_table` and `positions` are
+    /// written once at construction and never mutated by a kernel, so re-uploading
+    /// them is a belt-and-braces assertion of that invariant rather than a fix.
+    ///
+    /// Until this existed, `idx_tail` and `idx_pooled` held *uninitialised VRAM* in a
+    /// fresh process and the previous request's keys in a reused one; both are masked
+    /// by the current position today (`docs/phase-4/01-forward-pass.md` §8az carries
+    /// the proof that the outputs were already identical), so this closes the gap on
+    /// paper without changing a single token.
+    pub fn reset(&self, gpu: &Gpu) -> Result<()> {
+        for (what, dst) in [
+            ("KV k_pool", &self.k_pool),
+            ("KV v_pool", &self.v_pool),
+            ("indexer tail", &self.idx_tail),
+            ("indexer pooled", &self.idx_pooled),
+        ] {
+            let zeros = vec![0u8; dst.size as usize];
+            crate::gemv::upload_into(gpu, dst, &zeros)
+                .map_err(|e| anyhow!("zeroing the {what} of the QSA state: {e}"))?;
+        }
+        let pages = self.capacity_cells.div_ceil(PAGE_CELLS);
+        let table: Vec<u32> = (0..pages as u32).collect();
+        crate::gemv::upload_into(gpu, &self.page_table, &crate::ops::u32_to_bytes(&table))
+            .map_err(|e| anyhow!("restoring the KV page table: {e}"))?;
+        let pos: Vec<u32> = (0..self.max_pos as u32).collect();
+        crate::gemv::upload_into(gpu, &self.positions, &crate::ops::u32_to_bytes(&pos))
+            .map_err(|e| anyhow!("restoring the position table: {e}"))?;
+        Ok(())
     }
 
     pub fn bytes(&self) -> u64 {

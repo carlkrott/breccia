@@ -1490,11 +1490,31 @@ impl<'m> Session<'m> {
             .collect()
     }
 
-    /// Zero every recurrent state and the PLE history — a new sequence.
+    /// Zero every per-sequence buffer — a new request on a reused session.
+    ///
+    /// The complete list (docs/phase-4/01-forward-pass.md §8az):
+    ///
+    /// | state | where | reset |
+    /// |---|---|---|
+    /// | GDN conv history + delta-rule state | `gdn_state[b]` × 36 | `GdnState::reset` |
+    /// | QSA paged K/V pools | `qsa_state[b]` × 12 | `QsaState::reset` |
+    /// | QSA indexer raw tail (last partial block) | `qsa_state[b].idx_tail` | `QsaState::reset` |
+    /// | QSA pooled indexer keys | `qsa_state[b].idx_pooled` | `QsaState::reset` |
+    /// | QSA page + position tables | `qsa_state[b]` | re-uploaded (invariant check) |
+    /// | QSA per-call shape scalars (`n_blocks`, `max_ids`, `slots`) | `qsa_ws[b]` | rewritten by `run_qsa` every call, nothing to do |
+    /// | PLE rolling n-gram window + conv history | `ple` | `PleHost::reset` |
+    /// | expert bytes / forwards / head traffic | `Session` | zeroed below |
+    /// | per-stage timers | `Session::timers` | `Timers::clear` |
+    /// | position / token counters (`pos`, `cur_tok`) | `Session` | set by `begin_token` every token |
+    /// | staging ring contents | `stagings` | `flush()` below (the ring is drained, and every read is fence-ordered) |
+    /// | sampler RNG | `sampler` | **deliberately not reset** — sampling is seeded per draw, so a reset would not be a new sequence, it would be a different one |
     pub fn reset(&mut self) -> Result<()> {
         let m = self.model;
         for b in 0..m.cfg.n_layers {
             if let Some(st) = &self.gdn_state[b] {
+                st.reset(m.devices[m.device_of(b)].gpu())?;
+            }
+            if let Some(st) = &self.qsa_state[b] {
                 st.reset(m.devices[m.device_of(b)].gpu())?;
             }
         }

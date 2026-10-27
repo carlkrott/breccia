@@ -354,6 +354,13 @@ enum BenchKind {
         /// Extra complete generations before the measured window (`0` = cold)
         #[arg(long, default_value_t = 0)]
         warm: usize,
+        /// A **second prompt** generated in the *same* process after the measured
+        /// runs, e.g. `--prompt-ids <long> --then-prompt-ids <short>`. This is the
+        /// session-reuse case (`scripts/session-reset-test.sh`): its tokens must be
+        /// identical to a fresh process's, which is what makes a missing state reset
+        /// a deterministic failure instead of an intermittent one.
+        #[arg(long, value_name = "ID,ID,...")]
+        then_prompt_ids: Option<String>,
     },
 }
 fn main() {
@@ -538,6 +545,7 @@ fn run(cli: Cli) -> Result<()> {
                     prefill_chunk,
                     prefill_merged,
                     warm,
+                    then_prompt_ids,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -565,6 +573,7 @@ fn run(cli: Cli) -> Result<()> {
             prefill_chunk,
             prefill_merged,
             warm,
+            then_prompt_ids,
         }),
     }
 }
@@ -1564,6 +1573,7 @@ struct TokenArgs {
     prefill_chunk: usize,
     prefill_merged: bool,
     warm: usize,
+    then_prompt_ids: Option<String>,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -2682,6 +2692,32 @@ fn bench_token(a: TokenArgs) -> Result<()> {
     // ---- the report -------------------------------------------------------
     // The parity anchor is the prompt's last-token row; `first_step` is kept for
     // the "did the second step drift" question.
+    // ---- session reuse: a second prompt in the *same* process ---------------
+    // `scripts/session-reset-test.sh` compares this line against a fresh process's
+    // output. Anything in `Session::reset` that is missing shows up here as a
+    // different sequence, deterministically (see docs/phase-4/01-forward-pass.md §8az).
+    let mut then_tokens: Vec<u32> = Vec::new();
+    if let Some(list) = &a.then_prompt_ids {
+        let then: Vec<u32> = list
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|t| t.trim().parse::<u32>().ok())
+            .collect();
+        if then.is_empty() {
+            anyhow::bail!("--then-prompt-ids is empty");
+        }
+        let gen = sess
+            .generate(&then, a.gen, None)
+            .context("the second prompt (session reuse)")?;
+        then_tokens = gen.tokens.clone();
+        println!(
+            "\nthen     {} ids -> {} tokens at {:.2} tok/s: {:?}",
+            then.len(),
+            then_tokens.len(),
+            gen.tokens_per_s(),
+            &then_tokens[..then_tokens.len().min(8)]
+        );
+    }
+
     let first_summary = s1.clone();
     let _ = &first_step_logits;
     let notes = vec![
@@ -2734,6 +2770,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         hotspots,
         debug_layers: traces,
         notes,
+        then_generated: then_tokens,
     };
     println!(
         "cache    {:.2} GiB read from storage during the measured window ({:.1} MiB per prompt \

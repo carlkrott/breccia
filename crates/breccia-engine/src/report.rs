@@ -63,6 +63,11 @@ pub struct TokenReport {
     pub hotspots: Vec<String>,
     pub debug_layers: Vec<crate::stats::LayerTrace>,
     pub notes: Vec<String>,
+    /// Tokens from the optional **second prompt in the same process**
+    /// (`--then-prompt-ids`): the session-reuse case, which must equal a fresh
+    /// process's output (`scripts/session-reset-test.sh`).
+    #[serde(default)]
+    pub then_generated: Vec<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
