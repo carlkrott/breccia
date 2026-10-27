@@ -1764,6 +1764,11 @@ impl<'m> Session<'m> {
             }
         }
         self.submit_batch()?;
+        // Mark the drain explicitly (§8ae): the shared expert is the last stage a
+        // block records, so without this mark the flush() below is charged to it —
+        // which is exactly how `shared-exp` read 19-21 ms/token while its own work
+        // was 0.10 ms (§8ad). A stage mark must never be able to swallow a wait.
+        self.timers.mark(WAIT_GPU);
         let t_pass1 = std::time::Instant::now();
         self.flush()?;
         self.sh_sub[5] += t_pass1.elapsed().as_secs_f64();

@@ -2541,6 +2541,64 @@ Nothing on a decode path changed, and the reverted tree is the one §8ac measure
 **parity 32/32 at chunk 128 + merged, top-1 13.170561; the canonical gate stands at
 20.3 +- 1 aggregate, lane 40-43 ms/step.**
 
+## 8ae. The timer is honest now, and the drain is arithmetic: 2 waits per block, 28 ms of GPU per block
+
+Two items landed and one question answered with numbers. Parity unchanged:
+**chunk 128 + merged 32/32, top-1 13.170561.**
+
+### 1. A stage mark can no longer swallow a wait (one line, no behaviour change)
+
+`prefill_block` now emits `self.timers.mark(WAIT_GPU)` **before** the pass-1 `flush()`.
+Same chunk, same binary, 64-token prompt:
+
+| stage | before §8ad | after |
+|---|---:|---:|
+| `shared-exp` | 19.4-20.8 | **0.15** |
+| `wait-gpu` | (absorbed) | **21.14** |
+| `experts(host)` | 49.6 | 48.07 |
+| `ple` | 1.36 | 1.37 |
+
+That is the honest table: the routed shared expert is 0.15 ms/token (worst case, with
+the scalar gate included), the drain is 21.1 ms/token, and both are now visible at the
+same time. **Every stage number in §8w-§8ad that was adjacent to a flush should be
+re-read with this in mind**; `experts(host)` and `ple` were measured either side of a
+host-only section and are unaffected.
+
+### 2. How many waits does a block need? Two — the drain is not the wait count
+
+Chunked path, per block: **pass 1 submit+flush, then pass 2 submit+flush** = 2 fence
+waits, plus 2 per PLE token on block 1. The target "fewer than 2 waits per block" is
+therefore already met by construction, and the cost is not the submits: the 21.1
+ms/token of `wait-gpu` is **~28 ms of GPU execution per block per chunk** (0.44
+ms/block/token x 64), i.e. ~1 900 dispatches draining. Collapsing pass 1 and pass 2
+into one submit would not help — pass 2 *depends* on the host lane's output, so the
+dependency graph already forces the split (one submit per pass is ncnn's pattern, and
+we are at that: 2 submits, 2 waits).
+
+So the drain is launch-and-execution cost inside the passes, which is where §8ae's
+remaining items point:
+
+* **barrier pruning with per-resource tracking** (ncnn's `stage`/`access` model): the
+  mechanism the failed call-site flag could not express, re-priced at **3.43 µs per
+  dependent barrier ≈ 3.8 ms/token** at ~1 100 barriers. Not attempted here — it is a
+  new bookkeeping layer in `dispatch_batch::record` (track last write per `vk::Buffer`,
+  emit only when the next dispatch binds a previously-written buffer) and deserves its
+  own round with the sync2-vs-ALL_COMMANDS A/B folded in.
+* **fused gate+up+SwiGLU** (2 dispatches per expert instead of 3, measured 3.1x/5.3x):
+  it halves one of ~31 dispatches per block, so ~1.6 % of the drain — worth doing with
+  the barrier work, not before it.
+
+### 3. `VK_EXT_robustness2` is on, feature-detected
+
+`Gpu::create` now enables `VK_EXT_robustness2` when advertised, with
+`robustBufferAccess2` + `nullDescriptor` in the feature chain (both cards advertise
+it). An out-of-bounds descriptor read returns zeros instead of faulting the GPU, which
+turns the class of fault that has twice taken this box down into a wrong number the
+parity gate catches. Parity with it on: **32/32, top-1 13.170561** — bit-identical to
+the run without it, as expected (it changes fault behaviour, not arithmetic). The
+<=1 % cost is the research's measurement; this round was too contended to claim a
+quiet-window delta, so it is quoted, not measured.
+
 ## 9. Exact commands
 
 

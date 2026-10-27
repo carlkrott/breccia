@@ -609,6 +609,16 @@ impl Gpu {
         if external_memory_host {
             enabled_exts.push("VK_EXT_external_memory_host".to_string());
         }
+        // `VK_EXT_robustness2` (§8ae): an out-of-bounds descriptor read returns zeros
+        // instead of faulting the GPU. The two OOB faults this project has had (a
+        // gather and a conformance kernel) both took the card down on a *legal*
+        // stream; robustness turns that class into a wrong number the parity gate
+        // catches. Measured <=1 % on both cards, and feature-detected so a device
+        // without it still runs.
+        let robustness2 = dev.has_ext("VK_EXT_robustness2");
+        if robustness2 {
+            enabled_exts.push("VK_EXT_robustness2".to_string());
+        }
 
         // NOTE: Vulkan12Features already carries shaderFloat16/shaderInt8/atomic64/
         // timeline/hostQueryReset — validation forbids also chaining the promoted
@@ -639,10 +649,18 @@ impl Gpu {
             ..Default::default()
         };
 
+        let mut en_robust = vk::PhysicalDeviceRobustness2FeaturesEXT {
+            robust_buffer_access2: 1,
+            null_descriptor: 1,
+            ..Default::default()
+        };
         let mut feats2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut en_f11)
             .push_next(&mut en_f12)
             .push_next(&mut en_f13);
+        if robustness2 {
+            feats2 = feats2.push_next(&mut en_robust);
+        }
         if enabled_exts
             .iter()
             .any(|e| e == "VK_KHR_cooperative_matrix")
