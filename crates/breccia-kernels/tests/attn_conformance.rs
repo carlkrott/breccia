@@ -127,6 +127,18 @@ fn as_f64(v: &[f32]) -> Vec<f64> {
     v.iter().map(|x| f64::from(*x)).collect()
 }
 
+fn write_f32(gpu: &breccia_vk::ctx::Gpu, dst: &breccia_vk::ctx::Buf, v: &[f32]) {
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    breccia_kernels::gemv::upload_into(gpu, dst, &bytes).expect("upload_into");
+}
+
+fn read_f32(gpu: &breccia_vk::ctx::Gpu, src: &breccia_vk::ctx::Buf, n: usize) -> Vec<f32> {
+    let raw = breccia_kernels::gemv::download(gpu, src, n * 4).expect("download");
+    raw.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn upload(gpu: &breccia_vk::ctx::Gpu, v: &[f32]) -> breccia_vk::ctx::Buf {
     breccia_kernels::ops::upload_f32(gpu, v).expect("upload")
 }
@@ -213,7 +225,10 @@ fn gdn_sequence(chunk: usize, label: &str) {
     let map_alpha = breccia_kernels::proj::batch_map_buf(gpu, &bt_alpha, chunk).expect("map");
     let map_out = breccia_kernels::proj::batch_map_buf(gpu, &bt_out, chunk).expect("map");
 
-    let gdn = Gdn::new(gpu).expect("gdn pipelines");
+    // The reference comparison pins the **two-dispatch** `beta|alpha` shape, so the
+    // merged layout is one variable at a time (its bit-identity to this shape is
+    // asserted below and in `conformance::concatenated_rows_*`).
+    let gdn = Gdn::with_merge(gpu, false).expect("gdn pipelines");
     let state = GdnState::new(gpu).expect("gdn state");
     state.reset(gpu).expect("reset");
     let ws = gdn.workspace(gpu, chunk).expect("gdn workspace");
@@ -287,9 +302,53 @@ fn gdn_sequence(chunk: usize, label: &str) {
             w_beta: &b_w_beta,
             alpha,
             w_alpha: &b_w_alpha,
+            // The merged `beta|alpha` path is exercised by the graph's A/B and the
+            // bit-identity test in `conformance`; this suite pins the two-dispatch
+            // shape so the reference comparison stays one variable per run.
+            beta_alpha: None,
+            w_beta_alpha: None,
             out,
             w_out: &b_w_out,
         };
+        // ---- the merged `beta|alpha` layout must agree bit for bit (§8ay) ----
+        //
+        // The merge runs `ssm_beta` and `ssm_alpha` (both `[48, n_embd]`, same type,
+        // same input row) as **one** 96-row GEMV and reads both halves out of one
+        // buffer. A GEMV row is an independent dot product, so this must be
+        // bit-identical to the two-dispatch shape; `beta_gate` is compared too,
+        // because that is where the row base is applied.
+        if n == 1 {
+            let beta: Vec<f32> = (0..48).map(|i| 0.25 + i as f32 * 0.011).collect();
+            let alpha: Vec<f32> = (0..48).map(|i| -0.75 + i as f32 * 0.017).collect();
+            let mut merged_in = beta.clone();
+            merged_in.extend_from_slice(&alpha);
+
+            let ws_m = gdn.workspace(gpu, 1).expect("merged workspace");
+            write_f32(gpu, &ws_m.beta_raw, &beta);
+            write_f32(gpu, &ws_m.alpha, &alpha);
+            write_f32(gpu, &ws_m.beta_alpha, &merged_in);
+            let ws_s = gdn.workspace(gpu, 1).expect("separate workspace");
+            write_f32(gpu, &ws_s.beta_raw, &beta);
+            write_f32(gpu, &ws_s.alpha, &alpha);
+            write_f32(gpu, &ws_s.beta_alpha, &merged_in);
+
+            let g_merged = Gdn::with_merge(gpu, true).expect("merged pipelines");
+            let g_sep = Gdn::with_merge(gpu, false).expect("separate pipelines");
+            g_merged.beta_gate(&ws_m, &wg).expect("beta_gate merged");
+            g_sep.beta_gate(&ws_s, &wg).expect("beta_gate separate");
+            let b1 = read_f32(gpu, &ws_m.beta, 48);
+            let g1 = read_f32(gpu, &ws_m.gate, 48);
+            let b2 = read_f32(gpu, &ws_s.beta, 48);
+            let g2 = read_f32(gpu, &ws_s.gate, 48);
+            for i in 0..48 {
+                assert_eq!(b1[i].to_bits(), b2[i].to_bits(), "beta[{i}]");
+                assert_eq!(g1[i].to_bits(), g2[i].to_bits(), "gate[{i}]");
+            }
+            println!("merged beta|alpha: beta and gate bit-identical to the two-buffer path");
+            gdn.release(gpu, ws_m);
+            gdn.release(gpu, ws_s);
+        }
+
         // The workspace is sized for `chunk`; the last chunk may be shorter.
         if n != chunk {
             // Run the shorter tail with its own workspace (the kernels take the

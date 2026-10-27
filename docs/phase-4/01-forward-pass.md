@@ -4501,3 +4501,116 @@ timeout 90 env BRECCIA_KERNEL_DEVICE=0000:0e:00.0 BRECCIA_QTYPE=Q5_K \
   VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
   cargo test -p breccia-kernels --test conformance -- --test-threads=1
 ```
+
+## 8ay. The small-dispatch floor inside `hc-read`, and `beta`+`alpha` in one dispatch
+
+Two follow-ups to §8ax, which finger `hc-read` (6.4 ms/token) and the two 48-row GDN
+projections (829 µs/token) as the same disease: many tiny dispatches. One of them can
+be fixed by **rows per dispatch**; the other, it turns out, cannot be batched at all —
+but the measurement below says where its time actually is.
+
+### 1. `beta` + `alpha`: landed, one 96-row dispatch (`BRECCIA_NO_GDN_MERGE=1` reverts)
+
+`ssm_beta.weight` and `ssm_alpha.weight` are both `[48, 2560]`, same quant type, and
+both consume the **same** input row. A GEMV output row is an independent dot product
+over that row's weights, so concatenating the two matrices **along rows** into one
+`[96, 2560]` tensor and running one GEMV is bit-identical — proven two ways:
+
+* `conformance::concatenated_rows_are_bit_identical_to_the_separate_gemvs` (the kernel
+  invariant: 48+48 rows × 2560, BF16, all 96 outputs equal to the bit);
+* `attn_conformance` runs `beta_gate` over both layouts and asserts `sigmoid(beta)` and
+  the `softplus(alpha+dt)*a` gate equal to the bit (that is where the row base is
+  applied), plus the full GDN CPU-reference suite (6/6).
+
+The merge is one dispatch and one output buffer `[96]` (beta rows first, alpha second);
+`gdn_gate` takes the alpha base as a push-constant word it already had spare, so the
+shader change is *wired* (same bindings, same resources) and the unmerged path passes
+base 0 through the same code.
+
+| | before | after | Δ |
+|---|---:|---:|---:|
+| `gdn-beta` + `gdn-alpha` (probe, µs/token) | 473 + 354 = **827** | **440** (`gdn-beta`, alpha row gone) | **−388** |
+| dispatches/token (census, 30 resident blocks) | **1 746** | **1 710** | **−36** |
+| `sum` (GPU execution, µs/token) | 32 639 / 32 591 | 32 344 / 32 349 | −295 / −242 |
+| `wait-gpu` (µs/token) | 33 031 / 32 993 | 32 747 / 32 723 | −284 / −270 |
+| single stream, dual, 30 resident blocks | 17.89 / 18.68 tok/s | 18.04 / 18.17 tok/s | **inside the window's noise** |
+
+The 388 µs is real and shows up in both `sum` and `wait-gpu` on adjacent arms, but it is
+0.5 % of a 55 ms token: the wall clock moved by less than this window's spread (the two
+`sep` arms were 17.89 and 18.68 tok/s). Stated that way rather than as a gain.
+
+Parity, the multi-process way (§8aw's open intermittent is still open):
+
+```
+RACE_PROCS=8 RACE_RUNS=1 RACE_GEN=32 RACE_PROMPT=parity RACE_WARM=1 \
+  scripts/head-handoff-race.sh
+RACE: 8 generations over 8 exclusive processes, crossing refused OK -> GREEN
+```
+
+Eight **exclusive** processes, all matching the reference's 32 greedy tokens, crossing
+still refused. Every arm of my own A/B also generated `[110563, 96847, 271, 248068,
+198, 760, 1156, 369, …]`, and the census/`sum` tables above come from arms whose
+`pgrep` read zero co-tenants (a 1.8 tok/s / 543 ms run appeared twice while another
+agent's harness was up — the documented co-tenant signature, discarded, not chased).
+
+### 2. `hc-read` cannot be batched across blocks — and its real cost is the other half of the story
+
+The premise was that the 96 block-level `hc_read`s are independent, so 480 dispatches
+could become tens. **They are not independent, and the dependency is the model's, not
+the engine's.** One decode step is a strict chain:
+
+```
+r_b ──▶ hc_read(attn)_b ──▶ mixer_b ──▶ hc_write(attn)_b ──▶ hc_read(ffn)_b
+    ──▶ router/moe_b ──▶ hc_write(ffn)_b ──▶ r_{b+1} ──▶ hc_read(attn)_{b+1} …
+```
+
+`hc_read(attn)_{b+1}` consumes `r_{b+1}`, which only exists after block `b`'s ffn
+`hc_write`. At no instant are two block reads both ready, so no row-map / `GemmMany`
+fusion can cover them (an expert-style map works because *experts within one layer* are
+independent; blocks are not). The same argument rules out the attn/ffn pair inside a
+block — the mixer sits between them. What the round *can* do is say what the 7.18 ms is,
+with the new per-stage marks (clean window, 96 reads/token):
+
+| HC_READ sub-stage | µs/token | per read | workgroups | what limits it |
+|---|---:|---:|---:|---|
+| `hc-norm` | 867 | 9.0 | **~1–2** | pure dispatch latency (10 240 elements in one workgroup) |
+| `hc-down` (+ split-K reduce) | 1 961 | 20.4 | 40 × 4 splits | 320 output rows; **already split-K=4** (`down_splits()`), 262 GB/s — the best this shape does |
+| `hc-up` | 2 776 | 28.9 | 1 280 | K=320 (1.25 blocks/row): 361–400 GB/s; **splits make it worse** (measured 18 → 22 → 30 µs at s=2/4) |
+| `hc-gated` | 1 575 | 16.4 | **~1** | pure dispatch latency (2 560 outputs) |
+| **total** | **7 180** | **74.8** | | |
+
+So **34 % of the HC read (2.44 ms/token) is two elementwise kernels that are one
+workgroup each**: the grouped RMSNorm (867 µs) and the gated mean (1 575 µs) cost
+9–16 µs per launch to do 10-40 µs worth of arithmetic per *token*. The two GEMVs
+(4.74 ms) are at their measured shape limits. Fusing the norm into `down`'s prologue
+does **not** pay: with split-4 that recomputes 10 240 elements in 160 workgroups
+(6.4 MB of extra reads ≈ 8 µs) to save a 9 µs launch. The one fusion that does pay is
+**`gated` into `up`'s epilogue**, and it needs the column-blocked `up` tiling that
+§8at already named (`up` emits 8 consecutive `d` of one stream per workgroup; the gated
+mean needs all four streams at one `d`). That is the next HC commit: ~1.5 ms.
+
+### 3. A build trap worth recording (cost an hour this round)
+
+`build.rs` printed `cargo:rerun-if-changed=shaders` — the **directory**. Cargo only
+notices that when files are *added or removed*, so editing `gdn_gate.comp` in place and
+rebuilding ran the *previous* SPIR-V: the kernel ignored a new push-constant word and
+the symptom looked exactly like a binding bug (the merged path read alpha as 0.0). A
+second, independent bug hid underneath it: `GdnWorkspace::workspace()` sizes its buffers
+in a positional array, and the new `beta_alpha` slot was inserted one position too late,
+so the merged buffer was **64 floats, not 96** — `ALPHA[64]` was out of bounds and
+robustness2 returned 0. Both are now fixed and the sizes list is commented as
+order-sensitive; `build.rs` prints `rerun-if-changed` for **every** `.comp`/`.glsl`.
+
+### Commands
+
+```bash
+# the census + the table, both arms (a co-tenant makes the wall clock meaningless)
+BRECCIA_TRACE_DISPATCH=1 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" \
+  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --gen 8 --runs 1 --threads 16 --warm 1                        # 1 710 dispatches/token
+BRECCIA_NO_GDN_MERGE=1 BRECCIA_TRACE_DISPATCH=1 …                # 1 746 (the A/B arm)
+# bit-identity + the full GDN reference suite, on the headless card
+timeout 90 env BRECCIA_KERNEL_DEVICE=0000:0e:00.0 \
+  cargo test -p breccia-kernels --test attn_conformance -- --test-threads=1
+```

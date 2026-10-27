@@ -101,6 +101,11 @@ impl HcW {
 
 /// The GDN-only tensors (§6.2).
 pub struct GdnW {
+    /// `ssm_beta.weight` + `ssm_alpha.weight` concatenated **along rows** into one
+    /// `[96, 2560]` tensor of the same quant type (§8ay), so one 96-row GEMV
+    /// replaces the two 48-row dispatches. Each row is an independent dot product,
+    /// so the outputs are bit-identical to the separate runs.
+    pub beta_alpha: W,
     pub qkv: W,
     pub z: W,
     pub beta: W,
@@ -482,6 +487,14 @@ impl Model {
                     z: w(gpu, &shards, &format!("blk.{block}.attn_gate.weight"))?,
                     beta: w(gpu, &shards, &format!("blk.{block}.ssm_beta.weight"))?,
                     alpha: w(gpu, &shards, &format!("blk.{block}.ssm_alpha.weight"))?,
+                    beta_alpha: w_concat(
+                        gpu,
+                        &shards,
+                        &[
+                            &format!("blk.{block}.ssm_beta.weight"),
+                            &format!("blk.{block}.ssm_alpha.weight"),
+                        ],
+                    )?,
                     out: w(gpu, &shards, &format!("blk.{block}.ssm_out.weight"))?,
                     conv: raw(gpu, &shards, &format!("blk.{block}.ssm_conv1d.weight"))?,
                     dt: raw(gpu, &shards, &format!("blk.{block}.ssm_dt.bias"))?,
@@ -549,7 +562,7 @@ impl Model {
                 keys.insert(w.key);
             }
             if let Some(g) = &gdn {
-                for w in [&g.qkv, &g.z, &g.beta, &g.alpha, &g.out] {
+                for w in [&g.qkv, &g.z, &g.beta, &g.alpha, &g.out, &g.beta_alpha] {
                     keys.insert(w.key);
                 }
             }
@@ -1095,6 +1108,49 @@ fn w(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<W> {
         .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
     let key = PipeKey::of(&t)?;
     let buf = upload_tensor(gpu, name, &t)?;
+    Ok(W { buf, key })
+}
+
+/// Several tensors of the **same quant type and column count**, concatenated along
+/// rows into one allocation (§8ay).
+///
+/// This is what lets one GEMV cover N small matrices that share an input vector: a
+/// GEMV output row is an independent dot product over that row's weights, so
+/// concatenating along rows changes nothing about any row's arithmetic — the merged
+/// dispatch is **bit-identical** to the N separate ones, and it replaces N
+/// dependent launches (each of which is 6-80 workgroups of work) with one.
+fn w_concat(gpu: &Gpu, shards: &ShardSet, names: &[&str]) -> Result<W> {
+    let mut tensors = Vec::with_capacity(names.len());
+    let mut key: Option<PipeKey> = None;
+    let mut total = 0u64;
+    for name in names {
+        let t = shards
+            .tensor(name)
+            .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
+        let k = PipeKey::of(&t)?;
+        match &key {
+            None => key = Some(k),
+            Some(prev) if *prev != k => {
+                anyhow::bail!(
+                    "cannot concatenate {names:?}: `{name}` is a different quant type/layout"
+                )
+            }
+            _ => {}
+        }
+        total += t.n_bytes();
+        tensors.push(t);
+    }
+    let mut bytes = Vec::with_capacity(total as usize);
+    for t in &tensors {
+        bytes.extend_from_slice(t.as_slice());
+    }
+    let buf = breccia_kernels::gemv::upload(gpu, &bytes)
+        .with_context(|| format!("uploading the concatenation of {names:?} ({total} B)"))?;
+    // The pipeline key must describe the **concatenated** shape: same type and
+    // columns as the parts, `rows` summed. Taking the key from the first tensor
+    // would build a 48-row pipeline that silently computes only the first half.
+    let mut key = key.expect("at least one tensor");
+    key.rows = tensors.iter().map(|t| t.ne1() as usize).sum();
     Ok(W { buf, key })
 }
 

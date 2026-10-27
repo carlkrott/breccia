@@ -97,6 +97,8 @@ pub fn gdn_cells(
         };
         let proj = match (&bt_qkv, &bt_z, &bt_beta, &bt_alpha, &bt_out) {
             (Some(a), Some(b), Some(c), Some(d), Some(e)) => GdnProjections {
+                beta_alpha: None,
+                w_beta_alpha: None,
                 qkv: Proj::Batch {
                     pipe: a,
                     map: &maps[0],
@@ -124,6 +126,8 @@ pub fn gdn_cells(
                 w_out: &b_w_out,
             },
             _ => GdnProjections {
+                beta_alpha: None,
+                w_beta_alpha: None,
                 qkv: Proj::Single(&g_qkv),
                 w_qkv: &b_w_qkv,
                 z: Proj::Single(&g_z),

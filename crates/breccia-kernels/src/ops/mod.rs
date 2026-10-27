@@ -1852,13 +1852,21 @@ impl<'g> HcMixer<'g> {
     /// again — the A/B arm, `ws.lo_raw` holds the raw projection.
     pub fn read(&self, ws: &HcWorkspace, r: &Buf, w: &HcWeights<'_>) -> Result<()> {
         let t = ws.tokens;
+        // GPU-time probe marks (§8ay): the five stages of one HC_READ. `norm` and
+        // `gated` are one-workgroup kernels at `t = 1`, so this is where the
+        // dispatch floor of a 96-read token is visible.
+        let gpu = self.norm.pipe.gpu;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_NORM);
         self.norm.run(r, Some(w.norm), &ws.xn, self.hc * t)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_DOWN);
         self.run_down(ws, w)?;
         if !self.fused_act {
             self.act
                 .run(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32)?;
         }
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_UP);
         self.up.run(w.up, &ws.lo, &ws.gate, &ws.map_up, t)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_GATED);
         let winj = w.inject.unwrap_or(&self.no_weight);
         self.gated
             .run(&ws.xn, &ws.gate, &ws.mixed, winj, &ws.inject, t)?;

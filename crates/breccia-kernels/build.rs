@@ -144,7 +144,25 @@ const WIDE_SHADERS: &[&str] = &[
 ];
 
 fn main() {
-    println!("cargo:rerun-if-changed=shaders");
+    // **Every** shader and include, file by file. `rerun-if-changed=shaders` (the
+    // directory) only fires when a file is *added or removed*, so editing a
+    // `.comp` or `.glsl` in place silently kept the previous SPIR-V — a stale
+    // shader that looks like a kernel bug (§8ay: `gdn_gate` ignored a new push
+    // constant until this was fixed).
+    for dir in ["shaders", "shaders/tests"] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if matches!(
+                p.extension().and_then(|x| x.to_str()),
+                Some("comp") | Some("glsl")
+            ) {
+                println!("cargo:rerun-if-changed={}", p.display());
+            }
+        }
+    }
     println!("cargo:rerun-if-env-changed=GLSLC");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));

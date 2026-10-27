@@ -3144,6 +3144,12 @@ impl<'m> Session<'m> {
             w_beta: &gw.beta.buf,
             alpha: Proj::Single(v.pipes.get(&gw.alpha.key)?),
             w_alpha: &gw.alpha.buf,
+            beta_alpha: if breccia_kernels::gdn::beta_alpha_merged() {
+                Some(Proj::Single(v.pipes.get(&gw.beta_alpha.key)?))
+            } else {
+                None
+            },
+            w_beta_alpha: Some(&gw.beta_alpha.buf),
             out: Proj::Single(v.pipes.get(&gw.out.key)?),
             w_out: &gw.out.buf,
         };
