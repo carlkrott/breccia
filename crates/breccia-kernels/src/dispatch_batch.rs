@@ -91,6 +91,18 @@ thread_local! {
     /// **written since the last barrier** that separates them from a later reader.
     /// A barrier is emitted only when the next dispatch binds one of these.
     static DIRTY: RefCell<Vec<vk::Buffer>> = const { RefCell::new(Vec::new()) };
+    /// **Persistent descriptor sets** (§8ao): one set per
+    /// `(pipeline layout, buffer set)` — the decode shape is frozen per config, so
+    /// every token asks for exactly the same bindings and the set can be written
+    /// once, off the hot path. Keyed by the pipeline handle and the bound buffer
+    /// handles; allocated from a per-device pool that lives until `shutdown`.
+    static SETS: RefCell<std::collections::HashMap<(u64, Vec<vk::Buffer>), vk::DescriptorSet>> =
+        RefCell::new(std::collections::HashMap::new());
+    static SET_POOLS: RefCell<Vec<(ash::vk::Device, vk::DescriptorPool, ash::Device)>> =
+        const { RefCell::new(Vec::new()) };
+    /// Counters: sets written (cold) vs dispatches that reused one (hot).
+    static SETS_NEW: Cell<u64> = const { Cell::new(0) };
+    static SETS_HIT: Cell<u64> = const { Cell::new(0) };
     /// Barriers emitted into batches since the process started, and the subset the
     /// per-resource tracker **pruned** for comparison.
     static BARRIERS: Cell<u64> = const { Cell::new(0) };
@@ -196,6 +208,10 @@ pub fn shutdown() -> Result<()> {
         }
         SLOT_DEV.with(|d| d.borrow_mut()[slot] = None);
     }
+    for (_, pool, dev) in SET_POOLS.with(|v| std::mem::take(&mut *v.borrow_mut())) {
+        unsafe { dev.destroy_descriptor_pool(pool, None) };
+    }
+    SETS.with(|c| c.borrow_mut().clear());
     if std::env::var_os("BRECCIA_TRACE_BATCH").is_some() {
         eprintln!("batch ring: freed {freed} descriptor pool(s) at shutdown");
     }
@@ -267,6 +283,12 @@ pub fn recorded_on(gpu: &Gpu) -> u32 {
 /// always-barrier shape would have emitted (§8al).
 pub fn barriers() -> u64 {
     BARRIERS.with(|c| c.get())
+}
+
+/// Descriptor sets written once (cold) and dispatches that reused one (hot). The
+/// ratio is the per-dispatch descriptor cost the persistent cache removes.
+pub fn descriptor_sets() -> (u64, u64) {
+    (SETS_NEW.with(|c| c.get()), SETS_HIT.with(|c| c.get()))
 }
 
 /// Barriers the per-resource tracker decided were not needed.
@@ -774,6 +796,33 @@ unsafe fn transfer_barrier(d: &ash::Device, cmd: vk::CommandBuffer) {
 /// `bufs` are the dispatch's storage buffers in binding order; a fresh
 /// descriptor set is allocated for them (see the module docs for why it cannot
 /// be the kernel's own set).
+/// The persistent descriptor pool for `gpu`'s device (created on first use, freed by
+/// [`shutdown`]). Sized for the distinct `(pipeline, buffers)` combinations a session
+/// has — a few hundred, not one per dispatch.
+fn set_pool(gpu: &Gpu) -> Result<vk::DescriptorPool> {
+    ensure_slots();
+    let dev = gpu.device.handle();
+    if let Some((_, p, _)) =
+        SET_POOLS.with(|v| v.borrow().iter().find(|(d, _, _)| *d == dev).cloned())
+    {
+        return Ok(p);
+    }
+    let sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(MAX_SETS * MAX_BINDINGS)];
+    let pool = unsafe {
+        gpu.device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .pool_sizes(&sizes)
+                .max_sets(MAX_SETS * 4),
+            None,
+        )
+    }
+    .map_err(|e| anyhow!("creating the persistent descriptor pool: {e}"))?;
+    SET_POOLS.with(|v| v.borrow_mut().push((dev, pool, gpu.device.clone())));
+    Ok(pool)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record(
     gpu: &Gpu,
@@ -790,38 +839,102 @@ pub(crate) fn record(
     if pool == vk::DescriptorPool::null() {
         return Err(anyhow!("recording a dispatch without an open batch"));
     }
+    // **The set is written once per (pipeline, buffer set), not once per
+    // dispatch** (§8ao). The decode shape is frozen per config, so token *n* binds
+    // exactly the buffers token *n-1* did and the set can be cached. A cached set
+    // is only ever written before any command buffer references it, which is the
+    // rule the module docs impose on `vkUpdateDescriptorSets`; the per-batch pool's
+    // fresh set was the ~3 µs/dispatch this removes.
+    let key: (u64, Vec<vk::Buffer>) = (
+        ash::vk::Handle::as_raw(kernel.pipe),
+        bufs.iter().map(|b| b.buf).collect(),
+    );
+    let cached = SETS.with(|c| c.borrow().get(&key).copied());
+    let persistent = if track_disabled() {
+        None
+    } else {
+        cached.or_else(|| {
+            let pool = set_pool(gpu).ok()?;
+            let layouts = [kernel.dsl];
+            let sets = unsafe {
+                gpu.device.allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(pool)
+                        .set_layouts(&layouts),
+                )
+            }
+            .ok()?;
+            let set = sets[0];
+            let infos: Vec<vk::DescriptorBufferInfo> = bufs
+                .iter()
+                .map(|b| vk::DescriptorBufferInfo {
+                    buffer: b.buf,
+                    offset: 0,
+                    range: vk::WHOLE_SIZE,
+                })
+                .collect();
+            let writes: Vec<vk::WriteDescriptorSet> = infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_count(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
+            unsafe { gpu.device.update_descriptor_sets(&writes, &[]) };
+            SETS.with(|c| c.borrow_mut().insert(key, set));
+            SETS_NEW.with(|c| c.set(c.get() + 1));
+            Some(set)
+        })
+    };
+    if persistent.is_some() && cached.is_some() {
+        SETS_HIT.with(|c| c.set(c.get() + 1));
+    }
     unsafe {
-        let layouts = [kernel.dsl];
-        let sets = gpu
-            .device
-            .allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(pool)
-                    .set_layouts(&layouts),
-            )
-            .map_err(|e| anyhow!("allocating a batch descriptor set: {e}"))?;
-        let set = sets[0];
-        let infos: Vec<vk::DescriptorBufferInfo> = bufs
-            .iter()
-            .map(|b| vk::DescriptorBufferInfo {
-                buffer: b.buf,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            })
-            .collect();
-        let writes: Vec<vk::WriteDescriptorSet> = infos
-            .iter()
-            .enumerate()
-            .map(|(i, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(set)
-                    .dst_binding(i as u32)
-                    .descriptor_count(1)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            })
-            .collect();
-        gpu.device.update_descriptor_sets(&writes, &[]);
+        let batch_set;
+        let set = match persistent {
+            Some(s) => s,
+            None => {
+                // The A/B arm (`BRECCIA_NO_BARRIER_TRACK=1`) and any allocation
+                // failure keep the per-dispatch set from the batch's own pool.
+                let layouts = [kernel.dsl];
+                let sets = gpu
+                    .device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(pool)
+                            .set_layouts(&layouts),
+                    )
+                    .map_err(|e| anyhow!("allocating a batch descriptor set: {e}"))?;
+                batch_set = sets[0];
+                let infos: Vec<vk::DescriptorBufferInfo> = bufs
+                    .iter()
+                    .map(|b| vk::DescriptorBufferInfo {
+                        buffer: b.buf,
+                        offset: 0,
+                        range: vk::WHOLE_SIZE,
+                    })
+                    .collect();
+                let writes: Vec<vk::WriteDescriptorSet> = infos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, info)| {
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(batch_set)
+                            .dst_binding(i as u32)
+                            .descriptor_count(1)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .buffer_info(std::slice::from_ref(info))
+                    })
+                    .collect();
+                gpu.device.update_descriptor_sets(&writes, &[]);
+                batch_set
+            }
+        };
 
         gpu.device
             .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kernel.pipe);

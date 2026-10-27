@@ -3237,6 +3237,59 @@ dominates. That is the next round's first job, and it needs the per-slot query p
    hosted blocks — removes the last serial CPU section; needs 4096 B alignment and,
    for a pinned pool, `LimitMEMLOCK=infinity` (`ulimit -Hl` is 8 MiB here).
 
+## 8ao. Persistent descriptor sets: implemented, measured, **no delta** — so replay is not redundant
+
+### What was tried (Item 1a)
+
+`dispatch_batch::record` no longer allocates a set per dispatch: `SETS` caches one
+**pre-written** set per `(pipeline handle, buffer handles)`, allocated from a
+persistent per-device pool (`set_pool`, freed in `shutdown`). A cached set is written
+before any command buffer references it, so the module's `vkUpdateDescriptorSets` rule
+still holds. The A/B arm is the same switch as the barrier tracker
+(`BRECCIA_NO_BARRIER_TRACK=1` falls back to the per-batch set), and
+`descriptor_sets()` returns `(written, reused)`.
+
+### Measured (single stream, 30 blocks, gen 16, warm 1, clocks `high`, adjacent pair)
+
+| arm | record ms/token | dispatches/token | tok/s | ms/token | `wait-gpu` |
+|---|---:|---:|---:|---:|---:|
+| per-batch set (old) | 19.76 | 5 167 | 16.95 | 59.00 | 33.49 |
+| **persistent set (new)** | **19.48** | 5 167 | 16.78 | 59.60 | 33.40 |
+
+**No delta** (−0.3 ms, inside noise). So the ~3.2 µs/dispatch of record time is **not**
+descriptor-set allocation: with the alloc+write removed the hot path still costs
+`cmd_bind_pipeline` + `cmd_bind_descriptor_sets` + `cmd_push_constants` +
+`cmd_dispatch` + the barrier record, and that is where the time is. (The set write was
+already amortised in practice: RADV's pool allocation from a reset pool is cheap.)
+
+**Consequence for Item 2:** the frozen-CB replay is **not** made redundant by 1a — it
+removes the *whole* record path (all four commands plus the driver's validation of
+each), not just the set. At 3.2 µs/dispatch × 5 167 that is up to ~16 ms/token of host
+time, and it is the only remaining way to cut recording. It stays the next item, and it
+still needs the per-slot query pools (§8am) to be trusted.
+
+`BRECCIA_NO_BARRIER_TRACK=1` therefore now has two meanings (barriers **and** the
+descriptor cache); they must be split into two flags before the next measurement round.
+
+### State (single stream, both cards, clocks `high`)
+
+| quantity | value |
+|---|---:|
+| tok/s / ms per token | **17.56 / 56.94** (best of the window) |
+| `record` | 22.4 ms/token (this window), 19.5 in the adjacent pair |
+| `wait-gpu` | 33.4 (0.82 barriers/dispatch, 62 730 pruned) |
+| dispatches/token | **5 167** (36 per submit; ~3.2 µs each) |
+| `experts(host)` / `head` / `ple` / `xfer` | 13.4 / 7.0 / 1.2 / 1.1 |
+| expert bytes/token | 301 MiB |
+| parity (32 greedy tokens vs the HIP server) | **32/32** |
+
+### Not done (unchanged order)
+
+1. **Frozen-CB replay** — now confirmed as the only remaining record-path lever.
+2. **Complete dispatch census** (per-batch stage marks) — still 123 of 5 167 visible.
+3. The four fusions, the head-device option (~−4 ms), the adaptive arena
+   (measured-free-VRAM rule with a display-card reserve), zero-copy host-memory experts.
+
 ## 9. Exact commands
 
 
