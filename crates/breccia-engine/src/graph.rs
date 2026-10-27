@@ -511,6 +511,9 @@ pub struct Session<'m> {
     /// Fine-grained `shared-exp` attribution (§8ad): gate, up, swiglu, down, scalar
     /// gate in host seconds, then the pass-1 flush wait. Measurement only.
     sh_sub: [f64; 6],
+    /// Wall seconds spent inside [`Session::prefill`] and the prompt tokens it
+    /// covered — the denominator for the stage table's `sum vs total` line (§8ah).
+    pf_wall_s: f64,
     pf_merged_dispatches: u64,
     pf_arena_bytes: u64,
     pf_merged_experts: usize,
@@ -870,6 +873,7 @@ impl<'m> Session<'m> {
             pf_stream_wait_s: 0.0,
             pf_ple_prefetch_s: 0.0,
             sh_sub: [0.0; 6],
+            pf_wall_s: 0.0,
             pf_merged_dispatches: 0,
             pf_arena_bytes: 0,
             pf_merged_experts: 0,
@@ -1091,6 +1095,7 @@ impl<'m> Session<'m> {
         self.pf_stream_wait_s = 0.0;
         self.pf_ple_prefetch_s = 0.0;
         self.sh_sub = [0.0; 6];
+        self.pf_wall_s = 0.0;
         self.pf_merged_dispatches = 0;
         self.pf_arena_bytes = 0;
         self.pf_merged_experts = 0;
@@ -1568,6 +1573,7 @@ impl<'m> Session<'m> {
         let dev = 0;
         let gpu = m.devices[dev].gpu();
         let hc_dim = mc.hc_dim();
+        let wall0 = std::time::Instant::now();
         self.pf_toks.clear();
         self.pf_toks.extend_from_slice(toks);
         self.pf_tokens += t;
@@ -1645,9 +1651,26 @@ impl<'m> Session<'m> {
                 .filter(|(_, ms)| *ms > 0.01)
                 .map(|(name, ms)| format!("{name} {ms:.2}"))
                 .collect();
+            let sum_ms = self.timers.total_s() * 1e3 / t as f64;
+            // This chunk's own wall: the accumulator is only updated on return, so
+            // using it here printed 0.00 (which is the whole point of the line).
+            let wall_ms = wall0.elapsed().as_secs_f64() * 1e3 / t as f64;
             eprintln!(
                 "prefill stages blk48 t={t} (ms/token): {}",
                 rows.join(" · ")
+            );
+            eprintln!(
+                "prefill sum {:>7.2} · wall {:>7.2} · residual {:>7.2} ms/token \
+                 ({:.0}% unattributed) over {} tokens",
+                sum_ms,
+                wall_ms,
+                wall_ms - sum_ms,
+                if wall_ms > 0.0 {
+                    (wall_ms - sum_ms) / wall_ms * 100.0
+                } else {
+                    0.0
+                },
+                t
             );
             self.timers.clear();
         }
@@ -1659,6 +1682,7 @@ impl<'m> Session<'m> {
         let logits = self.finish_head()?;
         self.swap_r_in(dev, t - 1);
         self.timers.stop();
+        self.pf_wall_s += wall0.elapsed().as_secs_f64();
         Ok(logits)
     }
 

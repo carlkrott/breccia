@@ -2717,6 +2717,76 @@ for. One incidental confirmation: **PLE's cold rows are visible in the first chu
 line** (`ple 16.47` at 9 blocks, `5.27` at 13) and collapse to 1.1-1.3 ms/token by the
 second — §8z's cold-vs-warm story, seen in a single run.
 
+## 8ah. The stage table already sums to the wall — the "missing 100 ms" was an arithmetic artifact
+
+Item 1 delivered: a chunked-prefill token is now attributed **end to end**, and the
+residual is zero. There is no unaccounted ~100 ms, and the reason the earlier
+arithmetic suggested one is worth writing down because it will mislead the next reader
+too.
+
+### The complete table (`BRECCIA_TRACE_PREFILL` + the new `prefill sum` line)
+
+2 streams, 64-token chunk, `--warm 1`, both cards, ms per agent-token, **sum against
+that stream's own wall**:
+
+| stage | RX 6950 XT | MI50 |
+|---|---:|---:|
+| **experts(host)** | **83.04** | **83.39** |
+| **wait-gpu** | **32.79** | **85.80** |
+| mixer | 8.41 | 17.61 |
+| ple | 2.19 | 17.64 |
+| hc-write(ffn) | 1.52 | 0.51 |
+| hc-read(attn/ffn) + hc-write(attn) + router + shared-exp + embed | 0.54 | 1.36 |
+| **stage sum** | **128.50** | **206.33** |
+| **wall (this chunk)** | **128.54** | **206.35** |
+| **residual** | **0.04 (0.03 %)** | **0.02 (0.01 %)** |
+
+And the cross-check that closes it: `128.50 + 206.33 = 334.8` ms against
+`2 x 167.6 = 335.2` ms of combined wall — **0.1 % agreement**.
+
+### Why there was never a 95-105 ms hole
+
+`bench agents` prefills the streams **serially** (`for (s, sess) in multi.streams
+.iter_mut()`), and `prefill tok/s per agent` divides the *combined* wall of both
+streams by the tokens of one. So the per-agent figure (6.45 tok/s = 155 ms) is really
+"both cards' prefill time per token pair divided by two", while the stage table is
+measured inside **one** session. The table was always per stream and always complete;
+comparing it to the combined wall invented the missing 100 ms. The new `prefill sum`
+line prints `sum · wall · residual` per chunk precisely so this cannot recur: if the
+residual is not ~0, the table is lying, and now the number says so.
+
+### What the table says to do next (re-ordered by research round 7's finding)
+
+Research round 7 measured the cost model that matters: **a submit+fence is a fixed
+56-62 µs wall regardless of how many dispatches it carries**, and each command-buffer
+boundary costs 21-34 µs of GPU timeline even inside one submit. That reframes §8af:
+167 dispatches removed changed almost nothing because dispatches are not the unit.
+
+By that model the two structural numbers in hand are:
+
+| quantity | measured | predicted cost |
+|---|---|---|
+| submits per block-chunk in chunked prefill | **13.6**, not 2 | ~550 extra submits per prefill x 62 µs = **~34 ms** |
+| unneeded dependent barriers (~1 100 of ~4 800 per token) | §8af | ~3.8 ms/token at 3.43 µs |
+
+The 13.6 submits come from **PLE**: `ple_step` flushes twice per token and then records
+GPU work with no batch open, so each of those dispatches becomes its own submit. That
+makes **PLE batching the next item** (it also removes the cold-row serialisation of
+§8z): one batch around the whole PLE phase per block-chunk, target ~2.2 submits per
+block-chunk, and the submit count is now a headline metric to report beside the stage
+table.
+
+### Not landed this round
+
+Async expert prefetch (the ~38 ms/token lane item) and the per-resource barrier
+tracking: unchanged, and correctly sequenced **after** the submit reduction, because
+the two structural costs are now ordered by measurement rather than by estimate.
+Parity is untouched this round (timers only): chunk 128 + merged 32/32, top-1
+13.170561; no decode path changed, so the canonical gate stands at 20.3 +- 1 aggregate,
+lane 40-43 ms/step. The 2.98 tok/s/agent in this window is not a regression — it is a
+loaded box (`experts(host)` 83 vs 38-48 in quieter windows, `ple` 17.6 on the MI50
+stream); the attribution, not the rate, is the deliverable.
+
 ## 9. Exact commands
 
 
