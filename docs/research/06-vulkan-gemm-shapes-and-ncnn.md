@@ -1,14 +1,20 @@
 # 06 — small-M quantised GEMM shapes, fused SwiGLU, barrier bookkeeping; audit of ncnn
 
-**Round:** paired research 6 (2026-10-26/27). **Read-only:** no engine crate was touched. New
-harness: `harnesses/vk-r6-shapes` (standalone, own `VkDevice`, compiles the engine's own
-`crates/breccia-kernels/shaders/blocks.glsl` into its shaders so the measured kernel *is* the
-Q4_K decode path we ship). Raw data: `harnesses/vk-r6-shapes/results/{rx-a,rx-b,rx-c,rx-fuse-d,
-rx-fuse-e}.json`.
+**Round:** paired research 6 (2026-10-26/27). **Read-only:** no engine crate was touched
+(`git status` at the end of the round shows only `docs/research/*` from this agent).
 
-> `harnesses/vk-gemm-sweep/` is *not* mine — the paired implementation round owns that directory
-> (`main.rs`, `oob.comp`, `sweep_gemm.comp`). This round's harness lives in `vk-r6-shapes/` to
-> avoid two agents writing the same files.
+Measurement program: a throwaway standalone harness (own `VkDevice`, `ash`, no engine crate) in
+opencode's scratch space, per AGENTS.md — it compiled the engine's own
+`crates/breccia-kernels/shaders/blocks.glsl` into every shader, so the kernel it measured *is* the
+Q4_K decode path we ship. **The scratch source was not retained** (the concurrent implementation
+round reaped the scratch tree mid-round), so §0.1 and Appendix A carry everything needed to
+rebuild it in one sitting; the numbers below are the record. Every table in this doc is inline, so
+nothing depends on a surviving file.
+
+> The paired implementation round owns the shape/barrier harness that *is* kept
+> (`vk-gemm-shapes`, with `sweep` and `barrier` subcommands and PCI-targeted device selection);
+> this round's numbers came from an independent program so that neither agent's edits could move
+> the other's baseline.
 
 ## 0. What was measured, and how (read this before quoting a number)
 
@@ -343,3 +349,53 @@ rotation: no CUDA anywhere, so its solutions are the ones shaped by the same con
 * The 20.9–55.3 ms chunked shared expert in the trace is **not** explained by kernel time at m=8
   (§1 says 0.90 ms/token over 48 blocks). Whatever else is in that number, it is dependency and
   dispatch structure — which is exactly what adaptations 1 and 2 attack.
+
+## Appendix A — rebuilding the sweep (exact defines)
+
+`gemm_body.glsl`'s geometry lifted into compile-time defines, plus one extra body variant. Base:
+`crates/breccia-kernels/shaders/gemm_q4k.comp` = `#define QK 256u` / `#define BLOCK_WORDS 72u` /
+`#include "blocks.glsl"` / `#define DEQUANT_UNIT dequant_q4_k_unit`, then `gemm_body.glsl`'s `main`
+verbatim with these substitutions:
+
+```glsl
+layout(local_size_x = LSX) in;               // -DLSX=64|128|256|512|1024
+#define ROWS   ROWS_MACRO                    // -DROWS=1|2|4|8|16|32, kept <= LSX/32
+#if LDS_VECS > 0                             // -DLDS_VECS=1280 for the 20 KiB X-staging variant
+shared vec4 lds_x[LDS_VECS];                 // cooperative load + barrier() before the early-out
+#endif
+```
+
+* **`-DUNROLL=n`**: decode `n` blocks before any dot product so all `n` block loads are in flight:
+
+  ```glsl
+  for (; b + UNROLL <= bpr; b += UNROLL) {
+      float vv[UNROLL][8];
+      [[unroll]] for (uint t = 0u; t < UNROLL; ++t)
+          DEQUANT_UNIT(row_base + (b + t) * BLOCK_WORDS, u, vv[t]);
+      [[unroll]] for (uint t = 0u; t < UNROLL; ++t) { /* dot all m users, acc0/acc1 by (b+t)&1 */ }
+  }
+  ```
+
+  Accumulator parity must stay keyed on the absolute block index (`(b+t)&1`, not `t`), otherwise
+  the result is not bit-comparable with `UNROLL=1`.
+
+* **Fusion prototype** (`gateup_swiglu.comp`): `#define BRECCIA_OWN_BINDINGS 1` so the four SSBO
+  bindings and a 24-byte push constant (`rows, cols, bpr, base_gate, base_up, users`) can be
+  declared locally, then the same `DEQUANT_UNIT` twice per block (`vg[8]`, `vu[8]`) and one
+  per-user `dot` pair; epilogue `O[j*rows + row] = silu(Σgate) * Σup` after a 32-lane shuffle
+  reduce of both sums.
+
+* **Fixture** (this is what makes the numbers comparable): every Q4_K block has `d = f16 0x2400`
+  (2⁻⁶), `dmin = f16 0x2000` (2⁻⁷ — both finite and small), and pseudo-random bytes for the scale
+  and `qs` fields, so no fixture can produce inf/NaN scales while every decode path (scale unpack,
+  nibble select, tail mask) is exercised. Correctness gate: all geometries bit-identical and a CPU
+  f64 dequant+dot within 3 × 10⁻⁶ relative.
+
+* **Command lines** (RX = `--device 0`, MI50 = `--device 1`, all wrapped in `timeout 90`):
+
+  ```bash
+  <bin> --device 0 --mode verify                                  # correctness gate
+  <bin> --device 0 --mode all    --json rx.json                   # sweep + barrier + fuse
+  <bin> --device 1 --mode sweep  --shape gate --m 8 --sub none \
+        --only ls64/r2,ls128/r4,ls256/r8,ls512/r16                # display card: <=4 fresh shapes
+  ```
