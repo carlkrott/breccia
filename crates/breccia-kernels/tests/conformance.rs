@@ -287,6 +287,60 @@ fn concatenated_rows_are_bit_identical_to_the_separate_gemvs() {
     println!("concatenated rows: bit-identical ({rows_a} + {rows_b} x {cols})");
 }
 
+/// The **word-level pack** build (§8bc) must be bit-identical to the incumbent
+/// per-element build: same codes, same scale, same multiply order, fewer instructions.
+/// Compared on the GEMV's actual output (`to_bits()`), across shapes that include
+/// partial blocks and odd row counts.
+#[test]
+fn word_pack_is_bit_identical_to_the_default() {
+    let fx = need_gpu!();
+    let dev = fx.dev;
+    let gpu = dev.gpu();
+    let ty = breccia_kernels::QuantType::Iq4Xs;
+    if breccia_kernels::gemv::gemv_words_spv(ty).is_none() {
+        println!("word pack: no build for {ty}, skipping");
+        return;
+    }
+    let mut checked = 0;
+    for (rows, cols) in [
+        (1usize, 2560usize),
+        (3, 1024),
+        (640, 2560),
+        (2560, 640),
+        (7, 854),
+        (2, 257),
+        (10240, 2560),
+    ] {
+        let (packed, x) = real::synthetic_inputs(ty, bench::Shape::new(rows, cols), 0x77aa);
+        let w = breccia_kernels::gemv::upload(gpu, &packed).expect("upload w");
+        let xb = breccia_kernels::gemv::upload(gpu, &bench::f32_to_bytes(&x)).expect("upload x");
+        let out_a = breccia_kernels::gemv::alloc(gpu, (rows * 4) as u64).expect("out");
+        let out_b = breccia_kernels::gemv::alloc(gpu, (rows * 4) as u64).expect("out");
+        // The two builds are selected by the *environment* inside `Gemv`, so build
+        // them explicitly through the variant constructor the conformance suite owns.
+        let a = Gemv::with_variant(gpu, ty, rows, cols, breccia_kernels::Accum::F32, false)
+            .expect("default pipeline");
+        let b = Gemv::with_words(gpu, ty, rows, cols, breccia_kernels::Accum::F32)
+            .expect("word-pack pipeline");
+        a.run(&w, &xb, &out_a).expect("default run");
+        b.run(&w, &xb, &out_b).expect("word run");
+        let fa = bench::read_out(dev, &out_a, rows).expect("read a");
+        let fb = bench::read_out(dev, &out_b, rows).expect("read b");
+        for buf in [&w, &xb, &out_a, &out_b] {
+            gpu.destroy_buf(buf);
+        }
+        let diff = fa
+            .iter()
+            .zip(fb.iter())
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(diff, 0, "{rows}x{cols}: {diff} of {rows} rows differ");
+        println!("word pack {rows:>5}x{cols:<5} bit-identical");
+        checked += 1;
+    }
+    assert!(checked > 0);
+}
+
 #[test]
 fn non_finite_scales_do_not_corrupt_the_device() {
     let fx = need_gpu!();

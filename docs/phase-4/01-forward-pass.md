@@ -5078,3 +5078,111 @@ BRECCIA_GEMV_DP4A=1 BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
   --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
   --gen 16 --runs 1 --threads 16 --warm 1
 ```
+
+## 8bc. IQ4_XS word-level pack + LDS codebook: **2.0× on the MI50, 1.4× on the RX, bit-identical** — and the win was dependency, not instruction count
+
+§8bb closed the int8 door (accuracy) and pointed at the other half of research 12: reach
+the fp32 floor by extracting four codes per instruction instead of per element. IQ4_XS is
+the right first target because it is the **dense** chain's type (`attn_qkv` 3.5 ms,
+`ssm_out` 2.9, shared 1.5 of the 10.2 ms of quantised projections) and because research 12
+measured it at **47 % of its instruction model** — the worst stall on the box, from a
+per-element codebook lookup.
+
+### What landed: `gemv_iq4_xs_words` (`BRECCIA_NO_GEMV_WORDS=1` reverts)
+
+Two changes to `dequant_iq4_xs_unit`, both arithmetic-preserving:
+
+1. **Word-level nibble extraction.** A lane's 8 codes are the 8 bytes of two 32-bit words,
+   all taking the same nibble half, so `w & 0x0F0F0F0F` (or `(w >> 4) & 0x0F0F0F0F`)
+   yields four codes per instruction — one mask and one select per *word* instead of an
+   extract + select per element.
+2. **The 16-entry IQ4_NL codebook in LDS, as floats.** The incumbent path calls
+   `iq4nl_value(q)` = `float(int(T[TBL_IQ4NL_VALUES + q]))`: a descriptor load plus an
+   int→float convert per element, with a two-level dependency (byte → index → load). The
+   workgroup now copies the same 16 values into `shared float s_iq4nl[16]` before its
+   first `barrier()` and reads them from LDS. **The values are the same** — every output
+   bit is unchanged.
+
+| | before | after | Δ |
+|---|---:|---:|---:|
+| **static instructions per unit** (`spirv-dis`, minus the 28-op baseline) | 123 | **144** | **+17 %** |
+| MI50, `attn_qkv` 10240×2560 (26.2 M el) | 127 µs · 109 GB/s · 206 M el/ms | **63 µs · 222 GB/s · 416 M el/ms** | **2.02×** |
+| RX 6950 XT, same shape | 33 µs · 422 GB/s | **24 µs · 584 GB/s** | **1.38×** |
+| in-engine `gdn-proj` (36 calls) µs/token | 3 518.7 | **3 243.5** | −7.8 % |
+| in-engine `gdn-out` (36 calls) | 2 872.3 | **2 791.5** | −2.8 % |
+| `sum` (GPU execution) | 30 919.8 | **30 319.5** | −1.9 % |
+| single stream, dual, 30 resident | 17.69 tok/s · 56.54 ms | **18.59 tok/s · 53.78 ms** | **+5.1 %** |
+
+**The instruction count went *up* and the kernel got 2× faster.** That is the round's
+real finding and it corrects the premise we started from: at this shape the limit is not
+the instruction count but the **dependent per-element lookup chain** (research 12's
+"8 lookups → 47 % of the ideal rate"). Moving the table to LDS and extracting four codes
+per instruction removes the dependency; the extra mask/select ops are free by comparison.
+So the metric to steer by is *dependency depth per element*, not `I_unit`, and a static
+SPIR-V count will mislead on exactly the types that stall.
+
+### Bit-identity (the gate that makes this shippable)
+
+`conformance::word_pack_is_bit_identical_to_the_default` builds both pipelines in one
+process and compares the GEMV's output `to_bits()` on seven shapes, including the real
+`10240×2560` and the tail shapes `7×854`, `2×257`: **0 of N rows differ on every shape.**
+First run on the MI50 (headless), validation layer on, `spirv-val` clean at build time, no
+VU but the pre-existing robustness2 device-creation notice, `dpm` `high` before and after,
+no `amdgpu` fault in the window. It is on by default because it is bit-identical.
+
+**Parity: 32/32 at chunk 8/16/32/128** (top-1 `13.170510`, unchanged from §8az) and the
+**8-process gate is GREEN** (`RACE_PROCS=8 RACE_RUNS=1 RACE_GEN=32 RACE_PROMPT=parity
+RACE_WARM=1 scripts/head-handoff-race.sh`).
+
+### The engine-vs-bench gap (the next thing to read, not to guess)
+
+The isolated kernel is 2.02× on the MI50 but `gdn-proj` in the engine only moves 7.8 %.
+The stage is 97.7 µs per call against the bench's 63 µs (words) / 127 µs (wide), i.e. the
+stage carries ~35 µs per call that the kernel does not — the dependent-dispatch and
+barrier cost research 07 §A4 priced at 21–34 µs per command-buffer boundary. That is
+where the next 2 ms of this stage is, and it is a *boundary* question, not a kernel one.
+
+### Placement sweep (item 5): the incumbent wins, no free win here
+
+Research 12's law (RX holds 2.0× the instruction slots, MI50 1.85× the bytes) predicts the
+dense-byte split may be wrong for an ALU-bound workload. Measured (dual, probe on, gen 16,
+warm 1, co-tenant-guarded arms, `--gpu-experts` unchanged):
+
+| `--split-blocks` | tok/s | ms/token | `sum` µs |
+|---|---:|---:|---:|
+| **28,20 (incumbent)** | **18.99** | **52.67** | **30 318** |
+| 24,24 | 13.62 | 73.39 | 48 175 |
+| 32,16 | 13.74 | 72.77 | 48 833 |
+
+Moving blocks between the cards costs 20–25 % because it also moves the *expert arena*
+headroom and the lane's block count — the split is not a free knob, and 28,20 stays. A
+placement change would need the arena and the lane re-planned together, which is the
+`--gpu-experts auto` work another round owns.
+
+### What remains
+
+1. **IQ3_S / Q5_K word-level** — the same transformation on different bit patterns:
+   IQ3_S's grid indices (`qa`, `qhb`, `sgn`) are three 8-bit streams that can be extracted
+   with `& 0x0F0F0F0F`-style ops and a *uniform* LDS grid, which is where research 12
+   measured 2 lookups → 100 % of the model, i.e. no stall left to remove — so expect the
+   IQ3_S gain to be smaller than IQ4_XS's and to come from the extraction only.
+2. **The `hc-read` chain** (`up` at 2.5 ms) shares the IQ4_XS-free shape: BF16, so no
+   codebook — its cost is the 5-dispatch dependency, not decode.
+3. The **boundary** item above (35 µs per `gdn-proj` call outside the kernel).
+4. `BRECCIA_GEMV_DP4A` stays exactly where it is: off, with the 6.2e-3 ledger in §8bb.
+
+### Commands
+
+```bash
+# instructions per unit (host only, research 12's method; harness not in the repo)
+cd /var/tmp/users/korphaus/tmp/opencode/research-harnesses/r14-words && ./count.sh
+#   iq4xs_wide 151  iq4xs_words 172  iq3s_wide 195  q5k_wide 220  baseline 28
+# the per-card kernel numbers
+./target/release/breccia bench gemv --device 0000:0e:00.0 --real --tensor blk.0.attn_qkv.weight
+BRECCIA_NO_GEMV_WORDS=1 ./target/release/breccia bench gemv --device 0000:0e:00.0 --real \
+  --tensor blk.0.attn_qkv.weight          # 63 -> 127 us on the MI50
+# bit-identity + the full conformance suite, headless card first
+timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+  BRECCIA_KERNEL_DEVICE=0000:0e:00.0 cargo test -p breccia-kernels --test conformance \
+  word_pack -- --test-threads=1 --nocapture
+```
