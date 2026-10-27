@@ -4957,3 +4957,124 @@ timeout 90 env BRECCIA_KERNEL_DEVICE=0000:0e:00.0 \
 # the dp4a advertisement (no GPU compute needed)
 vulkaninfo | grep -E "integerDotProduct4x8BitPackedSignedAccelerated|shaderIntegerDotProduct"
 ```
+
+## 8bb. The int8-dot path exists and is measurably **not** the lever yet — and the toolchain blocker was a name
+
+Round 12 predicted that packed int8 dot products (`OpSDot` / `v_dot4_i32_i8`) are the
+only change that alters the *class* of the quantised GEMV: `I_unit` 177 → ~95 on IQ3_S,
+i.e. up to 1.87× on the MI50, with the RX already DRAM bound. This round built the path,
+measured it on both cards, and it comes in at **1.18× on the MI50 and 1.11× on the RX** —
+with an accuracy cost that breaks the agreed contract. Recorded in full because the
+*reasons* it misses are each fixable and each is priced below.
+
+### 1. The toolchain step: the blocker was the extension **name**, not the compiler
+
+Last round's probe reported that `glslc` 2026.4 and `glslangValidator` 1.4.363 both
+reject `GL_EXT_shader_integer_dot_product` — true, and irrelevant: the GLSL extension is
+**`GL_EXT_integer_dot_product`**, and both compilers support it. Verified:
+
+```bash
+# after `#extension GL_EXT_integer_dot_product : require`
+glslc -O --target-env=vulkan1.3 -o dp4a.spv dp4a.comp && spirv-val --target-env vulkan1.3 dp4a.spv
+spirv-dis dp4a.spv | grep OpSDot
+#   OpCapability DotProductInput4x8BitPacked / DotProduct
+#   %40 = OpSDot %int %31 %39 PackedVectorFormat4x8Bit
+```
+
+So the hot path stays in GLSL (`dotPacked4x8EXT(int, int)`), which is the maintainable
+form. The hand-written route is kept as the fallback it may be needed for: a
+`shaders/intdot_probe.spvasm` module with `OpSDot` + the packed-int8 capability,
+**assembled by `spirv-as` and validated by `spirv-val` inside `build.rs`** (SPIRV-Tools
+v2026.4, SPIR-V 1.6; `spirv-as`/`spirv-val` both ran, module accepted, `OpSDot
+PackedVectorFormat4x8Bit` present), and `.spvasm` is in the same per-file
+`rerun-if-changed` list as the `.comp`/`.glsl` files so it can never go stale.
+`gemv_iq3s_q8.spv` — the real kernel — carries exactly **2 `OpSDot`** per 8-element unit.
+
+### 2. What was built (behind `BRECCIA_GEMV_DP4A=1`, off by default)
+
+`ops_q8_quantize.comp` (activation → int8 + one f16 scale per 32-element group) and
+`gemv_iq3s_q8.comp` (IQ3_S blocks → int8 codes from the grid, `dotPacked4x8EXT` × 2 per
+unit, scale hoisted to the group: `acc += d_block · sc · d_activation · float(dot)`).
+Wired inside `Gemv` so `Proj::Single`, the bench and the graph all pick it up with one
+flag; buffers are sized from `cols`/`groups`, never a literal.
+
+### 3. Measured, per card (IQ3_S `blk.0.attn_gate.weight`, 6144×2560 = 15.7 M elements)
+
+| card | fp32 | int8 | speedup | GB/s | M el/ms | max rel vs f64 |
+|---|---:|---:|---:|---|---:|---:|
+| MI50 (headless) | 52 µs | **44 µs** | **1.18×** | 131 → 155 | 303 → 357 | 1.4e-7 → **6.21e-3** |
+| RX 6950 XT | 20 µs | **18 µs** | **1.11×** | 337 → 377 (85 % of 445) | 785 → 872 | 1.4e-7 → **6.21e-3** |
+
+Both cards behave exactly as research 12's model says they should: the **MI50 is
+instruction bound** (155 GB/s = 19 % of DRAM, so `I_unit` sets the rate) and the **RX is
+DRAM bound** (377 of 445 GB/s), which is why the RX moves only 11 %. The instruction
+count also explains why the MI50 gain is 1.18× and not 1.87×: this unit is **~140
+instructions**, not research's 95, because it still does per-element sign selection and
+bit extraction. Research's 95 assumes llama.cpp's word-level `QUANT_R_MMQ` packing
+(4 codes per instruction, `& 0x0F0F0F0F`), which this first version does not do.
+
+### 4. In the graph: no win, and the accuracy contract fails
+
+Dual, 30 resident blocks, gen 16, warm 1, probe on, adjacent arms:
+
+| | fp32 | int8 | |
+|---|---:|---:|---|
+| `gdn-z` (IQ3_S, 36 calls) µs/token | 1 799.6 | 1 770.6 | −1.6 % |
+| `sum` (GPU execution) | 30 921 | 31 030 | **+0.4 %** (the q8_1 producer dispatch eats the gain) |
+| single stream | 18.16 / 18.55 tok/s | 18.66 tok/s | inside noise |
+| **top-1 logit** | **110563 @ 13.1705** | **248046 @ 12.6574** | **the greedy token changes** |
+
+**Contract, measured against the numbers I proposed last round:**
+
+| bound | required | measured | verdict |
+|---|---|---:|---|
+| per-element relative vs f64 | ≤ 1e-3 | **6.21e-3** | **FAIL** (6× over) |
+| `mixed` / logits | ≤ 1e-5 | **5.1e-1** (13.1705 → 12.6574) | **FAIL** |
+| 32-token greedy | unchanged | **changed at token 1** | **FAIL** |
+
+The cause is not the int8 dot, it is the **`q8_1` activation quantisation**: 8-bit
+symmetric activations lose ~6e-3 of relative precision, and this model's top-1 is
+sensitive to it. llama.cpp ships exactly this (their gate is perplexity, not greedy
+argmax); we proposed a tighter contract and the measurement says it cannot be met at
+q8_1 without an outlier-aware scheme (per-32-group offsets, or a mixed 8/16-bit
+activation for the layers that matter). So: **flag off, fp32 stays the default and the
+reference**, and the contract needs re-negotiation before any int8 path can be a gate.
+
+### 5. What this says the next round should be (in order)
+
+1. **The dense chain is IQ4_XS, not IQ3_S.** Enumerating the tensors: `attn_qkv`
+   10240×2560 is **IQ4_XS** (3.5 ms/token), `ssm_out` **IQ4_XS** (2.9), shared expert
+   **IQ4_XS** (1.5), and only `attn_gate`/`gdn-z` (1.8) and the routed experts are
+   IQ3_S. So this kernel covers 1.8 ms of 10.2 — the IQ4_XS int8 kernel (research 12
+   prices it at `I_unit` 133 → ~50, the *largest* predicted gain of any type, 2.7–3×,
+   because it also removes an 8-LUT-per-element stall) is the one that matters.
+2. **Word-level packing** (research 12 §A3.3/§B2): `& 0x0F0F0F0F`, shift by 4, and the
+   sign byte as an XOR — that is what takes 140 → ~95 instructions and 1.18× → ~1.8×.
+3. **Fold the `q8_1` producer** into `ops_rmsnorm`/`ops_swiglu` (they already reduce a
+   whole row) instead of a separate dispatch: the in-graph measurement above says the
+   producer currently cancels the gain outright.
+4. **Re-negotiate the accuracy contract** with a measured basis: 6.21e-3 per element is
+   what q8_1 gives; the options are outlier-aware activations, or accepting a
+   top-1-changing path behind a non-default flag with its own ledger.
+5. Placement follows the measurement, not the hope: **int8 helps where the card is
+   instruction bound (MI50)** and is worth ~10 % where it is DRAM bound (RX) — the
+   inverse of the current `--split-blocks`, which is an argument for putting
+   instruction-bound quantised work on the MI50 once a kernel exists that actually wins.
+
+### Commands
+
+```bash
+# the toolchain proof
+glslc -O --target-env=vulkan1.3 -o /tmp/dp4a.spv dp4a.comp && spirv-val --target-env vulkan1.3 /tmp/dp4a.spv
+spirv-as --target-env vulkan1.3 crates/breccia-kernels/shaders/intdot_probe.spvasm -o /tmp/p.spv
+spirv-val --target-env vulkan1.3 /tmp/p.spv && spirv-dis /tmp/p.spv | grep OpSDot
+# the per-card measurement (adjacent arms)
+./target/release/breccia bench gemv --device 0000:0e:00.0 --real --tensor blk.0.attn_gate.weight
+BRECCIA_GEMV_DP4A=1 ./target/release/breccia bench gemv --device 0000:0e:00.0 --real \
+  --tensor blk.0.attn_gate.weight          # 52 -> 44 us, max rel 6.21e-3
+# the in-graph arm (flag on) — top-1 moves, which is why it stays off
+BRECCIA_GEMV_DP4A=1 BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" \
+  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --gen 16 --runs 1 --threads 16 --warm 1
+```

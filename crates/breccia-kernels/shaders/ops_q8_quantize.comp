@@ -1,0 +1,56 @@
+#version 450
+// q8_1 activation quantiser for the int8-dot GEMV (§8bb).
+//
+//   x (f32, K)  ->  q8 (int8, K)            symmetric per-32-element group
+//                   d  (f16 per group)      absmax / 127
+//
+// The group is 32 elements — the same boundary the IQ3_S block uses for its own
+// per-32-element scale — so the weight kernel applies `d_block * sc_group *
+// d_activation` **once per group** instead of per element. That hoisting is the
+// algebraic half of the int8 win (research 12 §B3) and it needs the activation in
+// this form, not just as int8.
+//
+// One workgroup of 256 threads covers 8 groups; `tid % 32` is the lane inside its
+// group, so the absmax is a 32-lane subgroup tree (fixed order, deterministic).
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XVec { float X[]; };
+layout(std430, binding = 1) writeonly buffer QVec { int8_t Q8[]; };
+layout(std430, binding = 2) writeonly buffer DVec { uint16_t D[]; }; // f16 per group
+
+layout(push_constant) uniform Params {
+    uint k;       // elements per row
+    uint groups;  // k / 32
+    uint pad0;
+    uint pad1;
+} pc;
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint group = gid / 32u;
+    uint lane = tid % 32u;
+    if (group >= pc.groups) {
+        return;
+    }
+    uint at = group * 32u + lane;
+    float v = (at < pc.k) ? X[at] : 0.0;
+    float amax = abs(v);
+    [[unroll]] for (uint off = 16u; off > 0u; off >>= 1u) {
+        amax = max(amax, subgroupShuffleXor(amax, off));
+    }
+    float inv = (amax > 0.0) ? (127.0 / amax) : 0.0;
+    int q = clamp(int(round(v * inv)), -127, 127);
+    if (at < pc.k) {
+        Q8[at] = int8_t(q);
+    }
+    if (lane == 0u) {
+        D[group] = uint16_t(packHalf2x16(vec2(amax / 127.0, 0.0)) & 0xFFFFu);
+    }
+}

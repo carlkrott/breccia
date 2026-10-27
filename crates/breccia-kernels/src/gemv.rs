@@ -100,6 +100,90 @@ impl std::str::FromStr for Accum {
     }
 }
 
+/// `BRECCIA_GEMV_DP4A=1`: run IQ3_S GEMVs on **packed int8 dot products** (§8bb) —
+/// `q8_1` activations from a small quantiser, int8 codes from the IQ3_S grid, and
+/// `dotPacked4x8EXT` (= SPIR-V `OpSDot`, `PackedVectorFormat4x8Bit`) doing 4 MACs per
+/// slot with the dequant's `u2f`/FMA/scale work gone.
+///
+/// Off by default: the fp32 path stays the reference (bit-reproducible) and this one
+/// is a rounding change (int32 accumulation, one scale per 32-element group).
+pub fn dp4a_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_GEMV_DP4A").is_some())
+}
+
+/// The int8-dot state one [`Gemv`] owns when the dp4a path is on: the two pipelines
+/// and the activation's `q8_1` buffers, sized from the shape (never a literal).
+struct Q8 {
+    quant: breccia_vk::ctx::Kernel,
+    gemv: breccia_vk::ctx::Kernel,
+    /// `cols` int8 quants, read as packed 4-byte words by the dot.
+    q8: Buf,
+    /// One f16 scale per 32-element group.
+    dq: Buf,
+    /// `cols / 32`, rounded up.
+    groups: usize,
+}
+
+/// Build the int8-dot state for a `cols`-wide row, sizing every buffer from `cols`.
+fn build_q8(gpu: &Gpu, cols: usize) -> Result<Q8> {
+    if !cols.is_multiple_of(32) {
+        return Err(anyhow!(
+            "the int8-dot GEMV needs cols % 32 == 0 (the q8_1 group), got {cols}"
+        ));
+    }
+    let groups = cols / 32;
+    let quant = gpu
+        .kernel(
+            include_bytes!(concat!(env!("OUT_DIR"), "/ops_q8_quantize.spv")),
+            3,
+        )
+        .map_err(|e| anyhow!("creating the q8_1 quantiser: {e}"))?;
+    let gemv = match gpu.kernel(
+        include_bytes!(concat!(env!("OUT_DIR"), "/gemv_iq3s_q8.spv")),
+        6,
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            gpu.destroy_kernel(&quant);
+            return Err(anyhow!("creating the IQ3_S dp4a GEMV pipeline: {e}"));
+        }
+    };
+    let q8 = match alloc(gpu, cols as u64) {
+        Ok(b) => b,
+        Err(e) => {
+            gpu.destroy_kernel(&quant);
+            gpu.destroy_kernel(&gemv);
+            return Err(e.context("allocating the activation quants"));
+        }
+    };
+    let dq = match alloc(gpu, (groups * 2) as u64) {
+        Ok(b) => b,
+        Err(e) => {
+            gpu.destroy_kernel(&quant);
+            gpu.destroy_kernel(&gemv);
+            gpu.destroy_buf(&q8);
+            return Err(e.context("allocating the activation scales"));
+        }
+    };
+    Ok(Q8 {
+        quant,
+        gemv,
+        q8,
+        dq,
+        groups,
+    })
+}
+
+/// The q8_1 quantiser's push constants: `k`, `groups`, then two unused words.
+fn q8_quant_pc(cols: usize, groups: usize) -> [u8; 32] {
+    let mut pc = [0u8; 32];
+    for (i, v) in [cols as u32, groups as u32, 0u32, 0u32].iter().enumerate() {
+        pc[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    pc
+}
+
 /// A fused dequant + mat-vector multiply for one quant type and shape.
 pub struct Gemv<'g> {
     ty: QuantType,
@@ -120,6 +204,8 @@ pub struct Gemv<'g> {
     /// The `_hcact` build of [`Gemv::reduce`] (used when `splits > 1`: the
     /// partials have to stay raw, so the activation moves into the sum).
     ep_reduce: Option<breccia_vk::ctx::Kernel>,
+    /// `Some` when this shape runs on the packed int8-dot path (§8bb).
+    q8: Option<Q8>,
 }
 
 impl<'g> Gemv<'g> {
@@ -184,6 +270,21 @@ impl<'g> Gemv<'g> {
                 return Err(anyhow!("creating the split-K reduce pipeline: {e}"));
             }
         };
+        // The int8-dot path (§8bb): only IQ3_S has a dp4a kernel, and only the fp32
+        // accumulator shape makes sense (int8 accumulation is its own thing).
+        let q8 = if ty == QuantType::Iq3S && accum == Accum::F32 && dp4a_enabled() {
+            match build_q8(gpu, cols) {
+                Ok(q) => Some(q),
+                Err(e) => {
+                    gpu.destroy_kernel(&kernel);
+                    gpu.destroy_kernel(&reduce);
+                    gpu.destroy_buf(&tables);
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
         Ok(Gemv {
             ty,
             accum,
@@ -196,6 +297,7 @@ impl<'g> Gemv<'g> {
             epilogue: None,
             ep_kernel: None,
             ep_reduce: None,
+            q8,
         })
     }
 
@@ -432,6 +534,34 @@ impl<'g> Gemv<'g> {
     /// `padded_cols()` fp32 values (zero-padded past `cols`), `out` receives
     /// `rows` fp32 values.
     pub fn run(&self, w: &Buf, x: &Buf, out: &Buf) -> Result<()> {
+        if let Some(q8) = &self.q8 {
+            if crate::dispatch_batch::is_open() {
+                self.record_q8(q8, w, x, out)?;
+            } else {
+                // One command buffer, two dispatches: the q8_1 quantiser then the
+                // dp4a GEMV. The quantiser is one workgroup per 8 groups.
+                let quant_pc = q8_quant_pc(self.cols, q8.groups);
+                let gemv_pc = self.q8_gemv_pc();
+                let qgrid = (q8.groups.div_ceil(8).max(1) as u32, 1, 1);
+                self.gpu
+                    .bind_kernel(&q8.quant, &[x.buf, q8.q8.buf, q8.dq.buf])
+                    .map_err(|e| anyhow!("{e}"))?;
+                self.gpu
+                    .bind_kernel(
+                        &q8.gemv,
+                        &[w.buf, x.buf, out.buf, self.tables.buf, q8.q8.buf, q8.dq.buf],
+                    )
+                    .map_err(|e| anyhow!("{e}"))?;
+                let (gx, gy) = self.grid_for(ROWS_PER_WG);
+                self.gpu
+                    .wall_run(Qc::C, |d, cmd| {
+                        crate::ops::record(d, cmd, &q8.quant, &quant_pc, qgrid);
+                        crate::ops::record(d, cmd, &q8.gemv, &gemv_pc, (gx, gy, 1));
+                    })
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
+            return Ok(());
+        }
         if crate::dispatch_batch::is_open() {
             return self.record_split(self.gpu, 1, &[w, x, out, &self.tables], None);
         }
@@ -440,6 +570,47 @@ impl<'g> Gemv<'g> {
             .wall_run(Qc::C, |d, cmd| self.dispatch_split(d, cmd, 1))
             .map_err(|e| anyhow!("{e}"))?;
         Ok(())
+    }
+
+    /// The IQ3_S dp4a kernel's push constants (`blocks.glsl`'s five words).
+    fn q8_gemv_pc(&self) -> [u8; 32] {
+        let mut pc = [0u8; 32];
+        for (i, v) in [
+            self.rows as u32,
+            self.cols as u32,
+            self.blocks_per_row() as u32,
+            1,
+            0,
+        ]
+        .iter()
+        .enumerate()
+        {
+            pc[4 * i..4 * i + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        pc
+    }
+
+    /// Record the q8_1 producer and the dp4a GEMV into the open batch (§8bb): two
+    /// dispatches, the first a one-workgroup-per-8-groups quantiser.
+    fn record_q8(&self, q8: &Q8, w: &Buf, x: &Buf, out: &Buf) -> Result<()> {
+        let quant_pc = q8_quant_pc(self.cols, q8.groups);
+        crate::dispatch_batch::record(
+            self.gpu,
+            &q8.quant,
+            &[x, &q8.q8, &q8.dq],
+            &quant_pc,
+            (q8.groups.div_ceil(8).max(1) as u32, 1, 1),
+        )?;
+        crate::dispatch_batch::record(
+            self.gpu,
+            &q8.gemv,
+            &[w, x, out, &self.tables, &q8.q8, &q8.dq],
+            &self.q8_gemv_pc(),
+            {
+                let (gx, gy) = self.grid_for(ROWS_PER_WG);
+                (gx, gy, 1)
+            },
+        )
     }
 
     /// Record the split dispatch (+ reduce when `splits > 1`) into the batch that
@@ -617,6 +788,23 @@ impl<'g> Gemv<'g> {
     /// Time `target_s` worth of repeated GEMVs (timestamps bracket the window).
     pub fn run_timed(&self, w: &Buf, x: &Buf, out: &Buf, target_s: f64) -> Result<GemvTiming> {
         self.bind(w, x, out)?;
+        // The int8-dot path (§8bb) is two dispatches (q8_1 quantiser + dp4a GEMV), so
+        // the timing window must record both or it would price the dot alone.
+        let q8 = self.q8.as_ref();
+        if let Some(q) = q8 {
+            self.gpu
+                .bind_kernel(&q.quant, &[x.buf, q.q8.buf, q.dq.buf])
+                .map_err(|e| anyhow!("{e}"))?;
+            self.gpu
+                .bind_kernel(
+                    &q.gemv,
+                    &[w.buf, x.buf, out.buf, self.tables.buf, q.q8.buf, q.dq.buf],
+                )
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+        let quant_pc = q8.map(|q| q8_quant_pc(self.cols, q.groups));
+        let gemv_pc = self.q8_gemv_pc();
+        let qgrid = q8.map(|q| (q.groups.div_ceil(8).max(1) as u32, 1, 1));
         let t = self
             .gpu
             .run_timed(Qc::C, target_s, |d, cmd, n| {
@@ -624,7 +812,13 @@ impl<'g> Gemv<'g> {
                 // barrier between dispatches keeps them serialised so the
                 // per-iteration number is a latency, not a pipelined average.
                 for _ in 0..n {
-                    self.dispatch_split(d, cmd, 1);
+                    if let (Some(q), Some(qpc), Some(qg)) = (q8, quant_pc.as_ref(), qgrid) {
+                        crate::ops::record(d, cmd, &q.quant, qpc, qg);
+                        let (gx, gy) = self.grid_for(ROWS_PER_WG);
+                        crate::ops::record(d, cmd, &q.gemv, &gemv_pc, (gx, gy, 1));
+                    } else {
+                        self.dispatch_split(d, cmd, 1);
+                    }
                     unsafe { Gpu::barrier_all(d, cmd) };
                 }
             })
