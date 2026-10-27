@@ -248,7 +248,13 @@ impl Placement {
 
     /// Fail the plan if any device's dense bytes exceed its capacity.
     pub fn check_capacity(&self, capacity: &[u64]) -> Result<()> {
-        for (i, (&want, &have)) in self.bytes.iter().zip(capacity.iter()).enumerate() {
+        self.check_capacity_of(&self.bytes, capacity)
+    }
+
+    /// [`Placement::check_capacity`] against an explicit per-device byte plan — used
+    /// when the tail does not ride the last block's device (`--head-device`).
+    pub fn check_capacity_of(&self, planned: &[u64], capacity: &[u64]) -> Result<()> {
+        for (i, (&want, &have)) in planned.iter().zip(capacity.iter()).enumerate() {
             if want == 0 {
                 continue;
             }

@@ -576,7 +576,7 @@ impl<'m> Session<'m> {
         } else {
             cfg.ctx_capacity
         };
-        let head_dev = model.device_of(mc.n_layers - 1);
+        let head_dev = model.head_device();
         let emb_ty = ty_of(model, "token_embd.weight")?;
         let ple_ty = ty_of(model, "per_layer_token_embd.weight")?;
         let mut venues = Vec::with_capacity(model.devices.len());
@@ -2706,15 +2706,38 @@ impl<'m> Session<'m> {
     /// Record and submit the output norm + head **without waiting**; pair it with
     /// [`Session::finish_head`] so two streams' heads run concurrently (they are
     /// the last serial GPU work of a stream, ~7-10 ms each).
+    ///
+    /// The head may live on a device other than the last block's (`--head-device`):
+    /// the residual then crosses the link once, through the same
+    /// [`Staging`] read/write pair the block-to-block hand-off uses
+    /// ([`Session::submit_block`]), because that machinery already owns the
+    /// synchronisation (its own submit + fence) and a second path would be a second
+    /// place to get the ordering wrong.
     pub fn submit_head(&mut self) -> Result<()> {
         let m = self.model;
         let mc = &m.cfg;
         self.flush()?;
         self.timers.mark(FINAL_HC);
         let last = m.device_of(mc.n_layers - 1);
-        self.ensure_batch(last)?;
+        let head_dev = m.head_device();
+        if head_dev != last {
+            // The residual is final once the last block's submission has completed,
+            // which `flush` has waited for. 40 KiB each way: one round trip a token.
+            self.timers.mark(HANDOFF);
+            let bytes = self.stagings[last].read_batch(
+                m.devices[last].gpu(),
+                &[(&self.venues[last].r, 0, mc.hc_dim() * 4)],
+            )?;
+            self.stagings[head_dev].write(
+                m.devices[head_dev].gpu(),
+                &self.venues[head_dev].r,
+                &bytes[0],
+            )?;
+            self.timers.mark(FINAL_HC);
+        }
+        self.ensure_batch(head_dev)?;
         {
-            let v = &self.venues[last];
+            let v = &self.venues[head_dev];
             let hw = HcWeights {
                 norm: &m.out_hc_norm,
                 down: &m.out_hc_down.buf,
@@ -2727,7 +2750,7 @@ impl<'m> Session<'m> {
             let out = v
                 .logits
                 .as_ref()
-                .ok_or_else(|| anyhow!("the last device has no logits buffer"))?;
+                .ok_or_else(|| anyhow!("device {head_dev} has no logits buffer"))?;
             v.pipes.get(&m.head.key)?.run(&m.head.buf, &ws.mixed, out)?;
         }
         self.submit_batch()?;
@@ -2738,14 +2761,14 @@ impl<'m> Session<'m> {
     pub fn finish_head(&mut self) -> Result<Vec<f32>> {
         let m = self.model;
         let mc = &m.cfg;
-        let last = m.device_of(mc.n_layers - 1);
+        let head_dev = m.head_device();
         self.flush()?;
-        let logits_buf = self.venues[last]
+        let logits_buf = self.venues[head_dev]
             .logits
             .as_ref()
-            .ok_or_else(|| anyhow!("the last device has no logits buffer"))?;
-        let raw = self.stagings[last]
-            .read_batch(m.devices[last].gpu(), &[(logits_buf, 0, mc.vocab * 4)])?;
+            .ok_or_else(|| anyhow!("device {head_dev} has no logits buffer"))?;
+        let raw = self.stagings[head_dev]
+            .read_batch(m.devices[head_dev].gpu(), &[(logits_buf, 0, mc.vocab * 4)])?;
         self.timers.stop();
         self.probe_report()?;
         self.forwards += 1;
