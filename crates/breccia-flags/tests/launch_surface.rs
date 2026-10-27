@@ -10,26 +10,45 @@ use breccia_flags::{
     LaunchPlan, ReasoningMode, Switch, WarningCode,
 };
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-/// Verbatim argument list from `/home/korphaus/projects/qwen-dual/qwen-dual-serve.sh`.
+static CELL: OnceLock<String> = OnceLock::new();
+
+/// Verbatim argument list from the production `qwen-dual-serve.sh`
+/// (paths supplied via BRECCIA_MODEL_ROOT / BRECCIA_SLOT_ROOT).
 ///
 /// Only the shell's line continuations are omitted; every flag and value is
 /// character-for-character what the service passes to `llama-server`.
-const SERVICE_ARGS: &str = r#"
--D /home/korphaus/llama.cpp-qwen4exp-mmap/build-hip-q5kv/bin/llama-server
+const SERVICE_ARGS_TEMPLATE: &str = r#"
+-D <MODEL_ROOT>/bin/llama-server
 -m /srv/strata-data/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
 --device ROCm0,ROCm1 -ngl 99 -ts 9,15
 -ot 'blk\.(0|1|2|4|8|18|20|22|23)\.ffn_(up|down|gate)_exps\.=ROCm0,blk\.(24|35)\.ffn_(up|down|gate)_exps\.=ROCm1'
 -cmoe --moe-cache-mib 0 -lzm on -lm none --no-host
 -c 200000 -kvu -np 1 --kv-unified-per-slot 200000 -ctk q4_0 -ctv q4_0 -fa on
--cram 0 -ctxcp 1 --slot-save-path /mnt/agent-storage-a/kv-slots/IQ3_XXS-q4_0-rocm-1x200k-1b70350c9/
+-cram 0 -ctxcp 1 --slot-save-path <SLOT_ROOT>/kv-slots/IQ3_XXS-q4_0-rocm-1x200k-1b70350c9/
 --mmproj /srv/strata-data/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf -mmdev ROCm0 --image-min-tokens 1024 --image-max-tokens 2048
 -lv 4 --reasoning off
 -t 16 -tb 16 --host 127.0.0.1 --port 8160 --jinja --metrics --fit off --no-op-offload -ub 256
 "#;
 
+fn path_var(name: &'static str) -> &'static str {
+    CELL.get_or_init(|| {
+        match std::env::var(name) {
+            Ok(v) if !v.trim().is_empty() => v.trim_end_matches('/').to_string(),
+            _ => panic!("{name} must be set for launch_surface tests"),
+        }
+    }).as_str()
+}
+
+fn service_args() -> String {
+    SERVICE_ARGS_TEMPLATE
+        .replace("<MODEL_ROOT>", path_var("BRECCIA_MODEL_ROOT"))
+        .replace("<SLOT_ROOT>", path_var("BRECCIA_SLOT_ROOT"))
+}
+
 fn service_plan() -> LaunchPlan {
-    parse_str(SERVICE_ARGS).expect("production launch line must parse")
+    parse_str(&service_args()).expect("production launch line must parse")
 }
 
 #[test]
@@ -42,7 +61,7 @@ fn parses_the_verbatim_production_line() {
     assert_eq!(
         plan.binary,
         Some(PathBuf::from(
-            "/home/korphaus/llama.cpp-qwen4exp-mmap/build-hip-q5kv/bin/llama-server"
+            format!("{}/bin/llama-server", path_var("BRECCIA_MODEL_ROOT"))
         ))
     );
     assert_eq!(
@@ -104,7 +123,7 @@ fn parses_the_verbatim_production_line() {
     assert_eq!(
         plan.slot_save_path,
         Some(PathBuf::from(
-            "/mnt/agent-storage-a/kv-slots/IQ3_XXS-q4_0-rocm-1x200k-1b70350c9/"
+            format!("{}/kv-slots/IQ3_XXS-q4_0-rocm-1x200k-1b70350c9/", path_var("BRECCIA_SLOT_ROOT"))
         ))
     );
     assert_eq!(
@@ -200,7 +219,7 @@ fn round_trip_parse_render_parse_is_a_fixed_point() {
 #[test]
 fn argv_and_string_forms_agree() {
     let from_str = service_plan();
-    let argv = tokenize(SERVICE_ARGS).unwrap();
+    let argv = tokenize(&service_args()).unwrap();
     let from_argv = parse_llama_server_args(&argv).unwrap();
     assert_eq!(from_str, from_argv);
     assert_eq!(argv[0], "-D");
@@ -253,7 +272,7 @@ fn unknown_flag_fails_with_flag_and_position() {
 
     // A single unknown flag in the middle of the production line still fails
     // loudly, and the position is the real argv index.
-    let mut argv = tokenize(SERVICE_ARGS).unwrap();
+    let mut argv = tokenize(&service_args()).unwrap();
     let insert_at = argv.iter().position(|t| t == "--jinja").unwrap();
     argv.insert(insert_at, "--no-such-flag".to_string());
     let err = parse_llama_server_args(&argv).unwrap_err();
@@ -286,7 +305,7 @@ fn plan_json_round_trips_with_overrides_and_warnings() {
 #[test]
 fn malformed_lines_never_panic() {
     // Every prefix of the production line must either parse or return an error.
-    let argv = tokenize(SERVICE_ARGS).unwrap();
+    let argv = tokenize(&service_args()).unwrap();
     for cut in 0..=argv.len() {
         let _ = parse_llama_server_args(&argv[..cut]);
     }

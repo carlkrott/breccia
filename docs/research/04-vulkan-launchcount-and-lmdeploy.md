@@ -37,7 +37,7 @@ means **barriers/token == dispatches/token** today.
 
 ### A.1 Method
 
-Standalone probe built *outside* the tree (`/var/tmp/users/korphaus/tmp/launchprobe`, a copy of
+Standalone probe built *outside* the tree (`<SCRATCH>/launchprobe`, a copy of
 `harnesses/vk-probe` plus a `--launch` mode), RADV/mesa 26.2.4, Vulkan 1.4.354, headless compute, one
 device per invocation, trivial shader (wg 256, one dependent store) unless stated. Barrier is a
 `vkCmdPipelineBarrier` with `COMPUTE_SHADER → COMPUTE_SHADER` and `SHADER_READ|WRITE` masks (the
@@ -349,7 +349,7 @@ code, their distributed/EP stack, and their sampling kernels.
 ## Appendix — probe provenance
 
 * Harness: copy of `harnesses/vk-probe` + `src/launch.rs` + `shaders/launch_noop.comp`,
-  `shaders/launch_row.comp`, built at `/var/tmp/users/korphaus/tmp/launchprobe` (never inside the repo,
+  `shaders/launch_row.comp`, built at `<SCRATCH>/launchprobe` (never inside the repo,
   so the tree stays read-only). Arms: R1–R6 record cost, G1/G2/G4/G5 GPU cost, E1/E2 replay, S1/S2 submit.
 * Devices by PCI identity: RX 6950 XT `0000:03:00.0` (Vulkan index 0), Radeon VII `0000:0e:00.0`
   (Vulkan index 1, always run first), iGPU `0000:75:00.0` unused.

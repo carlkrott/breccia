@@ -11,9 +11,9 @@ GPU        : AMD Radeon RX 6950 XT (RADV NAVI21), 0000:03:00.0 — HEADLESS card
 sclk       : 2695 MHz, power_dpm_force_performance_level=high  (checked before AND after every run)
 PCIe       : 16.0 GT/s x16 (gen4 x16); MI50 8.0 GT/s x16 (gen3 x16) — not touched this round
 driver     : mesa 26.2.4, RADV; Vulkan 1.4.354
-mlock      : soft 8 MiB / hard 8 MiB for korphaus ⇒ pinned arms run under `sudo -n` (root holds CAP_IPC_LOCK)
+mlock      : soft 8 MiB / hard 8 MiB for the login user ⇒ pinned arms run under `sudo -n` (root holds CAP_IPC_LOCK)
 host       : 58 GB RAM (44 GB available), 32 threads, single NUMA node
-harness    : /var/tmp/users/korphaus/tmp/opencode/research-harnesses/r09-zerocopy
+harness    : <SCRATCH>/opencode/research-harnesses/r09-zerocopy
              (`r09-zerocopy` ash harness + `c/nvme.c` liburing harness; results/ has the raw matrices)
 safety     : every run `timeout 90`, validation on for first runs of each path, ≤4 dispatched
              shapes per process, one process at a time, MI50 never used
@@ -182,7 +182,7 @@ Other findings:
 * **PLE pattern**: 4 KiB records at QD 32 cost **2.9 µs/row** vs 63 µs at QD 1 (round 5's number) —
   a 22× gain from queue depth alone, no layout change. At 48 rows/token that is 0.14 ms/token even
   fully cold.
-* **`/mnt/agent-storage-a` is a SATA SSD, not NVMe** (`sdb`, ext4): cold 460 KiB 332–390 MB/s, 4 KiB
+* **`<STORAGE_ROOT_A>` is a SATA SSD, not NVMe** (`sdb`, ext4): cold 460 KiB 332–390 MB/s, 4 KiB
   62 k IOPS / 243 MB/s. As a Tier-3 expert store it is **15× slower** than the model's own NVMe
   volume. The phase-0 note "Tier-3 belongs on agent-storage-a" is right for *capacity*, wrong for
   *expert streaming*: expert misses are cheaper served from the 990 PRO (5.8 GB/s) than from sdb1
@@ -444,7 +444,7 @@ Housekeeping that must land with the above: re-apply `read_ahead_kb=128` to `btr
 
 ### Sources / raw data
 
-* Harness: `/var/tmp/users/korphaus/tmp/opencode/research-harnesses/r09-zerocopy/`
+* Harness: `<SCRATCH>/opencode/research-harnesses/r09-zerocopy/`
   (`src/main.rs`, `shaders/read.comp`, `shaders/gemv.comp`, `c/hostptr.c`, `c/nvme.c`,
   `results/nvme.txt`, `results/nvme_aligned.txt`, `kvsim.py`).
 * Repro, capability probe: `timeout 60 ./target/release/r09-zerocopy caps`

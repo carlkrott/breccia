@@ -2,7 +2,7 @@
 
 Phase 4 paired research, round 2. Date: 2026-10-26. **Read-only**: no engine code changed, no
 engine shader touched. Everything in Part A is measured on the two discrete cards with a
-standalone harness that lives **outside the repo** (`/var/tmp/users/korphaus/tmp/vkround2/`,
+standalone harness that lives **outside the repo** (`<SCRATCH>/vkround2/`,
 ≈600 lines of C + 2 GLSL shaders, source listed in §A0.3 — an implementation agent may move it to
 `harnesses/vk-micro/` if it proves useful). Part B is read out of the cloned PowerInfer tree with
 `file:line` references.
@@ -51,7 +51,7 @@ statistic here: it removes scheduler jitter without hiding a real cost).
 ### A0.3 Reproduce
 
 ```bash
-cd /var/tmp/users/korphaus/tmp/vkround2
+cd <SCRATCH>/vkround2
 glslangValidator -V --target-env vulkan1.3 -o touch.spv touch.comp
 glslangValidator -V --target-env vulkan1.3 -o lat.spv   lat.comp
 gcc -O2 -o vkmicro vkmicro.c -lvulkan

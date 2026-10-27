@@ -7,7 +7,7 @@ kernel** (203 tensors, 6.45 GiB — 9.1 % of the model).
 
 Date: 2026-10-26 · GPUs idle at the start of every run (`pgrep llama-server`
 empty, `gpu_busy_percent` 0) · no service was started or stopped · artifacts in
-`/var/tmp/users/korphaus/tmp/opencode/p3/`.
+`<SCRATCH>/opencode/p3/`.
 
 > **This work order caused a GPU fault and a machine-wide freeze.** A conformance
 > run on the display card (RX 6950 XT) took the box down at ~10:09; it recovered

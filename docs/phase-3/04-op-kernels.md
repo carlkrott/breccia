@@ -9,7 +9,7 @@ add/scale — each with a CPU reference, a GPU↔CPU conformance test, and a
 Date: 2026-10-26 · both GPUs idle at the start of every run
 (`gpu_busy_percent` 0 / 7, `pgrep llama-server` empty) · no service was started
 or stopped (`qwen-dual`, `strata-rx`, `d1-mi50`: inactive before and after) ·
-artifacts in `/var/tmp/users/korphaus/tmp/opencode/p3-ops/`.
+artifacts in `<SCRATCH>/opencode/p3-ops/`.
 
 **Status: complete.** `cargo build/test --workspace`, `cargo clippy -p
 breccia-kernels -p breccia-cli --all-targets -- -D warnings`, `cargo fmt
@@ -561,7 +561,7 @@ timeout 150 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
   ./target/release/breccia bench ops --quick --device 0000:03:00.0
 ```
 
-Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p3-ops/`):
+Artifacts (`<SCRATCH>/opencode/p3-ops/`):
 `final-{mi50,rx}-<op>.log` (16 conformance logs), `bench-{mi50,rx}-<op>.json`
 (16 JSONs), `benchlog-{mi50,rx}-<op>.log` (16 bench logs + `benchlog-rx-all.log`).
 

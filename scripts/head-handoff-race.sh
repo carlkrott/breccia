@@ -41,13 +41,13 @@ RUNS=${RACE_RUNS:-4}
 GEN=${RACE_GEN:-8}
 ARENA=${RACE_ARENA:-none}
 WARM=${RACE_WARM:-0}
-OUT=${RACE_OUT:-/var/tmp/users/korphaus/tmp/opencode/head-race}
+OUT=${RACE_OUT:-${SCRATCH:?SCRATCH must point at the scratch dir}/head-race}
 PROMPT_MODE=${RACE_PROMPT:-short}
 mkdir -p "$OUT"
 rm -f "$OUT"/*.json "$OUT"/*.invalid.json
 
 case "$PROMPT_MODE" in
-  parity) PROMPT=$(cat /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids) ;;
+  parity) PROMPT=$(cat "${SCRATCH:?}/p4-token/parity-server.json.ids") ;;
   *)      PROMPT="760,13017,1433" ;;
 esac
 
@@ -131,7 +131,7 @@ for p, r, t in rows[1:]:
         print(f"UNSTABLE proc {p} run {r}: step {first} ours {t[first] if first < len(t) else '-'} "
               f"expected {base[first] if first < len(base) else '-'}")
 if mode == "parity":
-    ref = json.load(open("/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json"))["generated"]
+    ref = json.load(open(os.environ["SCRATCH"] + "/p4-token/parity-server.json"))["generated"]
     n = min(gen, len(ref), len(base))
     bad_ref = [i for i in range(n) if base[i] != ref[i]]
     if bad_ref:

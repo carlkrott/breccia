@@ -2,14 +2,14 @@
 
 Inventory of every weight artifact a from-scratch inference engine has to parse, with the exact
 byte-level structures as measured on 2026-10-25. Everything below was read directly from the files
-(GGUF headers parsed with `gguf-py` from `/home/korphaus/llama.cpp-qwen4exp-mmap/gguf-py`, plus
+(GGUF headers parsed with `gguf-py` from `<LLAMA_ROOT>/gguf-py`, plus
 hand-rolled `struct` parses for cross-checks); nothing here is copied from a README without
 verification. Where a number is a claim of a *different* release (Q2_0, Coder) it is marked as such.
 
 Re-verification recipe used throughout:
 
 ```bash
-PYTHONPATH=/home/korphaus/llama.cpp-qwen4exp-mmap/gguf-py python3 -c "
+PYTHONPATH=<LLAMA_ROOT>/gguf-py python3 -c "
 from gguf import GGUFReader
 r = GGUFReader('<shard>')
 print(len(r.tensors), r.data_offset, r.fields.keys())
@@ -25,13 +25,13 @@ for t in r.tensors[:5]: print(t.name, t.shape, t.tensor_type.name, t.data_offset
 | `/srv/strata-data/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-0000{1,2}-of-00002.gguf` | The model: 2 split GGUF shards (43.81 + 26.82 GiB) |
 | `/srv/strata-data/models/IQ3_XXS/*.gguf.done` | 16-byte download-completion markers, content is an ISO timestamp (`2026-10-11 01:42`) |
 | `/srv/strata-data/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf` | Vision projector (`clip` arch), BF16/F32 |
-| `/srv/strata-data/models/Q2_0` | **symlink** → `/mnt/agent-storage-b/ai-dev/ai-runtime/home/korphaus/models/qwen-dual/Q2_0` (see §7) |
+| `/srv/strata-data/models/Q2_0` | **symlink** → `<STORAGE_ROOT_B>/ai-dev/ai-runtime/<HOME>/models/qwen-dual/Q2_0` (see §7) |
 | `/srv/strata-data/models/tensor-allocation/*.rco-allocation.txt` | Per-tensor RCO quant allocation record (Q2_0 release) — see §3 |
 | `/srv/strata-data/packs/iq3_xxs/` | Strata "native pack": `index.txt`, `dense.bin`, `experts.bin`, `native_experts.txt`, JSON sidecars, `tokenizer/` — see §4 |
 | `/srv/strata-data/mtp/` | Multi-Token-Prediction (draft layer) artifacts — see §5 |
 | `/srv/strata-data/mtp-unsloth/MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf` | A second, unsloth-derived MTP GGUF (4,137,429,120 B), not wired into the config |
-| `/home/korphaus/projects/strata` | Reference engine (C++/HIP) that consumes the pack + MTP files |
-| `/home/korphaus/llama.cpp-qwen4exp-mmap` | llama.cpp fork with the `qwen4exp` architecture (source tree *and* `build-hip-mmap/` build dir in one place) |
+| `<STRATA_ROOT>` | Reference engine (C++/HIP) that consumes the pack + MTP files |
+| `<LLAMA_ROOT>` | llama.cpp fork with the `qwen4exp` architecture (source tree *and* `build-hip-mmap/` build dir in one place) |
 
 ### Disk sizes
 
@@ -60,7 +60,7 @@ for t in r.tensors[:5]: print(t.name, t.shape, t.tensor_type.name, t.data_offset
 | `mtp/rt/draft_vocab.bin` | 425,196 | 415 KiB |
 | `mtp/rt/dense.txt` | 1,851 | — |
 | `mtp/` dir total | 6,927,659,014 | 6.45 GiB |
-| Q2_0 shard 1 (on `/mnt/agent-storage-b`) | 37,623,740,192 | 35.04 GiB |
+| Q2_0 shard 1 (on `<STORAGE_ROOT_B>`) | 37,623,740,192 | 35.04 GiB |
 | `mtp-unsloth/MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf` | 4,137,429,120 | 3.85 GiB |
 | **Everything above, total** | ~1.70 × 10¹¹ | ~158 GiB |
 
@@ -567,7 +567,7 @@ script additions appended in id order). Written by `tools/draft_vocab.py` (varia
 `data/draft_vocab{,_en,_cyrillic,_fr}.bin` copied in by `setup.py::refresh_draft_vocab`). The draft
 head computes logits over these rows only; a token outside can never be drafted.
 
-Consumers in `/home/korphaus/projects/strata` (line numbers verified against the source):
+Consumers in `<STRATA_ROOT>` (line numbers verified against the source):
 
 | file | reader |
 | --- | --- |
@@ -603,7 +603,7 @@ and 2 × `mm.N.weight` (4608×4608) + 2 × `mm.N.bias` (the merger). Loaded by t
 
 ```
 /srv/strata-data/models/Q2_0
-  -> /mnt/agent-storage-b/ai-dev/ai-runtime/home/korphaus/models/qwen-dual/Q2_0/
+  -> <STORAGE_ROOT_B>/ai-dev/ai-runtime/<HOME>/models/qwen-dual/Q2_0/
        Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf          37,623,740,192 B  (regular file)
        Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf  ->  /srv/strata-data/models/IQ3_XXS/
                                                             ...-IQ3_XXS-00002-of-00002.gguf  (86-byte symlink)
@@ -612,13 +612,13 @@ and 2 × `mm.N.weight` (4608×4608) + 2 × `mm.N.bias` (the merger). Loaded by t
 So the Q2_0 variant shares the **IQ3_XXS shard 2** — i.e. the same IQ4_NL PLE table for both
 releases (confirmed by `docs/EXCHANGE_ROTATION.md:86` and `docs/AMD_HIP.md:163`: "Original GSQ-RCO
 IQ3_XXS uses shard 2 for PLE"). The symlink lives *outside* `/srv/strata-data` (on
-`/mnt/agent-storage-b`), so a hard-disk-space plan must account for it separately.
+`<STORAGE_ROOT_B>`), so a hard-disk-space plan must account for it separately.
 
 ---
 
 ## 8. Reference-engine source map (read-only citations)
 
-### strata (`/home/korphaus/projects/strata`)
+### strata (`<STRATA_ROOT>`)
 
 | file | what it defines |
 | --- | --- |
@@ -641,7 +641,7 @@ IQ3_XXS uses shard 2 for PLE"). The symlink lives *outside* `/srv/strata-data` (
 **No code in `strata` parses `*.rco-allocation.txt`** — `grep -rniI 'rco-allocation'` over the whole
 tree returns only the three doc/bench hits above. It is a provenance artifact, not an engine input.
 
-### llama.cpp fork (`/home/korphaus/llama.cpp-qwen4exp-mmap`, source tree + `build-hip-mmap/` in the same dir)
+### llama.cpp fork (`<LLAMA_ROOT>`, source tree + `build-hip-mmap/` in the same dir)
 
 | file | what it defines |
 | --- | --- |

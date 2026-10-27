@@ -2424,7 +2424,12 @@ fn io_read_mib() -> f64 {
 }
 
 fn parse_reference_prompt() -> Vec<u32> {
-    let path = "/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids";
+    // Parity-reference dir is host-specific; supplied via BRECCIA_PARITY_DIR.
+    let dir = match std::env::var("BRECCIA_PARITY_DIR") {
+        Ok(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+    let path = format!("{dir}/parity-server.json.ids");
     std::fs::read_to_string(path)
         .ok()
         .map(|t| {
@@ -2438,7 +2443,14 @@ fn parse_reference_prompt() -> Vec<u32> {
 
 /// `n/n` of agent 0's generated ids against the server's recorded sequence.
 fn reference_parity(ours: &[u32]) -> String {
-    let path = "/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json";
+    // Parity-reference dir is host-specific; supplied via BRECCIA_PARITY_DIR.
+    let Ok(dir) = std::env::var("BRECCIA_PARITY_DIR") else {
+        return "no reference file".to_string();
+    };
+    if dir.is_empty() {
+        return "no reference file".to_string();
+    }
+    let path = format!("{dir}/parity-server.json");
     let Ok(text) = std::fs::read_to_string(path) else {
         return "no reference file".to_string();
     };

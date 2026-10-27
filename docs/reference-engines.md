@@ -7,7 +7,7 @@ All URLs verified via GitHub API on 2026-10-25 (research pass, incl. live checks
 | Engine | Path | URL | License | Why (milestone) |
 |---|---|---|---|---|
 | llama.cpp (mainline) | `Reference Projects/llama.cpp` | https://github.com/ggml-org/llama.cpp | MIT | Baseline; ggml-vulkan (`ggml/src/ggml-vulkan/`), `-ot` offload maps, KV quant, split-mode (0.2, M2) |
-| Strata | `Reference Projects/Strata` | https://github.com/Niko1221/Strata | MIT | Design ancestor; expert cache, MTP, route-tail skipping (M3/M4). Local working copy: `/home/korphaus/projects/strata` |
+| Strata | `Reference Projects/Strata` | https://github.com/Niko1221/Strata | MIT | Design ancestor; expert cache, MTP, route-tail skipping (M3/M4). Local working copy: `<STRATA_ROOT>` |
 | ninfer | `Reference Projects/ninfer` | https://github.com/Neroued/ninfer | Apache-2.0 | Origin of Infernix; native MTP spec-decode, prefix cache (M4) |
 | Infernix | `Reference Projects/Infernix` | https://github.com/Wallawalla47/Infernix | Apache-2.0 | Async expert prefetch ring, SSD expert tier (M3) |
 | Basalt | `Reference Projects/Basalt` | https://github.com/jesdga95/basalt | MIT | Strata fork; RAM+2nd-GPU peer expert tier, MTP drafter (M3/M4) |

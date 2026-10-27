@@ -8,7 +8,7 @@ so it sets the arithmetic ceiling for the 20 → 85 tok/s lever.
 
 Date: 2026-10-26 · GPUs idle at the start of every run (`pgrep llama-server` empty,
 `gpu_busy_percent` 0/7 at start) · no service was started or stopped · artifacts in
-`/var/tmp/users/korphaus/tmp/opencode/p3/`.
+`<SCRATCH>/opencode/p3/`.
 
 **Status: complete.** `cargo build/test --workspace`, `cargo clippy -p breccia-kernels
 --all-targets -- -D warnings`, `cargo fmt --check` green; 0 validation-layer
@@ -343,7 +343,7 @@ VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ./target/release/breccia bench ge
 python3 tools/refcheck.py --blocks 2000       # 7 types bit-identical
 ```
 
-Logs/JSON: `/var/tmp/users/korphaus/tmp/opencode/p3/` (`synth-rx.json`, `synth-mi50-a.json`,
+Logs/JSON: `<SCRATCH>/opencode/p3/` (`synth-rx.json`, `synth-mi50-a.json`,
 `real-rx-*.json`, `real-mi50-*.json`, `conformance.log`, `validation-*.log`).
 
 ## 7. What's next (ordered by measured value)

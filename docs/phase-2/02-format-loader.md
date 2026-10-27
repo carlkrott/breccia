@@ -127,7 +127,7 @@ truncating.
 
 ## 4. Validation against the real shards
 
-Command (release build, `/home/korphaus/projects/Breccia`):
+Command (release build, `<REPO_ROOT>`):
 
 ```bash
 cargo build -p breccia-format --release --example inspect

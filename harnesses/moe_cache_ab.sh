@@ -3,11 +3,12 @@
 # Baseline (docs/phase-0/01): 20.79 tok/s @ moe-cache 0. Everything else identical
 # to qwen-dual-serve.sh. Ends each run cleanly; leaves no services started.
 set -uo pipefail
-BIN=/home/korphaus/llama.cpp-qwen4exp-mmap/build-hip-q5kv/bin/llama-server
+: "${LLAMA_ROOT:?LLAMA_ROOT must point at the llama.cpp qwen4exp checkout}"
+BIN=$LLAMA_ROOT/build-hip-q5kv/bin/llama-server
 M=/srv/strata-data/models
 PORT=8164
-OUT=${1:-/home/korphaus/projects/Breccia/logs/moe-cache-ab-$(date +%Y%m%d-%H%M).log}
-SLOT=/mnt/agent-storage-a/kv-slots/breccia-moeab/
+OUT=${1:-${REPO_ROOT:-$PWD}/logs/moe-cache-ab-$(date +%Y%m%d-%H%M).log}
+SLOT=${STORAGE_ROOT_A:?STORAGE_ROOT_A must point at the tier-3 mount}/kv-slots/breccia-moeab/
 mkdir -p "$SLOT"
 
 echo "# moe-cache A/B $(date -u +%FT%TZ)" | tee "$OUT"
@@ -27,7 +28,7 @@ for CACHE in 0 512 1024; do
   ok=0
   for i in $(seq 1 60); do sleep 5; curl -sf -m 3 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { ok=1; break; }; kill -0 $SRV 2>/dev/null || break; done
   if [ $ok -ne 1 ]; then echo "FAILED to become healthy (cache=$CACHE); see /tmp/moeab-$CACHE.log" | tee -a "$OUT"; tail -5 "/tmp/moeab-$CACHE.log" | tee -a "$OUT"; kill $SRV 2>/dev/null; sleep 3; continue; fi
-  timeout 300 python3 /home/korphaus/projects/Breccia/harnesses/bench_decode.py \
+  timeout 300 python3 "${REPO_ROOT:-$PWD}/harnesses/bench_decode.py" \
     --url "http://127.0.0.1:$PORT" --out "/tmp/moeab-$CACHE.json" --runs 3 --gen-tokens 256 \
     --tag "moe-cache-$CACHE" 2>&1 | grep -vi deprecat | tee -a "$OUT"
   echo "server timings:" | tee -a "$OUT"
