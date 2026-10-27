@@ -485,6 +485,21 @@ pub enum BarrierScope {
     None,
 }
 
+/// Wait for `fence` with [`Gpu::WAIT_TIMEOUT_NS`]; `false` on timeout or device loss.
+///
+/// The one place a fence wait happens, so no call site can reintroduce `u64::MAX`
+/// (AGENTS.md: an unbounded wait on the display GPU rebooted the box).
+fn wait_fence_bounded(d: &ash::Device, fence: vk::Fence, what: &str) -> bool {
+    let r = unsafe { d.wait_for_fences(&[fence], true, Gpu::WAIT_TIMEOUT_NS) };
+    match r {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("breccia: waiting on {what}: {e}");
+            false
+        }
+    }
+}
+
 /// `vkQueueSubmit2` with the lifetime erased (it is an ABI-level function
 /// pointer; the structs it points at are borrowed only for the call).
 pub type QueueSubmit2Fn = unsafe extern "system" fn(
@@ -1022,6 +1037,28 @@ impl Gpu {
         );
     }
 
+    /// How long any single GPU wait may block before the process aborts.
+    ///
+    /// An **unbounded** `vkWaitForFences(u64::MAX)` is what turned the 2026-10-26
+    /// ring timeout into a machine reboot: the wait blocked forever, the kernel's
+    /// GPU watchdog decided the card was wedged, and it issued a BACO reset on the
+    /// **display** GPU (AGENTS.md incident log). A bounded wait leaves the device
+    /// healthy — measured 81 ms to a usable device after an abort — so every fence
+    /// and semaphore wait here gives up, prints what it was waiting for, and aborts
+    /// the process instead of hanging.
+    pub const WAIT_TIMEOUT_NS: u64 = 10_000_000_000; // 10 s
+
+    /// Print a diagnostic and abort: used when a GPU wait expires.
+    pub fn fault_abort(what: &str) -> ! {
+        eprintln!(
+            "breccia: GPU wait for {what} exceeded {} s — aborting instead of hanging the \
+             device (AGENTS.md: a wedged wait on the display GPU costs the machine)",
+            WAIT_TIMEOUT_NS / 1_000_000_000
+        );
+        eprintln!("breccia: capture `journalctl -b -1 | grep -i amdgpu` before retrying");
+        std::process::abort();
+    }
+
     /// The per-dispatch barrier: fence a recorded compute dispatch against the one
     /// that follows it, at the narrowest scope that is still correct.
     ///
@@ -1247,10 +1284,10 @@ impl Gpu {
     }
 
     pub fn wait_fence(&self, fence: vk::Fence) -> R<()> {
-        unsafe {
-            let r = self.device.wait_for_fences(&[fence], true, u64::MAX);
-            self.device.destroy_fence(fence, None);
-            vk(r, "vkWaitForFences")?;
+        let ok = wait_fence_bounded(&self.device, fence, &self.info.name);
+        unsafe { self.device.destroy_fence(fence, None) };
+        if !ok {
+            fault_abort("a submitted fence");
         }
         Ok(())
     }

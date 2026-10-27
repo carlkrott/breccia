@@ -34,8 +34,8 @@ Three measurement traps this round hit, all worth knowing:
    without a dependency understates a real graph leg by ~4×.
 3. **Sub-occupied workgroups duplicate work.** With one 32-lane group per row, `rows_per_wg <
    local_size_x/32` makes idle lane groups process rows the *next* workgroup also owns: 2× and 4×
-   penalties measured (§1, `down` m=1: 3.44 µs at `ls256/r8` vs 13.2 µs at `ls256/r2`). Only
-   `rows_per_wg == local_size_x/32` variants are fair comparisons.
+   penalties measured (`down` m=1: **3 440 ns at `ls256/r8` vs 13 137 ns at `ls256/r2` and
+   26 181 ns at `ls256/r1`**). Only `rows_per_wg == local_size_x/32` variants are fair comparisons.
 
 ## 1. Part A1 — workgroup/occupancy sweep at N=640, K=2560 (and the `down` shape)
 
@@ -88,12 +88,11 @@ weight bytes / time (constant across m — that is the point); `GFLOP/s` counts 
   down m=1** (neutral-to-−3 % on down m=8 where `bpr = 3`). Unroll 4 is worse than 2 everywhere
   (register pressure). A `bpr`-specialised pipeline (§4.2) reaches the same effect more strongly,
   because it lets the compiler unroll the *whole* loop rather than 2 iterations of it.
-* **m = 8 buys 2.2× on gate/up and 2.9× per-user on `down`** (5 228 µs⁻¹ vs 8 × 2 389 ns for the
-  same eight users ⇒ **4.0×** less GPU time for gate/up, 3.0× for `down`). This is the quantitative
-  case for the chunked shared-expert pass that is already being built: at m=8 the shared expert's
-  three GEMMs cost **gate 4.83 + up 4.83 + down 9.14 ≈ 18.8 µs per block**, i.e. **0.90 ms/token**
-  over 48 blocks — against **~5.8 ms/token** in the T=1 trace, where the same work is issued as
-  dependent m=1 dispatches.
+* **m = 8 buys 3.7× on gate/up and 3.0× on `down`**: 5 228 ns (or 4 834 with unroll-2) for eight users, against
+  8 × 2 389 ns for eight separate m=1 calls. This is the quantitative case for the chunked shared-expert pass
+  that is already being built: at m=8 the shared expert's three GEMMs cost **gate 4.83 + up 4.83 + down 9.14 ≈
+  18.8 µs per block**, i.e. **0.90 ms/token** over 48 blocks — against **~5.8 ms/token** in the T=1 trace, where
+  the same work is issued as dependent m=1 dispatches.
 * **The MI50 is 3.0–5.2× slower than the RX on exactly these shapes** (gate/up m=8 44 GB/s vs 176,
   down m=8 24.6 vs 121). Its per-dispatch latency boundary (round 4: 4.4× the RX) shows up directly
   in throughput here; fine-grained shared-expert work belongs on the RX, and the MI50 should get
