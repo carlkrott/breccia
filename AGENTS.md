@@ -60,7 +60,7 @@ Every time an implementation or test subagent is launched, launch **one paired r
 1. audits Vulkan parameters/features/extensions we are not using, tied to the current bottleneck (driver caps, memory types, pipeline/shader features, subgroup and int-dot paths, RADV knobs), and
 2. audits **one** inference engine not yet covered, extracting workflows, methods and specific advantages to adapt, with a measurable sketch.
 
-Output goes to `docs/research/NN-<engine>.md`; the rotation and coverage table live in `docs/research/README.md`. Research subagents are read-only and never modify engine code. Implementation agents cite the research item they consume.
+Output goes to `docs/research/NN-<engine>.md`; the rotation and coverage table live in `docs/research/README.md`. Research subagents are read-only and never modify engine code. Implementation agents cite the research item they consume. Scratch benchmark harnesses belong in `/var/tmp/users/korphaus/tmp/opencode/research-harnesses/` — **not** in the repo; only the findings and the exact commands go into the doc.
 
 ## Grouped rounds (standing rule, 2026-10-26)
 
