@@ -361,6 +361,11 @@ enum BenchKind {
         /// a deterministic failure instead of an intermittent one.
         #[arg(long, value_name = "ID,ID,...")]
         then_prompt_ids: Option<String>,
+        /// D4: import host-lane expert bytes zero-copy via
+        /// `VK_EXT_external_memory_host` (an mlock'd host arena; needs
+        /// `LimitMEMLOCK=infinity` for the streaming set). Default OFF.
+        #[arg(long)]
+        host_expert_import: bool,
     },
 }
 fn main() {
@@ -546,6 +551,7 @@ fn run(cli: Cli) -> Result<()> {
                     prefill_merged,
                     warm,
                     then_prompt_ids,
+                    host_expert_import,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -574,6 +580,7 @@ fn run(cli: Cli) -> Result<()> {
             prefill_merged,
             warm,
             then_prompt_ids,
+            host_expert_import,
         }),
     }
 }
@@ -1070,6 +1077,27 @@ mod tests {
     fn garbage_spec_is_rejected() {
         assert!(selector_for("rx6950", None).is_err());
         assert!(selector_for("  ", None).is_err());
+    }
+
+    /// D4: the flag is parsed off by default and carried into the engine's
+    /// `LoadOptions` field by `bench token` (`host_expert_import: a.host_expert_import`).
+    #[test]
+    fn host_expert_import_flag_parses_off_by_default() {
+        let parse = |extra: &[&str]| -> bool {
+            let mut argv = vec!["breccia", "bench", "token", "--prompt-ids", "1"];
+            argv.extend_from_slice(extra);
+            match Cli::try_parse_from(argv).expect("cli parses").command {
+                Command::Bench {
+                    kind:
+                        Some(BenchKind::Token {
+                            host_expert_import, ..
+                        }),
+                } => host_expert_import,
+                _ => panic!("expected bench token"),
+            }
+        };
+        assert!(!parse(&[]));
+        assert!(parse(&["--host-expert-import"]));
     }
 }
 
@@ -1574,6 +1602,8 @@ struct TokenArgs {
     prefill_merged: bool,
     warm: usize,
     then_prompt_ids: Option<String>,
+    /// D4: import host-lane expert bytes via VK_EXT_external_memory_host
+    host_expert_import: bool,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1693,6 +1723,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 head_device: breccia_engine::HeadSpec::Auto,
                 profile: None,
                 arena: breccia_engine::ArenaSpec::List(expert_sets[s].clone()),
+                host_expert_import: a.host_expert_import,
                 verbose: s == 0,
             },
         )
@@ -2009,6 +2040,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
                 head_device: breccia_engine::HeadSpec::Auto,
                 profile: None,
                 arena: breccia_engine::ArenaSpec::List(groups[s].clone()),
+                host_expert_import: false,
                 verbose: s == 0,
             },
         )
@@ -2471,6 +2503,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             },
             profile: None,
             arena,
+            host_expert_import: a.host_expert_import,
             verbose: true,
         },
     )

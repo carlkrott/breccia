@@ -317,6 +317,9 @@ pub struct LoadOptions {
     /// (`--gpu-experts 0,1,…`, each on the device that owns the block), or the
     /// measured-free-VRAM rule (`--gpu-experts auto`, [`crate::arena`]).
     pub arena: ArenaSpec,
+    /// Zero-copy host expert import via `VK_EXT_external_memory_host` (`--host-expert-import`,
+    /// D4). Off by default: not yet consumed by the loader until D3 lands behind it.
+    pub host_expert_import: bool,
     pub verbose: bool,
 }
 
@@ -329,6 +332,7 @@ impl Default for LoadOptions {
             head_device: HeadSpec::Auto,
             profile: None,
             arena: ArenaSpec::Off,
+            host_expert_import: false,
             verbose: true,
         }
     }
@@ -1585,5 +1589,12 @@ mod tests {
         let (cur, peak) = rss_bytes();
         assert!(cur > 0, "the process must have resident memory");
         assert!(peak >= cur);
+    }
+
+    /// D4: the host expert import is opt-in — the default load path must not
+    /// import host memory (`--host-expert-import` is the only way in).
+    #[test]
+    fn host_expert_import_is_off_by_default() {
+        assert!(!LoadOptions::default().host_expert_import);
     }
 }
