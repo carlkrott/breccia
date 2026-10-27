@@ -4320,6 +4320,79 @@ suspect, and the sentinel test can be pointed at any single buffer), and the **p
 content checksum** of the uploaded weights across processes (the uploads are length-checked, not
 content-checked, and they are the only thing that differs per process at load besides layout).
 
+## 8bc. The positional-sizing class, reproduced on demand — and it does **not** produce the step-0 signature
+
+The hypothesis to close the case: the wrong-sequence family was the positional workspace sizing
+bug (a merged 96-row `beta|alpha` write landing in a slot sized for one head, the tail out of
+bounds, silently discarded by `robustness2`, so the read returns a *plausible* value that trips
+no NaN or coverage check).
+
+**Timeline first, because it is not decisive:** the two RED gates were 07:05 and 07:45; the GDN
+`beta|alpha` merge landed on `main` at 07:04:17/07:06:05 and my binary merged it at 07:47:48. So
+07:05 and 07:45 both ran pre-merge binaries — but the 07:17 GREEN also did, so the timeline
+neither convicts nor exonerates it. Hence the re-introduction.
+
+**Re-introduction** (`BRECCIA_FAULT_GDN_HALF_WORKSPACE=1`, sizes the merged slot for one head:
+48 floats instead of 96 — the original magnitude):
+
+```
+sized 48 floats (one head, the original bug's shape) -> bit-identical output, twice, three processes
+sized  1 float  (96x overrun, to prove the class can bite at all) -> row perturbed
+        (min -8.374 vs -10.226), tokens diverge from step 1, identical in both runs of the process
+```
+
+So a one-slot-short workspace of that size is **absorbed by the allocator's tail pad** and changes
+nothing — the class can perturb the row, but only with an overrun far larger than the one the
+hypothesis names, and even then the *step-0* argmax stayed correct (the divergence started at
+step 1). **The case is not closed by this route**: the deliberate re-introduction does not
+reproduce `step 0 ours 1049 expected 110563`, so the historical failures are not explained by a
+one-slot workspace error of that magnitude.
+
+### What is measured, and how strongly
+
+| window | arm | result |
+|---|---|---|
+| 07:17 (quiet, `REQUIRE_QUIET`) | `--inbatch-read true`, 16 proc x 2 x gen 32 | GREEN, 32 generations |
+| 07:54 (quiet, `REQUIRE_QUIET`) | same | GREEN, 32 generations |
+| 08:21 (quiet, `REQUIRE_QUIET`, 2 co-tenant discards) | same | GREEN, 32 generations |
+
+**96 generations over 48 exclusive processes, 0 wrong.** With zero failures the 95 % upper bound
+on the per-process rate is `1 - 0.05^(1/N) = 3/N` ⇒ **≤ 6.1 % per process at N=48**. That is
+*not* a claim of ≤1 %: to bound the rate at ≤1 % with zero failures you need **N ≈ 300
+exclusive processes** (~600 generations, ~5 h of windows at this box's contention). The honest
+statement is "no failure in 48 exclusive processes, upper bound ~6 %", which excludes the
+historical ~10-12 % only weakly.
+
+### The two instruments (permanent, flag-gated)
+
+* **`BRECCIA_DUMP_LAYOUT=1`** — `Session::layout_dump` prints the per-device buffer layout
+  (name, size, `VkBuffer`/`VkDeviceMemory` handles) plus each QSA block's state sizes. Diffing a
+  failing process against a clean one is the only way to see an allocation-order difference; 25
+  lines on this model.
+* **`BRECCIA_VERIFY_WEIGHTS=1|all`** — `upload_tensor` reads every uploaded tensor **back off the
+  device** and compares it with the mapping byte-for-byte (`1` skips tensors over
+  `BRECCIA_VERIFY_WEIGHTS_MAX_MIB`, default 512; `all` verifies everything). Result on this model:
+  **`weights 30 802 MiB of tensor uploads read back and compared byte-for-byte — 0 divergences`**,
+  i.e. content is *not* the per-process difference at load, which is the last candidate the
+  previous round named.
+
+### The guard for the class
+
+Three places, all where a positional array or a literal size lives:
+
+1. `GdnWorkspace::workspace` — `assert_eq!(sizes.len(), 9, …)` before the positional `take()`
+   chain, and the stale "eight buffers were allocated" message corrected to nine. A slot inserted
+   without its size now aborts the load instead of shifting every buffer after it.
+2. `QsaState::new` — `assert_eq!(sizes.len(), 6, …)`, and `QsaWorkspace::new` —
+   `assert_eq!(sizes.len(), 11, …)`; both are positional `take()` lists. (Writing these found that
+   the workspace array already had 11 entries against 11 fields with nothing checking it.)
+3. `hc_inject_bytes()` replaces the hard-coded `160` in the graph's injected-partial sizing, so the
+   copy size comes from a function instead of a literal — the second silent wrong-value bug of
+   this class.
+
+Rule to apply from here: **a positional array asserts its length against the field count, and a
+copy size comes from a function, never a literal.**
+
 ## 9. Exact commands
 
 

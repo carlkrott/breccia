@@ -2912,6 +2912,19 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         ),
         Err(e) => return Err(e).context("the head path moved far more than a residual per token"),
     }
+    if std::env::var_os("BRECCIA_DUMP_LAYOUT").is_some() {
+        println!("\nlayout (BRECCIA_DUMP_LAYOUT):");
+        for line in sess.layout_dump() {
+            println!("  {line}");
+        }
+    }
+    if breccia_engine::model::weight_check_bytes() > 0 {
+        println!(
+            "weights  {:.1} MiB of tensor uploads read back and compared byte-for-byte \
+             (BRECCIA_VERIFY_WEIGHTS) — 0 divergences",
+            breccia_engine::model::weight_check_bytes() as f64 / (1 << 20) as f64
+        );
+    }
     println!(
         "\nreadback {} in-batch readback(s) of which {} were read without a waited \
          submission (must be 0; docs/phase-4 §8ba)",

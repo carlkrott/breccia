@@ -252,17 +252,39 @@ impl<'g> Gdn<'g> {
         // Order matches the `GdnWorkspace` fields exactly (positional `take()`
         // below): qkv, z, alpha, beta_raw, beta, **beta_alpha** (two heads' worth),
         // gate, step, normed.
+        // `BRECCIA_FAULT_GDN_HALF_WORKSPACE=1` deliberately sizes the merged
+        // `beta|alpha` slot for **one** head instead of two — the exact class of the
+        // bug that produced a step-0-only wrong token for months (a positional
+        // workspace one slot short, the tail of the write out of bounds, silently
+        // discarded by `robustness2`, so the read returns a plausible value that trips
+        // no NaN or coverage check). It exists so that class can be reproduced on
+        // demand instead of waited for: docs/phase-4/01-forward-pass.md §8bc.
+        let ba_rows = if std::env::var_os("BRECCIA_FAULT_GDN_HALF_WORKSPACE").is_some() {
+            1
+        } else {
+            2 * tokens * MODEL_H_V
+        };
         let sizes = [
             tokens * CONV_CHANNELS,
             tokens * VALUE_DIM,
             tokens * MODEL_H_V,
             tokens * MODEL_H_V,
             tokens * MODEL_H_V,
-            2 * tokens * MODEL_H_V,
+            ba_rows,
             tokens * MODEL_H_V,
             tokens * VALUE_DIM,
             tokens * VALUE_DIM,
         ];
+        // The class guard: this array is consumed **positionally** by the `take()`
+        // chain below, so its length must equal the field count by construction. A
+        // slot that lands one position late is exactly how a merged 96-row write once
+        // landed in a 48-row buffer (`docs/phase-4/01-forward-pass.md` §8bc).
+        assert_eq!(
+            sizes.len(),
+            9,
+            "GdnWorkspace has nine fields; a positional slot list of a different length \
+             silently shifts every buffer after the insertion point"
+        );
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         for (i, n) in sizes.iter().enumerate() {
             match alloc(gpu, (*n * 4) as u64) {
@@ -276,7 +298,10 @@ impl<'g> Gdn<'g> {
             }
         }
         let mut it = bufs.into_iter();
-        let mut take = || it.next().expect("eight gdn buffers were allocated");
+        let mut take = || {
+            it.next()
+                .expect("nine gdn workspace buffers were allocated")
+        };
         Ok(GdnWorkspace {
             tokens,
             qkv: take(),

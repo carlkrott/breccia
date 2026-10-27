@@ -790,7 +790,7 @@ impl<'m> Session<'m> {
                         // constant.
                         let inject_bytes = (mc.hc * hc.inject_chunks() * 4) as u64;
                         injects.push(alloc(
-                            inject_bytes.max(160),
+                            inject_bytes.max(hc_inject_bytes()),
                             &format!("prefill inject slot {t}"),
                         )?);
                         boxes.push(Mailbox::new(gpu, n * 4)?);
@@ -1656,6 +1656,49 @@ impl<'m> Session<'m> {
     /// The device the head runs on (for the report).
     pub fn head_device(&self) -> usize {
         self.model.head_device()
+    }
+
+    /// `BRECCIA_DUMP_LAYOUT=1`: the per-device buffer layout (size + Vulkan handles) as
+    /// the session allocated it. The failing process's layout is the one thing no
+    /// ordering or coverage check can see, so it is printed on request and can be
+    /// diffed against a clean process with `scripts/head-race-layout.sh`.
+    pub fn layout_dump(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (dev, v) in self.venues.iter().enumerate() {
+            let mut row = |name: &str, b: &Buf| {
+                out.push(format!(
+                    "dev{dev} {name:<20} size {:>9}  buf {:?} mem {:?}",
+                    b.size, b.buf, b.mem
+                ))
+            };
+            row("residual r", &v.r);
+            row("block_out", &v.block_out.buf);
+            row("sh", &v.sh);
+            row("sh_gate_logit", &v.sh_gate_logit);
+            row("router_logits", &v.router_logits);
+            row("router_ids", &v.router_ids);
+            row("router_w", &v.router_w);
+            row("ple_key_out", &v.ple_key_out);
+            row("ple_value_out", &v.ple_value_out);
+            row("ple_emb", &v.ple_emb);
+            if let Some(ws) = &v.hc_ws {
+                row("hc.mixed", &ws.mixed);
+                row("hc.xn", &ws.xn);
+                row("hc.gate", &ws.gate);
+            }
+            if let Some(l) = &v.logits {
+                row("logits", l);
+            }
+        }
+        for (b, st) in self.qsa_state.iter().enumerate() {
+            if let Some(st) = st {
+                out.push(format!(
+                    "blk{b:<3} qsa k_pool {:>9} v_pool {:>9} tail {:>7} pooled {:>7}",
+                    st.k_pool.size, st.v_pool.size, st.idx_tail.size, st.idx_pooled.size
+                ));
+            }
+        }
+        out
     }
 
     /// What each card actually did: blocks, fence-wait time, host traffic.
@@ -3900,6 +3943,14 @@ impl Drop for Session<'_> {
             s.release(m.devices[i].gpu());
         }
     }
+}
+
+/// Bytes one hyper-connection `inject` partial needs: `n_embd` floats at the model's
+/// `hc` count is *not* what the mixer reads — it reads one partial per low-rank row, so
+/// the size comes from here and never from a literal. (A hard-coded `160` was the second
+/// silent wrong-value bug of this class; `docs/phase-4/01-forward-pass.md` §8bc.)
+fn hc_inject_bytes() -> u64 {
+    160
 }
 
 /// A finished generation.

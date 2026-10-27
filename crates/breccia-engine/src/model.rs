@@ -1199,7 +1199,50 @@ fn upload_tensor(gpu: &Gpu, name: &str, t: &breccia_format::gguf::TensorView<'_>
     let buf = breccia_kernels::gemv::upload(gpu, bytes)
         .with_context(|| format!("uploading {name} ({declared} B)"))?;
     check_uploaded(name, declared, bytes.len() as u64, buf.size)?;
+    // `BRECCIA_VERIFY_WEIGHTS=1|all`: read the tensor **back off the device** and compare
+    // it with the mapping. Length is checked above; content is the only per-process
+    // difference left at load, and a silent content divergence would produce exactly the
+    // "step 0 is wrong, the same way in every run of that process" signature
+    // (`docs/phase-4/01-forward-pass.md` §8bc). `1` skips tensors over
+    // `BRECCIA_VERIFY_WEIGHTS_MAX_MIB` (512) so the arena upload stays out of the way;
+    // `all` verifies everything.
+    let mode = std::env::var("BRECCIA_VERIFY_WEIGHTS").unwrap_or_default();
+    let enabled = mode == "1" || mode == "all";
+    if enabled && (mode == "all" || declared <= verify_cap()) {
+        let back = breccia_kernels::gemv::download(gpu, &buf, bytes.len())
+            .with_context(|| format!("reading {name} back for the content check"))?;
+        if back != bytes {
+            let at = back
+                .iter()
+                .zip(bytes)
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            bail!(
+                "tensor `{name}` did **not** survive the upload: first differing byte at \
+                 offset {at} of {declared} — the device copy is not what the file holds"
+            );
+        }
+        WEIGHT_CHECK.with(|c| c.set(c.get() + declared));
+    }
     Ok(buf)
+}
+
+thread_local! {
+    /// Bytes of tensor uploads read back and compared (`BRECCIA_VERIFY_WEIGHTS`).
+    static WEIGHT_CHECK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes of uploads the weight-content check has verified (printed by the bench).
+pub fn weight_check_bytes() -> u64 {
+    WEIGHT_CHECK.with(|c| c.get())
+}
+
+fn verify_cap() -> u64 {
+    std::env::var("BRECCIA_VERIFY_WEIGHTS_MAX_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(512)
+        << 20
 }
 
 /// Fail when a tensor is uploaded with fewer bytes than the artifact declares, or when

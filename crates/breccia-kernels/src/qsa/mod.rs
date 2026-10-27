@@ -142,6 +142,11 @@ impl QsaState {
             ((max_blocks * IDX_DIM * 4) as u64, "indexer pooled"),
             (max_pos as u64 * 4, "position table"),
         ];
+        assert_eq!(
+            sizes.len(),
+            6,
+            "QsaState has six fields; the positional slot list must match it"
+        );
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         for (bytes, what) in sizes.iter() {
             match alloc(gpu, *bytes) {
@@ -508,6 +513,11 @@ impl<'g> Qsa<'g> {
             MODEL_N_HEAD * tokens * slots,
             tokens * ATTN_OUT_DIM,
         ];
+        assert_eq!(
+            sizes.len(),
+            11,
+            "QsaWorkspace has eleven fields; the positional slot list must match it"
+        );
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         for (i, n) in sizes.iter().enumerate() {
             match alloc(gpu, (*n * 4) as u64) {
