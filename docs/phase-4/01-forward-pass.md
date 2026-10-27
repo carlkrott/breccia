@@ -3691,6 +3691,29 @@ That is the next shader round, not this one.
 ||||||| cbb0929
 ## 8av. `--head-device` (**-2.5 ms**) and an expert arena that is a rule, not a list
 
+> **STATUS 2026-10-27 — `--head-device` is OPT-IN and not gate-safe.** Follow-up runs found the
+> device-crossing handoff **intermittently wrong: 3 of 17 runs produced an incorrect greedy sequence**
+> (2 diverged at step 0, 1 looped from step 25) versus **0 of 20** without the handoff. Both prompt
+> passes were bit-identical *inside* the failing process, so this is persistent wrong state, not a torn
+> read, and it survived the in-batch upload rewrite. It is therefore **not** a timing artefact of the
+> benchmark window.
+> - Safe arm: `--head-device <pci of the last block's own device>` (no crossing) — bit-identical.
+> - The single-pass logits check (`--dump-logits`, head-RX vs head-MI50) **did** come back cmp-clean and
+>   max |Δ| 1.6e-5 on a 32-token run, which is exactly why one green run is not acceptance: the failure
+>   is intermittent, so any claim about this path needs **N ≥ 20 runs** and a greedy-sequence comparison.
+> - The 738 ms/token observation that started this investigation did **not** reproduce in a quiet window
+>   (16.32/16.91 tok/s, 4/4 runs). What does reproduce it is a window with another agent's process on
+>   both cards: `head` 152.6, `ple` 22.4, `wait-gpu` 119.3 ms — a whole-card ~15× slowdown while 68 GiB
+>   of model mapping thrashes a 58 GiB page cache. **A contended window can look exactly like a
+>   catastrophic bug**; check for a co-tenant process before believing a 10× regression.
+> - Guards that did land and are worth keeping: `Session::head_traffic_ok` asserts per run that the path
+>   moves at most one residual (the bench prints `40.0 KiB up + 1010.0 KiB down per token`), `head::handoff_bytes`
+>   with a unit test pins it three orders below the 416 MiB head, and `--head-device` now accepts
+>   `auto|N|PCI`, errors on an unknown ordinal/PCI and lists the devices (9 tests, both device orders).
+>
+> Do not enable it by default (or default the head to a non-owning device) until the handoff race is
+> understood and covered by a repeated-run test.
+
 Two items off the "not done" list, both measured on the dual configuration in one quiet
 window (both clocks `high` in every run header), parity **32/32** in every quoted run.
 
