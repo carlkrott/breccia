@@ -4042,6 +4042,77 @@ arena; the harness reproduces it on the shipped arm and is the gate for whoever 
 Until then, quote parity from **many processes**, never from one run: a single
 `--dump-logits` comparison in this same round would have certified the removed arm.
 
+## 8ay. The short-read hypothesis does not apply — the model path has no `read()` — and every observed failure had a co-tenant
+
+Scoped round: the correctness bug only.
+
+### The audit: there is no short read to have
+
+The hypothesis was a `pread`/`read` returning short on a cold page cache, leaving stale bytes
+in a staging buffer. **That cannot happen in this engine**, and the audit is short because
+the path is short:
+
+| path | mechanism | short-read possible? |
+|---|---|---|
+| GGUF shards (`breccia-format::filemap::map_readonly`, `Gguf::open`) | `memmap2::Mmap`, read-only; `TensorView::as_slice` is a subslice of the mapping, `n_bytes()` is its length | no — the kernel faults whole pages; there is no returned length to check |
+| tensor upload (`model::upload_tensor` → `gemv::upload_into`) | `staging()` allocates a **fresh** host-visible buffer per tensor (no pool, so no reuse), `write_host` = `copy_from_slice`, `copy_once` = one `cmd_copy_buffer` of exactly `data.len()` behind `wall_run`'s fence | no partial copy to leave stale bytes |
+| PLE table (27 GB) | the same mapping; `prefetch_rows` only *touches* one byte per row from up to 8 threads (a fault-warming hint, no data path) | no |
+| expert lane | reads `&[u8]` subslices of the same mapping | no |
+| staging readbacks (`Staging::read_batch`/`write`) | bounds-checked against `cap` and the destination size, one copy list, one fence | checked |
+
+`grep -rn "read_exact|\.read\(|pread"` over `breccia-format`/`breccia-engine`/`breccia-kernels`
+returns only `Gpu::read_host`/`Mmap` uses and the mixer's `read` (unrelated). So the injected
+fault has to be simulated — which is worth doing anyway, because "a tensor reached the device
+with fewer bytes than it declares" used to be **silent**:
+
+* `model::upload_tensor` now checks, once per tensor at load, that the **source length** equals
+  the declared `n_bytes()` and that the device buffer is at least that big (`alloc` rounds up:
+  40960 declares as a 41024-byte `Buf`, so the check is `>=` on the buffer and `==` on the
+  source). It is a release-mode `bail!`, not a `debug_assert` — the symptom it prevents is
+  what a debug build is not running when it matters.
+* `BRECCIA_FAULT_TRUNCATE_KB=k` truncates the first upload by `k` KiB. Deterministic test:
+  `BRECCIA_FAULT_TRUNCATE_KB=4 breccia bench token …` prints
+  `tensor `blk.0.hc_attn_norm.weight` was uploaded with 36864 bytes of 40960 (4096 bytes short)
+  … the load is refused` and exits non-zero; without the check it loads and generates.
+  Unit test: `model::tests::a_truncated_upload_is_refused` (source short / buffer short /
+  zero-byte / padded-OK).
+
+### What actually correlates: a co-tenant
+
+Re-reading every failure with the harness's discard log in hand, **all five wrong sequences
+happened in a window where a second GPU process shared the cards** — the `gpu-time-probe` and
+`hc-epilogue-fusion` rounds were benching concurrently, and the harness discarded procs 1/4/7
+for a co-tenant in the very run that flagged `ship-8`. In **exclusive** processes this round:
+**36 processes (≈ 500 generated tokens across the two arms) with 0 failures**, including the
+exact failing recipe (`--gpu-experts auto`, parity prompt, gen 32, `--warm 1`) at 10, 16 and
+8 processes, and a `--inbatch-read true/false` A/B (7 vs 9) with 0 failures either way.
+
+That kills the "residual one position stale" reading too: a shared card makes RADV evict
+device-local pages under a running kernel and makes the lane's mmap pages fight for the 58 GiB
+page cache, which is a mechanism for *wrong values*, not just slowness. It also explains why
+the rate moved between windows and why no single-process trace ever reproduced it.
+
+**Mitigation (not a cure, and labelled as such):** `model::co_tenant_check` reads
+`VK_EXT_memory_budget` at load and, when another process holds more than 512 MiB of a card this
+model spans (`heap_bytes > budget + usage + slack`), prints
+`WARNING: device N (…): another process holds X MiB of its VRAM … a shared card is the only
+condition under which this engine has produced a wrong greedy sequence`. `BRECCIA_REQUIRE_QUIET=1`
+makes it fatal, and that is how every benchmark in this file should be taken from now on.
+
+If it is not a co-tenant, the next suspects are unchanged and untested: the QSA state not being
+reset between generations (`reset()` clears GDN and PLE only — a *deterministic* per-process
+difference would need `--warm` to matter, and `--warm 0` has never failed while `--warm 1` has,
+which is worth one dedicated window), and arena `auto` picking a different set (weakened: two
+sets agree to 7.4e-5).
+
+### Gate, after the change (shipped arm, exclusive)
+
+`RACE_ARENA=auto RACE_PROMPT=parity RACE_PROCS=8 RACE_RUNS=2 RACE_GEN=32 RACE_WARM=1
+scripts/head-handoff-race.sh` -> **GREEN: 16 generations over 8 exclusive processes, crossing
+refused OK**, one process discarded because a co-tenant appeared during it (the guard doing its
+job, and the first time it has been able to say so). The two assertions (stability across
+processes + the crossing request refused) are unchanged.
+
 ## 9. Exact commands
 
 

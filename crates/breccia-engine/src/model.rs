@@ -403,6 +403,7 @@ impl Model {
             );
         }
         let caps: Vec<u64> = devices.iter().map(|d| vram_bytes(d.gpu())).collect();
+        co_tenant_check(&devices, opts.verbose)?;
 
         // --- head device (`--head-device`) -----------------------------------
         // The head is 416 MiB and its GEMV is the second-largest single item of a
@@ -1093,8 +1094,7 @@ fn w(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<W> {
         .tensor(name)
         .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
     let key = PipeKey::of(&t)?;
-    let buf = breccia_kernels::gemv::upload(gpu, t.as_slice())
-        .with_context(|| format!("uploading {name} ({} B)", t.n_bytes()))?;
+    let buf = upload_tensor(gpu, name, &t)?;
     Ok(W { buf, key })
 }
 
@@ -1102,8 +1102,73 @@ fn raw(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<Buf> {
     let t = shards
         .tensor(name)
         .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
-    breccia_kernels::gemv::upload(gpu, t.as_slice())
-        .with_context(|| format!("uploading {name} ({} B)", t.n_bytes()))
+    upload_tensor(gpu, name, &t)
+}
+
+/// The number of leading tensors to truncate by `BRECCIA_FAULT_TRUNCATE_KB`
+/// (fault injection for the short-read class, see [`check_uploaded`]). `0` = off.
+fn fault_truncate_kb() -> Option<u64> {
+    std::env::var("BRECCIA_FAULT_TRUNCATE_KB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|k| *k > 0)
+}
+
+/// Upload a whole tensor and **check the device got all of it**.
+///
+/// The model path has no `read()` to short-return (`breccia_format` maps the shards
+/// with `memmap2` and hands out `&[u8]` subslices), so a partial upload can only
+/// arise from a caller passing a truncated slice or a copy whose length disagrees
+/// with the tensor. Both are silent in release — the buffer keeps whatever the
+/// allocator left there and the engine produces plausible-but-wrong tokens — so the
+/// declared byte length is checked here, once per tensor, at load.
+///
+/// `BRECCIA_FAULT_TRUNCATE_KB=k` truncates the first `upload_tensor` call by `k` KiB
+/// to prove the check fires (it is the deterministic test for this class: without
+/// the check the same injection loads and generates wrong tokens).
+fn upload_tensor(gpu: &Gpu, name: &str, t: &breccia_format::gguf::TensorView<'_>) -> Result<Buf> {
+    static FAULTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let declared = t.n_bytes();
+    let mut bytes = t.as_slice();
+    if let Some(kb) = fault_truncate_kb() {
+        if !FAULTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            let cut = ((kb << 10) as usize).min(bytes.len().saturating_sub(1));
+            bytes = &bytes[..bytes.len() - cut];
+            eprintln!(
+                "breccia: FAULT INJECTION: uploading {name} with {} of {declared} bytes",
+                bytes.len()
+            );
+        }
+    }
+    let buf = breccia_kernels::gemv::upload(gpu, bytes)
+        .with_context(|| format!("uploading {name} ({declared} B)"))?;
+    check_uploaded(name, declared, bytes.len() as u64, buf.size)?;
+    Ok(buf)
+}
+
+/// Fail when a tensor is uploaded with fewer bytes than the artifact declares, or when
+/// the device buffer it landed in cannot hold the whole tensor.
+///
+/// This is the release-mode guard for the short/partial-upload class: it is *not* a
+/// `debug_assert`, because the symptom it prevents (wrong tokens at ~10 % of
+/// processes) is exactly what a debug build is not running when it matters. The
+/// source length is what matters — `alloc` rounds a buffer up (40960 declares as a
+/// 41024-byte `Buf` here), so a padded buffer is fine and a short *source* is not.
+fn check_uploaded(name: &str, declared: u64, source: u64, buf: u64) -> Result<()> {
+    if source != declared {
+        bail!(
+            "tensor `{name}` was uploaded with {source} bytes of {declared} ({} bytes short): a \
+             truncated upload would silently produce wrong tokens, so the load is refused",
+            declared.saturating_sub(source)
+        );
+    }
+    if buf < declared {
+        bail!(
+            "tensor `{name}` landed in a {buf}-byte buffer but declares {declared}: the upload \
+             could not have carried the whole tensor, so the load is refused"
+        );
+    }
+    Ok(())
 }
 
 fn raw_bytes(shards: &ShardSet, name: &str) -> Result<Vec<u8>> {
@@ -1176,6 +1241,46 @@ fn head_candidates(
             }
         })
         .collect()
+}
+
+/// Refuse (or warn about) a card another process is already using.
+///
+/// Every wrong greedy sequence this engine has produced in a *benchmark* window
+/// (5 of them, all before `scripts/head-handoff-race.sh` grew its guard) happened
+/// while a second GPU process shared the cards and the same 40 GB of expert mapping;
+/// in ~60 exclusive processes the rate is zero, and two arena choices are
+/// numerically interchangeable (max |Δlogit| 7.4e-5), so the remaining explanation
+/// for a *persistent* wrong token is the one condition that is not ours: another
+/// client holding VRAM (which makes RADV evict device-local pages under a running
+/// kernel) and thrashing the page cache the lane reads through.
+///
+/// `VK_EXT_memory_budget` answers it exactly: `heapBudget` is what *this* process may
+/// allocate, so a budget more than `SLACK` below the heap size means somebody else
+/// holds the difference. The default is a loud warning (a shared box is a legitimate
+/// way to run the engine); `BRECCIA_REQUIRE_QUIET=1` makes it fatal.
+fn co_tenant_check(devices: &[Device], verbose: bool) -> Result<()> {
+    const SLACK: u64 = 512 << 20;
+    let strict = std::env::var_os("BRECCIA_REQUIRE_QUIET").is_some();
+    for (i, dev) in devices.iter().enumerate() {
+        let Some(b) = dev.gpu().mem_budget() else {
+            continue;
+        };
+        let held = b.heap_bytes.saturating_sub(b.budget + b.usage);
+        if held > SLACK {
+            let msg = format!(
+                "device {i} ({}): another process holds {} MiB of its VRAM ({held} MiB below the                  heap). Benchmarks taken now are not comparable and a shared card is the only                  condition under which this engine has produced a wrong greedy sequence",
+                dev.info.pci_address,
+                held >> 20
+            );
+            if strict {
+                bail!("{msg} (BRECCIA_REQUIRE_QUIET is set)");
+            }
+            if verbose {
+                eprintln!("breccia: WARNING: {msg}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Measure each device's free VRAM and turn it into an arena budget.
@@ -1342,6 +1447,25 @@ mod tests {
         assert!(b < a, "keys must be totally ordered for the BTreeMap");
         // IQ4_XS is 256/136: 10 blocks per 2560-wide row.
         assert_eq!(a.weight_bytes(), (10240 * 10 * 136) as u64);
+    }
+
+    /// The deterministic test for the short/partial-upload class: a truncated tensor
+    /// must fail the load, not produce tokens. `BRECCIA_FAULT_TRUNCATE_KB` exercises
+    /// the same path end-to-end (a `bench token` run with it set must exit non-zero
+    /// with this message).
+    #[test]
+    fn a_truncated_upload_is_refused() {
+        // A padded buffer (alloc rounds up) is fine; a short *source* is not.
+        assert!(check_uploaded("blk.0.ffn_up_exps.weight", 1000, 1000, 1024).is_ok());
+        let e = check_uploaded("blk.0.ffn_up_exps.weight", 1000, 936, 1024).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("936 bytes of 1000"), "{msg}");
+        assert!(msg.contains("64 bytes short"), "{msg}");
+        assert!(msg.contains("refused"), "{msg}");
+        // A zero-byte upload of a non-empty tensor is the same class.
+        assert!(check_uploaded("x", 4096, 0, 4096).is_err());
+        // A device buffer that cannot hold the tensor is refused too.
+        assert!(check_uploaded("x", 4096, 4096, 2048).is_err());
     }
 
     #[test]
