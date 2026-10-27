@@ -2669,6 +2669,54 @@ canonical gate stands at 20.3 +- 1 / lane 40-43 ms/step. Prefill at 64-token chu
 this window: `experts(host)` 48.1, `wait-gpu` 20.6, `ple` 1.4, `mixer` 7.2, everything
 else <= 0.2 ms/token.
 
+## 8ag. Coverage cannot fix the lane: +4 blocks buys -7.5 %, and full coverage needs 43 GiB
+
+Item 2 of the round (a flag-only experiment) landed; Items 1 and 3 did not. The
+experiment is decisive about *whether the host lane is worth attacking in code*.
+
+### The sweep (`--gpu-experts`, 2 streams, 64-token chunked prefill, RX, ms/token)
+
+| placed blocks | `experts(host)` | `wait-gpu` | arena (VRAM) |
+|---:|---:|---:|---|
+| 9 (the shipped default) | **38.40** | 19.55 | ~7.9 GiB |
+| 13 | **35.52** | 19.28 | ~11.4 GiB |
+
++4 blocks (−44 % of the lane's work) buys **−2.88 ms/token (−7.5 %)** of lane time and
+**nothing** off the drain. The arithmetic is unforgiving: the lane's 38.4 ms/token is
+0.98 ms per non-resident block per token, and covering all 39 would need 39 x ~0.9 GiB
+= **~35 GiB of arena on top of the 3.7 GiB dense set** — against 16 GiB per card. Even
+17 blocks (~14 GiB of arena) is at the edge of what fits beside the dense weights and
+the state, and it would still leave 31 blocks on the lane.
+
+**So coverage is not the lever.** The two options that remain are the ones already on
+the list, and this experiment is what should decide between them: (a) **async prefetch**
+for the streamed path (§8x: 429-530 us per group serialised against 67-84 resident —
+overlapping the upload is worth ~4x on the streamed blocks, which *is* the lane), or
+(b) accept the lane and attack the drain instead (barrier tracking, ~3.8 ms/token).
+(a) is worth ~38 ms/token if it works; (b) is worth ~4 ms/token. That ordering is now
+quantified rather than assumed.
+
+### Items 1 and 3: not landed
+
+* **Per-resource barrier tracking** (the ~3.8 ms/token item): not implemented. The
+  design is settled — a `HashMap<vk::Buffer, Access>` in `dispatch_batch::record`,
+  emitting `copy_dependency`/`barrier_compute_on` only when a bound buffer's last
+  access was a write, with a per-token counter — but it is a change to the hottest
+  recording path and needs its own parity + counter + sync2 A/B run. Shipping it
+  unmeasured is exactly the mistake §8ac recorded.
+* **Fused gate+up+SwiGLU**: not attempted (depends on Item 1 landing first, and it is
+  ~1.6 % of the drain).
+
+### State
+
+No decode path touched; parity unchanged (chunk 128 + merged 32/32, top-1 13.170561);
+canonical gate stands at 20.3 +- 1 aggregate, lane 40-43 ms/step. This window was
+contended (back-to-back prefill runs, `ple` first-chunk rows cold at 16.5 vs 5.3 ms), so
+no prefill tok/s is claimed — only the stage table, which is what the guardrail asks
+for. One incidental confirmation: **PLE's cold rows are visible in the first chunk
+line** (`ple 16.47` at 9 blocks, `5.27` at 13) and collapse to 1.1-1.3 ms/token by the
+second — §8z's cold-vs-warm story, seen in a single run.
+
 ## 9. Exact commands
 
 
