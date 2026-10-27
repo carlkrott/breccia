@@ -246,8 +246,25 @@ fn main() {
                 &["BRECCIA_GEMV_EPILOGUE_SILU_DIV"],
             );
         }
+        // The q8_0 V-cache build (§8bg): a *wired* variant — same bindings, same
+        // push constants, one `-D` — so the f16 pipelines stay byte-identical
+        // SPIR-V and `BRECCIA_KV_Q8V` is a one-flag A/B and revert.
+        if KV_Q8V_SHADERS.contains(name) {
+            compile(
+                &glslc,
+                &out_dir,
+                name,
+                &format!("{name}_q8v"),
+                &["BRECCIA_KV_Q8V"],
+            );
+        }
     }
 }
+
+/// QSA stems that get the q8_0 **V**-cache build (`BRECCIA_KV_Q8V`, §8bg): the
+/// append (quantise on write) and the apply (dequantise in registers inside the
+/// accumulate loop). The scores kernel never reads V, so it has no variant.
+const KV_Q8V_SHADERS: &[&str] = &["qsa_kv_append", "qsa_attn_apply"];
 
 /// Assemble a hand-written `.spvasm` module with `spirv-as` and validate it, the
 /// same two-step the compiled shaders go through (`AGENTS.md`: malformed SPIR-V must

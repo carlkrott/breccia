@@ -28,6 +28,30 @@
 // same page geometry.
 //
 // One invocation per (token, kv_head, d-pair) so each writes exactly one word.
+//
+// # `BRECCIA_KV_Q8V` — the q8_0 **V** build (`docs/phase-4/01-forward-pass.md` §8bg)
+//
+// Built as a second pipeline from this same source (a **wired** variant in the
+// sanctioned sense: same bindings, same push constants, one `-D`), so the f16
+// build's SPIR-V stays byte-identical:
+//
+// ```text
+// v_pool :: u32 words, one Q8_0 block per 32 elements of a row
+//   row   = (page * n_kv_head + kv_head) * page_cells + cell_in_page
+//   block = row * blocks_per_row + d/32            (blocks_per_row = head_dim/32 = 8)
+//   word  = block * 9                              -> [0] = f32 scale bits,
+//                                                    [1..9] = 32 x i8, 4 per word
+// ```
+//
+// 288 B per 256-element row against 512 B for f16 (0.5625x, `qsa::sizes`). The
+// scale is `amax/127` and the value `round(x/scale)` — one scale per 32 elements,
+// the llama.cpp `Q8_0` rule, which is what the `qsa::cpu::to_q8_0` reference
+// models so the conformance test measures arithmetic and not storage.
+//
+// Quantisation needs the whole block in one invocation (the scale is a max over
+// it), so the q8_0 build has a different work shape: one invocation per
+// (token, kv_head, 32-element block) writing that block's 9 V words **and** the
+// 16 f16 K words of the same span. K stays f16 — this round is V only (§8bf).
 
 layout(local_size_x = 128) in;
 
@@ -51,6 +75,64 @@ layout(push_constant) uniform Params {
 #include "f16_storage.glsl"
 
 #define WG_X_MAX 65535u
+
+#ifdef BRECCIA_KV_Q8V
+
+/// Elements per q8_0 block (`Q8_0`), pinned against `qsa::sizes::Q8_BLOCK_ELEMS`.
+#define Q8_BLOCK_ELEMS 32u
+/// `32 x i8 + one f32 scale` = 8 packed words + 1 scale word.
+#define Q8_BLOCK_WORDS 9u
+#define Q8_BLOCK_QUANTA 127.0
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint unit = wg * 128u + gl_LocalInvocationID.x;
+    uint blocks = pc.head_dim / Q8_BLOCK_ELEMS;
+    uint total = pc.tokens * pc.n_kv_head * blocks;
+    if (unit >= total) {
+        return;
+    }
+    uint blk = unit % blocks;
+    uint rest = unit / blocks;
+    uint kvh = rest % pc.n_kv_head;
+    uint t = rest / pc.n_kv_head;
+
+    uint cell = uint(int(pc.pos0) + int(t));
+    uint page = PT[cell / pc.page_cells];
+    uint in_page = cell % pc.page_cells;
+    uint row = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
+
+    uint src = t * (pc.n_kv_head * pc.head_dim) + kvh * pc.head_dim + blk * Q8_BLOCK_ELEMS;
+
+    // K: still f16, and this block covers exactly head_dim/32 x 2 words of the row.
+    uint kword = row * (pc.head_dim / 2u) + blk * (Q8_BLOCK_ELEMS / 2u);
+    for (uint i = 0u; i < Q8_BLOCK_ELEMS / 2u; ++i) {
+        KP[kword + i] = breccia_pack_f16x2(KC[src + 2u * i], KC[src + 2u * i + 1u]);
+    }
+
+    // V: q8_0, one scale for the 32 values, quantised from the f32 value (not from
+    // f16 first: quantising twice loses accuracy for nothing).
+    float amax = 0.0;
+    for (uint i = 0u; i < Q8_BLOCK_ELEMS; ++i) {
+        amax = max(amax, abs(VC[src + i]));
+    }
+    // An all-zero block keeps scale 1.0 and stores q == 0, which dequantises to the
+    // same exact zero f16 would hold; scale 0 would make `x/scale` NaN and the
+    // float->int conversion undefined.
+    float scale = amax > 0.0 ? amax / Q8_BLOCK_QUANTA : 1.0;
+    uint at = (row * blocks + blk) * Q8_BLOCK_WORDS;
+    VP[at] = floatBitsToUint(scale);
+    for (uint w = 0u; w < Q8_BLOCK_WORDS - 1u; ++w) {
+        uint packed = 0u;
+        for (uint j = 0u; j < 4u; ++j) {
+            int q = int(round(clamp(VC[src + w * 4u + j] / scale, -Q8_BLOCK_QUANTA, Q8_BLOCK_QUANTA)));
+            packed |= (uint(q) & 0xffu) << (8u * j);
+        }
+        VP[at + 1u + w] = packed;
+    }
+}
+
+#else
 
 void main() {
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
@@ -77,3 +159,5 @@ void main() {
     KP[word] = breccia_pack_f16x2(KC[src], KC[src + 1u]);
     VP[word] = breccia_pack_f16x2(VC[src], VC[src + 1u]);
 }
+
+#endif

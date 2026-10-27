@@ -101,6 +101,39 @@ pub fn page_bytes() -> u64 {
     (2 * MODEL_N_KV_HEAD * PAGE_CELLS * MODEL_HEAD_DIM * 2) as u64
 }
 
+/// How the attention **V** cache is stored (`docs/phase-4/01-forward-pass.md` §8bf/§8bg).
+///
+/// `F16` is the default and the reference; `Q8_0` is the lossy 0.5625x layout,
+/// selected by `BRECCIA_KV_Q8V=1` ([`VLayout::from_env`]). K is f16 in both — this
+/// round is V only (§8bf: V alone reaches the 4-agent milestone, K buys headroom).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VLayout {
+    /// Paged f16 (`2 B` per element, the `docs/phase-3/05` §3 baseline).
+    #[default]
+    F16,
+    /// q8_0: 32 x i8 + one f32 scale per 32-element block (`36 B` per 32 elements).
+    Q8_0,
+}
+
+impl VLayout {
+    /// `BRECCIA_KV_Q8V=1|true|on|yes` selects [`VLayout::Q8_0`]; anything else (and
+    /// unset) keeps the f16 reference path.
+    pub fn from_env() -> Self {
+        match std::env::var("BRECCIA_KV_Q8V").ok().as_deref() {
+            Some("1") | Some("true") | Some("on") | Some("yes") => VLayout::Q8_0,
+            _ => VLayout::F16,
+        }
+    }
+
+    /// The flag's name in a report line.
+    pub fn name(self) -> &'static str {
+        match self {
+            VLayout::F16 => "f16",
+            VLayout::Q8_0 => "q8_0",
+        }
+    }
+}
+
 /// Per-layer, per-sequence QSA state: the paged K/V cache, its page table and
 /// the indexer's pooled-key cache.
 pub struct QsaState {
@@ -118,6 +151,8 @@ pub struct QsaState {
     pub capacity_cells: usize,
     /// Position table length (the rope table's `max_pos`).
     pub max_pos: usize,
+    /// The V layout `v_pool` is sized for and the attention kernels read.
+    pub v_layout: VLayout,
 }
 
 /// **Every** byte of QSA state, from a function, because three silent wrong-value
@@ -163,6 +198,28 @@ pub mod sizes {
         (blocks * IDX_DIM * 4) as u64
     }
 
+    /// **Words** of the f16 pool one cell row occupies (`head_dim / 2`).
+    pub fn f16_row_words() -> usize {
+        assert_eq!(
+            MODEL_HEAD_DIM % 2,
+            0,
+            "an f16 pool stores pairs of elements"
+        );
+        MODEL_HEAD_DIM / 2
+    }
+
+    /// **Words** of the q8_0 V pool one cell row occupies: `head_dim / 32` blocks of
+    /// 9 words (8 packed i8 + one f32 scale) = 72 words = 288 B.
+    pub fn q8v_row_words() -> usize {
+        q8_blocks_per_row() * (Q8_BLOCK_BYTES / 4)
+    }
+
+    /// Rows a pool of `pages` pages holds: `pages x n_kv_head x page_cells`. Both
+    /// pool layouts index exactly this many rows (`*_pool_bytes` must agree with it).
+    pub fn pool_rows(pages: usize) -> usize {
+        pages * MODEL_N_KV_HEAD * PAGE_CELLS
+    }
+
     /// Bytes of the indexer raw tail: `(idx_block - 1)` rows, because the completing
     /// cell arrives in registers (`qsa_idx_tail.comp`).
     pub fn idx_tail_bytes() -> u64 {
@@ -177,8 +234,19 @@ pub mod sizes {
 
 impl QsaState {
     /// Allocate for `capacity_cells` cells (rounded up to whole pages) and a rope
-    /// table of `max_pos` positions.
+    /// table of `max_pos` positions, with the V layout from `BRECCIA_KV_Q8V`.
     pub fn new(gpu: &Gpu, capacity_cells: usize, max_pos: usize) -> Result<Self> {
+        Self::with_layout(gpu, capacity_cells, max_pos, VLayout::from_env())
+    }
+
+    /// [`QsaState::new`] with the V layout given explicitly (the conformance test
+    /// needs both layouts in one process, which an env var cannot express).
+    pub fn with_layout(
+        gpu: &Gpu,
+        capacity_cells: usize,
+        max_pos: usize,
+        v_layout: VLayout,
+    ) -> Result<Self> {
         if capacity_cells == 0 || max_pos == 0 {
             return Err(anyhow!(
                 "qsa state needs capacity_cells > 0 and max_pos > 0"
@@ -186,12 +254,32 @@ impl QsaState {
         }
         let pages = capacity_cells.div_ceil(PAGE_CELLS);
         let cells = pages * PAGE_CELLS;
-        let pool_words = sizes::f16_pool_bytes(pages) / 4;
         let max_blocks = sizes::pooled_blocks(cells);
+        // The V pool's byte count is the one number the capacity argument turns on,
+        // so it is chosen from the layout and then **checked against the row count
+        // the kernels index** (cells x n_kv_head rows) instead of being trusted.
+        let v_bytes = match v_layout {
+            VLayout::F16 => sizes::f16_pool_bytes(pages),
+            VLayout::Q8_0 => sizes::q8v_pool_bytes(pages),
+        };
+        assert_eq!(
+            sizes::f16_pool_bytes(pages) as usize,
+            sizes::pool_rows(pages) * sizes::f16_row_words() * 4,
+            "the f16 pool must hold cells x n_kv_head rows of f16_row_words() words"
+        );
+        assert_eq!(
+            sizes::q8v_pool_bytes(pages) as usize,
+            sizes::pool_rows(pages) * sizes::q8v_row_words() * 4,
+            "the q8_0 V pool must hold cells x n_kv_head rows of q8_blocks_per_row() blocks"
+        );
+        assert!(
+            v_bytes == sizes::f16_pool_bytes(pages) || v_bytes == sizes::q8v_pool_bytes(pages),
+            "the V pool is one of the two layouts the kernels index, not a literal"
+        );
 
         let sizes = [
             (sizes::f16_pool_bytes(pages), "kv k_pool"),
-            (sizes::f16_pool_bytes(pages), "kv v_pool"),
+            (v_bytes, "kv v_pool"),
             (pages as u64 * 4, "kv page_table"),
             (sizes::idx_tail_bytes(), "indexer tail"),
             (sizes::pooled_idx_bytes(max_blocks), "indexer pooled"),
@@ -200,7 +288,7 @@ impl QsaState {
         assert_eq!(
             sizes.len(),
             6,
-            "QsaState has six fields; the positional slot list must match it"
+            "QsaState has six buffers; the positional slot list must match it"
         );
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         for (bytes, what) in sizes.iter() {
@@ -215,7 +303,7 @@ impl QsaState {
             }
         }
         let mut it = bufs.into_iter();
-        let mut take = || it.next().expect("seven qsa state buffers were allocated");
+        let mut take = || it.next().expect("six qsa state buffers were allocated");
         let k_pool = take();
         let v_pool = take();
         let page_table = take();
@@ -236,7 +324,6 @@ impl QsaState {
         // freeze a token's position, `qsa.hpp:236-241`).
         let table: Vec<u32> = (0..pages as u32).collect();
         let pos: Vec<u32> = (0..max_pos as u32).collect();
-        let zeros = vec![0u8; pool_words as usize * 4];
         let prepared: [(&str, &Buf, Vec<u8>); 2] = [
             (
                 "KV page table",
@@ -254,6 +341,9 @@ impl QsaState {
             }
         }
         for (what, dst) in [("k_pool", &k_pool), ("v_pool", &v_pool)] {
+            // From the buffer, not from the f16 pool's size: with `BRECCIA_KV_Q8V`
+            // the V pool is 0.5625x the K pool and a shared length would overrun.
+            let zeros = vec![0u8; dst.size as usize];
             if let Err(e) = crate::gemv::upload_into(gpu, dst, &zeros) {
                 for b in all {
                     gpu.destroy_buf(b);
@@ -285,6 +375,7 @@ impl QsaState {
             positions,
             capacity_cells: cells,
             max_pos,
+            v_layout,
         })
     }
 
@@ -440,12 +531,16 @@ pub struct QsaProjections<'a, 'g, 'w> {
 pub struct Qsa<'g> {
     q_norm: Pipe<'g>,
     kv_append: Pipe<'g>,
+    /// `BRECCIA_KV_Q8V`: quantise V on write (`qsa_kv_append.comp` q8_0 build).
+    kv_append_q8: Pipe<'g>,
     idx_tail: Pipe<'g>,
     idx_pool: Pipe<'g>,
     idx_score: Pipe<'g>,
     topk: Pipe<'g>,
     attn_scores: Pipe<'g>,
     attn_apply: Pipe<'g>,
+    /// `BRECCIA_KV_Q8V`: read V as q8_0, dequantise in registers in the dot.
+    attn_apply_q8: Pipe<'g>,
     softmax: Softmax<'g>,
     rope_hd: Rope<'g>,
     rope_idx: Rope<'g>,
@@ -471,6 +566,12 @@ impl<'g> Qsa<'g> {
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_kv_append.spv")),
             5,
             "qsa kv append",
+        )?;
+        let kv_append_q8 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_kv_append_q8v.spv")),
+            5,
+            "qsa kv append (q8_0 V)",
         )?;
         let idx_tail = Pipe::new(
             gpu,
@@ -508,6 +609,12 @@ impl<'g> Qsa<'g> {
             7,
             "qsa attention apply",
         )?;
+        let attn_apply_q8 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_q8v.spv")),
+            7,
+            "qsa attention apply (q8_0 V)",
+        )?;
         let softmax = Softmax::new(gpu)?;
         let rope_hd = Rope::new(gpu, MODEL_HEAD_DIM, MODEL_N_ROT, max_pos)?;
         let rope_idx = Rope::new(gpu, IDX_DIM, MODEL_N_ROT, max_pos)?;
@@ -518,12 +625,14 @@ impl<'g> Qsa<'g> {
         Ok(Qsa {
             q_norm,
             kv_append,
+            kv_append_q8,
             idx_tail,
             idx_pool,
             idx_score,
             topk,
             attn_scores,
             attn_apply,
+            attn_apply_q8,
             softmax,
             rope_hd,
             rope_idx,
@@ -698,7 +807,8 @@ impl<'g> Qsa<'g> {
         )
     }
 
-    /// Append this call's K/V to the paged f16 cache.
+    /// Append this call's K/V to the paged cache (V quantised to q8_0 when the
+    /// state's layout says so).
     pub fn kv_append(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
         if pos0 + ws.tokens > state.capacity_cells {
             return Err(anyhow!(
@@ -715,8 +825,8 @@ impl<'g> Qsa<'g> {
             .u(MODEL_N_KV_HEAD as u32)
             .u(MODEL_HEAD_DIM as u32)
             .u(PAGE_CELLS as u32);
-        let (gx, gy) = grid_for(ws.tokens * MODEL_N_KV_HEAD * (MODEL_HEAD_DIM / 2), 128);
-        self.kv_append.run(
+        let (pipe, gx, gy) = self.kv_append_target(state, ws.tokens);
+        pipe.run(
             &[
                 &state.k_pool,
                 &state.v_pool,
@@ -727,6 +837,36 @@ impl<'g> Qsa<'g> {
             &pc,
             (gx, gy, 1),
         )
+    }
+
+    /// The append pipeline **and** work shape for this state's V layout. The two
+    /// differ because q8_0's scale is a max over the block, so the q8_0 build runs
+    /// one invocation per (token, kv_head, 32-element block) and the f16 build one
+    /// per (token, kv_head, d-pair). Same bindings, same push constants.
+    fn kv_append_target(&self, state: &QsaState, tokens: usize) -> (&Pipe<'g>, u32, u32) {
+        let (pipe, units, wg) = match state.v_layout {
+            VLayout::F16 => (
+                &self.kv_append,
+                tokens * MODEL_N_KV_HEAD * sizes::f16_row_words(),
+                128,
+            ),
+            VLayout::Q8_0 => (
+                &self.kv_append_q8,
+                tokens * MODEL_N_KV_HEAD * sizes::q8_blocks_per_row(),
+                32,
+            ),
+        };
+        let (gx, gy) = grid_for(units, wg);
+        (pipe, gx, gy)
+    }
+
+    /// The apply pipeline for this state's V layout (f16 load, or q8_0 dequantised
+    /// in registers); the work shape is the same `(token, head, d)` in both.
+    fn attn_apply_target(&self, state: &QsaState) -> &Pipe<'g> {
+        match state.v_layout {
+            VLayout::F16 => &self.attn_apply,
+            VLayout::Q8_0 => &self.attn_apply_q8,
+        }
     }
 
     /// Pool the indexer keys of every block completed by this call.
@@ -865,7 +1005,7 @@ impl<'g> Qsa<'g> {
             .u(PAGE_CELLS as u32)
             .u(MODEL_N_KV_HEAD as u32);
         let (gx, gy) = grid_for(ws.tokens * ATTN_OUT_DIM, 256);
-        self.attn_apply.run(
+        self.attn_apply_target(state).run(
             &[
                 &ws.attn,
                 &state.v_pool,
@@ -1089,8 +1229,8 @@ impl Qsa<'_> {
             .u(MODEL_N_KV_HEAD as u32)
             .u(MODEL_HEAD_DIM as u32)
             .u(PAGE_CELLS as u32);
-        let (kx, ky) = grid_for(t * MODEL_N_KV_HEAD * (MODEL_HEAD_DIM / 2), 128);
-        let kva = self.kv_append.run_timed(
+        let (kv_pipe, kx, ky) = self.kv_append_target(state, t);
+        let kva = kv_pipe.run_timed(
             &[
                 &state.k_pool,
                 &state.v_pool,
@@ -1199,7 +1339,7 @@ impl Qsa<'_> {
                 .run_timed(&ws.attn, &ws.attn, MODEL_N_HEAD * t, ws.slots, target_s)?;
         attn.per_iter_s += sm.per_iter_s;
         let (apx, apy) = grid_for(t * ATTN_OUT_DIM, 256);
-        let apply = self.attn_apply.run_timed(
+        let apply = self.attn_apply_target(state).run_timed(
             &[
                 &ws.attn,
                 &state.v_pool,
@@ -1272,6 +1412,89 @@ mod tests {
     #[test]
     fn a_head_dim_that_is_not_a_block_multiple_is_refused() {
         assert_eq!(MODEL_HEAD_DIM % Q8_BLOCK_ELEMS, 0);
+    }
+
+    /// The pool byte counts are consumed by index arithmetic, so they are held to
+    /// the row counts the kernels compute (`row = (page*n_kv_head + kvh)*page_cells
+    /// + in_page`, one row per cell per head) rather than to a literal.
+    #[test]
+    fn both_pool_layouts_hold_the_rows_the_kernels_index() {
+        for pages in [1usize, 8, 128, 2048] {
+            let rows = pool_rows(pages);
+            assert_eq!(rows, pages * MODEL_N_KV_HEAD * PAGE_CELLS);
+            assert_eq!(
+                f16_pool_bytes(pages) as usize,
+                rows * f16_row_words() * 4,
+                "f16 pool, {pages} pages"
+            );
+            assert_eq!(
+                q8v_pool_bytes(pages) as usize,
+                rows * q8v_row_words() * 4,
+                "q8_0 V pool, {pages} pages"
+            );
+            // One row of one layout, spelled out: 128 words vs 72 words.
+            assert_eq!(f16_row_words(), 128);
+            assert_eq!(q8v_row_words(), 72);
+            assert_eq!(q8v_row_words() * 4, Q8_BLOCK_BYTES * q8_blocks_per_row());
+        }
+    }
+
+    /// The 32K numbers the capacity table in §8bf/§8bg quotes, from the same
+    /// functions `QsaState::new` allocates with.
+    #[test]
+    fn the_q8v_saving_at_32k_is_the_capacity_table() {
+        let pages = 32768 / PAGE_CELLS;
+        let per_block_mib =
+            (f16_pool_bytes(pages) - q8v_pool_bytes(pages)) as f64 / (1 << 20) as f64;
+        assert!(
+            (13.9..14.1).contains(&per_block_mib),
+            "per-block V saving {per_block_mib} MiB"
+        );
+        // 12 QSA layers: 933 MiB -> 765 MiB per agent.
+        let per_agent = per_block_mib * 12.0;
+        assert!(
+            (167.0..169.0).contains(&per_agent),
+            "per-agent V saving {per_agent} MiB"
+        );
+    }
+
+    /// `to_q8_0` is the store rule, so its error is bounded by the block scale — and
+    /// an all-zero block must round-trip exactly (a zero scale would make the
+    /// device's `float -> int` conversion undefined).
+    #[test]
+    fn the_q8_0_reference_is_bounded_and_exact_on_zeros() {
+        let zeros = vec![0.0f32; 64];
+        assert_eq!(crate::qsa::cpu::to_q8_0(&zeros), zeros);
+        let mut s = 12345u64;
+        let x: Vec<f32> = (0..256)
+            .map(|_| {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 8.0
+            })
+            .collect();
+        let q = crate::qsa::cpu::to_q8_0(&x);
+        assert_eq!(q.len(), x.len());
+        for b in 0..x.len() / Q8_BLOCK_ELEMS {
+            let lo = b * Q8_BLOCK_ELEMS;
+            let amax = x[lo..lo + Q8_BLOCK_ELEMS]
+                .iter()
+                .fold(0.0f32, |m, v| m.max(v.abs()));
+            let half_lsb = amax / 127.0 / 2.0;
+            for i in lo..lo + Q8_BLOCK_ELEMS {
+                assert!(
+                    (q[i] - x[i]).abs() <= half_lsb * 1.001,
+                    "element {i}: {} vs {} (half lsb {half_lsb})",
+                    q[i],
+                    x[i]
+                );
+            }
+            // A block with one value at amax must land exactly on the q8_0 grid.
+            let at_max = q[lo..lo + Q8_BLOCK_ELEMS]
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max);
+            assert!((at_max - amax).abs() <= half_lsb * 1.001);
+        }
     }
 
     use super::*;

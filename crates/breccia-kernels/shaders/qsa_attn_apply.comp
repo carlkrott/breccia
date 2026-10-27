@@ -47,10 +47,40 @@ layout(push_constant) uniform Params {
 #include "f16_storage.glsl"
 #include "ops_math.glsl"
 
+#ifdef BRECCIA_KV_Q8V
+// `BRECCIA_KV_Q8V`: V is q8_0 (`docs/phase-4/01-forward-pass.md` §8bg) and is
+// dequantised **in registers inside the accumulate loop** — `v = i8 * scale` added
+// straight into `acc`. There is deliberately no dequantise-the-cache-to-f16 pass
+// anywhere: that is the exllamav2 shape, it writes and re-reads what it just
+// quantised, and it makes the quantised path *slower* than f16 even though it reads
+// fewer bytes (research 11, MLC).
+//
+// Byte cost per (cell, 32-element block): 8 words of i8 that four neighbouring
+// lanes share plus one broadcast scale word = 36 B for 32 elements, against 64 B
+// for f16 — the 0.5625x the capacity arithmetic assumes, and it survives only
+// because the four int8 in a word are consumed by consecutive lanes and the scale
+// by all 32.
+//
+// `qsa::sizes::Q8_BLOCK_ELEMS` / `Q8_BLOCK_WORDS` pin these constants.
+#define Q8_BLOCK_ELEMS 32u
+#define Q8_BLOCK_WORDS 9u
+
+// One q8_0 element of the paged V cache: `elem` is the element index inside a row,
+// `row` the row's index in the pool.
+float load_v_q8(uint row, uint elem, uint blocks) {
+    uint at = (row * blocks + (elem / Q8_BLOCK_ELEMS)) * Q8_BLOCK_WORDS;
+    float scale = uintBitsToFloat(VP[at]);
+    // Signed 8-bit extract: sign-extending is exactly the i8 decode.
+    int q = bitfieldExtract(int(VP[at + 1u + ((elem % Q8_BLOCK_ELEMS) >> 2u)]),
+                            int((elem % 4u) * 8u), 8);
+    return float(q) * scale;
+}
+#else
 // One f16 element of the paged cache (`elem` is the element index inside a row).
 float load_half(uint elem) {
     return breccia_load_f16(VP[elem >> 1], elem);
 }
+#endif
 
 void main() {
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
@@ -68,6 +98,10 @@ void main() {
     int pos = pc.pos0 + int(t);
     uint kvh = h * pc.n_kv_head / pc.n_head;
     uint row = t * pc.n_head + h;
+
+#ifdef BRECCIA_KV_Q8V
+    uint blocks = pc.head_dim / Q8_BLOCK_ELEMS;
+#endif
 
     float acc = 0.0;
     for (uint r = 0u; r < count; ++r) {
@@ -87,9 +121,15 @@ void main() {
             }
             uint page = PT[uint(cell) / pc.page_cells];
             uint in_page = uint(cell) % pc.page_cells;
+#ifdef BRECCIA_KV_Q8V
+            // One row of the q8_0 pool, then the block this lane's `d` falls in.
+            uint vrow = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
+            acc += p * load_v_q8(vrow, d, blocks);
+#else
             uint base = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
                         in_page * pc.head_dim;
             acc += p * load_half(base + d);
+#endif
         }
     }
 

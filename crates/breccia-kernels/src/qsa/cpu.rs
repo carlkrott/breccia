@@ -52,6 +52,35 @@ pub fn to_f16(x: f32) -> f32 {
     f32::from_bits(sign | (((e2 + 127) as u32) << 23) | ((q2 & 0x3ff) << 13))
 }
 
+/// q8_0 round trip of a V row: `scale = amax/127` per 32-element block,
+/// `q = round(x/scale)`, and the value the attention kernel reads back is
+/// `q * scale`.
+///
+/// This is `qsa_kv_append.comp`'s `BRECCIA_KV_Q8V` store and
+/// `qsa_attn_apply.comp`'s in-register dequant in Rust: same block size
+/// (`sizes::Q8_BLOCK_ELEMS` = 32), same scale rule, same rounding (`round()` is
+/// half-away-from-zero in both), so the conformance test measures the arithmetic
+/// around the cache instead of hiding the storage loss. A block of exact zeros
+/// keeps `scale = 1` and stores `q = 0`, i.e. dequantises to the same exact zero.
+pub fn to_q8_0(x: &[f32]) -> Vec<f32> {
+    use crate::qsa::sizes::Q8_BLOCK_ELEMS;
+    assert_eq!(
+        x.len() % Q8_BLOCK_ELEMS,
+        0,
+        "a q8_0 row is a whole number of {Q8_BLOCK_ELEMS}-element blocks"
+    );
+    let mut out = Vec::with_capacity(x.len());
+    for b in x.chunks_exact(Q8_BLOCK_ELEMS) {
+        let amax = b.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        for &v in b {
+            let q = (v / scale).clamp(-127.0, 127.0).round();
+            out.push(q * scale);
+        }
+    }
+    out
+}
+
 fn sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
         1.0 / (1.0 + (-x).exp())

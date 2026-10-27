@@ -1708,8 +1708,12 @@ impl<'m> Session<'m> {
         for (b, st) in self.qsa_state.iter().enumerate() {
             if let Some(st) = st {
                 out.push(format!(
-                    "blk{b:<3} qsa k_pool {:>9} v_pool {:>9} tail {:>7} pooled {:>7}",
-                    st.k_pool.size, st.v_pool.size, st.idx_tail.size, st.idx_pooled.size
+                    "blk{b:<3} qsa k_pool {:>9} v_pool {:>9} ({}) tail {:>7} pooled {:>7}",
+                    st.k_pool.size,
+                    st.v_pool.size,
+                    st.v_layout.name(),
+                    st.idx_tail.size,
+                    st.idx_pooled.size
                 ));
             }
         }

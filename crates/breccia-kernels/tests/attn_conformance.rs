@@ -1210,3 +1210,176 @@ fn qsa_kv_cache_layout_and_f16_precision() {
     qsa.release(gpu, ws);
     state.release(gpu);
 }
+
+// ---------------------------------------------------------------------------
+// q8_0 V cache (`BRECCIA_KV_Q8V`, docs/phase-4/01-forward-pass.md §8bg)
+// ---------------------------------------------------------------------------
+
+/// One attention pass over a filled 64-cell cache with the given V layout.
+///
+/// The block selection is uploaded instead of computed (`topk` is covered above);
+/// what this exercises is exactly the pair this round added — `qsa_kv_append`'s
+/// q8_0 store and `qsa_attn_apply`'s in-register dequant — plus the pool sizing
+/// that feeds them.
+#[allow(clippy::too_many_arguments)]
+fn qsa_v_attention(
+    gpu: &breccia_vk::ctx::Gpu,
+    qsa: &Qsa,
+    layout: qsa::VLayout,
+    max_pos: usize,
+    cells: usize,
+    ids: &[u32],
+    k_all: &[f32],
+    v_all: &[f32],
+    q: &[f32],
+    q_full: &[f32],
+) -> (Vec<f32>, Vec<f32>, u64) {
+    let state = QsaState::with_layout(gpu, cells, max_pos, layout).expect("state");
+    assert_eq!(state.v_layout, layout);
+    let pages = state.capacity_cells / qsa::PAGE_CELLS;
+    let want_bytes = match layout {
+        qsa::VLayout::F16 => qsa::sizes::f16_pool_bytes(pages),
+        qsa::VLayout::Q8_0 => qsa::sizes::q8v_pool_bytes(pages),
+    };
+    assert_eq!(state.v_pool.size, want_bytes, "v_pool bytes for {layout:?}");
+
+    // Fill every cell through the append path the graph uses.
+    let fill = qsa.workspace(gpu, cells, cells).expect("fill ws");
+    write_f32(gpu, &fill.k_cur, k_all);
+    write_f32(gpu, &fill.v_cur, v_all);
+    qsa.kv_append(&state, &fill, 0).expect("append");
+    qsa.release(gpu, fill);
+
+    // One query token at the last cell, over the uploaded block ids.
+    let ws = qsa.workspace(gpu, 1, cells).expect("ws");
+    assert_eq!(ws.max_ids, cells / qsa::IDX_BLOCK + 1);
+    write_f32(gpu, &ws.q, q);
+    write_f32(gpu, &ws.q_full, q_full);
+    let mut id_row = vec![0u32; ws.max_ids];
+    id_row[..ids.len()].copy_from_slice(ids);
+    breccia_kernels::gemv::upload_into(gpu, &ws.ids, &breccia_kernels::ops::u32_to_bytes(&id_row))
+        .expect("ids");
+    breccia_kernels::gemv::upload_into(
+        gpu,
+        &ws.counts,
+        &breccia_kernels::ops::u32_to_bytes(&[ids.len() as u32]),
+    )
+    .expect("counts");
+
+    let pos0 = cells - 1;
+    qsa.attend(&state, &ws, pos0).expect("attend");
+    qsa.apply(&state, &ws, pos0).expect("apply");
+    let out = read_f32(gpu, &ws.attn_out, qsa::MODEL_N_HEAD * qsa::MODEL_HEAD_DIM);
+    let probs = read_f32(gpu, &ws.attn, qsa::MODEL_N_HEAD * ws.slots);
+    let pool_bytes = state.v_pool.size;
+    qsa.release(gpu, ws);
+    state.release(gpu);
+    (out, probs, pool_bytes)
+}
+
+/// The q8_0 **V** path, held to two things at once:
+///
+/// 1. the CPU reference **with the same quantisation** (`qsa::cpu::to_q8_0`), at the
+///    1e-5 bar the f16 path is held to — so the layout (288 B rows, 9-word blocks,
+///    sign-extended i8 lanes) is right, not merely close;
+/// 2. its distance from the f16 path, reported as a number: q8_0 is lossy and this
+///    is where the loss is measured at the kernel level.
+#[test]
+fn qsa_v_q8_0_matches_the_reference_and_the_f16_path() {
+    let fx = need_gpu!("q8v");
+    let gpu = fx.dev.gpu();
+    let max_pos = 4096usize;
+    let cells = 64usize;
+    let ids = [0u32, 5, 9, 15];
+    let qsa = Qsa::new(gpu, max_pos).expect("qsa");
+
+    let dim = qsa::MODEL_N_KV_HEAD * qsa::MODEL_HEAD_DIM;
+    let k_all = normalish(0xF1, cells * dim);
+    let v_all = normalish(0xF2, cells * dim);
+    let q = normalish(0xF3, qsa::MODEL_N_HEAD * qsa::MODEL_HEAD_DIM);
+    let q_full = normalish(0xF4, qsa::MODEL_N_HEAD * 2 * qsa::MODEL_HEAD_DIM);
+
+    let (out_f16, _, bytes_f16) = qsa_v_attention(
+        gpu,
+        &qsa,
+        qsa::VLayout::F16,
+        max_pos,
+        cells,
+        &ids,
+        &k_all,
+        &v_all,
+        &q,
+        &q_full,
+    );
+    let (out_q8, _, bytes_q8) = qsa_v_attention(
+        gpu,
+        &qsa,
+        qsa::VLayout::Q8_0,
+        max_pos,
+        cells,
+        &ids,
+        &k_all,
+        &v_all,
+        &q,
+        &q_full,
+    );
+
+    // Gate half of the projection, as `attend`'s reference takes it.
+    let mut gate = vec![0.0f32; qsa::MODEL_N_HEAD * qsa::MODEL_HEAD_DIM];
+    for h in 0..qsa::MODEL_N_HEAD {
+        for d in 0..qsa::MODEL_HEAD_DIM {
+            gate[h * qsa::MODEL_HEAD_DIM + d] =
+                q_full[h * 2 * qsa::MODEL_HEAD_DIM + qsa::MODEL_HEAD_DIM + d];
+        }
+    }
+    let cells_sel = qsa::cpu::cells_of(&ids, qsa::IDX_BLOCK);
+    let kf: Vec<f32> = k_all.iter().map(|&x| qsa::cpu::to_f16(x)).collect();
+    let vf: Vec<f32> = v_all.iter().map(|&x| qsa::cpu::to_f16(x)).collect();
+    let vq = qsa::cpu::to_q8_0(&v_all);
+    let want_f16 = qsa::cpu::attend(
+        &q,
+        &kf,
+        &vf,
+        &cells_sel,
+        cells - 1,
+        qsa::MODEL_N_HEAD,
+        qsa::MODEL_N_KV_HEAD,
+        qsa::MODEL_HEAD_DIM,
+        &gate,
+    );
+    let want_q8 = qsa::cpu::attend(
+        &q,
+        &kf,
+        &vq,
+        &cells_sel,
+        cells - 1,
+        qsa::MODEL_N_HEAD,
+        qsa::MODEL_N_KV_HEAD,
+        qsa::MODEL_HEAD_DIM,
+        &gate,
+    );
+
+    let rel_f16 = max_rel(&out_f16, &as_f64(&want_f16));
+    let rel_q8 = max_rel(&out_q8, &as_f64(&want_q8));
+    assert!(
+        rel_f16 <= 1e-5,
+        "f16 attention max rel {rel_f16:e} (bar 1e-5)"
+    );
+    assert!(
+        rel_q8 <= 1e-5,
+        "q8_0 attention max rel {rel_q8:e} (bar 1e-5) — the pool layout or the \
+         in-register dequant does not match qsa::cpu::to_q8_0"
+    );
+    // q8_0 vs f16 on the same input: the loss this round is allowed to have.
+    let rel_vs_f16 = max_rel(&out_q8, &as_f64(&out_f16));
+    let max_abs = out_q8
+        .iter()
+        .zip(&out_f16)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+
+    println!(
+        "qsa v-q8_0          ref {rel_q8:.2e} (f16 path {rel_f16:.2e}), vs f16 {rel_vs_f16:.2e} \
+         rel / {max_abs:.2e} abs; pool {bytes_f16} -> {bytes_q8} B",
+    );
+}
