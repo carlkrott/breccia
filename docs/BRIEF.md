@@ -106,10 +106,12 @@ sum 30,319 µs   vs   wait-gpu 30,691 µs   (residual ~1 %, so the table explain
    **33.2 µs** (8.6 submit + 22–24 wait) versus **8.6 µs queued**. Recording a dispatch is
    only **0.28 µs** (and 165 ns of that was our own profiler timers).
    **And the engine is fully synchronous at the submission level: 64 submits/token, 100 %
-   fence-waited, 34.19 ms/token spent inside the wait** (64 % of a 53.8 ms token). The host
-   therefore cannot run ahead of the GPU within a stream — that is the structural reason a
-   single stream is `lane + GPU` rather than `max(lane, GPU)`. Converting the waits that
-   nothing reads (the 30 placed-block segment waits) is the highest-value open item.
+   fence-waited, 34.0 ms/token spent inside the wait.** Deferring the 30 placed-block waits
+   was implemented and **closed the question**: `wait-gpu` fell 30.8 → 10.2 ms/token (−67 %)
+   and **the token did not move**, because the waits simply relocated to the next
+   fence-bearing operation. So ~30.4 ms of the 34.0 ms is *real GPU execution*, ~3.5 ms is
+   latency, and **single-stream `lane + GPU` is structural** — it cannot be fixed by fence
+   bookkeeping. The only remaining lever on a single stream is making the GPU work smaller.
 2. **A barrier costs `1.1 µs + 0.45 µs × bpr`** — flat in grid size and in bytes, i.e. it is
    the next leg's cold dependent-load chain, not a dirty-L2 flush.
 3. **Element rate = `K / I_unit`** with `K = 7.8e12 slots/s` (MI50) and `1.59e13` (RX).
@@ -273,7 +275,9 @@ measured recommendation: `docs/research/01`–`12`. The most consequential:
 
 | # | Item | Expected | State |
 |---|---|---|---|
-| 1 | **Defer the 30 placed-block segment waits** (queue order already covers them; the patch is `finish_block` keeping `pending_seg` when `placed && trace.is_none()`) and **batch the 18 host readbacks into one wait per pass** | the wait count is the architectural serialiser; measured ceiling 1.6 ms of pure convert cost, plus the host/GPU overlap it unlocks | next |
+| 1 | ~~Defer the placed-block waits~~ | **DONE, and it closed the question**: `wait-gpu` −67 %, token unchanged ⇒ the engine is GPU-execution-bound; fences were never the problem | done |
+| 1b | **`gdn-scan` anomaly** — 2 860 µs/token (36 blocks × ~79 µs) for a per-position state update over `S=128, hv=48`, i.e. a few thousand elements, versus `moe-gate`'s 1 088 µs moving millions of bytes. At T=1 there is no position loop; this should be one fused pass | ~2.5 ms if the anomaly is what it looks like — the largest single identifiable win left | **in flight when work stopped** |
+| 1c | Then the other small-but-expensive kernels: `hc-norm`/`hc-gated` elementwise, `final-hc`, `moe-swiglu`, `rope`, `kv-append`, `router` | each needs the arithmetic-first diagnosis the head got | queued |
 | 2 | **IQ3_S / Q5_K word-level** dequant (dependency depth, not opcodes) | stage-dependent, bit-identical | planned |
 | 3 | ~~**V-q8_0 KV**~~ | **landed**: 932 → 764 MiB/agent ⇒ 4 agents (capacity, not speed) | done |
 | 4 | **K-q8_0** on top | 728 MiB/agent ⇒ 5–6 agents | next |
@@ -327,3 +331,22 @@ Diagnostic env switches: `BRECCIA_REQUIRE_QUIET`, `BRECCIA_DUMP_LAYOUT`,
 `BRECCIA_FAULT_DIVERGE_STEP`, `BRECCIA_NO_HC_EPILOGUE`, `BRECCIA_NO_HC_GATED`,
 `BRECCIA_NO_GDN_MERGE`, `BRECCIA_NO_GEMV_WORDS`, `BRECCIA_GEMV_DP4A`,
 `BRECCIA_NO_PLE_BATCH`, `BRECCIA_NO_PREFILL_PLAN`, `BRECCIA_NO_BARRIER_TRACK`.
+
+
+---
+
+## 14. Handover state (work stopped here, 2026-10-27)
+
+- `main` is **clean, green and pushed** at `e77b95a`; `./scripts/verify.sh` passes.
+- **One round was in flight when work stopped** and is *not* on main: the `gdn-scan` /
+  tiny-kernel round, in worktree `~/.local/share/opencode/worktree/afb070/gpu-time-probe`
+  on branch `gpu-time-table` (3 files dirty at handover). Check it before starting anything —
+  it may contain a par
+
+tial fix worth keeping or discarding, and its uncommitted state is the only loose work.
+- Worktrees that are **fully merged** and can be pruned: `hc-epilogue-fusion` (detached),
+  `head-device-arena` (`3ec0c95`), `kv-q8v` (detached, `d855841`). Their commits are on main.
+- `wip/four-gemms-crash-20261026` is historical (the 2026-10-26 reboot) — keep, don't merge.
+- The brief, the plan and the coverage audit are the three docs to read first:
+  `docs/BRIEF.md` (this), `docs/plan/BRECCIA-PLAN.md`, `docs/plan/PDF-GAP-ANALYSIS.md`.
+  Live work log: `docs/phase-4/01-forward-pass.md` §8a–§8bh.
