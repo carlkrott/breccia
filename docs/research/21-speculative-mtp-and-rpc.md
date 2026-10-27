@@ -1,6 +1,6 @@
 # 21 — Speculative decoding (MTP, suffix drafter, layer skip) and llama.cpp RPC for Breccia
 
-Round 21 of the paired rotation. Research only: no code was changed, and no GPU, binary or benchmark was run. Every speed number is cited, marked `derived` (arithmetic on cited inputs), or marked `UNVERIFIED - requires the GPU qualification card`. The tailnet mesh is deferred and is not covered; only the llama.cpp RPC mechanism is.
+Round 21 of the paired rotation. Research only: no code was changed, and no GPU, binary or benchmark was run. Every speed number is cited, marked `derived` (arithmetic on cited inputs), or marked `UNVERIFIED - requires the GPU qualification card`. The multi-host mesh is deferred and is not covered; only the llama.cpp RPC mechanism is.
 
 ## 1. Summary
 
@@ -83,7 +83,7 @@ The "m" rows fix the marginal row cost, so r = 1 + k(m + d) (doc 02 §6's table 
 
 - llama.cpp `tools/rpc/README.md` (master; not pinned to the SHA): the server is "insecure" and must not run on an open network (line 5); it exposes every accelerator device on the host (line 36); local cache with `-c` (line 88); RDMA with TCP fallback (line 98).
 - An RPC split puts a socket round trip at each cross-host block boundary. Breccia's 48-block chain pays no such cost on one host. The size of that cost is UNVERIFIED - requires measurement. Nothing in this round supports RPC as a speedup; it is a capacity option.
-- The tailnet mesh is deferred. This doc names no hosts or addresses.
+- The multi-host mesh is deferred. This doc names no hosts or addresses.
 
 ## 8. Sources, unverified items and skipped reads
 
