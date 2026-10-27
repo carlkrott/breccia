@@ -105,6 +105,11 @@ sum 30,319 µs   vs   wait-gpu 30,691 µs   (residual ~1 %, so the table explain
 1. **Cost is per submit/command-buffer boundary, not per dispatch.** Fence-waited submit
    **33.2 µs** (8.6 submit + 22–24 wait) versus **8.6 µs queued**. Recording a dispatch is
    only **0.28 µs** (and 165 ns of that was our own profiler timers).
+   **And the engine is fully synchronous at the submission level: 64 submits/token, 100 %
+   fence-waited, 34.19 ms/token spent inside the wait** (64 % of a 53.8 ms token). The host
+   therefore cannot run ahead of the GPU within a stream — that is the structural reason a
+   single stream is `lane + GPU` rather than `max(lane, GPU)`. Converting the waits that
+   nothing reads (the 30 placed-block segment waits) is the highest-value open item.
 2. **A barrier costs `1.1 µs + 0.45 µs × bpr`** — flat in grid size and in bytes, i.e. it is
    the next leg's cold dependent-load chain, not a dirty-L2 flush.
 3. **Element rate = `K / I_unit`** with `K = 7.8e12 slots/s` (MI50) and `1.59e13` (RX).
@@ -268,7 +273,7 @@ measured recommendation: `docs/research/01`–`12`. The most consequential:
 
 | # | Item | Expected | State |
 |---|---|---|---|
-| 1 | **Fewer fence-waited submits** (33.2 µs each vs 8.6 queued) | ~1.3–2 ms/token | in progress |
+| 1 | **Defer the 30 placed-block segment waits** (queue order already covers them; the patch is `finish_block` keeping `pending_seg` when `placed && trace.is_none()`) and **batch the 18 host readbacks into one wait per pass** | the wait count is the architectural serialiser; measured ceiling 1.6 ms of pure convert cost, plus the host/GPU overlap it unlocks | next |
 | 2 | **IQ3_S / Q5_K word-level** dequant (dependency depth, not opcodes) | stage-dependent, bit-identical | planned |
 | 3 | ~~**V-q8_0 KV**~~ | **landed**: 932 → 764 MiB/agent ⇒ 4 agents (capacity, not speed) | done |
 | 4 | **K-q8_0** on top | 728 MiB/agent ⇒ 5–6 agents | next |
