@@ -4523,6 +4523,63 @@ and an in-process multi-stream run must not trip it.
 * **q8_0 KV** — still required, with the byte arithmetic above as the reason, and §8bd's plan
   unchanged (append quantising on write, both attention kernels dequantising in registers).
 
+## 8bf. The q8_0 **V** sizing is now code with a test; the kernel is not landed, and the arithmetic says why it must be V-then-K
+
+### What this round did and did not deliver
+
+**Landed:** `qsa::sizes`, the sizing vocabulary the kernel round has to be written against, all
+from functions (no literals) and pinned by tests —
+`f16_pool_bytes(pages)` (16 KiB/page), `q8v_pool_bytes(pages)` (32 x i8 + f32 scale per block,
+`q8v_vs_f16()` = 0.5625), `pooled_idx_bytes(blocks)`, `pooled_blocks(cells)`, `idx_tail_bytes()`,
+`q8_blocks_per_row()` (asserts `head_dim % 32 == 0`). `QsaState::new` now sizes every buffer
+through them, and `qsa::tests` asserts the two numbers the capacity argument turns on:
+
+```
+per-block V saving at 32K: 14 MiB   (32 MiB f16 -> 18 MiB q8_0)
+per-agent (12 blocks):     168 MiB  (933 MiB -> 765 MiB)
+K+V pair ratio:            0.78     (K stays f16, V q8_0)
+```
+
+**Not landed: the kernel.** `qsa_kv_append.comp` must gain a q8_0 V write path (one invocation per
+(32-element block) computing the scale, a new dispatch shape) and `qsa_attn_apply.comp` a
+`load_v_q8(base, d)` that dequantises **in registers inside the accumulate loop** — the same
+`acc += p * v` with `v = i8 * scale`. That is two shader entry points plus the Rust dispatch, and
+it is a numerics change to the attention path that has to go through MI50-first /
+one-fresh-shape-per-process / validation-on with a quality characterisation against the f16
+logits. I am not going to land it half-built at the end of a session: the numbers below are the
+*arithmetic* that the kernel must be validated against, and the shapes it needs are exactly the
+two pinned above.
+
+**Why V first is the right call, quantified:** V is half the pool, so q8_0 V removes 14 MiB of
+each block's 32 MiB f16 pool — 168 MiB per agent, which takes 933 → **765 MiB** and makes
+**4 agents at 32K fit in 3.06 GiB of the 3.3 GiB** left beside the 30-block arena (25 GiB).
+Quantising K as well would take it to ~0.78 x 933 = 728 MiB — 37 MiB more per agent, i.e. the
+difference between "4 agents comfortably" and "4 agents with 0.2 GiB spare". So V alone reaches
+the 4-agent milestone; K buys headroom for a 5th, not the milestone.
+
+| configuration (32 GiB box, 30-block arena) | per agent | agents |
+|---|---:|---:|
+| 32K f16 (measured) | 933 MiB | **3** |
+| 32K **V q8_0** (arithmetic above) | 765 MiB | **4** (3.06 GiB of 3.3) |
+| 32K K+V q8_0 | 728 MiB | 4, with 0.4 GiB spare |
+| 64K f16 (measured) | 1751 MiB | 1-2 |
+| 64K V q8_0 | 1447 MiB | 2 |
+
+### Quality: not measured yet, and that is the gate this round cannot skip
+
+No V-q8_0 logits exist, so there is no `max|Δ|`, no top-1 p-delta and no greedy agreement to
+report. The f16 default path is unchanged and re-checked (parity 32/32), which is the only parity
+claim this commit can make. The quality protocol the kernel round owes, unchanged from §8bd:
+logits `max|Δ|` and top-1 p-delta on the parity prompt at short context **and** at 32K, 32-token
+greedy agreement, then the 8-process gate — reported as numbers, with the contexts where it flips
+top-1 named.
+
+### Multi-stream at 32K
+
+2 streams measured last round (23.74 tok/s aggregate). 4 and 6 streams need 4-6 model loads in
+one quiet window; this round's windows were refused three times by `BRECCIA_REQUIRE_QUIET`
+(a foreign process held 14 GiB of the RX), so no new throughput number is quoted.
+
 ## 9. Exact commands
 
 
