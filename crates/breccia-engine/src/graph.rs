@@ -103,6 +103,18 @@ const GPU_PROBE_BATCHES: usize = 256;
 /// batches so short that the submissions dominate.
 const MERGED_BATCH_CAP: u32 = 6000;
 
+/// One row of [`Session::gpu_time_table`]: a stage's GPU execution time for one
+/// decode step.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct GpuStageRow {
+    /// Stage name (`hc-read`, `qkv`, `moe-gate`, …).
+    pub stage: &'static str,
+    /// `(µs of GPU time per token, intervals per token)` — one entry per device.
+    pub per_device: Vec<(f64, u32)>,
+    /// Summed over the devices, µs of GPU time per token.
+    pub total_us: f64,
+}
+
 /// Wall-clock accounting: host-side deltas around synchronous dispatch groups.
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Timers {
@@ -554,6 +566,18 @@ pub struct Session<'m> {
     /// the number of batches stamped so far (`None` = done or disabled).
     probe_pools: Vec<ash::vk::QueryPool>,
     probe_batches: Option<u32>,
+    /// Per device, the probe's cumulative per-stage GPU nanoseconds **at the start
+    /// of the measured window** ([`Session::reset_counters`]). The table is the
+    /// difference, so it covers the decode window and not the prompt.
+    probe_base: Vec<[u64; batch_cmd::probe::MAX]>,
+    /// The same snapshot for the interval **counts** (they must be differenced with
+    /// the same base as the nanoseconds, or the table's `n` is a process total).
+    probe_base_n: Vec<[u32; batch_cmd::probe::MAX]>,
+    /// Latest `VK_EXT_calibrated_timestamps` sample per device (one per second of
+    /// the probe run) — the anchor that puts query ticks on the host clock.
+    anchor: Vec<Option<breccia_vk::ctx::Calibration>>,
+    /// When the anchors above were taken (`None` = never).
+    anchor_at: Option<std::time::Instant>,
     /// Accumulated GPU-busy seconds per device (the probe's total).
     gpu_busy_s: Vec<f64>,
     /// Per device: fence-wait seconds and host↔device bytes, so a dual run can
@@ -963,10 +987,16 @@ impl<'m> Session<'m> {
             pf_merged_bytes: 0,
             pf_tokens: 0,
             probe_pools: {
-                let on = cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some();
+                // The legacy per-batch probe shares **one pool per device across all
+                // ring slots**, so its read can see another slot's in-flight query —
+                // the recorded `A fence or query has not yet completed` abort (§8am).
+                // The per-slot stage probe below replaces it; when that one is on, the
+                // legacy pools are not even allocated.
+                let legacy = (cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some())
+                    && !batch_cmd::probe::enabled();
                 let mut v = Vec::with_capacity(model.devices.len());
                 for i in 0..model.devices.len() {
-                    v.push(if on {
+                    v.push(if legacy {
                         model.devices[i]
                             .gpu()
                             .query_pool(2 * GPU_PROBE_BATCHES as u32)
@@ -977,11 +1007,17 @@ impl<'m> Session<'m> {
                 }
                 v
             },
-            probe_batches: if cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some() {
+            probe_batches: if (cfg.probe || std::env::var_os("BRECCIA_GPU_TIME").is_some())
+                && !batch_cmd::probe::enabled()
+            {
                 Some(0)
             } else {
                 None
             },
+            probe_base: vec![[0u64; batch_cmd::probe::MAX]; model.devices.len()],
+            probe_base_n: vec![[0u32; batch_cmd::probe::MAX]; model.devices.len()],
+            anchor: vec![None; model.devices.len()],
+            anchor_at: None,
             gpu_busy_s: vec![0.0; model.devices.len()],
             dev_wait_s: vec![0.0; model.devices.len()],
             dev_down: vec![0; model.devices.len()],
@@ -1001,6 +1037,12 @@ impl<'m> Session<'m> {
     /// This session's devices (one model's placement).
     fn device_gpus(&self) -> Vec<&breccia_vk::ctx::Gpu> {
         self.model.devices.iter().map(|d| d.gpu()).collect()
+    }
+
+    /// A GPU-time probe stage boundary on `dev` (`BRECCIA_GPU_TIME`; a cached-bool
+    /// no-op otherwise).
+    fn probe_mark(&self, dev: usize, stage: u8) {
+        batch_cmd::probe::enter(self.model.devices[dev].gpu(), stage);
     }
 
     /// Is a segment of this session's still in flight?
@@ -1178,7 +1220,28 @@ impl<'m> Session<'m> {
 
     /// GPU seconds each of this session's devices was busy, from the probe
     /// (flushed, so it is current). Zero when the probe is off.
+    ///
+    /// With the per-slot **stage** probe on (`BRECCIA_GPU_TIME`), the busy time is
+    /// the sum of the stage intervals minus the window's snapshot: the same thing
+    /// the legacy per-batch probe measured, without the shared-pool race that made
+    /// that one abort (§8am).
     pub fn gpu_busy_s(&mut self) -> Result<Vec<f64>> {
+        if batch_cmd::probe::enabled() {
+            let mut out = Vec::new();
+            for (i, gpu) in self.device_gpus().into_iter().enumerate() {
+                let (ns, _) = batch_cmd::probe::totals(gpu);
+                let base = self
+                    .probe_base
+                    .get(i)
+                    .copied()
+                    .unwrap_or([0; batch_cmd::probe::MAX]);
+                let sum: u64 = (0..batch_cmd::probe::MAX)
+                    .map(|s| ns[s].saturating_sub(base[s]))
+                    .sum();
+                out.push(sum as f64 / 1e9);
+            }
+            return Ok(out);
+        }
         self.probe_flush()?;
         Ok(self.gpu_busy_s.clone())
     }
@@ -1209,11 +1272,93 @@ impl<'m> Session<'m> {
         self.dev_down.iter_mut().for_each(|x| *x = 0);
         self.dev_up.iter_mut().for_each(|x| *x = 0);
         self.timers.clear();
+        self.snapshot_probe();
         self.reset_gpu_busy()
     }
 
-    /// Zero the probe's accumulated busy time and drop any unread timestamps, so
-    /// the next window is measured from scratch.
+    /// Remember the GPU-time probe's cumulative per-stage totals, so the table
+    /// covers the measured decode window and not the prompt.
+    fn snapshot_probe(&mut self) {
+        if !batch_cmd::probe::enabled() {
+            return;
+        }
+        let mut snap: Vec<([u64; batch_cmd::probe::MAX], [u32; batch_cmd::probe::MAX])> =
+            Vec::new();
+        for gpu in self.device_gpus() {
+            let (ns, n) = batch_cmd::probe::totals(gpu);
+            snap.push((ns, n));
+        }
+        for (i, (ns, n)) in snap.into_iter().enumerate() {
+            if let Some(slot) = self.probe_base.get_mut(i) {
+                *slot = ns;
+            }
+            if let Some(slot) = self.probe_base_n.get_mut(i) {
+                *slot = n;
+            }
+        }
+    }
+
+    /// The GPU-time table for the measured window: per stage, **µs of GPU time per
+    /// token**, one column per device, plus the row totals.
+    ///
+    /// `None` when the probe is off. The intervals are the GPU timeline between two
+    /// stage boundaries inside one batched submission (`vkCmdWriteTimestamp2`,
+    /// `COMPUTE_SHADER`), read once after the slot's fence — so a row is "the GPU
+    /// was executing this stage's dispatches and their barriers", not a host price.
+    /// The residual against the host's fence wait is the caller's subtraction:
+    /// `wait - sum` is launch/serialisation (the submit round trip, the command-
+    /// buffer prologue, and any time the GPU sat idle waiting for the host to
+    /// record).
+    pub fn gpu_time_table(&self) -> Option<Vec<GpuStageRow>> {
+        if !batch_cmd::probe::enabled() {
+            return None;
+        }
+        let tokens = self.forwards.max(1) as f64;
+        let gpus = self.device_gpus();
+        let mut rows: Vec<GpuStageRow> = Vec::new();
+        for (stage, name) in batch_cmd::probe::NAMES.iter().enumerate() {
+            if name.is_empty() {
+                continue;
+            }
+            let mut per: Vec<(f64, u32)> = Vec::with_capacity(gpus.len());
+            let mut total = 0.0;
+            for (i, gpu) in gpus.iter().enumerate() {
+                let (ns, cnt) = batch_cmd::probe::totals(gpu);
+                let base = self
+                    .probe_base
+                    .get(i)
+                    .copied()
+                    .unwrap_or([0; batch_cmd::probe::MAX]);
+                let base_n = self
+                    .probe_base_n
+                    .get(i)
+                    .copied()
+                    .unwrap_or([0; batch_cmd::probe::MAX]);
+                let d = ns[stage].saturating_sub(base[stage]);
+                let dn = cnt[stage].saturating_sub(base_n[stage]);
+                let us = d as f64 / 1e3 / tokens;
+                total += us;
+                per.push((us, (dn as f64 / tokens).round() as u32));
+            }
+            // Drop the columns that nothing stamps, so the table is the graph's
+            // actual stage list and not a 29-row enum.
+            if total > 0.0 || per.iter().any(|(_, n)| *n > 0) {
+                rows.push(GpuStageRow {
+                    stage: name,
+                    per_device: per,
+                    total_us: total,
+                });
+            }
+        }
+        Some(rows)
+    }
+
+    /// `wait-gpu` per token of the measured window, in µs — the number the GPU-time
+    /// sum is the residual against.
+    pub fn wait_gpu_us_per_token(&self) -> f64 {
+        self.timers.ns[WAIT_GPU] as f64 / 1e3 / self.forwards.max(1) as f64
+    }
+
     pub fn reset_gpu_busy(&mut self) -> Result<()> {
         for (i, pool) in self.probe_pools.iter().enumerate() {
             if *pool != ash::vk::QueryPool::null() {
@@ -1232,6 +1377,42 @@ impl<'m> Session<'m> {
     /// Print and disable the GPU-time probe (called once a token).
     fn probe_report(&mut self) -> Result<()> {
         self.probe_flush()?;
+        // The calibrated anchor: one `VK_EXT_calibrated_timestamps` sample per
+        // device per second (the recipe's cadence, `docs/research/07` §A6 step 2).
+        // It is what lets the table's GPU time be compared against the host's
+        // fence wait on one timeline; the unit trap is A3's (calibrated values are
+        // **ns**, query values are **ticks**).
+        if batch_cmd::probe::enabled()
+            && self
+                .anchor_at
+                .map(|t| t.elapsed().as_secs_f64() >= 1.0)
+                .unwrap_or(true)
+        {
+            let mut cal: Vec<Option<breccia_vk::ctx::Calibration>> = Vec::new();
+            for gpu in self.device_gpus() {
+                cal.push(gpu.calibrate());
+            }
+            for (i, c) in cal.into_iter().enumerate() {
+                if let Some(c) = c {
+                    if let Some(slot) = self.anchor.get_mut(i) {
+                        *slot = Some(c);
+                    }
+                }
+            }
+            self.anchor_at = Some(std::time::Instant::now());
+            for (i, c) in self.anchor.iter().enumerate() {
+                if let Some(c) = c {
+                    eprintln!(
+                        "gpu-time anchor device {i}: gpu {} ns vs host {} ns (offset {:+.1} us, \
+                         max deviation {} ns)",
+                        c.device_ns,
+                        c.host_ns,
+                        (c.host_ns as f64 - c.device_ns as f64) / 1e3,
+                        c.max_dev_ns
+                    );
+                }
+            }
+        }
         // **Dispatch census** (`BRECCIA_TRACE_DISPATCH=1`): dispatches per stage for
         // one token. The stage tags are the graph's own marks, so this says *where*
         // the ~4 700 dispatches/token come from without any GPU work (§8an).
@@ -1496,8 +1677,10 @@ impl<'m> Session<'m> {
         // ---- a block whose experts are resident: no host, no readback --------
         if let Some(pe) = m.placed.get(&b) {
             self.timers.mark(EXPERTS);
+            self.probe_mark(dev, batch_cmd::probe::MOE_MAP);
             self.run_placed_moe(b, dev, pe, mc.n_embd, mc.n_ff, mc.n_expert_used)?;
             self.timers.mark(HC_WRITE_F);
+            self.probe_mark(dev, batch_cmd::probe::HC_WRITE);
             {
                 let v = &self.venues[dev];
                 let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
@@ -1514,6 +1697,7 @@ impl<'m> Session<'m> {
         if self.inbatch_read {
             let k = mc.n_expert_used;
             let gpu = m.devices[dev].gpu();
+            self.probe_mark(dev, batch_cmd::probe::XFER);
             let v = &self.venues[dev];
             let st = &self.stagings[dev];
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
@@ -1556,6 +1740,7 @@ impl<'m> Session<'m> {
         let m = self.model;
         let mc = &m.cfg;
         self.timers.mark(HC_READ_A);
+        self.probe_mark(dev, batch_cmd::probe::HC_READ);
         {
             let v = &self.venues[dev];
             hc_read(v, &m.layers[b].hc_attn, &v.r)?;
@@ -1572,6 +1757,7 @@ impl<'m> Session<'m> {
 
         // ---- (D) HC_WRITE(attn) ----------------------------------------------
         self.timers.mark(HC_WRITE_A);
+        self.probe_mark(dev, batch_cmd::probe::HC_WRITE);
         {
             let v = &self.venues[dev];
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
@@ -1580,6 +1766,7 @@ impl<'m> Session<'m> {
 
         // ---- (E) HC_READ(ffn) ------------------------------------------------
         self.timers.mark(HC_READ_F);
+        self.probe_mark(dev, batch_cmd::probe::HC_READ);
         {
             let v = &self.venues[dev];
             hc_read(v, &m.layers[b].hc_ffn, &v.r)?;
@@ -1588,6 +1775,7 @@ impl<'m> Session<'m> {
 
         // ---- (F) router ------------------------------------------------------
         self.timers.mark(ROUTER);
+        self.probe_mark(dev, batch_cmd::probe::ROUTER);
         {
             let lw = &m.layers[b];
             let v = &self.venues[dev];
@@ -1603,6 +1791,7 @@ impl<'m> Session<'m> {
 
         // ---- (G) shared expert + its scalar sigmoid gate ---------------------
         self.timers.mark(SHARED);
+        self.probe_mark(dev, batch_cmd::probe::SH_GATE);
         let mut sub = [0f64; 5];
         {
             let lw = &m.layers[b];
@@ -1619,20 +1808,24 @@ impl<'m> Session<'m> {
                 .get(&lw.moe.gate.key)?
                 .run(&lw.moe.gate.buf, &ws.mixed, &v.shexp_gate)?;
             sub[0] = t0.elapsed().as_secs_f64();
+            self.probe_mark(dev, batch_cmd::probe::SH_UP);
             let t0 = std::time::Instant::now();
             pipes
                 .get(&lw.moe.up.key)?
                 .run(&lw.moe.up.buf, &ws.mixed, &v.shexp_up)?;
             sub[1] = t0.elapsed().as_secs_f64();
+            self.probe_mark(dev, batch_cmd::probe::SH_SWIGLU);
             let t0 = std::time::Instant::now();
             v.swiglu
                 .run(&v.shexp_gate, &v.shexp_up, &v.shexp_act, mc.n_ff)?;
             sub[2] = t0.elapsed().as_secs_f64();
+            self.probe_mark(dev, batch_cmd::probe::SH_DOWN);
             let t0 = std::time::Instant::now();
             pipes
                 .get(&lw.moe.down.key)?
                 .run(&lw.moe.down.buf, &v.shexp_act, &v.sh)?;
             sub[3] = t0.elapsed().as_secs_f64();
+            self.probe_mark(dev, batch_cmd::probe::SH_SCALAR);
             let t0 = std::time::Instant::now();
             pipes.get(&lw.moe.shexp_gate.key)?.run(
                 &lw.moe.shexp_gate.buf,
@@ -2675,6 +2868,7 @@ impl<'m> Session<'m> {
         // the write happens on the host.
         self.timers.mark(HC_WRITE_F);
         self.ensure_batch(dev)?;
+        self.probe_mark(dev, batch_cmd::probe::HC_WRITE);
         {
             let v = &self.venues[dev];
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
@@ -2734,6 +2928,9 @@ impl<'m> Session<'m> {
         self.timers.mark(FINAL_HC);
         let last = m.device_of(mc.n_layers - 1);
         let head_dev = m.head_device();
+        // GPU-time probe: close the last block's FINAL_HC span on the
+        // device that ran it, before any handoff to the head device.
+        self.probe_mark(last, batch_cmd::probe::FINAL_HC);
         if head_dev != last {
             // The residual is final once the last block's submission has completed,
             // which `flush` has waited for. 40 KiB each way: one round trip a token.
@@ -2761,6 +2958,7 @@ impl<'m> Session<'m> {
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
             v.final_hc.read(ws, &v.r, &hw)?;
             self.timers.mark(HEAD);
+            self.probe_mark(last, batch_cmd::probe::HEAD);
             let out = v
                 .logits
                 .as_ref()
@@ -2822,20 +3020,29 @@ impl<'m> Session<'m> {
         let mixed = &v.hc_ws.as_ref().expect("hc ws").mixed;
         // gate / up: one shared activation, and **one map per role** — the two
         // tensors need not share a type, and the row map's units depend on it.
+        let gpu = self.model.devices[dev].gpu();
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_MAP);
         let gate = pipes.batch(&pe.gate.key)?;
         v.moe_map
             .run(&v.router_ids, &v.moe_map_gate, gate, k, 0, false)?;
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_GATE);
         gate.run(&pe.gate.buf, mixed, &v.moe_gate, &v.moe_map_gate, k)?;
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_MAP);
         let up = pipes.batch(&pe.up.key)?;
         v.moe_map
             .run(&v.router_ids, &v.moe_map_up, up, k, 0, false)?;
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_UP);
         up.run(&pe.up.buf, mixed, &v.moe_up, &v.moe_map_up, k)?;
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_SWIGLU);
         v.swiglu.run(&v.moe_gate, &v.moe_up, &v.moe_act, k * n_ff)?;
         // down: one activation row per expert, so the map carries the stride
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_MAP);
         let down = pipes.batch(&pe.down.key)?;
         v.moe_map
             .run(&v.router_ids, &v.moe_map_down, down, k, 0, true)?;
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_DOWN);
         down.run(&pe.down.buf, &v.moe_act, &v.moe_down, &v.moe_map_down, k)?;
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_COMBINE);
         v.moe_combine.run(
             &v.moe_down,
             &v.router_w,
@@ -3299,6 +3506,9 @@ impl<'m> Session<'m> {
         self.forwards = 0;
         self.expert_bytes = 0;
         self.timers.clear();
+        // The GPU-time probe's window starts here too, so its table covers the
+        // decode steps and not the prompt.
+        self.snapshot_probe();
         // The prompt passes must not inflate the per-device figures.
         batch_cmd::reset_record_seconds();
         self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);

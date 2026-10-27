@@ -57,7 +57,9 @@ pub mod xfer;
 
 pub use arena::{ArenaChoice, ArenaOpts, ArenaReport, ArenaSpec};
 pub use config::{LayerKind, ModelConfig};
-pub use graph::{prefill_cap, prefill_plan, Generation, Session, SessionCfg, Timers, STAGES};
+pub use graph::{
+    prefill_cap, prefill_plan, Generation, GpuStageRow, Session, SessionCfg, Timers, STAGES,
+};
 
 pub use model::{LoadOptions, LoadStats, Model};
 pub use multi::{Multi, MultiGeneration, StreamReport};
