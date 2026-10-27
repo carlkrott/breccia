@@ -1,0 +1,68 @@
+; intdot_probe.spvasm — the **toolchain proof** for `OpSDot` (§8bb).
+;
+; Our GLSL compiler turned out to support the dot after all, under the extension's
+; real name (`GL_EXT_integer_dot_product` + `dotPacked4x8EXT`, see
+; `gemv_iq3s_q8.comp`), so this module is not on the hot path. It is kept as the
+; fallback: if a future shaderc/glslang drops the GLSL extension, this is the shape
+; that still assembles — a hand-written module with `OpSDot` and the packed-int8
+; capability, built by `build.rs` with `spirv-as` and checked with `spirv-val` at
+; build time exactly like the compiled shaders.
+;
+;   o[i] = sd.ot(a[i], b[i])   with PackedVectorFormat4x8Bit, i.e. dp4a
+               OpCapability Shader
+               OpCapability DotProduct
+               OpCapability DotProductInput4x8BitPacked
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %A %B %O %gin
+               OpExecutionMode %main LocalSize 32 1 1
+               OpDecorate %A DescriptorSet 0
+               OpDecorate %A Binding 0
+               OpDecorate %B DescriptorSet 0
+               OpDecorate %B Binding 1
+               OpDecorate %O DescriptorSet 0
+               OpDecorate %O Binding 2
+               OpDecorate %st_u Block
+               OpDecorate %st_i Block
+               OpMemberDecorate %st_u 0 Offset 0
+               OpMemberDecorate %st_i 0 Offset 0
+               OpDecorate %rt_u ArrayStride 4
+               OpDecorate %rt_i ArrayStride 4
+               OpDecorate %gin BuiltIn GlobalInvocationId
+       %void = OpTypeVoid
+      %fnv = OpTypeFunction %void
+      %uint = OpTypeInt 32 0
+       %int = OpTypeInt 32 1
+     %v3u = OpTypeVector %uint 3
+    %ptr_u = OpTypePointer StorageBuffer %uint
+    %ptr_i = OpTypePointer StorageBuffer %int
+     %u4096 = OpConstant %uint 4096
+     %rt_u = OpTypeArray %uint %u4096
+     %rt_i = OpTypeArray %int %u4096
+     %st_u = OpTypeStruct %rt_u
+     %st_i = OpTypeStruct %rt_i
+      %cp_u = OpTypePointer StorageBuffer %st_u
+      %cp_i = OpTypePointer StorageBuffer %st_i
+       %A = OpVariable %cp_u StorageBuffer
+       %B = OpVariable %cp_u StorageBuffer
+       %O = OpVariable %cp_i StorageBuffer
+     %ptr_in = OpTypePointer Input %v3u
+     %gin = OpVariable %ptr_in Input
+     %u0 = OpConstant %uint 0
+     %u1 = OpConstant %uint 1
+     %u2 = OpConstant %uint 2
+    %fmt = OpConstant %uint 0
+     %main = OpFunction %void None %fnv
+     %entry = OpLabel
+      %gidv = OpLoad %v3u %gin
+      %idx = OpCompositeExtract %uint %gidv 0
+     %aptr = OpAccessChain %ptr_u %A %u0 %idx
+     %bptr = OpAccessChain %ptr_u %B %u0 %idx
+     %optr = OpAccessChain %ptr_i %O %u0 %idx
+       %av = OpLoad %uint %aptr
+       %bv = OpLoad %uint %bptr
+       %ai = OpBitcast %int %av
+       %bi = OpBitcast %int %bv
+      %dot = OpSDot %int %ai %bi PackedVectorFormat4x8Bit
+               OpStore %optr %dot
+               OpReturn
+               OpFunctionEnd

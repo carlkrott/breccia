@@ -1,0 +1,106 @@
+#version 450
+// IQ3_S GEMV on **packed int8 dot products** (§8bb): `o[r] = W[r,:] · x` with the
+// weights decoded from their 110-byte IQ3_S blocks into signed int8 codes and the
+// activation supplied as `q8_1` (int8 + one f16 scale per 32 elements).
+//
+// This is the shape research 12 §B describes, at `n = 1` (decode):
+//
+//   per 8-element unit per lane:  2 x `dotPacked4x8EXT`      (8 MACs, 2 slots)
+//                                 + the IQ3_S grid/sign decode (unchanged)
+//   per 32-element group:         1 x (d_block * sc * d_x)   (scale hoisted)
+//   per row:                      the 32-lane fp32 reduce      (unchanged)
+//
+// versus the fp32 path's 8 x `u2f` + 8 x FMA + 8 x scale multiply per unit. IQ3_S
+// has **no min/offset term** (that is Q4_K/Q5_K/Q6_K), so the `- dmin * Σx` collapse
+// of research 12 has nothing to remove here; the win is (a) 4 MACs per slot, (b) the
+// conversions and per-element multiplies gone, (c) the scale hoisted to the group.
+//
+// `dotPacked4x8EXT` is GLSL's name for SPIR-V `OpSDot` with
+// `PackedVectorFormat4x8Bit` — the extension is `GL_EXT_integer_dot_product` (NOT
+// `GL_EXT_shader_integer_dot_product`, which is what blocked the previous round).
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+
+#define QK 256u
+#define BLOCK_WORDS 55u // IQ3_S: 110 bytes
+#define LANES 32u
+#define ROWS_PER_WG 8u
+#define WG_X_MAX 65535u
+#include "blocks.glsl"
+
+layout(local_size_x = 256) in;
+
+// Bindings 0..3 are blocks.glsl's (W, X, O, tables); 4..5 are this kernel's.
+#ifdef BRECCIA_OWN_BINDINGS
+#endif
+layout(std430, binding = 4) readonly buffer Q8Vec { uint QW[]; }; // 4 x int8 per word
+layout(std430, binding = 5) readonly buffer DQVec { uint16_t DQ[]; }; // f16 per group
+
+/// The four int8 codes of `word` as a packed dp4a operand, sign applied from
+/// `sgn` (bit `bit` = 1 means negative).
+int codes4(uint word, uint sgn, uint bit) {
+    int v = int(word);
+    int c0 = int(bitfieldExtract(v, 0, 8));
+    int c1 = int(bitfieldExtract(v, 8, 8));
+    int c2 = int(bitfieldExtract(v, 16, 8));
+    int c3 = int(bitfieldExtract(v, 24, 8));
+    // Two's-complement negate per element, then repack: the dot treats each byte
+    // as int8, so a negated code simply flips that byte's sign bit pattern.
+    int m0 = ((sgn >> (bit + 0u)) & 1u) != 0u ? -c0 : c0;
+    int m1 = ((sgn >> (bit + 1u)) & 1u) != 0u ? -c1 : c1;
+    int m2 = ((sgn >> (bit + 2u)) & 1u) != 0u ? -c2 : c2;
+    int m3 = ((sgn >> (bit + 3u)) & 1u) != 0u ? -c3 : c3;
+    return (m0 & 0xFF) | ((m1 & 0xFF) << 8) | ((m2 & 0xFF) << 16) | ((m3 & 0xFF) << 24);
+}
+
+void main() {
+    uint lane = gl_LocalInvocationID.x % LANES;
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint row = wg * ROWS_PER_WG + gl_LocalInvocationID.x / LANES;
+    if (row >= pc.rows) {
+        return;
+    }
+    const uint u = lane; // 32 lanes cover one 256-element block
+    const uint ib32 = u >> 2u; // 32-element group 0..7
+    const uint l = u & 3u; // 8-element unit inside the group
+    float acc = 0.0;
+
+    for (uint b = 0u; b < pc.bpr; ++b) {
+        uint off = (row * pc.bpr + b) * BLOCK_WORDS + pc.base;
+        // --- the IQ3_S decode (identical to dequant_iq3_s_unit) ---------------
+        uint qhb = byte2(off + 33u + (ib32 >> 1u), ib32 & 1u);
+        uint sc = byte2(off + 53u + (ib32 >> 2u), (ib32 >> 1u) & 1u);
+        uint nib = (ib32 & 1u) == 0u ? (sc & 0x0fu) : (sc >> 4u);
+        float db = f16_at(off) * (1.0 + 2.0 * float(nib));
+        uint qa = u32_at(off + 1u + 4u * ib32 + 2u * (l >> 1u));
+        uint g1 = byte4(qa, 2u * (l & 1u)) | ((qhb << (8u - 2u * l)) & 256u);
+        uint g2 = byte4(qa, 2u * (l & 1u) + 1u) | ((qhb << (7u - 2u * l)) & 256u);
+        uint sb = 4u * ib32 + l;
+        uint sgn = byte2(off + 37u + (sb >> 1u), sb & 1u);
+        uint lo1 = grid_iq3s(g1); // 4 int8 codes packed
+        uint lo2 = grid_iq3s(g2);
+        // --- the int8 dot: 8 MACs in two slots --------------------------------
+        uint gidx = b * (QK / 32u) + ib32; // the activation's group
+        // 4 int8 per word, 8 words per 32-element group; this lane's 8 elements
+        // are the group's words [2l, 2l+1].
+        uint xw = gidx * 8u + 2u * l;
+        int x0 = int(QW[xw]);
+        int x1 = int(QW[xw + 1u]);
+        int s8 = dotPacked4x8EXT(codes4(lo1, sgn, 0u), x0)
+               + dotPacked4x8EXT(codes4(lo2, sgn, 4u), x1);
+        // --- the scale, hoisted to the 32-element group -----------------------
+        float dq = unpackHalf2x16(uint(DQ[gidx])).x;
+        acc += dq * db * float(s8);
+    }
+    // The row's 32 lanes each own 8 elements of every block; reduce as before.
+    [[unroll]] for (uint off = 16u; off > 0u; off >>= 1u) {
+        acc += subgroupShuffleXor(acc, off);
+    }
+    if (lane == 0u) {
+        O[row] = acc;
+    }
+}

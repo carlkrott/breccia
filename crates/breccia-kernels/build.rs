@@ -116,6 +116,9 @@ const SHADERS: &[&str] = &[
     "qsa_topk",
     "qsa_attn_scores",
     "qsa_attn_apply",
+    // int8-dot decode path (§8bb): the q8_1 quantiser and the IQ3_S dp4a GEMV.
+    "ops_q8_quantize",
+    "gemv_iq3s_q8",
     // Host-free MoE: device-side expert indirection + the routed combine.
     "moe_map",
     "moe_combine",
@@ -157,7 +160,7 @@ fn main() {
             let p = e.path();
             if matches!(
                 p.extension().and_then(|x| x.to_str()),
-                Some("comp") | Some("glsl")
+                Some("comp") | Some("glsl") | Some("spvasm")
             ) {
                 println!("cargo:rerun-if-changed={}", p.display());
             }
@@ -167,6 +170,10 @@ fn main() {
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
     let glslc = std::env::var("GLSLC").unwrap_or_else(|_| "glslc".to_string());
+
+    // The hand-written `OpSDot` fallback module (§8bb): assembled and validated with
+    // the same discipline as the compiled shaders.
+    assemble(&out_dir, "shaders/intdot_probe.spvasm");
 
     for name in SHADERS {
         compile(&glslc, &out_dir, name, name, &[]);
@@ -224,6 +231,42 @@ fn main() {
             );
         }
     }
+}
+
+/// Assemble a hand-written `.spvasm` module with `spirv-as` and validate it, the
+/// same two-step the compiled shaders go through (`AGENTS.md`: malformed SPIR-V must
+/// abort the host process, never reach the GPU).
+fn assemble(out_dir: &Path, src: &str) {
+    let spv = out_dir.join(format!(
+        "{}.spv",
+        Path::new(src)
+            .file_stem()
+            .expect("a file stem")
+            .to_string_lossy()
+    ));
+    let asm = Command::new("spirv-as")
+        .args(["--target-env", "vulkan1.3", src, "-o"])
+        .arg(&spv)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to launch `spirv-as` ({e}); is spirv-tools installed?"));
+    if !asm.status.success() {
+        panic!(
+            "spirv-as failed for {src}:\n{}",
+            String::from_utf8_lossy(&asm.stderr)
+        );
+    }
+    let st = Command::new("spirv-val")
+        .args(["--target-env", "vulkan1.3"])
+        .arg(&spv)
+        .output()
+        .unwrap_or_else(|e| panic!("failed to launch `spirv-val` ({e})"));
+    if !st.status.success() {
+        panic!(
+            "spirv-val rejected {src}:\n{}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+    }
+    println!("cargo:rerun-if-changed={src}");
 }
 
 /// `glslc -O ... <src>.comp -o <out>.spv` followed by `spirv-val`.
