@@ -81,6 +81,31 @@ Small changes are measured in **seconds, not tens of minutes**. Every sweep is t
 - **Kill and conclude**: if a sweep shows the same sign after ~2 minutes of data, stop it and act. A negative result already visible does not need more cells.
 - New bench modes must offer short forms and print a per-phase summary so a run can be abandoned early with usable data.
 
+## Adding a kernel (sanctioned procedure, 2026-10-27)
+
+This exists so a shader round is never blocked by re-litigating safety. The protocol is fixed; follow
+it and proceed.
+
+1. **Build-time validation**: `build.rs` runs `spirv-val` on every shader. Malformed SPIR-V aborts the
+   host process — it never reaches the GPU.
+2. **Land it behind a flag, default off**, and keep the incumbent path intact so an A/B and a revert
+   are both one flag.
+3. **Validation run on the RX 6950 XT (`0000:03:00.0`, headless)**: one new shader per process,
+   ≤4 fresh dispatched shapes per process, `timeout 90`, `VK_LAYER_KHRONOS_validation` enabled,
+   `power_dpm_force_performance_level=high` verified first (and re-checked after — a ring reset drops
+   it to `auto` silently).
+4. **Parity first, benchmarks second**: the new path must be bit-identical on the parity set
+   (32/32 tokens, top-1 13.170561 at chunk 8/16/32/128) or state a documented ≤1e-6 difference and why.
+5. **Only then** enable by default, measure, and — last — repeat on the MI50 (the **display** card),
+   one type per process.
+6. **A reset is a stop-the-line event**: stop, capture `journalctl -b -1`, save the evidence, report.
+   Do not re-run to "see if it happens again".
+
+A *wired* change to an existing shader (same bindings and resources, an added entry point or a new
+specialisation constant) is the **lowest-risk class**; that is how the four multi-user GEMMs
+(IQ4_XS/Q4_K/Q5_K/Q6_K) were added and validated on both cards. Adding a kernel is not an exceptional
+event — not adding one out of caution is the costlier mistake.
+
 ## Measurement traps (learned the hard way)
 
 | Trap | Symptom | Rule |
