@@ -2948,6 +2948,79 @@ right — and the **prefill** balance agrees: at chunk 64 a 64-token prompt cost
 The reason the split does not pay yet is that both cards idle under the host lane
 in the measured windows, not that the placement is wrong.
 
+## 8ak. Single-stream: the lane is removed by **expert coverage**, not by overlap
+
+The round's objective was 20.79 tok/s (llama.cpp) on **one** stream with both cards
+working. Measured ladder below; every run clock-verified (`power_dpm_force_performance_level`
+= `high` on both cards), quiet window, 27-token prompt, gen 8/32, `--warm 1`,
+`--threads 16`, dual placement `--split-blocks 28,20`.
+
+### The ladder (single stream, both cards)
+
+| blocks' experts resident | arena | expert bytes/token | `experts(host)` | `wait-gpu` | `head` | tok/s | ms/token |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 (all 48 on the lane) | 0 | **799 MiB** | **47.5** | 21.9 | 4.2 | 11.82 | 84.6 |
+| 16 | 14.9 GiB | 508 MiB | 30.0 | — | — | 14.26 | 70.1 |
+| 26 | 22.5 GiB | 360 MiB | 17.5 | 33.2 | 7.4 | 15.76 | 63.5 |
+| **30** | **25.5 GiB** | **301 MiB** | **13.5** | **33.4** | 7.1 | **16.94** | **59.0** |
+
+`--gpu-experts "0..15,28..41"`, `--split-blocks 28,20`. Parity **32/32** at 30 blocks
+(16.70 tok/s, 59.89 ms/token, 301 MiB/token): resident experts are the same kernels
+on the arena, so the sequence is bit-identical to the server's.
+
+**+43 % single-stream (11.82 -> 16.94 tok/s) with no engine change** — the item is a
+placement/VRAM budget, not a pipelining one. Per block the arena costs 930 MiB
+(measured), so full coverage would need ~44 GiB; both cards hold 32 GiB, of which
+3.2 GiB is dense weights and 0.4 GiB the head. ~30-32 blocks is the ceiling, which
+is what the 30-block row is: 29.2 GiB of 32 GiB used.
+
+### Why the planned overlap (task 1a) is **not** what limits one stream
+
+Block L+1's dense prelude consumes the residual that block L's **lane** produces, so
+inside one stream the lane is a strict serial section, not a schedulable one: there
+is no GPU work that can be issued while it runs. What *can* be overlapped is the
+lane's **data** (page-cache reads / PCIe), not its compute — and at 30 blocks that
+data is 301 MiB/token = ~13.5 ms, i.e. **the whole remaining headroom of 1a is
+13.5 ms** (59 -> 45.5 ms, 22 tok/s) and it is I/O prefetch, not lane hiding. The
+same accounting sets 1b's value: a CPU+RX+MI50 expert split can only help the 18
+blocks that do *not* fit in VRAM, and their cost is the host read (~301 MiB), not
+spare GPU compute.
+
+### What is left, in order
+
+1. **`wait-gpu` 33.4 ms/token (57 %) is now the bottleneck** — the GPU chain itself:
+   ~4 800 dispatches/token at 4.4 µs plus the command-buffer boundaries priced in
+   §8af/§8ag. This is the barrier-tracking / T-batched-dense-chain item, and it is
+   the only path to 20.8 tok/s now (target: 4 800 -> ~2 800 dispatches, or 3.4 -> 2.0
+   barriers/dispatch).
+2. **`head` 7.1 ms** (248 320x2 560 GEMV) runs on whichever card owns block 47 — the
+   MI50 under every contiguous split. Moving the last block to the RX is worth up to
+   ~4 ms/token (head on the 1.43x faster card).
+3. Then the lane's 13.5 ms, as a prefetch (1a), if 1 and 2 are exhausted.
+
+### Not attempted this round
+
+- **Route-tail skipping (task 2)** — no ε sweep, no divergence table, nothing to
+  report; it stays unmeasured and off.
+- **Subgroup-size/tile spec constants (task 3)** — untouched.
+- The planned **layer L+1 expert prefetch** and the **CPU+RX+MI50 expert split**
+  (task 1) were not implemented: the measurement above reorders them behind (1),
+  because coverage already removed 71 % of the lane (`799 -> 301 MiB/token`) and the
+  GPU chain is now 2.5x the lane.
+
+### Commands
+
+```bash
+# clocks (both cards must read `high`), then the ladder
+for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do cat "$f"; done
+D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+timeout 900 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 \
+  --gpu-experts "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,28,29,30,31,32,33,34,35,36,37,38,39,40,41" \
+  --prompt-ids-file $D/parity-server.json.ids --gen 32 --runs 1 --threads 16 --warm 1 \
+  --json $D/cov30-parity.json
+```
+
 ## 9. Exact commands
 
 
