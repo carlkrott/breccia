@@ -343,6 +343,12 @@ rotation: no CUDA anywhere, so its solutions are the ones shaped by the same con
   or the descriptor-set rebind. This matters because it is the *same* factor that makes the
   engine's shared expert cost ~120 µs/block while the work is ~8.5 µs — worth one measurement with
   a 3 200-row shape (320 WGs) to see whether the drain disappears at high occupancy.
+  → **answered in [`06a`](06a-shape-and-barrier-independent-check.md) §2**: the dependent-chain cost is
+  **flat from 1 to 320 workgroups** (so it is not drain) and tracks **`bpr`** instead
+  (1.15 µs + ≈0.45 µs per dependent block: `bpr` 2/3/10 = 1.62/2.48/5.6 µs) — i.e. the barrier's
+  acquire **invalidates the caches** and each dependent block load is a cold round trip. That reprices
+  §3's barrier pruning from −0.7…−1.0 to **≈−4.5 ms/token**, and it is why `UNROLL=2` and tracked
+  barriers attack the same term.
 * **`VK_KHR_cooperative_matrix` is absent**, so a WMMA path for prefill (m ≥ 64) is off the table;
   fp32 packed-fp16 (`V_PK_FMA_F16`, 2×) remains the only arithmetic-rate lever, and only if the
   decode can be expressed in fp16 without a parity break.
