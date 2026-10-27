@@ -2838,6 +2838,116 @@ Submits per block-chunk remain **13.6** (unchanged), `wait-gpu` and `ple` unchan
 top-1 13.170561 (the change is allocation sizing only). No decode path touched, so the
 canonical gate stands at 20.3 +- 1 aggregate, lane 40-43 ms/step.
 
+## 8aj. Landed: PLE batching (13.92 -> 4.65 submits/block-chunk) and the tail-chunk plan
+
+Both items of this round landed. Every number below is **clock-verified**
+(`power_dpm_force_performance_level` = `high` on both cards, read in the run
+header). The RX 6950 XT idling at 500 MHz voided placement conclusions in
+sections before this one — treat any single-device RX figure in §8s-§8ai as
+**clock-throttled** rather than comparable (AGENTS.md "Measurement traps").
+
+### What changed
+
+1. **PLE is one batched phase per chunk** (`Session::ple_chunk`): the host hash
+   still runs token by token (it advances the rolling context), then **one**
+   concatenated pack + prefetch, **one** upload recorded into the batch, **one**
+   gather over `t*16` rows, per token `copy` (a `Buf` has no offset field, so this
+   is the "copy-inside-the-batch" route §8ai chose) + key/value GEMV recorded in
+   the **same** batch, **one** `read_batch` for all `t` residuals/keys/values, `t`
+   host blocks, **one** region-array writeback (`Staging::write_regions`). The
+   per-token key/value outputs are one buffer each for the same no-offset reason.
+   Revert/A-B arm: `BRECCIA_NO_PLE_BATCH=1` (decode is untouched — it still uses
+   `ple_step`).
+2. **Dynamic chunk sizing** (`prefill_cap` / `prefill_plan`, both pure and unit
+   tested): `--prefill-chunk N` is now a **target**; the scratch is sized for
+   `cap = 1.5 N` and a prompt is split into `ceil(len/cap)` **even** chunks, so no
+   chunk is below `cap/2` and a 132-token prompt is `66 + 66`, not `64 + 64 + 4`.
+   Revert/A-B arm: `BRECCIA_NO_PREFILL_PLAN=1` (greedy `N`-sized chunks + tail).
+3. **A real per-queue submit counter** (`breccia_vk::ctx::submits()`): the
+   headline metric cannot come from `Session::submits`, which only counts the
+   batch ring — the staging readbacks and one-shot uploads submit on their own, and
+   *those* are what PLE batching removes. The `prefill sum` line now prints
+   `N submits (X/block-chunk, M from the batch ring)`.
+4. **The parity gate earned its keep**: the first version of (2) shadowed `pos` in
+   `generate`, so decode started at position 0 — logits after prefill were
+   bit-identical, the *second* generated token diverged. Caught by 32/32 parity,
+   not by any timing.
+
+### Measured (RX 6950 XT, 64-token prompt, chunk 64, clocks high, quiet window)
+
+| quantity | before | after | delta |
+|---|---:|---:|---:|
+| **submits/block-chunk** (all queues) | **13.92** | **4.65** | **-9.27 (3.0x)** |
+| of which the PLE phase, per chunk | 451 | 5 | -446 |
+| of which the batch ring, per chunk | 217 | 218 | 0 (dense chain, next lever) |
+| `ple` stage, ms/token | 0.94-1.01 | 0.42-0.46 | **-0.52** (~-34 ms per 64-token chunk) |
+| `wait-gpu`, ms/token | 10.13 | 10.12 | 0 |
+| `prefill sum · wall · residual` | 70.81 · 70.83 · 0.03 | 71.88 · 71.91 · 0.03 | residual still ~0 |
+
+The **-0.52 ms/token x 64 = -34 ms** is the prediction of §8ah's cost model
+(550 submits x 62 us) hit exactly, and it is the honest claim: the *total* chunk
+wall does not move because it sits inside `experts(host)`'s +-1.6 ms/token drift
+in this window. The remaining 4.65 is **not PLE** — it is the dense chain's batch
+segmentation (4.54/block against the 2 passes), i.e. the next item.
+
+### Tail chunk: real, but window-dependent
+
+| prompt | plan before | plan after | prefill total before | after |
+|---|---|---|---|---|
+| 64 | 64 | 64 | 4.53 s | 4.60 s |
+| 132 | 64+64+**4** | **66+66** | 8.76 s | **8.61 s** (-1.7 %) |
+| 300 | 64x4+**44** | **75x4** | 20.02 s | 20.48 s (+2 %, noise) |
+
+The tail's own cost here is **72-104 ms/token** against 66-69 for a full chunk
+(+8-50 %, not the 8x that `docs/research/07` measured on a loaded box), so removing
+it is worth only 1.7 % of a 132-token prefill and nothing measurable at 300 (four
+75-token chunks cost the same as four 64s plus a 44). The plan is still the right
+default: the pathological shape is gone and `132` no longer pays a 3rd chunk's
+fixed cost. **Quote the tail number with its window** — on the loaded MI50 the same
+shape was 13 % of the run.
+
+### Parity and gates
+
+- Chunked parity, single device, new plan + batched PLE: **32/32 at chunk
+  8/16/32/128**, RX (`0000:03:00.0`). The 27-token gate prompt is now split
+  `9+9+9` at chunk 8 (was `8+8+8+3`) and `27` at chunk 32/128.
+- The "`--prefill-chunk` is wrong for chunk >= 9" note in §10 **did not
+  reproduce** on the RX in this tree: HEAD is 32/32 at chunk 9, 32 and 128.
+- Decode path untouched: the 2-stream aggregate in the same window is
+  16.5-19.8 tok/s depending on split (see below); the canonical 20.3 +- 1 gate is
+  a different (quieter) window, so no decode claim is made here.
+- `cargo test --workspace` (29 suites), clippy `-D warnings`, `fmt --check`,
+  `./scripts/verify.sh`: green.
+
+### Split sweep with clocks pinned (27-token prompt, gen 8, warm 0, 2 and 4 streams)
+
+| split (RX / MI50) | 2 streams agg | 4 streams agg |
+|---|---:|---:|
+| 28 / 20 | **23.57** | 20.67 |
+| 32 / 16 | 22.76 | **20.79** |
+| 36 / 12 | 21.89 | 20.96 |
+| 40 / 8 | 23.15 | 20.87 |
+
+At gen 16 + `--warm 1` the 2-stream ranking **inverts** (32/16 19.84, 40/8 18.85,
+28/20 16.54), so the split is inside the window's noise at these lengths: neither
+the 2-stream nor the 4-stream table shows a real split effect (4 streams: 0.4 %
+spread). **Keep 28/20 as the default**; do not tune it further until the host lane
+stops being the constraint (lane 69-82 ms/step, fence 12-13 ms/step, 100 %
+overlapped).
+
+### Corrected per-card baselines (clocks high, 27-token prompt, gen 32, warm 1)
+
+| card | decode | per-token |
+|---|---:|---:|
+| RX 6950 XT `0000:03:00.0` | **13.29 tok/s** | 75.2 ms |
+| MI50/Radeon VII `0000:0e:00.0` | 9.30 tok/s | 107.5 ms |
+
+RX is **1.43x** the MI50 single-device, so an RX-favoured split is directionally
+right — and the **prefill** balance agrees: at chunk 64 a 64-token prompt costs
+**65.5 ms/token on the RX vs 92.0 on the MI50** (1.40x; `wait-gpu` 10.1 vs 29.3).
+The reason the split does not pay yet is that both cards idle under the host lane
+in the measured windows, not that the placement is wrong.
+
 ## 9. Exact commands
 
 

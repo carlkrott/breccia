@@ -55,7 +55,8 @@ pub mod stats;
 pub mod xfer;
 
 pub use config::{LayerKind, ModelConfig};
-pub use graph::{Generation, Session, SessionCfg, Timers, STAGES};
+pub use graph::{prefill_cap, prefill_plan, Generation, Session, SessionCfg, Timers, STAGES};
+
 pub use model::{LoadOptions, LoadStats, Model};
 pub use multi::{Multi, MultiGeneration, StreamReport};
 pub use placement::{DeviceSpec, Placement};

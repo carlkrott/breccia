@@ -534,6 +534,19 @@ pub fn find_mem_type(
     fallback
 }
 
+/// Every `vkQueueSubmit` this process has made, from any queue.
+///
+/// The chunked prefill's headline metric is **submits per block-chunk**, and a
+/// batch-level counter cannot see them: the staging readbacks, the one-shot
+/// uploads and every single-dispatch `wall_run` submit on their own. This counts
+/// the real thing (`docs/phase-4` §8aj).
+pub static SUBMITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`SUBMITS`] as a plain number.
+pub fn submits() -> u64 {
+    SUBMITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Gpu {
     pub fn create(host: &Host, dev: &Dev, index: u32) -> R<Gpu> {
         let instance = &host.instance;
@@ -1219,6 +1232,7 @@ impl Gpu {
         signal: Option<(&Timeline, u64)>,
     ) -> R<vk::Fence> {
         let (queue, _, _, _) = self.parts(q);
+        SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         unsafe {
             let fence = vk(
                 self.device

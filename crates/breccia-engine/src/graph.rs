@@ -323,6 +323,17 @@ pub struct Venue<'m> {
     pub ple_key_out: Buf,
     pub ple_value_out: Buf,
     pub ple_emb: Buf,
+    /// The chunked PLE phase's scratch (`docs/phase-4` §8aj), `Some` only for a
+    /// chunked session: the whole chunk's gathered rows as one stack
+    /// (`[t * ple_n_head, ple_dim]`), the chunk's packed table rows, the identity
+    /// index list that gather reads, and **one key / value output buffer per
+    /// token** — a `Buf` has no offset field, so a projection's output cannot be
+    /// a row range of a stack.
+    pub ple_emb_chunk: Option<Buf>,
+    pub ple_packed: Option<Buf>,
+    pub ple_idx: Option<Buf>,
+    pub ple_key_slots: Vec<Buf>,
+    pub ple_value_slots: Vec<Buf>,
     pub logits: Option<Buf>,
     /// Device-resident MoE scratch (`--gpu-experts`): `[k, n_ff]` gate/up/act,
     /// `[k, n_embd]` down, and the two row maps the device fills in.
@@ -485,8 +496,11 @@ pub struct Session<'m> {
     pub inbatch_read: bool,
     /// Tokens per prefill chunk (0 = token by token). The chunk's buffers live on
     /// the venue; the dense chain runs **per token** (unchanged) and only the
-    /// expert lane is grouped (§8s).
+    /// expert lane is grouped (§8s). This is the **cap** the scratch is sized for
+    /// ([`prefill_cap`]); the planner uses the target to split a prompt.
     pub prefill_chunk: usize,
+    /// The `--prefill-chunk` target the cap came from ([`prefill_plan`]).
+    prefill_target: usize,
     /// See [`SessionCfg::prefill_merged`].
     pub prefill_merged: bool,
     /// Host-side per-token routing for the chunk's grouped lane, and the chunk's
@@ -600,7 +614,7 @@ impl<'m> Session<'m> {
                 192 << 10
             };
             let chunk_slots = if i == 0 && cfg.prefill_chunk > 0 && model.devices.len() == 1 {
-                cfg.prefill_chunk
+                prefill_cap(cfg.prefill_chunk)
             } else {
                 1
             };
@@ -653,7 +667,7 @@ impl<'m> Session<'m> {
             let moe_map_up = alloc((2 * k * ff) as u64 * 4, "moe map up")?;
             let moe_map_down = alloc((2 * k * mc.n_embd) as u64 * 4, "moe map down")?;
             let chunk = if i == 0 && cfg.prefill_chunk > 0 && model.devices.len() == 1 {
-                cfg.prefill_chunk
+                prefill_cap(cfg.prefill_chunk)
             } else {
                 0
             };
@@ -678,6 +692,39 @@ impl<'m> Session<'m> {
                 }
                 (chunk_buf, slots, injects, boxes)
             };
+            // The chunked PLE phase's scratch (§8aj): the chunk's gathered rows,
+            // its packed table rows, the identity index list and one key/value
+            // output per token. Allocated once for the configured chunk, because a
+            // per-call allocation would cost more than the submits it deletes.
+            let (ple_emb_chunk, ple_packed, ple_idx, ple_key_slots, ple_value_slots) =
+                if chunk > 0 && !mc.ple.layers.is_empty() {
+                    let rows = chunk * mc.ple.n_head();
+                    let idx: Vec<u8> = (0..rows as u32).flat_map(|i| i.to_le_bytes()).collect();
+                    let mut keys = Vec::with_capacity(chunk);
+                    let mut values = Vec::with_capacity(chunk);
+                    for t in 0..chunk {
+                        keys.push(alloc(mc.hc_dim() as u64 * 4, &format!("PLE key slot {t}"))?);
+                        values.push(alloc(n * 4, &format!("PLE value slot {t}"))?);
+                    }
+                    (
+                        Some(alloc(
+                            rows as u64 * emb_ple.padded_cols() as u64 * 4,
+                            "the prefill chunk PLE embeddings",
+                        )?),
+                        Some(alloc(
+                            rows as u64 * model.ple_row_bytes() as u64,
+                            "the prefill chunk PLE packed rows",
+                        )?),
+                        Some(
+                            breccia_kernels::gemv::upload(gpu, &idx)
+                                .context("uploading the PLE gather index list")?,
+                        ),
+                        keys,
+                        values,
+                    )
+                } else {
+                    (None, None, None, Vec::new(), Vec::new())
+                };
             let moe_map = breccia_kernels::MoeMap::new(gpu)?;
             let moe_combine = breccia_kernels::MoeCombine::new(gpu)?;
             let moe_fanin = breccia_kernels::MoeFanIn::new(gpu)?;
@@ -754,6 +801,11 @@ impl<'m> Session<'m> {
                 ple_key_out,
                 ple_value_out,
                 ple_emb,
+                ple_emb_chunk,
+                ple_packed,
+                ple_idx,
+                ple_key_slots,
+                ple_value_slots,
                 logits,
                 moe_gate,
                 moe_up,
@@ -865,6 +917,11 @@ impl<'m> Session<'m> {
             batching: cfg.batching,
             inbatch_read: cfg.inbatch_read,
             prefill_chunk: if model.devices.len() == 1 {
+                prefill_cap(cfg.prefill_chunk)
+            } else {
+                0
+            },
+            prefill_target: if model.devices.len() == 1 {
                 cfg.prefill_chunk
             } else {
                 0
@@ -1569,7 +1626,8 @@ impl<'m> Session<'m> {
         }
         if t > self.prefill_chunk {
             bail!(
-                "prefill chunk of {t} tokens exceeds the configured chunk of {}",
+                "prefill chunk of {t} tokens exceeds the session's chunk cap of {} \
+                 (`prefill_cap(target)`; see `prefill_plan`)",
                 self.prefill_chunk
             );
         }
@@ -1586,6 +1644,11 @@ impl<'m> Session<'m> {
         let gpu = m.devices[dev].gpu();
         let hc_dim = mc.hc_dim();
         let wall0 = std::time::Instant::now();
+        let subs0 = self.submits;
+        // Every queue submission, not just the batch ring's: the staging
+        // readbacks and the one-shot uploads are what PLE batching removes, and a
+        // batch-level counter cannot see them (§8aj).
+        let q0 = breccia_vk::ctx::submits();
         self.pf_toks.clear();
         self.pf_toks.extend_from_slice(toks);
         self.pf_tokens += t;
@@ -1673,7 +1736,7 @@ impl<'m> Session<'m> {
             );
             eprintln!(
                 "prefill sum {:>7.2} · wall {:>7.2} · residual {:>7.2} ms/token \
-                 ({:.0}% unattributed) over {} tokens",
+                 ({:.0}% unattributed) over {} tokens · {} submits ({:.2}/block-chunk,                  {} from the batch ring)",
                 sum_ms,
                 wall_ms,
                 wall_ms - sum_ms,
@@ -1682,7 +1745,10 @@ impl<'m> Session<'m> {
                 } else {
                     0.0
                 },
-                t
+                t,
+                breccia_vk::ctx::submits() - q0,
+                (breccia_vk::ctx::submits() - q0) as f64 / mc.n_layers.max(1) as f64,
+                self.submits - subs0
             );
             self.timers.clear();
         }
@@ -1709,38 +1775,48 @@ impl<'m> Session<'m> {
         let k = mc.n_expert_used;
         let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
 
-        // ---- PLE: per-token fallback (it needs the residual on the host) -----
+        // ---- PLE: one batched phase for the whole chunk (§8aj) ---------------
         if mc.is_ple_layer(b) {
             self.timers.mark(PLE);
-            // Batch the IO half: hash every token's 16 table rows up front and
-            // fault them in with **one** `prefetch_rows` over `t * 16` rows, so the
-            // 90-byte-within-a-4-KiB-page reads of a 28.8 GiB table stop serialising
-            // per token (`docs/research/03`: 65 µs per cold row, 48x extent
-            // over-read). The host blocks stay sequential — the rolling context and
-            // the conv state are per token by definition.
-            let table = self.model.ple_table()?;
-            let row_bytes = self.model.ple_row_bytes();
-            let mut per: Vec<Vec<u32>> = Vec::with_capacity(t);
-            let mut all: Vec<u32> = Vec::with_capacity(t * 16);
-            {
-                let ple = self
-                    .ple
-                    .as_mut()
-                    .ok_or_else(|| anyhow!("no PLE host state"))?;
-                for i in 0..t {
-                    let r = ple.rows_for(self.pf_toks[i]);
-                    all.extend_from_slice(&r);
-                    per.push(r);
+            // The batched form needs the chunk scratch, a chunk of more than one
+            // token and no `BRECCIA_NO_PLE_BATCH` (the A/B arm, and the revert
+            // path). Everything else keeps the per-token host round trip.
+            let batched = t > 1
+                && self.venues[dev].ple_emb_chunk.is_some()
+                && std::env::var_os("BRECCIA_NO_PLE_BATCH").is_none();
+            if batched {
+                self.ple_chunk(b, t)?;
+            } else {
+                // Batch the IO half: hash every token's 16 table rows up front and
+                // fault them in with **one** `prefetch_rows` over `t * 16` rows, so
+                // the 90-byte-within-a-4-KiB-page reads of a 28.8 GiB table stop
+                // serialising per token (`docs/research/03`: 65 µs per cold row,
+                // 48x extent over-read). The host blocks stay sequential — the
+                // rolling context and the conv state are per token by definition.
+                let table = self.model.ple_table()?;
+                let row_bytes = self.model.ple_row_bytes();
+                let mut per: Vec<Vec<u32>> = Vec::with_capacity(t);
+                let mut all: Vec<u32> = Vec::with_capacity(t * 16);
+                {
+                    let ple = self
+                        .ple
+                        .as_mut()
+                        .ok_or_else(|| anyhow!("no PLE host state"))?;
+                    for i in 0..t {
+                        let r = ple.rows_for(self.pf_toks[i]);
+                        all.extend_from_slice(&r);
+                        per.push(r);
+                    }
                 }
-            }
-            let t_prefetch = std::time::Instant::now();
-            prefetch_rows(table, &all, row_bytes);
-            self.pf_ple_prefetch_s += t_prefetch.elapsed().as_secs_f64();
-            for (i, rows) in per.iter().enumerate() {
-                self.swap_r_in(dev, i);
-                self.cur_tok = self.pf_toks[i];
-                self.ple_step_rows(b, rows)?;
-                self.swap_r_in(dev, i);
+                let t_prefetch = std::time::Instant::now();
+                prefetch_rows(table, &all, row_bytes);
+                self.pf_ple_prefetch_s += t_prefetch.elapsed().as_secs_f64();
+                for (i, rows) in per.iter().enumerate() {
+                    self.swap_r_in(dev, i);
+                    self.cur_tok = self.pf_toks[i];
+                    self.ple_step_rows(b, rows)?;
+                    self.swap_r_in(dev, i);
+                }
             }
         }
 
@@ -2889,6 +2965,169 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// The **chunked** PLE phase (§8aj): one flush, one concatenated upload, `t`
+    /// gathers-worth of batched GPU work, one readback, `t` host blocks, one
+    /// writeback — instead of a host round trip per token.
+    ///
+    /// The per-token preamble costs ~9 submits (measured: 13.6 per block-chunk
+    /// against 2 for the dense passes), and a submit+fence is a fixed 56 µs
+    /// regardless of what it carries, so the unit to delete is the submit. The
+    /// shape here is:
+    ///
+    /// ```text
+    /// host   hash `t` tokens (ordered), pack `t*16` rows, prefetch them
+    /// batch  upload the packed rows → 1 gather over `t*16` rows → per token
+    ///        copy the token's row range into `ple_emb`, key GEMV, value GEMV
+    /// read   R, key and value for every token in **one** `read_batch`
+    /// host   the `t` blocks, in sequence (the rolling context and conv state)
+    /// write  the `t` new residuals in **one** region-array writeback
+    /// ```
+    ///
+    /// The copies exist because `Buf` has no offset field: the gather's output is
+    /// one stack, and a projection can only read a buffer from 0. The key/value
+    /// outputs are one buffer per token for the same reason, which also lets the
+    /// readback address them as an offset list.
+    fn ple_chunk(&mut self, b: usize, t: usize) -> Result<()> {
+        if t == 0 {
+            return Ok(());
+        }
+        let m = self.model;
+        let mc = &m.cfg;
+        let raw = m
+            .ple
+            .as_ref()
+            .ok_or_else(|| anyhow!("block {b} runs PLE but the model has no PLE tensors"))?;
+        let table = m.ple_table()?;
+        let row_bytes = m.ple_row_bytes();
+        let n_head = mc.ple.n_head();
+        let hc_dim = mc.hc_dim();
+        let n_embd = mc.n_embd;
+        let dev = m.device_of(b);
+        let gpu = m.devices[dev].gpu();
+
+        // ---- 1. the host hash, in sequence, then one prefetch and one pack ----
+        //
+        // The hash advances the rolling context, so it cannot be batched; the
+        // table rows it produces can. One `prefetch_rows` over `t*16` rows keeps
+        // the 90-byte-within-a-4-KiB-page reads of the 28.8 GiB table from
+        // serialising per token (`docs/research/03`, §8z).
+        let mut rows: Vec<u32> = Vec::with_capacity(t * n_head);
+        {
+            let ple = self
+                .ple
+                .as_mut()
+                .ok_or_else(|| anyhow!("no PLE host state"))?;
+            for &tok in self.pf_toks.iter().take(t) {
+                rows.extend_from_slice(&ple.rows_for(tok));
+            }
+        }
+        let t_prefetch = std::time::Instant::now();
+        prefetch_rows(table, &rows, row_bytes);
+        self.pf_ple_prefetch_s += t_prefetch.elapsed().as_secs_f64();
+        let packed = EmbGather::pack_rows(table, row_bytes, &rows)?;
+
+        // ---- 2. one batch: upload, gather, `2t` projections, `t` view copies --
+        self.ensure_batch(dev)?;
+        {
+            let v = &self.venues[dev];
+            let emb_chunk = v
+                .ple_emb_chunk
+                .as_ref()
+                .ok_or_else(|| anyhow!("no PLE chunk scratch on device {dev}"))?;
+            let packed_buf = v
+                .ple_packed
+                .as_ref()
+                .ok_or_else(|| anyhow!("no PLE packed-row buffer on device {dev}"))?;
+            let idx = v
+                .ple_idx
+                .as_ref()
+                .ok_or_else(|| anyhow!("no PLE gather index list on device {dev}"))?;
+            let key_slots = &v.ple_key_slots;
+            let value_slots = &v.ple_value_slots;
+            if key_slots.len() < t || value_slots.len() < t {
+                bail!(
+                    "the PLE key/value slots cover {} tokens, not {t}",
+                    key_slots.len()
+                );
+            }
+            // The upload rides the batch: a `Staging::write` here would cost a
+            // submit + fence in front of the work that consumes it.
+            self.stagings[dev].record_upload(gpu, packed_buf, 0, &packed)?;
+            // `t * 16` rows of the chunk at once, token-major, stride
+            // `ple.padded_cols()`: token `i`'s rows are `i*n_head .. (i+1)*n_head`.
+            v.emb_ple.run(packed_buf, idx, emb_chunk, t * n_head)?;
+            let view = (n_head * v.emb_ple.padded_cols() * 4) as u64;
+            for i in 0..t {
+                batch_cmd::record_copy(
+                    gpu,
+                    &v.ple_emb,
+                    0,
+                    emb_chunk,
+                    i as u64 * view,
+                    (n_embd * 4) as u64,
+                )?;
+                v.pipes
+                    .get(&raw.key.key)?
+                    .run(&raw.key.buf, &v.ple_emb, &key_slots[i])?;
+                v.pipes
+                    .get(&raw.value.key)?
+                    .run(&raw.value.buf, &v.ple_emb, &value_slots[i])?;
+            }
+        }
+        self.submit_batch()?;
+
+        // ---- 3. one readback for the whole chunk ------------------------------
+        //
+        // `read_batch` waits for the batch above (same queue, one fence), so the
+        // `t` tokens' R/key/value arrive in a single round trip.
+        let parts = {
+            let v = &self.venues[dev];
+            let mut items: Vec<(&Buf, u64, usize)> = Vec::with_capacity(3 * t);
+            for i in 0..t {
+                items.push((&v.r_slots[i], 0, hc_dim * 4));
+                items.push((&v.ple_key_slots[i], 0, hc_dim * 4));
+                items.push((&v.ple_value_slots[i], 0, n_embd * 4));
+            }
+            self.stagings[dev].read_batch(gpu, &items)?
+        };
+
+        // ---- 4. the host blocks, in sequence, then one writeback --------------
+        let mut out = vec![0f32; t * hc_dim];
+        {
+            let ple = self
+                .ple
+                .as_mut()
+                .ok_or_else(|| anyhow!("no PLE host state"))?;
+            for i in 0..t {
+                let r_host = f32_from_bytes(&parts[3 * i]);
+                let key = f32_from_bytes(&parts[3 * i + 1]);
+                let value = f32_from_bytes(&parts[3 * i + 2]);
+                ple.block(
+                    &r_host,
+                    &key,
+                    &value,
+                    &mut out[i * hc_dim..(i + 1) * hc_dim],
+                )?;
+            }
+        }
+        let bytes = f32_to_bytes(&out);
+        {
+            let v = &self.venues[dev];
+            let items: Vec<(&Buf, u64, &[u8])> = (0..t)
+                .map(|i| {
+                    (
+                        &v.r_slots[i],
+                        0,
+                        &bytes[i * hc_dim * 4..(i + 1) * hc_dim * 4],
+                    )
+                })
+                .collect();
+            self.stagings[dev].write_regions(gpu, &items)?;
+        }
+        self.cur_tok = self.pf_toks[t - 1];
+        Ok(())
+    }
+
     /// Digest every stage of a GDN sublayer's workspace.
     fn gdn_trace(&mut self, dev: usize) -> Result<GdnTrace> {
         self.flush()?;
@@ -2970,10 +3209,12 @@ impl<'m> Session<'m> {
         let mut logits = Vec::new();
         if self.prefill_chunk > 0 {
             // Chunked prompt pass (§8s): same tokens, same arithmetic, grouped
-            // expert lane.
-            for part in prompt.chunks(self.prefill_chunk) {
-                logits = self.prefill(part, pos)?;
-                pos += part.len();
+            // expert lane. The chunk sizes come from the planner, so a prompt does
+            // not end in a tiny tail chunk (`prefill_plan`). `pos` is the outer
+            // one — decode continues from it.
+            for len in prefill_plan(prompt.len(), self.prefill_target) {
+                logits = self.prefill(&prompt[pos..pos + len], pos)?;
+                pos += len;
             }
         } else {
             for &t in prompt {
@@ -3074,7 +3315,19 @@ impl Drop for Session<'_> {
             if let Some(rc) = &v.r_chunk {
                 gpu.destroy_buf(rc);
             }
-            for b in v.r_slots.iter().chain(v.inject_slots.iter()) {
+            for b in v
+                .r_slots
+                .iter()
+                .chain(v.inject_slots.iter())
+                .chain(v.ple_key_slots.iter())
+                .chain(v.ple_value_slots.iter())
+            {
+                gpu.destroy_buf(b);
+            }
+            for b in [&v.ple_emb_chunk, &v.ple_packed, &v.ple_idx]
+                .into_iter()
+                .flatten()
+            {
                 gpu.destroy_buf(b);
             }
             for mb in &v.moe_out {
@@ -3202,6 +3455,52 @@ fn prefetch_rows(table: &[u8], rows: &[u32], row_bytes: usize) {
     });
 }
 
+/// The **hard cap** a chunked session allocates for, from the `--prefill-chunk`
+/// target: `1.5 x target`.
+///
+/// A prompt's prefill cost is `n_chunks * fixed + len * per_token`, and the fixed
+/// part is not small — one chunk runs the whole grouped expert lane over all 48
+/// blocks (`docs/research/07` §C1.3: 4-token tail = 658 ms/token against 88 for a
+/// full chunk). So the number of chunks is the thing to minimise, and
+/// `ceil(len / target)` leaves a tiny tail whenever `len` is a little over a
+/// multiple of the target (`132 = 64 + 64 + 4`). The slack lets the planner use
+/// `ceil(len / cap)` chunks instead — two chunks of 66 for that prompt — at the
+/// cost of 50 % more chunk scratch (~100 KiB/token), which is noise beside the
+/// weights.
+pub fn prefill_cap(target: usize) -> usize {
+    if target == 0 {
+        0
+    } else {
+        target + target / 2
+    }
+}
+
+/// The chunk sizes a prompt of `len` tokens is prefilled in, for a
+/// `--prefill-chunk` target: the **fewest** chunks allowed by
+/// [`prefill_cap`], split **evenly**.
+///
+/// Even splitting is what removes the tail: with `n = ceil(len / cap)` every chunk
+/// is at least `len / n > cap * (n-1) / n >= cap/2`, so no chunk can be tiny. It
+/// also never exceeds the cap, so the scratch allocated for
+/// [`prefill_cap`] is enough.
+pub fn prefill_plan(len: usize, target: usize) -> Vec<usize> {
+    let cap = prefill_cap(target);
+    if len == 0 || cap == 0 || target == 0 {
+        return Vec::new();
+    }
+    // A/B arm and revert path (`docs/phase-4` §8aj): the pre-planner split, greedy
+    // `target`-sized chunks with whatever tail is left.
+    if std::env::var_os("BRECCIA_NO_PREFILL_PLAN").is_some() {
+        let n = len.div_ceil(target);
+        let mut v = vec![target; n];
+        v[n - 1] = len - (n - 1) * target;
+        return v;
+    }
+    let n = len.div_ceil(cap);
+    let (base, rem) = (len / n, len % n);
+    (0..n).map(|i| base + usize::from(i < rem)).collect()
+}
+
 fn hc_read(v: &Venue<'_>, w: &HcW, r: &Buf) -> Result<()> {
     let hw = HcWeights {
         norm: &w.norm,
@@ -3268,4 +3567,52 @@ pub fn assert_head(m: &Model) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// The chunk planner is pure, and the number it removes is measured: a
+    /// 132-token prompt at `--prefill-chunk 64` used to be `64 + 64 + 4`, where the
+    /// 4-token tail ran at 658 ms/token against 88 (`docs/research/07` §C1.3). The
+    /// plan must instead be the fewest chunks the cap allows, split evenly.
+    #[test]
+    fn the_plan_never_leaves_a_tiny_tail_chunk() {
+        let cap = super::prefill_cap(64);
+        assert_eq!(cap, 96);
+        // The gate prompt and the two agent prefixes.
+        assert_eq!(super::prefill_plan(132, 64), vec![66, 66]);
+        assert_eq!(super::prefill_plan(300, 64), vec![75, 75, 75, 75]);
+        assert_eq!(super::prefill_plan(64, 64), vec![64]);
+        // A prompt under the cap is one chunk, at the target or not.
+        assert_eq!(super::prefill_plan(1, 64), vec![1]);
+        assert_eq!(super::prefill_plan(95, 64), vec![95]);
+        // Just over the cap is two balanced chunks, not cap + a stub.
+        assert_eq!(super::prefill_plan(97, 64), vec![49, 48]);
+        // Every plan tiles the prompt, never exceeds the cap, and every chunk is
+        // at least half the cap (so no chunk is "pure overhead").
+        for len in [1usize, 2, 63, 64, 65, 96, 97, 132, 193, 300, 4096] {
+            let plan = super::prefill_plan(len, 64);
+            assert_eq!(plan.iter().sum::<usize>(), len, "len {len}: {plan:?}");
+            assert!(
+                plan.iter().all(|t| *t <= cap),
+                "len {len}: {plan:?} exceeds the cap"
+            );
+            // A prompt longer than half a chunk must never be split into a stub:
+            // every chunk is at least half the cap.
+            if len > cap / 2 {
+                assert!(
+                    plan.iter().all(|t| *t >= cap / 2),
+                    "len {len}: {plan:?} has a tiny chunk"
+                );
+            }
+            assert_eq!(
+                plan.len(),
+                len.div_ceil(cap),
+                "len {len}: {plan:?} is not the fewest chunks"
+            );
+        }
+        // `0` stays token by token, which is the caller's fallback.
+        assert!(super::prefill_plan(132, 0).is_empty());
+        assert!(super::prefill_plan(0, 64).is_empty());
+    }
 }

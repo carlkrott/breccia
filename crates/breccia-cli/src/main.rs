@@ -1579,9 +1579,9 @@ fn feed_prompt(
     let mut logits = Vec::new();
     if chunk > 0 {
         let mut pos = 0usize;
-        for part in prompt.chunks(chunk) {
-            logits = sess.prefill(part, pos)?;
-            pos += part.len();
+        for len in breccia_engine::prefill_plan(prompt.len(), chunk) {
+            logits = sess.prefill(&prompt[pos..pos + len], pos)?;
+            pos += len;
         }
         return Ok(logits);
     }
@@ -2081,9 +2081,9 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         logits = vec![Vec::new(); n];
         for (s, sess) in multi.streams.iter_mut().enumerate() {
             let mut pos = 0usize;
-            for part in padded[s].chunks(a.prefill_chunk) {
-                logits[s] = sess.prefill(part, pos)?;
-                pos += part.len();
+            for len in breccia_engine::prefill_plan(padded[s].len(), a.prefill_chunk) {
+                logits[s] = sess.prefill(&padded[s][pos..pos + len], pos)?;
+                pos += len;
             }
         }
     } else {

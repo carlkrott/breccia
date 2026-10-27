@@ -279,6 +279,112 @@ impl Staging {
         Ok(secs)
     }
 
+    /// Stage `data` in the mapping's upload area and record the host→device copy
+    /// into the **open batch** instead of submitting one of its own.
+    ///
+    /// A chunked prefill's PLE phase is the caller (§8aj): its packed table rows
+    /// are one concatenated block, and a `write` per chunk would put a
+    /// submit+fence (~56 µs) in front of the batch that consumes it for no reason
+    /// — `vkQueueSubmit` already orders prior host writes to coherent memory
+    /// against the submitted work, so recording the copy is enough.
+    ///
+    /// The upload area is the head of the buffer past the block region; the caller
+    /// must not [`Staging::read_batch`] until this batch has been waited for (the
+    /// read lands in the same bytes, after the copy has been consumed).
+    pub fn record_upload(&mut self, gpu: &Gpu, dst: &Buf, dst_off: u64, data: &[u8]) -> Result<()> {
+        let len = data.len() as u64;
+        if len > self.cap {
+            return Err(anyhow!(
+                "upload of {len} bytes exceeds the {}-byte staging buffer",
+                self.cap
+            ));
+        }
+        if dst_off.saturating_add(len) > dst.size {
+            return Err(anyhow!(
+                "upload of {len} bytes at offset {dst_off} is outside a {}-byte buffer",
+                dst.size
+            ));
+        }
+        // SAFETY: `len <= cap` was checked above and the mapping covers
+        // `cap + BLOCK_REGION + TAIL_PAD` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                self.ptr.add(self.region as usize),
+                data.len(),
+            )
+        };
+        breccia_kernels::batch_cmd::record_copy(gpu, dst, dst_off, &self.buf, self.region, len)?;
+        self.bytes_up += len;
+        Ok(())
+    }
+
+    /// Host→device for several `(buffer, offset, bytes)` items: every block goes
+    /// into the staging mapping, then one command buffer carries one copy per
+    /// item behind a single fence.
+    ///
+    /// The chunked PLE phase writes `t` residuals back after its host block, and
+    /// `Buf` has no offset field — so the items are distinct buffers and a
+    /// per-buffer [`Staging::write`] would be `t` submissions (§8aj).
+    pub fn write_regions(&mut self, gpu: &Gpu, items: &[(&Buf, u64, &[u8])]) -> Result<f64> {
+        if items.is_empty() {
+            return Ok(0.0);
+        }
+        let total: u64 = items.iter().map(|(_, _, d)| d.len() as u64).sum();
+        if total > self.cap {
+            return Err(anyhow!(
+                "write of {total} bytes exceeds the {}-byte staging buffer",
+                self.cap
+            ));
+        }
+        for (dst, off, data) in items {
+            if off.saturating_add(data.len() as u64) > dst.size {
+                return Err(anyhow!(
+                    "write of {} bytes at offset {off} is outside a {}-byte buffer",
+                    data.len(),
+                    dst.size
+                ));
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let mut regions: Vec<(vk::Buffer, vk::BufferCopy)> = Vec::with_capacity(items.len());
+        let mut at = self.region;
+        for (dst, off, data) in items {
+            // SAFETY: the blocks tile `total <= cap`, checked above, and the
+            // mapping covers `cap + BLOCK_REGION + TAIL_PAD` bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(at as usize), data.len())
+            };
+            regions.push((
+                dst.buf,
+                vk::BufferCopy::default()
+                    .src_offset(at)
+                    .dst_offset(*off)
+                    .size(data.len() as u64),
+            ));
+            at += data.len() as u64;
+        }
+        let src = self.buf.buf;
+        gpu.record(Qc::C, |d, cmd| unsafe {
+            Gpu::barrier_all(d, cmd);
+            for (dst, region) in &regions {
+                d.cmd_copy_buffer(cmd, src, *dst, std::slice::from_ref(region));
+            }
+            Gpu::barrier_all(d, cmd);
+        })
+        .map_err(|e| anyhow!("recording the writeback: {e}"))?;
+        let fence = gpu
+            .submit(Qc::C)
+            .map_err(|e| anyhow!("submitting the writeback: {e}"))?;
+        gpu.wait_fence(fence)
+            .map_err(|e| anyhow!("waiting for the writeback: {e}"))?;
+        let secs = t0.elapsed().as_secs_f64();
+        self.bytes_up += total;
+        self.trips_up += 1;
+        self.seconds_up += secs;
+        Ok(secs)
+    }
+
     /// Read a single `f32` vector back (token logits, router weights, …).
     pub fn read_f32(&mut self, gpu: &Gpu, src: &Buf, n: usize) -> Result<Vec<f32>> {
         let v = self.read_batch(gpu, &[(src, 0, n * 4)])?;
