@@ -119,6 +119,39 @@ impl MultiGeneration {
     }
 }
 
+/// `BRECCIA_BLOCK_MAJOR=1`: submit **all** streams' block *b+1* only after the
+/// last stream's block-*b* lane, instead of each stream submitting its own right
+/// after its lane. The lanes then read block *b*'s expert blob back to back with
+/// no fresh GPU submission (and no *b+1* dense weights) in between — the shape
+/// that hypothesis wants (§2 of the Vulkan levers assessment). Off by default,
+/// and the schedule it changes touches no numerics: block *b*'s dependency chain
+/// is unchanged, only *when* the next block is handed to the queue. Cached.
+fn block_major_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_BLOCK_MAJOR").is_some())
+}
+
+/// When block *b+1* is recorded, relative to the lanes of block *b*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Submit {
+    /// After this stream's own lane — the default stream-major shape.
+    Now,
+    /// Once every stream's block-*b* lane has run.
+    AtBlockEnd,
+    /// Last block: there is no *b+1* to record.
+    Never,
+}
+
+fn submit_plan(block_major: bool, b: usize, n_layers: usize) -> Submit {
+    if b + 1 >= n_layers {
+        Submit::Never
+    } else if block_major {
+        Submit::AtBlockEnd
+    } else {
+        Submit::Now
+    }
+}
+
 /// N independent sequences over N single-device sessions.
 pub struct Multi<'m> {
     pub streams: Vec<Session<'m>>,
@@ -184,12 +217,14 @@ impl<'m> Multi<'m> {
             sess.begin_token(t, pos)?;
         }
         let n_layers = self.streams[0].model.cfg.n_layers;
+        let block_major = block_major_order();
         let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
         let mut digests = Vec::with_capacity(n);
         for sess in self.streams.iter_mut() {
             digests.push(sess.submit_block(0, &mut no_trace)?);
         }
         for b in 0..n_layers {
+            let plan = submit_plan(block_major, b, n_layers);
             #[allow(clippy::needless_range_loop)]
             for s in 0..n {
                 // Was another stream's GPU work in flight while this lane runs?
@@ -198,12 +233,24 @@ impl<'m> Multi<'m> {
                 let t0 = std::time::Instant::now();
                 self.streams[s].finish_block(b, d, &mut no_trace, covered)?;
                 let t1 = std::time::Instant::now();
-                if b + 1 < n_layers {
+                if plan == Submit::Now {
                     digests[s] = self.streams[s].submit_block(b + 1, &mut no_trace)?;
+                    self.t_submit += t1.elapsed().as_secs_f64();
                 }
-                let t2 = std::time::Instant::now();
                 self.t_finish += t1.duration_since(t0).as_secs_f64();
-                self.t_submit += t2.duration_since(t1).as_secs_f64();
+            }
+            // Block-major: every stream's *b+1* goes in only now, so the lanes
+            // above all read block *b*'s weights with nothing new submitted.
+            // shortcut: only the *submit* point moves — a batch the recorder
+            // closes at SOFT_LIMIT still flushes mid-lane, and with one stream
+            // there is nothing to group; upgrade if a stream's lanes still get
+            // evicted by its own partial batch.
+            if plan == Submit::AtBlockEnd {
+                for s in 0..n {
+                    let t1 = std::time::Instant::now();
+                    digests[s] = self.streams[s].submit_block(b + 1, &mut no_trace)?;
+                    self.t_submit += t1.elapsed().as_secs_f64();
+                }
             }
         }
         // The per-stream heads interleave too: submit both, then read both.
@@ -277,5 +324,31 @@ impl<'m> Multi<'m> {
             steps,
             steps_s,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{submit_plan, Submit};
+
+    /// Unset (`block_major = false`) must keep the stream-major shape exactly:
+    /// each stream records its own *b+1* right after its own lane.
+    #[test]
+    fn default_submits_after_each_stream_lane() {
+        for b in 0..47 {
+            assert_eq!(submit_plan(false, b, 48), Submit::Now);
+        }
+    }
+
+    /// On, every block is handed in once all its lanes have run — and the last
+    /// block still has nothing to record, or the loop would submit past the end.
+    #[test]
+    fn block_major_defers_to_the_block_end() {
+        for b in 0..47 {
+            assert_eq!(submit_plan(true, b, 48), Submit::AtBlockEnd);
+        }
+        assert_eq!(submit_plan(true, 47, 48), Submit::Never);
+        assert_eq!(submit_plan(false, 47, 48), Submit::Never);
+        assert_eq!(submit_plan(true, 0, 1), Submit::Never);
     }
 }
