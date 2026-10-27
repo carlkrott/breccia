@@ -4459,6 +4459,70 @@ The measured *target* the work is aiming at: 0.53 x the KV bytes per cell (34 B 
 vs 64 B for f16), which is ~495 MiB instead of 933 MiB per agent at 32K, and research 9's
 attention-time ratio (11.7 -> 3.8 ms/token at 32K) on top of it.
 
+## 8be. The 640 MiB "workspace" is the **KV pools** — tiling the attention would buy 0.4 %
+
+The premise for this round was that ~640 MiB of the 933 MiB per agent at 32K was per-call
+scratch, so tiling the attention over KV blocks (flash/paged online softmax) would recover it for
+free. The attribution below (measured with `BRECCIA_DUMP_LAYOUT=1`, per QSA block, at 256 and
+32 768 cells) says otherwise: **the state is the cache, not the scratch.**
+
+### Attribution, per QSA block (12 of them), measured
+
+| buffer | 256 cells | 32 768 cells | scales with | allocation site |
+|---|---:|---:|---|---|
+| `k_pool` | 262 208 B | **33 554 496 B** | cells x 2 heads x 256 dims x 2 B (f16) | `QsaState::new` ("kv k_pool") |
+| `v_pool` | 262 208 B | **33 554 496 B** | same | `QsaState::new` ("kv v_pool") |
+| `idx_pooled` | 33 344 B | **4 194 880 B** | `max_blocks = cells/4 + 1` x 128 dims x 4 B | `QsaState::new` ("indexer pooled") |
+| `idx_tail` | 1 600 B | 1 600 B | constant (3 x 128) | `QsaState::new` |
+| page table + positions | ~1 KiB | ~132 KiB | cells | `QsaState::new` |
+| **per-call workspace** (`q_full`, `q`, `k_cur`, `v_cur`, `idx_q`, `idx_k`, `idx_scores`, `ids`, `counts`, `attn`, `attn_out`) | — | **≤ 4 MiB** (see below) | **one token** x `slots` / `n_blocks` | `QsaWorkspace::new` |
+
+At 32K the twelve QSA blocks are 12 x (64 MiB pools + 4 MiB pooled keys + 0.13 MiB tables) =
+**817 MiB**, GDN's recurrent state is ~110 MiB, and the workspaces are ~4 MiB: 817 + 110 + 4 + 2
+= 933 MiB ✓. The workspace is already **O(one token)** — `attn` is `24 x 1 x slots` = 197 KiB even
+at 32K, `idx_scores` is `n_blocks` = 32 KiB — so it can never be 640 MiB, and tiling it would
+save **≤ 4 MiB of 933 (0.4 %)**. The `slots`-sized buffers are the *attention window of one
+token*, not the context; the thing that is O(context) is the KV the window reads.
+
+**Consequence: the flash-style tiling is not implemented, on purpose.** It is a three-shader
+rewrite that changes the reduction order, and it would buy 0.4 % of state. §8bd's "the per-call
+workspace that grows with `n_blocks`/`slots` is the rest" was wrong and is corrected here.
+
+### Capacity arithmetic on this box (2 x 16 GiB, measured bytes)
+
+| configuration | per agent | agents that fit |
+|---|---:|---:|
+| 32K, f16 KV, no expert arena | 933 MiB + 3.7 GiB weights (shared) | state-wise ~30; throughput-bound long before |
+| 32K, f16 KV, 30-block arena (25 GiB) | 933 MiB | **3** (32 − 3.7 − 25 = 3.3 GiB) |
+| 64K, f16 KV, 30-block arena | 1751 MiB | **1-2** |
+| 32K, **q8_0 KV** (0.53x bytes), 30-block arena | ~495 MiB | **6** |
+| 64K, q8_0 KV, 30-block arena | ~930 MiB | **3** |
+
+So the plan's "1-2 slots -> 5-7 slots" is reproduced by arithmetic from the measured f16 bytes,
+and **q8_0 KV is still the lever**: 4 agents x 933 MiB = 3.7 GiB does not fit beside the arena
+(3.3 GiB), while 4 x 495 = 1.9 GiB does. Tiling the scratch changes none of these numbers.
+
+### Measured, 32K context
+
+| streams | arena | aggregate | per stream | notes |
+|---|---|---:|---:|---|
+| 2 | 9-block default | **23.74 tok/s** | 11.87 tok/s (84.2 ms/token) | lane 56.1 ms/step, fence 9.7, overlap 100 %, both streams greedy-identical to the reference |
+| 4 | none | not measured | — | blocked twice: a genuine co-tenant held 14 GiB of the RX in this window (`REQUIRE_QUIET` refused, correctly) |
+| 6 | none | not measured | — | same window |
+
+One real bug came out of trying: `co_tenant_check` fired on **its own** earlier streams ("another
+process holds 826 MiB" on stream 1 of a 4-stream run), because each stream loads its own model.
+It now runs only for the first model a process opens; the guard's purpose is a foreign process,
+and an in-process multi-stream run must not trip it.
+
+### What is left
+
+* **4- and 6-stream numbers at 32K** — the arithmetic says they fit with q8_0 KV and *not* with
+  f16 + arena, which is exactly why the two are one item; the measurement needs a quiet window
+  long enough for 4-6 model loads.
+* **q8_0 KV** — still required, with the byte arithmetic above as the reason, and §8bd's plan
+  unchanged (append quantising on write, both attention kernels dequantising in registers).
+
 ## 9. Exact commands
 
 

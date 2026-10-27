@@ -1358,6 +1358,14 @@ fn head_candidates(
 /// holds the difference. The default is a loud warning (a shared box is a legitimate
 /// way to run the engine); `BRECCIA_REQUIRE_QUIET=1` makes it fatal.
 fn co_tenant_check(devices: &[Device], verbose: bool) -> Result<()> {
+    // Only the **first** model this process opens can be checked: a multi-stream run
+    // loads one model per stream, and the earlier streams' own VRAM is not a co-tenant.
+    // (Found the hard way: a 4-stream 32K run aborted on stream 1 with 826 MiB "held by
+    // another process" — its own stream 0.)
+    static OPENS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    if OPENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+        return Ok(());
+    }
     const SLACK: u64 = 512 << 20;
     let strict = std::env::var_os("BRECCIA_REQUIRE_QUIET").is_some();
     for (i, dev) in devices.iter().enumerate() {
