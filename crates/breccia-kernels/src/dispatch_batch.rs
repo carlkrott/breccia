@@ -437,7 +437,7 @@ pub mod probe {
     /// families that have internal stages (`qsa`, `gdn`), so a mark inside a
     /// kernel and a mark in the graph land in the same column. Append-only: the
     /// ids are what a probe table is compared against between rounds (§8ax).
-    pub const MAX: usize = 36;
+    pub const MAX: usize = 40;
     /// The closing stamp of a submission (not a stage).
     pub const CLOSE: u8 = 255;
 
@@ -473,6 +473,14 @@ pub mod probe {
     /// The GDN projections, split (§8ax): `GDN_PROJ` is `attn_qkv`, then `z`
     /// (the output gate), and the two 48-row `beta`/`alpha` projections, which are
     /// 6 workgroups each and therefore pure latency.
+    /// The HC_READ chain, split (§8ay): the RMSNorm, the 320-row bottleneck `down`
+    /// (+ its split-K `reduce`), the 10 240-row `up`, and the gated mean. Two of the
+    /// five are **one workgroup** (`norm`, `gated`), i.e. pure dispatch latency.
+    pub const HC_NORM: u8 = 32;
+    pub const HC_DOWN: u8 = 33;
+    pub const HC_REDUCE: u8 = 34;
+    pub const HC_UP: u8 = 35;
+    pub const HC_GATED: u8 = 36;
     pub const GDN_Z: u8 = 29;
     pub const GDN_BETA: u8 = 30;
     pub const GDN_ALPHA: u8 = 31;
@@ -511,7 +519,11 @@ pub mod probe {
         "gdn-z",
         "gdn-beta",
         "gdn-alpha",
-        "",
+        "hc-norm",
+        "hc-down",
+        "hc-reduce",
+        "hc-up",
+        "hc-gated",
         "",
         "",
         "",

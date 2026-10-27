@@ -128,6 +128,11 @@ pub struct GdnWorkspace {
     pub alpha: Buf,
     /// `[T, 48]` raw `ssm_beta`.
     pub beta_raw: Buf,
+    /// `[T, 96]` the **merged** `beta | alpha` projection output (§8ay): one
+    /// 96-row GEMV replaces the two 48-row dispatches. Row `i` is beta, row
+    /// `T*h_v + i` is alpha; `beta_gate` reads both through this one buffer, so a
+    /// token's worth is contiguous and no consumer needs a copy.
+    pub beta_alpha: Buf,
     /// `[T, 48]` `sigmoid(beta_raw)`.
     pub beta: Buf,
     /// `[T, 48]` `softplus(alpha + dt) * a`.
@@ -146,6 +151,7 @@ impl GdnWorkspace {
             &self.alpha,
             &self.beta_raw,
             &self.beta,
+            &self.beta_alpha,
             &self.gate,
             &self.step,
             &self.normed,
@@ -171,6 +177,8 @@ pub struct GdnWeights<'a> {
 
 /// The five GDN-only dispatches, compiled once per device.
 pub struct Gdn<'g> {
+    /// `beta`/`alpha` are one 96-row GEMV and one output buffer (§8ay).
+    merged: bool,
     conv: Pipe<'g>,
     qk_l2: Pipe<'g>,
     gate: Pipe<'g>,
@@ -178,9 +186,31 @@ pub struct Gdn<'g> {
     norm_gate: Pipe<'g>,
 }
 
+/// `beta` and `alpha` (both `[48, n_embd]`) are run as **one** 96-row GEMV
+/// (§8ay). The two matrices read the same input row and produce independent output
+/// rows, so concatenating them along rows changes no accumulation order: the
+/// outputs are bit-identical to the two separate dispatches
+/// (`conformance::merged_beta_alpha_is_bit_identical`), and it removes 36
+/// dependent 48-row dispatches per token (11.5 us of pure latency each).
+///
+/// `BRECCIA_NO_GDN_MERGE=1` restores the two-dispatch path — the A/B arm and the
+/// revert. Cached: read once when the session's weight layout is built.
+pub fn beta_alpha_merged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_NO_GDN_MERGE").is_none())
+}
+
 impl<'g> Gdn<'g> {
     pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Self::with_merge(gpu, beta_alpha_merged())
+    }
+
+    /// [`Gdn::new`] with the `beta|alpha` shape chosen explicitly: `true` reads the
+    /// merged 96-row buffer, `false` the two 48-row ones. The conformance suite
+    /// builds both to prove they agree bit for bit (§8ay).
+    pub fn with_merge(gpu: &'g Gpu, merged: bool) -> Result<Self> {
         Ok(Gdn {
+            merged,
             conv: Pipe::new(
                 gpu,
                 include_bytes!(concat!(env!("OUT_DIR"), "/gdn_conv.spv")),
@@ -219,12 +249,16 @@ impl<'g> Gdn<'g> {
         if tokens == 0 {
             return Err(anyhow!("gdn workspace needs tokens >= 1"));
         }
+        // Order matches the `GdnWorkspace` fields exactly (positional `take()`
+        // below): qkv, z, alpha, beta_raw, beta, **beta_alpha** (two heads' worth),
+        // gate, step, normed.
         let sizes = [
             tokens * CONV_CHANNELS,
             tokens * VALUE_DIM,
             tokens * MODEL_H_V,
             tokens * MODEL_H_V,
             tokens * MODEL_H_V,
+            2 * tokens * MODEL_H_V,
             tokens * MODEL_H_V,
             tokens * VALUE_DIM,
             tokens * VALUE_DIM,
@@ -250,6 +284,7 @@ impl<'g> Gdn<'g> {
             alpha: take(),
             beta_raw: take(),
             beta: take(),
+            beta_alpha: take(),
             gate: take(),
             step: take(),
             normed: take(),
@@ -263,6 +298,7 @@ impl<'g> Gdn<'g> {
             &ws.alpha,
             &ws.beta_raw,
             &ws.beta,
+            &ws.beta_alpha,
             &ws.gate,
             &ws.step,
             &ws.normed,
@@ -315,10 +351,23 @@ impl<'g> Gdn<'g> {
 
     /// `beta = sigmoid(beta_raw)`, `gate = softplus(alpha + dt) * a`.
     pub fn beta_gate(&self, ws: &GdnWorkspace, w: &GdnWeights<'_>) -> Result<()> {
-        let pc = Pc::new().u(ws.tokens as u32).u(MODEL_H_V as u32);
+        // Merged (§8ay): beta occupies rows `[0, h_v)`, alpha rows `[h_v, 2h_v)` of
+        // one buffer, so both bindings point at it and `alpha_base` selects the
+        // half. Unmerged: the two buffers and base 0 — the incumbent shape, same
+        // shader (one push-constant word, no layout change).
+        let (alpha, beta_in, base) = if self.merged {
+            (&ws.beta_alpha, &ws.beta_alpha, MODEL_H_V as u32)
+        } else {
+            (&ws.alpha, &ws.beta_raw, 0u32)
+        };
+        let pc = Pc::new()
+            .u(ws.tokens as u32)
+            .u(MODEL_H_V as u32)
+            .u(base)
+            .u(0);
         let (gx, gy) = grid_for(ws.tokens * MODEL_H_V, 128);
         self.gate.run(
-            &[&ws.alpha, &ws.beta_raw, w.dt, w.a, &ws.beta, &ws.gate],
+            &[alpha, beta_in, w.dt, w.a, &ws.beta, &ws.gate],
             &pc,
             (gx, gy, 1),
         )
@@ -400,9 +449,24 @@ impl<'g> Gdn<'g> {
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_Z);
         proj.z.run(proj.w_z, x, &ws.z, t)?;
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_BETA);
-        proj.beta.run(proj.w_beta, x, &ws.beta_raw, t)?;
-        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_ALPHA);
-        proj.alpha.run(proj.w_alpha, x, &ws.alpha, t)?;
+        // The shape is decided in **one** place (`self.merged`) and the projections
+        // must agree with it: `beta_gate` reads whichever layout this branch wrote,
+        // so a disagreement would be silent garbage rather than a wrong number.
+        if self.merged {
+            let (Some(ba), Some(wba)) = (proj.beta_alpha.as_ref(), proj.w_beta_alpha) else {
+                return Err(anyhow!(
+                    "GDN beta|alpha merge is on but the projections were built for the \
+                     two-dispatch layout (this is a caller bug; `Gdn::with_merge(_, false)` \
+                     and `BRECCIA_NO_GDN_MERGE=1` both select the legacy shape)"
+                ));
+            };
+            // One dispatch for both 48-row matrices (bit-identical, §8ay).
+            ba.run(wba, x, &ws.beta_alpha, t)?;
+        } else {
+            proj.beta.run(proj.w_beta, x, &ws.beta_raw, t)?;
+            crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_ALPHA);
+            proj.alpha.run(proj.w_alpha, x, &ws.alpha, t)?;
+        }
 
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_SCAN);
         self.conv(state, &ws.qkv, w.conv, t)?;
@@ -432,6 +496,12 @@ pub struct GdnProjections<'a, 'g, 'w> {
     pub w_beta: &'w Buf,
     pub alpha: Proj<'a, 'g>,
     pub w_alpha: &'w Buf,
+    /// The **merged** `[2*h_v, n_embd]` projection (§8ay): `beta` and `alpha`
+    /// concatenated along rows, one GEMV instead of two. A GEMV row is
+    /// independent, so every value is bit-identical to the two separate runs.
+    /// `None` on the A/B arm (`BRECCIA_NO_GDN_MERGE=1`).
+    pub beta_alpha: Option<Proj<'a, 'g>>,
+    pub w_beta_alpha: Option<&'w Buf>,
     pub out: Proj<'a, 'g>,
     pub w_out: &'w Buf,
 }

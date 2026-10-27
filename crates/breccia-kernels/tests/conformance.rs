@@ -237,6 +237,56 @@ fn wide_dequant_is_bit_identical_to_the_default() {
     assert!(checked > 0, "no type with a `_wide` build was tested");
 }
 
+/// Concatenating two same-type matrices **along rows** and running one GEMV must be
+/// **bit-identical** to running the two separately (§8ay). This is the invariant the
+/// GDN `beta`+`alpha` merge relies on: a GEMV output row is an independent dot
+/// product, so `rows` only changes which row each workgroup owns.
+#[test]
+fn concatenated_rows_are_bit_identical_to_the_separate_gemvs() {
+    let fx = need_gpu!();
+    let dev = fx.dev;
+    let gpu = dev.gpu();
+    let ty = breccia_kernels::QuantType::Bf16;
+    let (rows_a, rows_b, cols) = (48usize, 48usize, 2560usize);
+    let (packed_a, x) = real::synthetic_inputs(ty, bench::Shape::new(rows_a, cols), 0x1234);
+    let (packed_b, _) = real::synthetic_inputs(ty, bench::Shape::new(rows_b, cols), 0x9876);
+    let row_bytes = packed_a.len() / rows_a;
+    assert_eq!(packed_b.len() / rows_b, row_bytes);
+    let mut both = packed_a.clone();
+    both.extend_from_slice(&packed_b);
+
+    let w_a = breccia_kernels::gemv::upload(gpu, &packed_a).expect("upload a");
+    let w_b = breccia_kernels::gemv::upload(gpu, &packed_b).expect("upload b");
+    let w_ab = breccia_kernels::gemv::upload(gpu, &both).expect("upload ab");
+    let xb = breccia_kernels::gemv::upload(gpu, &bench::f32_to_bytes(&x)).expect("upload x");
+    let out_a = breccia_kernels::gemv::alloc(gpu, (rows_a * 4) as u64).expect("out a");
+    let out_b = breccia_kernels::gemv::alloc(gpu, (rows_b * 4) as u64).expect("out b");
+    let out_ab = breccia_kernels::gemv::alloc(gpu, ((rows_a + rows_b) * 4) as u64).expect("out ab");
+    let ga = Gemv::new(gpu, ty, rows_a, cols).expect("pipe a");
+    let gb = Gemv::new(gpu, ty, rows_b, cols).expect("pipe b");
+    let gab = Gemv::new(gpu, ty, rows_a + rows_b, cols).expect("pipe ab");
+    ga.run(&w_a, &xb, &out_a).expect("run a");
+    gb.run(&w_b, &xb, &out_b).expect("run b");
+    gab.run(&w_ab, &xb, &out_ab).expect("run ab");
+    let a = bench::read_out(dev, &out_a, rows_a).expect("read a");
+    let b = bench::read_out(dev, &out_b, rows_b).expect("read b");
+    let ab = bench::read_out(dev, &out_ab, rows_a + rows_b).expect("read ab");
+    for buf in [&w_a, &w_b, &w_ab, &xb, &out_a, &out_b, &out_ab] {
+        gpu.destroy_buf(buf);
+    }
+    for i in 0..rows_a {
+        assert_eq!(a[i].to_bits(), ab[i].to_bits(), "row {i} of the first half");
+    }
+    for i in 0..rows_b {
+        assert_eq!(
+            b[i].to_bits(),
+            ab[rows_a + i].to_bits(),
+            "row {i} of the second half"
+        );
+    }
+    println!("concatenated rows: bit-identical ({rows_a} + {rows_b} x {cols})");
+}
+
 #[test]
 fn non_finite_scales_do_not_corrupt_the_device() {
     let fx = need_gpu!();

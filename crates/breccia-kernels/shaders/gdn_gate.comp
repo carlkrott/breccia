@@ -23,6 +23,11 @@
 
 layout(local_size_x = 128) in;
 
+// `ALPHA` and `BETA_IN` may be **the same buffer** (§8ay): the two 48-row
+// projections are fused into one 96-row GEMV (a GEMV row is independent, so the
+// values are bit-identical) and its output holds beta first, alpha second.
+// `pc.pad0` is the alpha base row, 0 when they are still separate buffers — the
+// incumbent path — so this is a wired change with one push-constant word.
 layout(std430, binding = 0) readonly buffer AlphaVec { float ALPHA[]; }; // [T,h_v]
 layout(std430, binding = 1) readonly buffer BetaVec { float BETA_IN[]; }; // [T,h_v]
 layout(std430, binding = 2) readonly buffer DtVec { float DT[]; }; // [h_v]
@@ -33,7 +38,7 @@ layout(std430, binding = 5) writeonly buffer GateOut { float GATE[]; }; // [T,h_
 layout(push_constant) uniform Params {
     uint tokens;
     uint h_v;
-    uint pad0;
+    uint alpha_base; // row offset of alpha inside `ALPHA` (0 = its own buffer)
     uint pad1;
 } pc;
 
@@ -56,5 +61,5 @@ void main() {
     }
     uint h = i % pc.h_v;
     BETA[i] = breccia_sigmoid(BETA_IN[i]);
-    GATE[i] = breccia_softplus(ALPHA[i] + DT[h]) * A[h];
+    GATE[i] = breccia_softplus(ALPHA[i + pc.alpha_base] + DT[h]) * A[h];
 }
