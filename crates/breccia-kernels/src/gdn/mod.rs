@@ -393,10 +393,15 @@ impl<'g> Gdn<'g> {
         let gpu = self.conv.gpu();
         // GPU-time probe stage boundaries (`BRECCIA_GPU_TIME`, no-op when off).
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_PROJ);
-        // Projections (§4.2 first block).
+        // Projections (§4.2 first block). Marked separately (§8ax): `beta` and
+        // `alpha` are 48-row matrices, i.e. 6 workgroups each, so they are a
+        // latency floor per block rather than arithmetic.
         proj.qkv.run(proj.w_qkv, x, &ws.qkv, t)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_Z);
         proj.z.run(proj.w_z, x, &ws.z, t)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_BETA);
         proj.beta.run(proj.w_beta, x, &ws.beta_raw, t)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_ALPHA);
         proj.alpha.run(proj.w_alpha, x, &ws.alpha, t)?;
 
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_SCAN);

@@ -4293,3 +4293,140 @@ happened.) The box was shared with two other agents' benchmarks for most of the
 window; each arm's log/grep records whether another `breccia bench` was alive, and the
 table above quotes arms whose neighbours were, while the probe-overhead A/B/A/B quotes
 the one clean stretch (`pgrep` = this process only).
+
+## 8ax. The m=1 GEMV is **element-throughput** bound, not bandwidth bound — and the head was 8× off it
+
+§8av priced the `wait-gpu` 22-33 ms as GPU execution and named single-token GEMV as
+the wall. This round asks *which* wall. The answer, from a shape-controlled sweep that
+holds `rows × cols` fixed (248320×2560 = 636 M elements, MI50, one process at a time):
+
+| type | bpw | MiB read | ms | GB/s | **M elements/ms** |
+|---|---:|---:|---:|---:|---:|
+| BF16 | 16.00 | 1212 | 1.570 | **809.8 (98 % of 825)** | 405 |
+| F16 | 16.00 | 1212 | 1.576 | 806.8 | 404 |
+| F32 | 32.00 | 2425 | 2.993 | 849.7 (103 %) | 213 |
+| IQ2_XXS | 2.06 | 156 | 1.918 | 85.4 | 332 |
+| IQ2_XS | 2.31 | 175 | 1.843 | 99.7 | 345 |
+| IQ3_S | 3.44 | 260 | 1.810 | 150.9 | 351 |
+| IQ4_XS | 4.25 | 322 | 2.881 | 117.2 | 221 |
+| Q5_K | 5.50 | 417 | **4.538** | **96.3 (12 %)** | **140** |
+
+The same GEMV structure saturates DRAM at 16-32 bpw (98-103 %), so the launch shape,
+the N-mapping and the coalescing *of the vector stream* are fine. What changes with the
+quant type is **cost per element**: 140-351 M elements/ms against a 405 M ceiling. The
+currency is element throughput, not bytes — which is why `splits` never helped here
+(see below) and why "if the streaming ran at 450 GB/s" was never reachable for a
+quantised tensor: 450 GB/s of Q5_K *is* 1 400 M elements/ms, 3.5× the best this kernel
+achieves at any bpw.
+
+### The worst stage, explained by its own sector arithmetic
+
+`head` = `output.weight`, **Q5_K 248320×2560**, 417 MiB, 4.25 ms/token. Occupancy
+arithmetic (MI50, 60 CU, Wave64, 1.7 GHz):
+
+* 31 040 workgroups (8 rows each), 124 160 Wave64 waves → **2 069 waves per CU**: the
+  shape is *not* parallelism-starved, and `splits=2/4` measured −2 %/−6 % (the reduce
+  pass costs more than the parallelism buys). The RX, with 80 CU, was the same.
+* per wave = 2 rows = 2 × 10 Q5_K blocks (176 B each) = 3.5 KB, walked **sequentially**
+  with one dependent load per block.
+* `dequant_q5_k_unit` loaded each unit as **8 two-byte loads at an 8-byte lane stride**
+  (`byte2(off + 24 + ((ql0+jj)>>1), …)`), so per instruction the warp touched **4
+  sectors to use 16 bytes of them**, 8 instructions per unit → **~32 sector-touches
+  for 128 B, i.e. 8× amplification** on the ql stream (and the same on qh). At 96 GB/s
+  of DRAM traffic that is ≈1.3 TB/s of L1↔L2 traffic — an L2-transaction bound, not a
+  DRAM one.
+
+### The fix: one wide load per unit (`_wide` build, bit-identical)
+
+`dequant_q5_k_unit` (and IQ4_XS's, same pattern) now loads the unit's whole 8 ql bytes
+and 8 qh bytes as **two 32-bit words each** — 4 loads instead of 16, one sector-touch
+per half-unit — and unpacks the nibbles/high bits from registers. Same block bytes,
+same nibble extraction, same fp32 accumulation order: the conformance suite proves the
+output is **bit-identical** on 6 shapes per type
+(`wide_dequant_is_bit_identical_to_the_default`), which is why the greedy parity below
+does not move.
+
+| where | before | after | Δ |
+|---|---:|---:|---:|
+| `head` kernel, MI50 | 4.540 ms · 96.3 GB/s · 140 M el/ms | **2.018 ms · 216.6 GB/s · 315 M el/ms** | **2.25×** |
+| `head` kernel, RX 6950 XT | 1.595 ms · 274.1 GB/s | **1.009 ms · 433.1 GB/s (97 % of 445)** | **1.58×** |
+| `head` stage **in the engine** (MI50-resident), µs/token | 4 254 | **1 772** | −2 482 |
+| `sum` (GPU execution), µs/token | 35 128 | **32 089** | −3 039 |
+| single stream, dual, 30 resident blocks | 17.20 tok/s · 58.17 ms | **17.83 tok/s · 56.09 ms** | **+3.7 %** |
+
+### Where the remaining stages sit (probe, wide on, µs/token and the metric that matters)
+
+| stage | µs/token | M elements/ms | what limits it |
+|---|---:|---:|---|
+| hc-read (96 calls) | 6 367 | 99 | **latency**: 40 WGs for the 320-row `down` (already split-K=4 in-engine, `down_splits()`), 1.25 blocks/row for the K=320 `up`; 4 dependent dispatches × 96 |
+| gdn-proj `attn_qkv` (36) | 3 518 | 268 | IQ3_S at 85 % of its own ceiling (351); 97.6 µs/call vs 76 µs standalone = dependent-dispatch floor |
+| gdn-out `ssm_out` (36) | 2 873 | 197 | 320 WGs = 5.3/CU, no split gain (measured 93 → 100 GB/s at s=4) |
+| gdn-scan (36) | 2 794 | — | **sequential** delta-rule state; not a GEMV |
+| qkv (QSA, 12) | 1 966 | 268 | IQ3_S, same as `attn_qkv` |
+| gdn-z `attn_gate` (36) | 1 809 | 313 | at its ceiling |
+| router (48) | 1 345 | 47 | **latency**: 512 rows = 64 WGs = 0.8/CU; splits flat (166 → 168 GB/s) |
+| moe gate+up+down+combine (30 blocks) | 4 021 | **366** | at the ceiling: the batched expert dispatch is the most efficient GEMV in the token |
+| shared expert (48) | 1 508 | 156 | **latency**: 640 rows = 80 WGs = 1/CU; IQ4_XS wide is neutral here (0.018 → 0.018 ms) |
+| gdn-beta + gdn-alpha (72) | **829** | — | **pure latency**: two 48-row × 2560 BF16 GEMVs (6 WGs) at 11.5 µs each |
+| attn + attn-out + qsa-aux + rope + kv-append | 3 408 | — | QSA kernels, unchanged |
+| head | **1 772** | 359 | Q5_K at 78 % of the BF16 ceiling after the fix |
+| xfer | 277 | — | readback copies |
+
+`sum` 32 089 · `wait-gpu` 32 532 · residual **+443 µs (+1.4 %)** — the table still
+accounts for the fence wait, so the fix moved execution, not a boundary.
+
+### What this says for the next round (and what it forbids)
+
+* **The dequant lever is spent except for latency-bound shapes.** Q5_K and IQ4_XS were
+  the only types whose per-element cost was >2× the memory floor; Q5_K is fixed, IQ4_XS
+  is neutral because its shapes are latency-bound before they are ALU-bound. IQ3_S/IQ2_*
+  are at 85-90 % of the ceiling and have no byte-load loop left to coalesce.
+* **The next 10 ms is *the small-N latency group*, not GEMV arithmetic**:
+  `gdn-beta`+`gdn-alpha` 829 µs for 0.5 MB of weights (one merged 96-row dispatch would
+  save ~0.4 ms, bit-identical since a GEMV row is independent), `router` 1 345 µs at
+  47 M el/ms, `shared` 1 508 µs at 156 M el/ms, and `hc-read`'s 6 367 µs whose `down` is
+  already split-K=4 and whose remainder is 4 dependent dispatches × 96 calls. These want
+  either **merging tiny projections into one dispatch** or **more users per dispatch**
+  (T-batching), both of which are structure, not dequant.
+* **The head's last 0.8 ms is placement, not arithmetic**: on the RX the same Q5_K head
+  is 1.009 ms against 2.018 on the MI50, and it runs on whichever device owns block 47
+  (`--head-device` is the other round's item).
+
+### Parity and safety
+
+* **32/32 at chunk 8/16/32/128 with the wide build on *and* off**, top-1 `13.170561`
+  in all 8 arms; `wide_dequant_is_bit_identical_to_the_default` passes for Q5_K and
+  IQ4_XS on 6 shapes each (1×2560, 3×1024, 640×2560, 2560×640, 7×854, 2×257).
+* New shader first run **on the MI50 (headless)**, one quant type per process,
+  `timeout 90`, `VK_LAYER_KHRONOS_validation` on: `spirv-val` clean at build time, the
+  only VU is the pre-existing robustness2 device-creation notice, `dpm` read `high`
+  before and after, **no `amdgpu` page fault / ring timeout / reset** in the window
+  (`journalctl -k`, last 20 min = 0). The full `conformance` binary passes for both
+  converted types (12 tests each).
+* `cargo test --workspace`, `clippy -D warnings`, `fmt --check`, `verify.sh` all clean.
+
+### Commands
+
+```bash
+# the type sweep that names the wall (one card, one process at a time)
+for t in BF16 F16 F32 IQ2_XXS IQ2_XS IQ3_S IQ4_XS Q5_K; do
+  timeout 90 ./target/release/breccia bench gemv --device 0000:0e:00.0 \
+    --rows 248320 --cols 2560 --type $t
+done
+# the head, both cards, both dequant builds
+for d in 0000:0e:00.0 0000:03:00.0; do
+  timeout 90 ./target/release/breccia bench gemv --device $d --real --tensor output.weight
+  timeout 90 env BRECCIA_GEMV_NO_WIDE=1 ./target/release/breccia bench gemv \
+    --device $d --real --tensor output.weight
+done
+# the engine A/B (probe on; one flag reverts)
+BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" \
+  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --gen 16 --runs 1 --threads 16 --warm 1                       # wide (default)
+BRECCIA_GEMV_NO_WIDE=1 BRECCIA_GPU_TIME=1 ./target/release/breccia bench token …  # A/B
+# bit-identity + full conformance for one type, on the headless card
+timeout 90 env BRECCIA_KERNEL_DEVICE=0000:0e:00.0 BRECCIA_QTYPE=Q5_K \
+  VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+  cargo test -p breccia-kernels --test conformance -- --test-threads=1
+```

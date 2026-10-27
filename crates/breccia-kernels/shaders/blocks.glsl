@@ -270,11 +270,25 @@ void dequant_iq4_xs_unit(uint off, uint u, out float v[8]) {
     float dl = f16_at(off) * float(int(ls) - 32);
     uint base = off + 4u + 8u * ib + 4u * (h & 1u); // qs[ib*16 + h*8 .. +8] -> 4 words
     uint hi = h >> 1u;
+#ifdef BRECCIA_WIDE_DEQUANT
+    // Coalesced form of the same unit (§8ax): the unit's 8 qs bytes are 4 words
+    // starting at `base` (8-byte aligned), so two 32-bit loads replace eight
+    // two-byte ones whose 8-byte stride touched each sector 8 times. Values are
+    // identical; `byte2(base + (j>>1), j&1)` is `byte4` of the two words.
+    uint w0 = u32_at(base);
+    uint w1 = u32_at(base + 2u);
+    for (uint j = 0u; j < 8u; ++j) {
+        uint b = byte4(j < 4u ? w0 : w1, j & 3u);
+        uint q = hi == 0u ? (b & 0x0fu) : (b >> 4u);
+        v[j] = dl * iq4nl_value(q);
+    }
+#else
     for (uint j = 0u; j < 8u; ++j) {
         uint b = byte2(base + (j >> 1u), j & 1u);
         uint q = hi == 0u ? (b & 0x0fu) : (b >> 4u);
         v[j] = dl * iq4nl_value(q);
     }
+#endif
 }
 
 // ---- Q4_K  (256 elements / 144 B) -----------------------------------------
@@ -330,6 +344,29 @@ void dequant_q5_k_unit(uint off, uint u, out float v[8]) {
     uint l0 = (s & 3u) * 8u;             // element offset inside the sub-block
     uint ql0 = g * 32u + l0;             // qs/ql byte, qh byte share the index
     uint mask = (s < 4u ? 1u : 2u) << (2u * g);
+#ifdef BRECCIA_WIDE_DEQUANT
+    // **Coalesced unit load** (`docs/phase-4/01` §8ax). The per-element form below
+    // issues 16 two-byte loads per unit whose 8-byte lane stride makes every
+    // 32-byte sector be touched 8 times: measured **140 M elements/ms** on the
+    // MI50, against **405 M** for the same shape in BF16 (= 98 % of DRAM), i.e.
+    // the Q5_K head was sector/instruction bound, not bandwidth bound. Here the
+    // unit's whole 8 ql bytes (block bytes 48+ql0, 8-byte aligned) and 8 qh bytes
+    // (16+l0) are read as two 32-bit words each and unpacked from registers: one
+    // load per half-unit, four sectors per instruction, same arithmetic and the
+    // same values (the conformance suite is bit-identical).
+    uint qw = off + 24u + (ql0 >> 1u); // u16 words of the unit's 8 ql bytes
+    uint hw = off + 8u + (l0 >> 1u);   // u16 words of the unit's 8 qh bytes
+    uint qa = u32_at(qw);
+    uint qb = u32_at(qw + 2u);
+    uint ha = u32_at(hw);
+    uint hb = u32_at(hw + 2u);
+    uint shift = s < 4u ? 0u : 4u;
+    for (uint jj = 0u; jj < 8u; ++jj) {
+        uint nib = (byte4(jj < 4u ? qa : qb, jj & 3u) >> shift) & 0x0fu;
+        uint hi = byte4(jj < 4u ? ha : hb, jj & 3u);
+        v[jj] = d * float(nib + ((hi & mask) != 0u ? 16u : 0u)) - dm;
+    }
+#else
     for (uint jj = 0u; jj < 8u; ++jj) {
         uint idx = ql0 + jj;
         uint qb = byte2(off + 24u + (idx >> 1u), idx & 1u);
@@ -338,6 +375,7 @@ void dequant_q5_k_unit(uint off, uint u, out float v[8]) {
         uint q = nib + ((hb & mask) != 0u ? 16u : 0u);
         v[jj] = d * float(q) - dm;
     }
+#endif
 }
 
 // ---- Q6_K  (256 elements / 210 B) -----------------------------------------
