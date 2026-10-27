@@ -411,7 +411,32 @@ impl Model {
         // an ordinal indexes `--devices`, and a PCI address indexes identity.
         let last_dev = placement.device_of(cfg.n_layers - 1);
         let candidates = head_candidates(&devices, opts.profile.as_deref(), opts.verbose);
-        let head_choice = head::resolve(&opts.head_device, &candidates, last_dev)?;
+        let mut head_choice = head::resolve(&opts.head_device, &candidates, last_dev)?;
+        // **The device-crossing hand-off is removed, not disabled.** It produced a
+        // wrong greedy sequence in 2 of 16 exclusive processes (`scripts/
+        // head-handoff-race.sh`), the residual copy itself was proven byte-exact, and
+        // the perturbation was never localised — so the arm is not shippable and the
+        // head may only run where block 47 runs (docs/phase-4/01-forward-pass.md §8aw).
+        //
+        // An *explicit* crossing request is an error (the operator asked for something
+        // the engine will not do). The `auto` rule is not: it reports what the profile
+        // would prefer and then keeps the head where it must be, because a default
+        // that refuses to load a legal device list would be worse than a default that
+        // cannot honour the role.
+        if opts.head_device == HeadSpec::Auto {
+            if head_choice.device != last_dev {
+                head_choice.reason = format!(
+                    "{} — but the head may only run where block {} runs (the crossing \
+                     hand-off was removed), so it stays there; list the card you want \
+                     last in `--devices` to give it the last block",
+                    head_choice.reason,
+                    cfg.n_layers - 1
+                );
+                head_choice.device = last_dev;
+            }
+        } else {
+            head::gate(head_choice.device, last_dev, &candidates)?;
+        }
         let head_dev = head_choice.device;
         if opts.verbose {
             eprintln!(

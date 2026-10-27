@@ -3922,6 +3922,103 @@ timeout 400 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:
   --dump-logits mi50.txt --top-logits 32
 ```
 
+## 8ax. The crossing hand-off is **removed**: the harness reproduces it, and the defect is not the hand-off
+
+The follow-up round was scoped to the hand-off race and nothing else. It ends with the
+crossing path deleted and — the more useful result — **the failure reproduced on the arm
+that does not cross at all**, so the defect that was attributed to `--head-device` lives in
+the base path and is still open.
+
+### The harness (the acceptance gate, and now a regression test)
+
+`scripts/head-handoff-race.sh`: `--procs` processes × `--runs` generations of the same
+configuration, every sequence compared with the first, plus (with `RACE_PROMPT=parity`) the
+reference's first `--gen` tokens, and the crossing arm asserted **refused**. It refuses to
+measure while a co-tenant holds the cards (`pgrep -x breccia`, VRAM > 1.5 GiB) and discards
+any process a co-tenant appears *during* — a contended window reproduces a 15× slowdown
+(same command: `head` 152.6 vs 3.9 ms, 3.19 vs 18 tok/s) and would otherwise be reported as
+a bug.
+
+Cheap enough for every round: `RACE_PROCS=8 RACE_RUNS=4` (no arena) is ~2 min;
+`RACE_ARENA=auto RACE_PROMPT=parity RACE_RUNS=1 RACE_GEN=32 RACE_WARM=1 RACE_PROCS=8` (the
+shipped configuration) is ~8 min.
+
+**Red on the code as merged** (`ba86db2`, head crossing to the RX), quiet window, 16
+exclusive processes:
+
+```
+CROSSING-FAIL proc 1 run 0: step 0/32 ours 1049 expected 110563
+CROSSING-FAIL proc 14 run 0: step 0/32 ours 1049 expected 110563
+RACE: 16 control + 16 crossing generations, 2 mismatch(es) -> RED
+```
+
+### What the failure is, and what it is not
+
+* **It is not a torn read.** Inside a failing process both prompt passes are
+  bit-identical (`max |Δlogit| 0.000e0`) and the wrong sequence repeats across generations
+  (`--runs 2`: 31/32 mismatches in *both* runs, identical). The head's row is perturbed
+  smoothly — `logits[110563]` 13.1705 → 12.8037, `min` −11.065 → −11.506, top-1 still
+  right — and the generated sequence is the reference **with one token dropped**, then it
+  re-syncs. That is a one-position-stale residual feeding the head, not garbage.
+* **It is not the residual hand-off's write.** A read-back compare
+  (`BRECCIA_HEAD_VERIFY=1`: re-read `venues[head_dev].r` off the head device after the
+  batch was waited and compare it with the bytes uploaded) was clean in
+  8 processes × 2 runs, including the failing one.
+* **It is not the arena set.** The `auto` set vs the hand-tuned 30-block list, same window,
+  `--dump-logits`: identical top-16 ids in the same order, max |Δlogit| **7.4e-5**. Two
+  arena choices are numerically interchangeable; a set difference cannot move a logit by
+  0.37.
+* **It is not the crossing.** The harness then flagged the *shipped* arm — head on block
+  47's device, no hand-off at all:
+
+```
+UNSTABLE proc 8 run 0: step 0 ours 1049 expected 110563
+RACE: 8 generations over 8 exclusive processes, crossing refused OK -> RED
+```
+
+  Rate so far: ~2 of 16 crossing processes and ~1 of 8 shipped-arm processes, i.e. **~10 %
+  of processes, either arm**. The earlier "3 of 17 with the hand-off vs 0 of 20 without"
+  was a small sample in a window where the *other* arm was mostly run with a hot page cache.
+* The one correlate that has held every time: **the failing process is one whose warm
+  generation had to fault expert/PLE pages in** (`warm 0 … 0.98 GiB storage read` in the
+  failing process, `0.00 GiB` in the passing ones — but cold reads alone are not
+  sufficient: several cold processes are correct). That is the thread the next round should
+  pull: the lane and the PLE gather read the mmap *while* the same pages are being faulted
+  in by the other device's work, and one token's residual ends up one position stale.
+
+### The removal
+
+`head::gate` now refuses any head device that is not the device owning the last block, with
+the reason and the workaround in the message; `auto` keeps the head where it must be and
+says what the profile *would* have preferred and how to give that card the last block
+(list it last in `--devices`). `submit_head` has one path again (a `debug_assert` pins it),
+the in-batch residual upload is gone, and `session.head_traffic_ok` now simply asserts the
+up-link is 0 on every bench run. The flag still parses an ordinal, a PCI address or a role,
+and the tests that pinned those semantics stay (they are what makes the refusal readable).
+
+**Accepted cost:** the legal single-stream best is the head on block 47's device,
+`head` 7.37-7.42 ms, **17.29-17.37 tok/s / 57.6-57.8 ms**; the removed arm reached
+18.26 / 54.77. So this round gives back ~1 tok/s (5 %) rather than ship an opt-in path that
+is wrong in ~10 % of processes.
+
+### Arena rule vs the tuned list, same window, interleaved (parity 32/32 in all four)
+
+| arm | lane | `head` | `wait-gpu` | tok/s | ms/token |
+|---|---:|---:|---:|---:|---:|
+| tuned list (30 blocks) | 13.03 / 13.25 | 7.38 | 32.20 | 17.34 / 17.29 | 57.66 / 57.82 |
+| **default** (`--gpu-experts auto`) | 12.88 / 15.93 | 7.36-7.42 | 32.26 | **17.37** / 16.26 | **57.56** / 61.51 |
+
+The default's second run is the cold-cache outlier (its warm pass faulted 1.41 GiB in);
+hot-cache it is `lane` 12.88 vs 13.03 and 17.37 vs 17.34 tok/s — i.e. **the rule costs
+nothing against the tuned list** and it holds 1.8 GiB more resident bytes.
+
+### Open
+
+The ~10 %/process wrong-sequence bug itself. It is not the head, not the hand-off, not the
+arena; the harness reproduces it on the shipped arm and is the gate for whoever takes it.
+Until then, quote parity from **many processes**, never from one run: a single
+`--dump-logits` comparison in this same round would have certified the removed arm.
+
 ## 9. Exact commands
 
 

@@ -2808,42 +2808,16 @@ impl<'m> Session<'m> {
         let mc = &m.cfg;
         self.flush()?;
         self.timers.mark(FINAL_HC);
-        let last = m.device_of(mc.n_layers - 1);
         let head_dev = m.head_device();
-        // Cross-check for the per-token cost of the head *path*: only the residual
-        // may ever cross this way. The counters accumulate per measured window
-        // (`reset` / the post-prompt clear in `generate`), not per token.
+        debug_assert_eq!(
+            head_dev,
+            m.device_of(mc.n_layers - 1),
+            "the head runs where block {} runs: the device-crossing hand-off was removed \
+             (docs/phase-4/01-forward-pass.md §8aw)",
+            mc.n_layers - 1
+        );
         self.head_traffic0 = self.staging_traffic();
-        // The residual is final once the last block's submission has completed,
-        // which `flush` has waited for. 40 KiB each way: one round trip a token.
-        //
-        // The **write half rides the head's own batch** (`record_upload`) rather
-        // than being a submission of its own. That is not only one submit + fence
-        // cheaper: it makes the copy and the `final_hc` dispatch that reads it
-        // neighbours *inside one command buffer*, so the dependency is a barrier
-        // the batch records instead of submission order across two submissions
-        // (which orders execution but is not, by itself, a memory dependency).
-        self.timers.mark(HANDOFF);
-        let moved = if head_dev != last {
-            let n = crate::head::handoff_bytes(mc.hc_dim());
-            let bytes = self.stagings[last].read_batch(
-                m.devices[last].gpu(),
-                &[(&self.venues[last].r, 0, n as usize)],
-            )?;
-            Some(bytes)
-        } else {
-            None
-        };
         self.ensure_batch(head_dev)?;
-        if let Some(bytes) = moved {
-            self.stagings[head_dev].record_upload(
-                m.devices[head_dev].gpu(),
-                &self.venues[head_dev].r,
-                0,
-                &bytes[0],
-            )?;
-        }
-        self.timers.mark(FINAL_HC);
         {
             let v = &self.venues[head_dev];
             let hw = HcWeights {

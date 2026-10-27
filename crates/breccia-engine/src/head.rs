@@ -199,6 +199,39 @@ pub fn resolve(spec: &HeadSpec, candidates: &[HeadCandidate], last: usize) -> Re
     }
 }
 
+/// Refuse a head device that is not the device that owns the last block.
+///
+/// The crossing hand-off was **removed** (`docs/phase-4/01-forward-pass.md` §8aw):
+/// with the head on the other card, 2 of 16 exclusive processes produced a wrong
+/// greedy sequence, the residual copy itself was proven byte-exact (a read-back
+/// compare), and the perturbation of the head's input was never localised. An
+/// opt-in flag that occasionally returns wrong tokens is worse than no flag, so the
+/// placement is now a consequence of `--split-blocks` / the `--devices` order: put
+/// the card you want the head on **last**, or give it the last block.
+///
+/// `scripts/head-handoff-race.sh` is the harness that produced the 2/16 — it must
+/// stay green (i.e. it must keep getting refused) for as long as this gate exists.
+pub fn gate(device: usize, last: usize, candidates: &[HeadCandidate]) -> Result<()> {
+    if device == last {
+        return Ok(());
+    }
+    let name = |i: usize| {
+        candidates
+            .get(i)
+            .map(|c| format!("{} ({})", c.pci, c.name))
+            .unwrap_or_else(|| format!("device {i}"))
+    };
+    bail!(
+        "the head can only run on the device that owns the last block ({}), not on {}: the \
+         device-crossing hand-off is removed — it returned a wrong greedy sequence in 2 of 16 \
+         exclusive processes and could not be made sound (docs/phase-4/01-forward-pass.md \
+         §8aw). Either list `--devices` so the card you want owns the last block (the last \
+         entry, since a contiguous split puts the tail there), or drop `--head-device`",
+        name(last),
+        name(device)
+    )
+}
+
 /// Bytes the residual hand-off moves **each way** when the head lives on another
 /// device: one `[hc, n_embd]` stack of f32. 40 KiB on this model.
 ///
@@ -213,6 +246,23 @@ pub fn handoff_bytes(hc_dim: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_crossing_head_device_is_refused() {
+        let c = this_box();
+        // The head may name block 47's device...
+        assert!(gate(1, 1, &c).is_ok());
+        assert!(gate(0, 0, &c).is_ok());
+        // ...and nothing else, with a message that says what to do instead.
+        let e = gate(0, 1, &c).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("removed"), "{msg}");
+        assert!(msg.contains("0000:03:00.0"), "{msg}");
+        assert!(
+            msg.contains("--split-blocks") || msg.contains("--devices"),
+            "{msg}"
+        );
+    }
 
     #[test]
     fn the_handoff_is_one_residual_stack_and_cannot_be_the_head() {
