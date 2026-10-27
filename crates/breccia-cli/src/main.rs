@@ -2719,6 +2719,19 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         sess.dispatches,
         sess.dispatches as f64 / sess.submits.max(1) as f64
     );
+    // Barrier accounting: `barriers + pruned` is the always-barrier shape, so the
+    // pair is the per-resource tracker's own delta (docs/phase-4 §8al).
+    println!(
+        "barrier  {} emitted, {} pruned by the per-resource tracker ({:.2} vs {:.2} per token, \
+         {:.2} barriers/dispatch)",
+        breccia_kernels::batch_cmd::barriers(),
+        breccia_kernels::batch_cmd::barriers_pruned(),
+        breccia_kernels::batch_cmd::barriers() as f64 / runs_n,
+        (breccia_kernels::batch_cmd::barriers() + breccia_kernels::batch_cmd::barriers_pruned())
+            as f64
+            / runs_n,
+        breccia_kernels::batch_cmd::barriers() as f64 / sess.dispatches.max(1) as f64
+    );
     println!("\nper device (per generated token):");
     for line in sess.per_device(forwards / runs_n.max(1.0).floor() as usize) {
         println!("  {line}");

@@ -3021,6 +3021,74 @@ timeout 900 ./target/release/breccia bench token \
   --json $D/cov30-parity.json
 ```
 
+## 8al. Per-resource barrier tracking: landed, correct, and it finds only 20 % — the rest are real
+
+### What landed
+
+`dispatch_batch::record` now tracks a **dirty set** of `vk::Buffer`s written since the
+last barrier and emits a compute→compute barrier **only when the dispatch about to be
+recorded binds one of them** (ncnn's model, per *dispatch* rather than per call site,
+which is why it cannot repeat §8z's parity failure). Two correctness anchors:
+
+- the dirty set is **conservative in one direction** — every bound buffer counts as
+  possibly written, because a kernel does not declare its writes — so it can only
+  drop barriers between dispatches whose storage sets are disjoint;
+- `end_submit` closes every batch with one barrier if the set is non-empty, because
+  queue order alone does not make memory visible across submissions;
+- any recorded copy (`record_copy`/`record_copies`) clears the set, since its own
+  pre/post barriers fence every prior write.
+
+A/B arm `BRECCIA_NO_BARRIER_TRACK=1` (always-barrier shape). Counters:
+`batch_cmd::barriers()` / `barriers_pruned()`, printed as a `barrier` line.
+
+### Measured (single stream, both cards, 30 blocks resident, clocks `high`)
+
+| quantity | always-barrier | per-resource |
+|---|---:|---:|
+| barriers per token (32 generated) | 319 400 | **256 670 (-19.6 %)** |
+| barriers per dispatch | 1.00 | **0.82** |
+| tok/s / ms per token | 16.94 / 59.0 (gen 8 window) | 17.14 / **58.36** |
+| parity (32 greedy tokens vs the HIP server) | 32/32 | **32/32** |
+
+**Why only 20 %**: this graph is a chain through the residual stack `r`. Almost every
+dispatch binds `r` and most write it, so with no read/write declaration per kernel the
+intersection is non-empty by construction (~0.8 of dispatches). §8af's "~1 100 of 4 800
+barriers are unneeded" was a *call-site* estimate; at the dispatch level they are
+dependencies. **Cutting `wait-gpu` further needs fewer dispatches (fusion), not fewer
+barriers** — which reorders §8af's items: item 2 (fused kernels) first.
+
+### sync2 vs v1 `ALL_COMMANDS`, equal barrier count (same flags, adjacent runs)
+
+| barrier form | tok/s | ms/token |
+|---|---:|---:|
+| v1 `ALL_COMMANDS` (`BRECCIA_BARRIER=full`) | 11.89 | 84.10 |
+| sync2 COMPUTE→COMPUTE (default) | **17.27** | **57.91** |
+
+Both arms emitted exactly 184 190 barriers, so this is the barrier's own cost:
+**-26.2 ms/token, 1.45x** — the "1.6x cheaper" research run is right and the
+"identical" one was measuring a window where something else dominated. Keep sync2 the
+default.
+
+**Window caveat**: research round 9 was benchmarking on the RX throughout, so the
+gen-8 numbers bounce 11.9-17.3 tok/s for identical barrier counts; the pairs above are
+adjacent, so the *deltas* are usable and the absolute rates are not. The 32-token parity
+run (17.14, 58.36) is the one to quote, and it is within noise of §8ak's 16.94.
+
+### Correction to §8ag
+
+§8ag concluded "coverage cannot fix the lane (+4 blocks buys -7.5 %, full coverage needs
+~43 GiB)". The second half stands; the first was a **4-block step, not a ladder**:
+0 -> 30 blocks takes the lane 47.5 -> 13.5 ms and the stream 11.82 -> 16.94 tok/s
+(§8ak). Coverage *is* the lane lever up to the VRAM ceiling (~30-32 blocks of 48).
+
+### Not done this round
+
+Items 2 (fused RMSNorm+QKV / gate+up+SwiGLU / RoPE+KV / hyper-connection), 3 (frozen
+command-buffer replay) and 4b (adaptive coverage from measured free VRAM with a reserve
+on the display card) were **not** implemented: item 1's measurement reordered them
+(fusion first), and the window did not allow a new shader round that could pass the
+GPU-safety protocol (one shape per invocation, validation on, RX first).
+
 ## 9. Exact commands
 
 

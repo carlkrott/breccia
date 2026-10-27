@@ -87,6 +87,14 @@ thread_local! {
     static RECORD_NS: Cell<u64> = const { Cell::new(0) };
     /// Host seconds spent waiting for slots in [`wait_all`]/[`begin`].
     static WAIT_NS: Cell<u64> = const { Cell::new(0) };
+    /// Per-resource dependency tracking (§8al, ncnn's model): the `vk::Buffer`s
+    /// **written since the last barrier** that separates them from a later reader.
+    /// A barrier is emitted only when the next dispatch binds one of these.
+    static DIRTY: RefCell<Vec<vk::Buffer>> = const { RefCell::new(Vec::new()) };
+    /// Barriers emitted into batches since the process started, and the subset the
+    /// per-resource tracker **pruned** for comparison.
+    static BARRIERS: Cell<u64> = const { Cell::new(0) };
+    static BARRIERS_SAVED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Segments that may be in flight at once. Two are enough for a block (the
@@ -254,6 +262,24 @@ pub fn recorded_on(gpu: &Gpu) -> u32 {
     })
 }
 
+/// Dispatch barriers emitted into batches (process-wide), and how many the
+/// per-resource tracker pruned. `barriers + pruned` is what the old
+/// always-barrier shape would have emitted (§8al).
+pub fn barriers() -> u64 {
+    BARRIERS.with(|c| c.get())
+}
+
+/// Barriers the per-resource tracker decided were not needed.
+pub fn barriers_pruned() -> u64 {
+    BARRIERS_SAVED.with(|c| c.get())
+}
+
+/// `BRECCIA_NO_BARRIER_TRACK=1`: emit the pre-§8al always-barrier shape (the A/B
+/// arm; never a correctness aid — the tracker is the conservative-correct one).
+fn track_disabled() -> bool {
+    std::env::var_os("BRECCIA_NO_BARRIER_TRACK").is_some()
+}
+
 /// Host seconds spent recording since the last [`reset_record_seconds`].
 pub fn record_seconds() -> f64 {
     RECORD_NS.with(|c| c.get()) as f64 / 1e9
@@ -284,6 +310,8 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
         ));
     }
     ensure_slots();
+    // A new command buffer starts with no in-batch writes to order against.
+    DIRTY.with(|d| d.borrow_mut().clear());
     let dev = gpu.device.handle();
     // Slots another open batch is recording into are off limits, and a slot whose
     // fence belongs to another device can be neither waited nor freed here (§8o:
@@ -411,6 +439,16 @@ pub fn end_submit(gpu: &Gpu, signal: Option<(&Timeline, u64)>) -> Result<Segment
         ));
     }
     let cmd = gpu.cmds_c[1 + slot];
+    // **Cross-submission edge.** The tracker prunes the barrier *after* a dispatch
+    // when nothing in the batch reads it, so the batch must close with everything
+    // written visible to whatever the next submission (or the host) reads — queue
+    // order alone does not make memory visible. One barrier per batch against the
+    // ~30-100 it replaces.
+    if !track_disabled() && DIRTY.with(|d| !d.borrow().is_empty()) {
+        unsafe { gpu.barrier_compute_on(cmd) };
+        BARRIERS.with(|c| c.set(c.get() + 1));
+        DIRTY.with(|d| d.borrow_mut().clear());
+    }
     unsafe {
         gpu.device
             .end_command_buffer(cmd)
@@ -575,6 +613,9 @@ pub fn record_copy(
         // See `record_copies`: the compute-scoped dispatch barrier does not cover
         // COPY -> COMPUTE, so the copy closes its own dependency.
         gpu.copy_dependency(cmd, false);
+        // The copy's own barriers fence every prior write, so the dirty set starts
+        // empty for the dispatches that follow.
+        DIRTY.with(|d| d.borrow_mut().clear());
     }
     Ok(())
 }
@@ -657,6 +698,9 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
         // GEMMs race their uploads — measured as non-deterministic logits on the
         // MI50 (max |Δlogit| 2.46 between two identical prompts, §8w/§8x).
         gpu.copy_dependency(cmd, false);
+        // The copy's own barriers fence every prior write, so the dirty set starts
+        // empty for the dispatches that follow.
+        DIRTY.with(|d| d.borrow_mut().clear());
     }
     Ok(())
 }
@@ -791,19 +835,54 @@ pub(crate) fn record(
         );
         gpu.device
             .cmd_push_constants(cmd, kernel.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
+        // **Per-resource dependency tracking** (`docs/phase-4` §8al, ncnn's model).
+        //
+        // The old shape emitted a compute→compute barrier after *every* dispatch,
+        // which is correct but prices ~4 800 barriers/token (§8af). A barrier is
+        // only needed when the dispatch about to be recorded touches a buffer that
+        // an earlier dispatch **wrote** and no barrier has separated since. The
+        // dirty set is conservative in one direction — every bound buffer is
+        // treated as possibly written, because a kernel does not declare its
+        // writes — so this can never drop a required barrier; it only drops the
+        // ones where the two dispatches' storage sets are disjoint.
+        //
+        // This is per *dispatch*, not per call site: that distinction is exactly
+        // why `skip_next_barrier` failed its parity gate (§8z/§8aa).
+        let need = if SKIP_BARRIER.with(|c| c.replace(false)) || track_disabled() {
+            false
+        } else {
+            DIRTY.with(|d| {
+                let d = d.borrow();
+                let hit = bufs.iter().any(|b| d.contains(&b.buf));
+                if hit {
+                    // The barrier below fences everything recorded so far.
+                    drop(d);
+                    DIRTY.with(|d| d.borrow_mut().clear());
+                }
+                hit
+            })
+        };
+        if need {
+            gpu.barrier_compute_on(cmd);
+            BARRIERS.with(|c| c.set(c.get() + 1));
+        } else if track_disabled() {
+            // A/B arm: the pre-§8al always-barrier shape.
+            gpu.barrier_compute_on(cmd);
+            BARRIERS.with(|c| c.set(c.get() + 1));
+        } else {
+            BARRIERS_SAVED.with(|c| c.set(c.get() + 1));
+        }
         gpu.device
             .cmd_dispatch(cmd, grid.0.max(1), grid.1.max(1), grid.2.max(1));
-        // The narrowest correct fence between two dispatches: `Gpu::barrier_all`
-        // (ALL_COMMANDS → ALL_COMMANDS) costs 4.4 µs (MI50) / 5.2 µs (RX) of
-        // forced launch serialisation per dispatch, a compute-scoped sync2
-        // barrier 0.65 / 2.87 µs, and the dispatches themselves are 4-5 µs
-        // (`docs/research/02`/`04`). A caller that declared this dispatch
-        // independent of the last one (`skip_next_barrier`) needs none.
-        if SKIP_BARRIER.with(|c| c.replace(false)) {
-            // nothing to fence: the previous dispatch's outputs are not inputs here
-        } else {
-            gpu.barrier_compute_on(cmd);
-        }
+        // Everything bound here may now have been written.
+        DIRTY.with(|d| {
+            let mut d = d.borrow_mut();
+            for b in bufs {
+                if !d.contains(&b.buf) {
+                    d.push(b.buf);
+                }
+            }
+        });
     }
     bump_open(gpu);
     RECORD_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos() as u64));
