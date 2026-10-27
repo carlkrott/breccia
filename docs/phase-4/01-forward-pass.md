@@ -3404,6 +3404,102 @@ reserve, D1-D4.
 | `experts(host)` / `head` / `ple` / `xfer` | 13.9 / 7.0 / 1.2 / 1.1 |
 | parity (32 greedy tokens vs the HIP server) | **32/32** |
 
+## 8ar. No implementation this round; the three blockers, exactly
+
+This round produced no code. Writing that down with the specific obstacle for each item
+so the next one starts from facts.
+
+### D5 / D1 (shader items): blocked on the GPU-safety protocol, not on design
+
+Both need a **new kernel** (`hc_read`/`hc_write` collapsed; gate+up+SwiGLU fused), and
+the repository's own rule for a new shader is: RX first, **one fresh dispatch shape per
+process**, `VK_LAYER_KHRONOS_validation` on, `timeout 90`, and a reset is a
+stop-the-line event (AGENTS.md, after the 2026-10-26 BACO reset). That is a window of
+its own: compile the SPIR-V, run one shape, read the VU list, then the second shape. It
+cannot be interleaved with benchmark runs of the same process, and it is not something
+to start with a few minutes of budget left — the failure mode is a machine reboot.
+
+The design inputs are ready and unchanged: the HC projector is 14 of a block's 32
+dispatches (44 %), the gate+up+SwiGLU fusion is measured at 3.1x (m=1) / 5.3x (m=8),
+and the collapse target is -290…-380 dispatches/token (research 10). The one cheap
+prerequisite is **census marks inside `submit_block`** (prelude / per-expert / ffn) so
+each fusion's delta is attributable — that is a ~20-line change with no GPU risk and it
+should be the first commit of the next round.
+
+### `--head-device`: not a config flag, a placement change with a handoff
+
+The head is loaded onto `placement.device_of(n_layers - 1)` (`model.rs:507`) and the
+final residual is consumed where block 47 ran. Moving the head to the RX therefore needs
+(a) a `SessionCfg`/CLI override and (b) a **residual handoff** to the head device in
+`submit_head` — the machinery exists (`HANDOFF`, used for a block crossing devices) but
+it has to be wired for the head, plus the 416 MiB `output.weight` upload redirect. Not a
+flag rename; a small feature with a new data path, which deserves its own parity run.
+
+### Adaptive arena: needs a VRAM query that is not wired
+
+Nothing in the tree asks the driver for free VRAM (no `VK_EXT_memory_budget`, no
+`rocm-smi` parse), so "size the arena from measured free VRAM with a display-card
+reserve" needs: a free-VRAM probe per device, a byte-budget → block-list selector
+(replacing the hardcoded 30-block list), an explicit reserve on the display card, and a
+refuse/degrade path that turns a would-be `VK_ERROR_OUT_OF_DEVICE_MEMORY` into "N blocks
+resident". Each piece is small; together it is a round, and it must not be rushed on the
+same card that drives the displays.
+
+### Where the budget stands (unchanged, proven)
+
+`wait-gpu 32.0 · lane 13.9 · head 7.0 · ple 1.2 · xfer 1.1` of 58.4 ms; 1 843
+dispatches/token; recording 0.5 ms (measured per-phase, ~0.3 µs/dispatch); barriers are
+real dependencies. **Fusions are the only lever on the 32 ms**, and they are shader work.
+
+## 8as. Census marks inside `submit_block` landed; D5 not attempted
+
+### Census: the 1 719-dispatch lump is now split (2-way, attributable)
+
+`Session::census_split(dev)` closes the open batch and opens the next at the phases'
+own marks, **only** when `BRECCIA_TRACE_DISPATCH=1` (it adds a submit per call, so its
+numbers are for attribution, never for quoting as performance). One decode token:
+
+| phase (batch opened at) | dispatches/token |
+|---|---:|
+| `ple` | 78 |
+| prelude (HC read, mixer, attention, router) — attributed to `xfer-down` because that mark opens the batch | **543** |
+| lane + ffn write — `hc-write(ffn)` | **1 176** |
+| handoff / final-hc | 39 / 7 |
+| **total** | **1 843** (sums exactly) |
+
+The split is honest but only 2-way: the prelude's batch opens at the `XFER_DOWN` mark,
+so the name is wrong even though the count is right; separating the lane from the ffn
+write needs one more `census_split` before the ffn batch. That is a one-line change for
+the next round, and it is what D5's delta must be measured against.
+
+### D5 (HC collapse): not attempted, and why
+
+The sanctioned kernel procedure now exists (`AGENTS.md` "Adding a kernel"), so this is no
+longer a safety question — it is budget. Collapsing the 14 hyper-connection dispatches
+per block is not a *wired* change to an existing shader (the lowest-risk class): it needs
+a new entry point that consumes **all four streams' `hc_read` inputs and produces all
+four writes** in one dispatch, i.e. new bindings, a new specialisation of the HC
+pipeline, and a careful accumulation-order argument for bit-identity (the four streams
+are independent today; batching them must not change any per-stream order — it should be
+bit-identical by construction, but that has to be *shown* on the parity set). That is a
+shader + host-plumbing round, not a few minutes, and starting it with no budget left
+would have left the tree mid-flight.
+
+**Next round, in order (all inputs ready):** (1) the third `census_split` so lane and ffn
+are attributed separately; (2) D5 with the incumbent HC path kept behind
+`BRECCIA_NO_HC_FUSED`, one shape per process on the RX with validation, parity first;
+(3) D1 gate+up+SwiGLU.
+
+### State
+
+| quantity | value |
+|---|---:|
+| tok/s / ms per token | **17.01 / 58.80** |
+| dispatches/token (census, sums) | 1 843 (prelude 543 · lane+ffn 1 176) |
+| `wait-gpu` / lane / head / ple / xfer | 32.0 / 13.9 / 7.0 / 1.2 / 1.1 |
+| parity (32 greedy tokens vs the HIP server) | **32/32** |
+| `sum · wall · residual` | 0.02-0.03 ms/token |
+
 ## 9. Exact commands
 
 

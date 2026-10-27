@@ -1050,6 +1050,19 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// Census-only batch split (`BRECCIA_TRACE_DISPATCH=1`): close the open batch and
+    /// open the next one, so the dispatch counter can attribute a whole command
+    /// buffer's dispatches to the phase that produced them (§8as). Costs a submit per
+    /// call, which is why it is **only** on under the census flag — the numbers it
+    /// prints are for attribution, not for quoting as performance.
+    fn census_split(&mut self, dev: usize) -> Result<()> {
+        if std::env::var_os("BRECCIA_TRACE_DISPATCH").is_none() {
+            return Ok(());
+        }
+        self.flush()?;
+        self.ensure_batch(dev)
+    }
+
     /// Submit the open batch without waiting; the fence is kept in
     /// [`Session::pending_seg`] so [`Session::finish_block`] can wait for it.
     fn submit_batch(&mut self) -> Result<()> {
@@ -2583,6 +2596,7 @@ impl<'m> Session<'m> {
 
         // ---- one readback: mixed, ids, weights, shared out, shared gate ------
         self.timers.mark(XFER_DOWN);
+        self.census_split(dev)?;
         let k = mc.n_expert_used;
         let ws_mixed = &self.venues[dev]
             .hc_ws
