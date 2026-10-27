@@ -5690,3 +5690,79 @@ implying it.
 3. Re-read the submit count after `--split-blocks`/arena changes: it is now a first-class
    number on the report line, and it moves with placement (each placed block removes a
    readback *and* a wait).
+
+## 8bh. The placed-block wait deferral landed — and it proves the waits are **GPU time**, not overhead
+
+§8bg measured 64 submits/token, 100 % fence-waited, 34.19 ms/token in the wait, and named
+the 30 **placed-block** segment waits as the ones nothing needs: their `HC_WRITE` rides
+the next submission on the same queue, so queue order already covers the dependency. That
+deferral is now in (`BRECCIA_NO_DEFER_PLACED=1` reverts), with the gates a
+fence-resolution change requires.
+
+```rust
+let defer = m.placed.contains_key(&b) && trace.is_none() && defer_placed_waits();
+if defer { self.deferred_waits += 1; }              // leave the segment in flight
+else if let Some(seg) = self.pending_seg.take() { …wait… }
+```
+
+A deferred segment is collected by `flush()`/`wait_all` — which already wait every fence on
+the session's devices — and by the ring's own back-pressure (`begin` waits a slot before
+reuse). The **traced** path keeps its wait because it reads GPU buffers back, and
+`readbacks_unfenced` (a co-tenant round's instrumentation: a `read_block` whose copies were
+not fenced) stays **0** on every arm below, which is the invariant that could have broken.
+
+| arm | tok/s | ms/token | waits/token | host-wait ms/token | `wait-gpu` µs | `sum` µs |
+|---|---:|---:|---:|---:|---:|---:|
+| no-defer | 18.38 / 18.29 | 54.40 / 54.66 | 64.0 | 33.99 / 34.07 | 30 848 / 30 916 | 30 377 / 30 477 |
+| **defer** | 18.19 / 18.33 | 54.97 / 54.54 | 64.0 | 34.04 / 33.93 | **10 158 / 10 129** | 30 408 / 30 308 |
+
+`deferred 4140` (process-cumulative ≈ 30/token) · `unfenced readbacks 0` · adjacent arms,
+co-tenant-guarded (`pgrep` = 0).
+
+**The deferral works exactly as designed and buys nothing, and that is the result.** The
+`wait-gpu` stage drops 30.8 → 10.2 ms/token (−67 %), i.e. two thirds of that stage's time
+was *not* the GPU work it was named after — but the token does not move (54.4-54.7 →
+54.5-55.0 ms), the total host wait is unchanged (34.0 ms), and `sum` (GPU execution) is
+unchanged to 0.3 %. The waits did not disappear; they moved to the next fence-bearing
+operation (`flush()`, the next readback), where they cost the same.
+
+That closes the question §8bg opened, with numbers:
+
+* **64 waits × 531 µs each is not 64 × 24.6 µs of overhead.** The waits are dominated by
+  real GPU time: `sum` 30.4 ms of execution against 34.0 ms of wait, i.e. **~3.5 ms of the
+  34 is latency/convert** (research 08's 24.6 µs × 64 ≈ 1.6 ms, plus the submit's 8.6 µs).
+  The rest is the host correctly waiting for a GPU-bound stream.
+* **Deferring a placed block cannot buy overlap, because a placed block has no host work.**
+  The chain for one stream is `readback → lane → upload → next block's GPU work`; the block
+  whose wait can go is precisely the block that has no lane step to overlap with it. The
+  serialiser is the *host-lane block's own dependency* on its fence, not the fence count —
+  so a single stream is `lane + GPU` for structural reasons, and the only ways out are
+  (a) two streams (which `multi.rs` already does), or (b) giving the lane work that does
+  not need this block's readback (a different restructure).
+* The flag stays as the A/B and the revert; the default is **deferred** because it is
+  neutral in wall clock, strictly smaller in the `wait-gpu` attribution, and passes the
+  gates below.
+
+### Gates
+
+* **Parity 32/32 at chunk 8 and 32** with the deferral on, top-1 `13.170510` unchanged.
+* **8-process gate GREEN** with the deferral on (`BRECCIA_REQUIRE_QUIET` was not needed —
+  the harness discards a co-tenant process and said nothing about one this run):
+  `RACE_PROCS=8 RACE_RUNS=1 RACE_GEN=32 RACE_PROMPT=parity RACE_WARM=1
+  scripts/head-handoff-race.sh` → `8 generations over 8 exclusive processes, crossing
+  refused OK -> GREEN`.
+* `cargo test --workspace`, clippy `-D warnings`, fmt, `verify.sh` clean.
+
+### Deliverable 2 (batch the 18 readbacks into one wait per pass): **not done, and now priced**
+
+The measurement above says it would remove ~17 waits/token, i.e. ~17 × 24.6 µs ≈ **0.4 ms**
+of the 3.5 ms that is actually latency — the other 30 ms is GPU time that no readback
+batching touches. It also cannot be done without moving the lane to run after the pass's
+last submit (the same restructure as the interleaved-prefill item), so its real value is
+the *restructure*, not the wait count. Recorded rather than attempted with no budget.
+
+### Deliverable 3 (IQ3_S word-level): not reached
+
+Still the honest prediction from §8bc — IQ3_S's grid lookups already run at ~100 % of the
+instruction model, so the extraction win is smaller than IQ4_XS's — but it is
+**unmeasured**, and this round's numbers do not stand in for it.

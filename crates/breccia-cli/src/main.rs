@@ -2804,7 +2804,8 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         let per = forwards.max(1) as f64;
         println!(
             "submits  {:.1}/token · {} total · waited {} ({:.1}/token) · queued {} ({:.1}/token) \
-             · fence waits {} ({:.1}/token, {:.2} ms/token in the wait)",
+             · fence waits {} ({:.1}/token, {:.2} ms/token in the wait) · deferred {} · \
+             unfenced readbacks {}",
             st.submits as f64 / per,
             st.submits,
             st.waited,
@@ -2814,6 +2815,8 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             st.waits,
             st.waits as f64 / per,
             st.wait_s * 1e3 / per,
+            sess.deferred_waits,
+            sess.readbacks_unfenced,
         );
     }
     // The per-dispatch price from **one** window: `RECORD_NS` and its own dispatch

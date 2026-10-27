@@ -88,6 +88,18 @@ const HANDOFF: usize = 13;
 const FINAL_HC: usize = 14;
 const HEAD: usize = 15;
 
+/// `BRECCIA_NO_DEFER_PLACED=1`: restore the one-fence-wait-per-block shape, i.e. wait
+/// for a **placed** block's segment even though nothing on the host reads it (§8bh).
+///
+/// The deferral is what lets the host record block *b+1* while block *b* still runs:
+/// a placed block's `HC_WRITE` is ordered against the next submission by the queue
+/// itself, so the wait is pure host latency (research 08: 24.6 us of the 33.2 us a
+/// waited submit costs). Cached — read once per session.
+fn defer_placed_waits() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_NO_DEFER_PLACED").is_none())
+}
+
 /// Live sessions on this process, so the last one to drop can release the shared
 /// dispatch ring's pools.
 static LIVE_SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -600,6 +612,10 @@ pub struct Session<'m> {
     /// bare slice of the mapping, so it is only correct if the copies that fill it have
     /// been fenced. Must be 0 on every run.
     pub readbacks_unfenced: u64,
+    /// Segments whose fence wait was **deferred** because nothing on the host reads
+    /// their result (§8bh): a placed block's `HC_WRITE` rides the next submission, so
+    /// `flush()`/`wait_all` (and the ring's back-pressure) are what collect them.
+    pub deferred_waits: u64,
     /// Indices of the logits row that still held the poison after the head ran, at the
     /// first check (`BRECCIA_FAULT_POISON_LOGITS`). `Some(0)` = the head wrote every
     /// entry; `Some(n > 0)` = `n` entries were never written.
@@ -1098,6 +1114,7 @@ impl<'m> Session<'m> {
             head_up: 0,
             head_down: 0,
             readbacks_unfenced: 0,
+            deferred_waits: 0,
             logits_unwritten: None,
             block_seg: None,
             head_traffic0: (0, 0),
@@ -2986,7 +3003,18 @@ impl<'m> Session<'m> {
         // submitted nothing, which cannot have an in-batch readback either).
         let mine = self.block_seg.take();
         let had_segment = mine.is_some() && mine == self.pending_seg;
-        if let Some(seg) = self.pending_seg.take() {
+        // **Deferred wait** (§8bh). A block whose experts are resident reads nothing
+        // back: its `HC_WRITE` is recorded into the next submission on the *same*
+        // queue, so queue order already guarantees the dependency and this wait is
+        // pure host latency. Leaving the segment in flight is also what lets the host
+        // record block b+1 while block b executes — the overlap a single stream needs
+        // to stop being `lane + GPU`. `flush()`/`wait_all` and the ring's own
+        // back-pressure (`begin` waits a slot before reuse) collect it; the *traced*
+        // path reads GPU buffers back, so it keeps its wait.
+        let defer = m.placed.contains_key(&b) && trace.is_none() && defer_placed_waits();
+        if defer {
+            self.deferred_waits += 1;
+        } else if let Some(seg) = self.pending_seg.take() {
             let d = self.pending_dev.take().unwrap_or(dev);
             let wait = {
                 let gpus = self.device_gpus();
