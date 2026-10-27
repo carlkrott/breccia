@@ -445,7 +445,12 @@ mod tests {
     fn plan_reports_expert_pin_only_when_flag_on() {
         let on = plan_text(&profile(), Some(16 << 20));
         assert!(on.contains("imported arena pin: 16.0 MiB"), "{on}");
-        assert!(on.contains("units need LimitMEMLOCK=infinity"), "{on}");
+        // Bind to the new block: bare "units need LimitMEMLOCK=infinity" also
+        // appears on the Tier-2 line, so it would pass with the block absent.
+        assert!(
+            on.contains("imported arena pin: 16.0 MiB → units need LimitMEMLOCK=infinity"),
+            "{on}"
+        );
         let small = plan_text(&profile(), Some(4 << 20));
         assert!(
             small.contains("fits the default 8 MiB mlock limit"),
