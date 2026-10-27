@@ -406,7 +406,9 @@ impl<'g> Gdn<'g> {
             .u(MODEL_H_V as u32)
             .u(MODEL_S as u32)
             .u(CONV_CHANNELS as u32);
-        let (gx, gy) = grid_for(MODEL_H_V * MODEL_S, 128);
+        // One workgroup per 4 columns (32 lanes each), so the state is streamed
+        // once per call instead of twice per token (§8bi).
+        let (gx, gy) = grid_for(MODEL_H_V * MODEL_S / 4, 1);
         self.step.run(
             &[&state.state, &ws.qkv, &ws.gate, &ws.beta, out],
             &pc,
@@ -427,7 +429,7 @@ impl<'g> Gdn<'g> {
             .u(MODEL_H_V as u32)
             .u(MODEL_S as u32)
             .u(CONV_CHANNELS as u32);
-        let (gx, gy) = grid_for(MODEL_H_V * MODEL_S, 128);
+        let (gx, gy) = grid_for(MODEL_H_V * MODEL_S / 4, 1);
         self.step.run_timed(
             &[&state.state, &ws.qkv, &ws.gate, &ws.beta, out],
             &pc,
