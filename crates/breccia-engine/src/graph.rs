@@ -1098,18 +1098,20 @@ impl<'m> Session<'m> {
         let Some(k) = self.probe_batches else {
             return Ok(());
         };
+        // The pool holds `GPU_PROBE_BATCHES` pairs and **cannot be read while its
+        // submissions are in flight** (`vkGetQueryPoolResults` without
+        // `WAIT` returns NOT_READY, and this probe used to abort the run there).
+        // Reading can only happen once the caller has waited, which is at the end
+        // of the token — so when the pool is full the probe simply stops stamping
+        // and keeps its samples (§8am).
+        if k as usize >= GPU_PROBE_BATCHES {
+            return Ok(());
+        }
         let pool = self.probe_pools[dev];
         let query = 2 * k + u32::from(end);
         batch_cmd::record_timestamp(self.model.devices[dev].gpu(), pool, query)?;
         if end {
-            let k = k + 1;
-            if k as usize >= GPU_PROBE_BATCHES {
-                // The pool is full: read it out and start again, so the probe
-                // measures the whole run rather than its first 256 batches.
-                self.probe_flush()?;
-            } else {
-                self.probe_batches = Some(k);
-            }
+            self.probe_batches = Some(k + 1);
         }
         Ok(())
     }
@@ -1123,6 +1125,12 @@ impl<'m> Session<'m> {
         if k == 0 {
             return Ok(());
         }
+        // `vkGetQueryPoolResults` without `WAIT` returns NOT_READY if the
+        // submission that wrote the stamps is still in flight — which it was, on
+        // the first token, and this probe aborted the run there (§8am). Drain this
+        // session's segments first; the callers (`gpu_busy_s`, the token report) are
+        // outside any batch.
+        self.flush()?;
         for (i, pool) in self.probe_pools.iter().enumerate() {
             if *pool == ash::vk::QueryPool::null() {
                 continue;
@@ -1201,6 +1209,23 @@ impl<'m> Session<'m> {
     /// Print and disable the GPU-time probe (called once a token).
     fn probe_report(&mut self) -> Result<()> {
         self.probe_flush()?;
+        // **Dispatch census** (`BRECCIA_TRACE_DISPATCH=1`): dispatches per stage for
+        // one token. The stage tags are the graph's own marks, so this says *where*
+        // the ~4 700 dispatches/token come from without any GPU work (§8an).
+        if std::env::var_os("BRECCIA_TRACE_DISPATCH").is_some() {
+            let rows: Vec<String> = STAGES
+                .iter()
+                .zip(self.timers.dispatches.iter())
+                .filter(|(_, n)| **n > 0)
+                .map(|(name, n)| format!("{name} {n}"))
+                .collect();
+            eprintln!(
+                "dispatch census token {}: {} · total {}",
+                self.forwards,
+                rows.join(" · "),
+                self.timers.dispatches.iter().sum::<u32>()
+            );
+        }
         if std::env::var_os("BRECCIA_GPU_TIME_VERBOSE").is_some() {
             for (i, s) in self.gpu_busy_s.iter().enumerate() {
                 eprintln!(

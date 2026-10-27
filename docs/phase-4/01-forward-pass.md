@@ -3089,6 +3089,154 @@ on the display card) were **not** implemented: item 1's measurement reordered th
 (fusion first), and the window did not allow a new shader round that could pass the
 GPU-safety protocol (one shape per invocation, validation on, RX first).
 
+## 8am. `wait-gpu` is **78 % launch overhead**: fusions before traffic (and the probe is still broken)
+
+### The verdict, from a controlled A/B rather than a stage table
+
+`BarrierScope::Full` and `BarrierScope::Sync2` do the **same work, the same
+dispatches and the same bytes**; they differ only in the sync primitive. At an
+identical barrier count (184 190 emitted in both arms) on the same config (single
+stream, 30 blocks resident, clocks `high`):
+
+| arm | tok/s | ms/token |
+|---|---:|---:|
+| v1 `ALL_COMMANDS` (`BRECCIA_BARRIER=full`) | 11.89 | 84.10 |
+| sync2 COMPUTE→COMPUTE (default) | **17.27** | **57.91** |
+
+**26.2 ms/token of the 32.5 ms `wait-gpu` is launch/serialisation cost**, i.e.
+**≈78 % overhead, ≈22 % execution**. Nothing about arithmetic, bytes or residency
+changes between the arms, so this is not an inference from wall/diff — it isolates the
+overhead directly. With 0.82 barriers/dispatch and ~4 700 dispatches/token, 26.2 ms
+over 3 900 barriers is 6.7 µs per barrier of *GPU-timeline* serialisation, which is the
+launch cost the barrier forces (§8af priced the freed dispatch at 4.4 µs; the barrier
+that follows it costs more than the dispatch).
+
+**Consequence (this reorders the round's items):** cut **dispatch count**, not bytes.
+Fused RMSNorm+QKV / RoPE+KV / HC read+write / gate+up+SwiGLU, then the frozen
+command-buffer replay. Route-tail skipping (bytes) and expert residency are *not* the
+next lever at a 22 % execution share.
+
+### The per-stage GPU table is blocked: the probe aborts
+
+`BRECCIA_GPU_TIME=1` dies on the first forward pass with
+
+```
+breccia: the first forward pass: reading the GPU-time probe:
+         vkGetQueryPoolResults: A fence or query has not yet completed
+```
+
+The probe read its pool while the submission that wrote the stamps was still in
+flight. Two fixes landed in `Session::probe_stamp`/`probe_flush`: stop stamping when
+the pool is full instead of reading mid-recording, and drain this session's segments
+before the read. The read **still** races on the first pass (a pool is shared across
+the ring's slots, so the not-ready stamps belong to a submission that is not the
+session's `pending_seg`), so **no per-stage µs table exists this round** — the
+instrument needs a per-slot pool (one pool per ring slot, read when that slot's fence
+has been waited) before it can be trusted. Recorded here so the next round fixes it
+rather than rediscovering it.
+
+### State after this round (single stream, both cards, clocks `high`)
+
+| quantity | value |
+|---|---:|
+| tok/s / ms per token | **17.32 / 57.74** |
+| `wait-gpu` | 32.5 (56.6 %) |
+| `experts(host)` (lane, 301 MiB/token) | 13.4 |
+| `head` | 7.0 |
+| ple / xfer-down | 1.2 / 0.6 |
+| parity (32 greedy tokens vs the HIP server) | **32/32** |
+| barrier accounting | 256 670 emitted, 62 730 pruned (0.82/dispatch) |
+
+### Items 2 and 3: what was and was not done
+
+- **No fusion shaders were written.** The GPU-safety protocol (RX first, one new
+  shape per invocation, validation on, `timeout`) needs a dedicated window, and the
+  round's budget went to the attribution that decides *which* fusions matter. The
+  order they should land, from the overhead share above: (1) fused `gate+up+SwiGLU`
+  — 2 dispatches per expert instead of 3, the largest single dispatch reduction per
+  token; (2) fused RMSNorm+QKV; (3) fused RoPE+KV-write; (4) frozen CB replay.
+- **`head` cannot be moved by a split choice** (item 3a): the head runs on the device
+  that owns block 47, and every split that keeps ~30 blocks resident puts block 47 on
+  the MI50. Making the RX own the last block needs an explicit head-device option (a
+  code change, ~-4 ms expected), not a different `--split-blocks`. The best 1-stream
+  config remains `--split-blocks 28,20` with the 30-block arena.
+- **Adaptive coverage (item 3b) not done**: the arena is still a host-specific block
+  list; sizing it from measured free VRAM with an explicit reserve on the display
+  card (MI50 drives DP-0/DP-1/HDMI-A-0) and a refuse-and-degrade path is the next
+  portable piece.
+
+**Window note**: the paired research agent was benching the RX during these runs —
+the lane swung 13.4-26.2 ms between identical configs. The pairs above are adjacent
+(same window), so the *deltas* are sound; the absolute 17.32 tok/s had one clean
+re-measurement and matches §8ak/§8al within noise.
+
+## 8an. The census is wrong and the record path is the real twin of `wait-gpu`
+
+### Dispatch count: ~2 800/token, not 4 700
+
+`313 790` dispatches over `112` token-graphs (3 prompt passes x 27 + 31 decode) =
+**~2 800 dispatches/token** on the 30-block config. The 4 700 in the round's premise
+came from §8af's pre-residency chain; expert coverage removed ~40 % of it. With
+`0.82 barriers/dispatch` that is **~2 300 barriers x 6.7 µs ≈ 15.4 ms of the 32.5 ms
+`wait-gpu` (47 %)** — barrier serialisation is *half* the fence wait, not all of it.
+The round's predicted fusion+replay+head budget (−15 ms) survives, but its components
+shrink: fusing 700 dispatches is now 700 of 2 800 (25 %) and worth ~−4 ms only if the
+dispatching really is per-expert (unproven — see below).
+
+### The census instrument is not usable yet
+
+`BRECCIA_TRACE_DISPATCH=1` (`Session::probe_report`) prints per-stage dispatch counts
+from `Timers::dispatches`, but that accounting only sees stages that are current **at a
+batch flush**, and its `dispatch_mark` uses the process-wide `recorded()` counter which
+resets per batch. One decode token prints only `shared-exp 90 · hc-write(ffn) 32 ·
+head 1`, i.e. **123 of ~2 800** — everything recorded inside a block's batch is
+invisible. A correct census needs the dispatch count of *each* batch attributed to the
+stage that was current when the batch was **opened** (`ensure_batch`), i.e. per-batch
+marks rather than per-flush ones. Not done: the number above (total/token) is sound,
+the per-stage split is not yet.
+
+### The finding that reorders item 2: **record time is 32.5 ms/token**
+
+```
+record   32.52 ms/token of host recording (313790 dispatches, 36 per submit)
+```
+
+That is the *host* side of the same 58 ms token, and it is as large as `wait-gpu`
+(32.5 ms). Per dispatch it is **~11.6 µs** — far above research 08's 1.4 µs
+submit-path figure, because `dispatch_batch::record` allocates and writes a **fresh
+descriptor set per dispatch** (the rule that keeps recorded batches safe, module docs).
+So the frozen-CB replay (item 2 of the round) is the **largest single item on the
+board**, not the third: it removes both the per-dispatch set write and the record-path
+CPU time, and the two are worth up to ~20-30 ms/token if the set allocation is what
+dominates. That is the next round's first job, and it needs the per-slot query pools
+(recorded in §8am) plus a shape-frozen decode graph.
+
+### State (single stream, both cards, clocks `high`, quiet window)
+
+| quantity | value |
+|---|---:|
+| tok/s / ms per token | **17.19 / 58.16** (17.32 / 57.74 in the prior window) |
+| `wait-gpu` | 32.5 (56 %) |
+| host record time | **32.5 ms/token** |
+| dispatches/token | **~2 800** (0.82 barriers/dispatch) |
+| `experts(host)` / `head` / `ple` / `xfer` | 13.4 / 7.0 / 1.3 / 1.1 |
+| parity (32 greedy tokens vs the HIP server) | **32/32** |
+| expert bytes/token | 301 MiB |
+
+### Not done this round, in the order the numbers now dictate
+
+1. **Frozen-CB replay** — the biggest item (record path 32.5 ms/token, 11.6 µs per
+   dispatch). Requires a shape-frozen decode graph and per-slot query pools.
+2. **Correct dispatch census** (per-batch stage marks) — cheap, and it decides whether
+   the per-expert GEMVs really are individual dispatches (`GemmMany` collapse would be
+   worth more than all the fusions).
+3. The four fusions (gate+up+SwiGLU, RMSNorm+QKV, RoPE+KV, HC) — ~−4 ms, unmeasured
+   because not written; new shaders need the GPU-safety window.
+4. Head-device option (−4 ms) and the adaptive arena (portable coverage rule).
+5. Zero-copy host-memory experts (`docs/research/09`: 22-26 GB/s verified) for the 18
+   hosted blocks — removes the last serial CPU section; needs 4096 B alignment and,
+   for a pinned pool, `LimitMEMLOCK=infinity` (`ulimit -Hl` is 8 MiB here).
+
 ## 9. Exact commands
 
 
