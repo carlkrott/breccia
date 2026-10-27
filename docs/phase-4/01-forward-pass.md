@@ -2476,6 +2476,71 @@ site can reintroduce `u64::MAX`; the remaining one is
 | dependent-chain timing only for dispatch-cost claims | adopted |
 | barrier cost is 3.43 us per **dependent** barrier (~3.8 ms/token over ~1,100) | re-prices the parked item upward; stays parked until the shared expert lands |
 
+## 8ad. `shared-exp` was a timer artifact: the stage is 0.1 ms/token, not 15-55
+
+The round's job was to instrument before restructuring again. It settles the question
+**against** a second attempt, and it invalidates one of this document's own numbers.
+
+### The breakdown (`BRECCIA_TRACE_SHARED`, 64-token chunk, per prompt token, 48 blocks)
+
+| sub-stage | ms/token |
+|---|---:|
+| `sh_gate` (GEMV) | 0.02 |
+| `sh_up` (GEMV) | 0.02 |
+| `sh_swiglu` | 0.02 |
+| `sh_down` (GEMV) | 0.02 |
+| `sh_scalar_gate` (the 1-float projection) | 0.02 |
+| **routed shared expert, total** | **0.10** |
+| **pass-1 flush wait** | **19.3-20.7** |
+| `shared-exp` stage as `Timers` reports it | 19.4-20.8 |
+
+So the **routed shared expert costs 0.10 ms/token of host time** — it is already
+essentially free — and the 19-21 ms that the `Timers` table attributes to
+`shared-exp` is **the pass-1 GPU wait**, charged to that stage by mark ordering: the
+shared expert is the last thing `record_dense_prelude` records, so the gap between
+its `SHARED` mark and the next mark swallows the `flush()` that closes pass 1 (the
+wait for ~1 900 recorded dispatches per block).
+
+That also explains the shape §8z recorded and the restructure chased:
+"20.9-55.3 ms/token chunked, 15.4 token-by-token" is `blocks x flush / t` — it grows
+as `t` shrinks because the same per-block drain is divided by fewer tokens, not
+because the shared expert degrades.
+
+**Consequences.**
+
+1. The chunk-level shared expert is **not worth a second attempt**: its ceiling is the
+   0.10 ms/token above, i.e. ~0.5 % of prefill, and §8ab's "0.03-0.04 ms/token"
+   price was right about the GEMMs and wrong about what the 15-55 ms was.
+2. The stage table needs the pass-1 flush attributed to `WAIT_GPU`, not to whichever
+   stage happened to run last. That is a one-line timer fix and it is what the next
+   round should do before trusting any other stage number in §8w-§8ad.
+3. What the restructure *would* have helped with is the thing it was never aimed at:
+   the **23 ms/token of GPU drain per block** in chunked prefill. The levers there are
+   the launch side (barrier pruning, re-priced at 3.43 us per dependent barrier ≈
+   3.8 ms/token), fewer dispatches per block (fused gate+up+SwiGLU: 2 instead of 3 per
+   expert), and the descriptor-set cost — not the shared expert's arithmetic.
+
+The four §8ab pieces stay reverted (they were wrong, §8ac) and are now **not worth
+fixing**; the code is out of the tree and the design is recorded here only as a
+negative result.
+
+### Safety: the last unbounded wait is bounded
+
+`TransferRing::wait_semaphores` was the engine's last `u64::MAX`: it now waits
+`Gpu::WAIT_TIMEOUT_NS` and, on expiry, prints what it waited for and calls
+`Gpu::fault_abort` (§8ac), which leaves the device healthy instead of hanging it on
+the display card. With `wait_fence` and the batch ring's shutdown wait already
+bounded, **no unbounded GPU wait remains** (grep-checked). `VK_EXT_robustness2`
+(OOB -> zeros, <=1 % cost) is still **queued**: it needs the device-creation feature
+chain and the extension string, which is a change to `Gpu::create`'s feature list and
+deserves its own parity run rather than the tail of this round.
+
+### Parity and gate
+
+Nothing on a decode path changed, and the reverted tree is the one §8ac measured:
+**parity 32/32 at chunk 128 + merged, top-1 13.170561; the canonical gate stands at
+20.3 +- 1 aggregate, lane 40-43 ms/step.**
+
 ## 9. Exact commands
 
 

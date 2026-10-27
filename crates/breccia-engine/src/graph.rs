@@ -508,6 +508,9 @@ pub struct Session<'m> {
     pf_stream_wait_s: f64,
     /// Host seconds spent faulting PLE table rows in for the whole chunk.
     pf_ple_prefetch_s: f64,
+    /// Fine-grained `shared-exp` attribution (§8ad): gate, up, swiglu, down, scalar
+    /// gate in host seconds, then the pass-1 flush wait. Measurement only.
+    sh_sub: [f64; 6],
     pf_merged_dispatches: u64,
     pf_arena_bytes: u64,
     pf_merged_experts: usize,
@@ -866,6 +869,7 @@ impl<'m> Session<'m> {
             pf_stream_fill_s: 0.0,
             pf_stream_wait_s: 0.0,
             pf_ple_prefetch_s: 0.0,
+            sh_sub: [0.0; 6],
             pf_merged_dispatches: 0,
             pf_arena_bytes: 0,
             pf_merged_experts: 0,
@@ -1086,6 +1090,7 @@ impl<'m> Session<'m> {
         self.pf_stream_fill_s = 0.0;
         self.pf_stream_wait_s = 0.0;
         self.pf_ple_prefetch_s = 0.0;
+        self.sh_sub = [0.0; 6];
         self.pf_merged_dispatches = 0;
         self.pf_arena_bytes = 0;
         self.pf_merged_experts = 0;
@@ -1475,6 +1480,7 @@ impl<'m> Session<'m> {
 
         // ---- (G) shared expert + its scalar sigmoid gate ---------------------
         self.timers.mark(SHARED);
+        let mut sub = [0f64; 5];
         {
             let lw = &m.layers[b];
             let v = &self.venues[dev];
@@ -1483,22 +1489,37 @@ impl<'m> Session<'m> {
             // `gate` and `up` both read `ws.mixed` and write disjoint outputs, so
             // the fence between them is dead: drop *gate's* trailing fence (§8z).
             batch_cmd::skip_next_barrier();
+            // Fine-grained attribution (§8ad): this stage measures as 15-21 ms/token
+            // while the routed shared expert prices at ~0.9, so time each call.
+            let t0 = std::time::Instant::now();
             pipes
                 .get(&lw.moe.gate.key)?
                 .run(&lw.moe.gate.buf, &ws.mixed, &v.shexp_gate)?;
+            sub[0] = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             pipes
                 .get(&lw.moe.up.key)?
                 .run(&lw.moe.up.buf, &ws.mixed, &v.shexp_up)?;
+            sub[1] = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             v.swiglu
                 .run(&v.shexp_gate, &v.shexp_up, &v.shexp_act, mc.n_ff)?;
+            sub[2] = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             pipes
                 .get(&lw.moe.down.key)?
                 .run(&lw.moe.down.buf, &v.shexp_act, &v.sh)?;
+            sub[3] = t0.elapsed().as_secs_f64();
+            let t0 = std::time::Instant::now();
             pipes.get(&lw.moe.shexp_gate.key)?.run(
                 &lw.moe.shexp_gate.buf,
                 &ws.mixed,
                 &v.sh_gate_logit,
             )?;
+            sub[4] = t0.elapsed().as_secs_f64();
+        }
+        for (acc, d) in self.sh_sub.iter_mut().zip(sub) {
+            *acc += d;
         }
 
         Ok(BlockDigests {
@@ -1594,6 +1615,28 @@ impl<'m> Session<'m> {
         // `BRECCIA_TRACE_PREFILL=1`: the chunk's own stage split, ms per prompt
         // token, so "the dense chain" and "the expert lane" are numbers and not
         // guesses. This is what decides whether a T-batched dense chain can pay.
+        if std::env::var_os("BRECCIA_TRACE_SHARED").is_some() {
+            let t = t.max(1) as f64;
+            let names = [
+                "sh_gate",
+                "sh_up",
+                "sh_swiglu",
+                "sh_down",
+                "sh_scalar_gate",
+                "pass1_flush",
+            ];
+            let rows: Vec<String> = names
+                .iter()
+                .zip(self.sh_sub.iter())
+                .map(|(n, s)| format!("{n} {:.2}", s * 1e3 / t))
+                .collect();
+            eprintln!(
+                "shared-exp blk48 t={t} (ms/token): {} · total {:.2}",
+                rows.join(" · "),
+                self.sh_sub.iter().sum::<f64>() * 1e3 / t
+            );
+            self.sh_sub = [0.0; 6];
+        }
         if std::env::var_os("BRECCIA_TRACE_PREFILL").is_some() {
             let rows: Vec<String> = self
                 .timers
@@ -1721,7 +1764,9 @@ impl<'m> Session<'m> {
             }
         }
         self.submit_batch()?;
+        let t_pass1 = std::time::Instant::now();
         self.flush()?;
+        self.sh_sub[5] += t_pass1.elapsed().as_secs_f64();
 
         if m.placed.contains_key(&b) {
             return Ok(());

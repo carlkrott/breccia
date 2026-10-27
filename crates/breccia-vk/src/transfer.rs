@@ -501,12 +501,20 @@ impl<'a> TransferRing<'a> {
             .semaphores(&sems)
             .values(&values);
         let t0 = Instant::now();
-        unsafe {
-            vk(
-                self.gpu.device.wait_semaphores(&info, u64::MAX),
-                "vkWaitSemaphores",
-            )?;
+        // **Bounded** (§8ad): the last unbounded wait in the engine. An infinite
+        // wait on the display GPU is what let the kernel watchdog issue a BACO reset
+        // on 2026-10-26; this one gives up, says what it was waiting for, and aborts,
+        // which leaves the device healthy (AGENTS.md incident log).
+        let r = unsafe {
+            self.gpu
+                .device
+                .wait_semaphores(&info, crate::ctx::Gpu::WAIT_TIMEOUT_NS)
+        };
+        if let Err(e) = r {
+            eprintln!("breccia: waiting on a transfer-ring semaphore: {e}");
+            crate::ctx::Gpu::fault_abort("a transfer-ring semaphore");
         }
+        let _ = vk::Result::SUCCESS;
         Ok(t0.elapsed().as_secs_f64())
     }
 
