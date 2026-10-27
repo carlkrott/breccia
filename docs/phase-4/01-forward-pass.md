@@ -5599,3 +5599,94 @@ timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
   BRECCIA_KERNEL_DEVICE=0000:0e:00.0 cargo test -p breccia-kernels --test conformance \
   word_pack -- --test-threads=1 --nocapture
 ```
+
+## 8bg. Submit accounting: **64 submits/token, all 64 fence-waited, 0 queued** — 34 ms/token of host wait
+
+The round-`8bc` measurement said `gdn-proj` costs 97.7 µs/call in the engine against 63 in
+the isolated bench, i.e. ~35 µs of something that is not the kernel. Research 08's price
+list says a **fence-waited** submit is 33.2 µs (submit 8.6 + wait 22–24) where a **queued**
+one is 8.6, so the question is how many submissions the token makes and how many of them
+the host actually waits for. `ctx` now counts exactly that.
+
+### The instrument (this round's deliverable, and it is now on the report line)
+
+`breccia_vk::ctx` counts `SUBMITS` (as before), `FENCE_WAITS`, `FENCE_WAIT_NS`, and
+classifies every submit as **waited** or **queued**: a submit is charged *waited* if a
+fence wait happens before the next submit on that thread, everything else as *queued*
+(`submit_stats()` / `submit_stats_window()`, with the window opened by
+`reset_submit_stats()` at the same point the engine resets its record counters — after the
+prompt, so nothing is prompt-inflated). `bench token` prints:
+
+```
+submits  64.0/token · 960 total · waited 960 (64.0/token) · queued 0 (0.0/token)
+         · fence waits 960 (64.0/token, 34.19 ms/token in the wait)
+```
+
+(An earlier attempt to snapshot in the CLI loop reported 188.8/token and 96 ms of wait on a
+54 ms token — the window included the prompt's own pass. The measurement was wrong, not
+the engine; the window is now opened inside `generate()`. That is worth recording because
+the first number looked like a 3× smoking gun and was an accounting artefact of exactly
+the kind `docs/REPRODUCE.md` §0b warns about.)
+
+### What the number says
+
+| quantity | value |
+|---|---:|
+| submits/token | **64.0** |
+| of which fence-waited | **64.0 (100 %)** |
+| queued (pipelined) | **0** |
+| host time in fence waits | **34.19 ms/token** (64 % of a 53.80 ms token) |
+| single stream, dual, 30 resident | 18.59 tok/s · 53.80 ms/token |
+| `sum` / `wait-gpu` | 30 601 / 31 047 µs (residual +1.4 %) |
+
+So the engine is **fully synchronous at the submission level**: every one of its 64
+submissions per token is followed by a fence wait. At research 08's 24.6 µs of avoidable
+latency per waited-vs-queued submit, the ceiling is **1.6 ms/token if every wait could
+go**, and the honest floor is smaller because some waits are load-bearing.
+
+### Which waits are load-bearing (measured, not assumed)
+
+* **Readbacks — must stay.** 18 host-lane blocks × 1 readback/token, plus the head's
+  logits row: the host `memcpy`s the mapping immediately after, so the fence is the
+  correctness edge, not overhead.
+* **`flush()` drains — must stay** at the points where the host lane or the sampler
+  consumes a buffer (they are what makes `sum ≡ wait-gpu` hold to 1.4 %).
+* **The 30 placed-block segment waits — do not have to stay.** A block whose experts are
+  resident reads nothing back: its `HC_WRITE` rides the *next* submission on the same
+  queue, so queue ordering already guarantees the dependency and the fence only costs the
+  wait. 30 waits/token → **~0.7 ms**. The patch is `finish_block`: leave `pending_seg` in
+  place for `m.placed.contains_key(&b) && trace.is_none()` (the traced path reads GPU
+  buffers back, so it keeps its wait) and let `flush()`/`wait_all` and the ring's own
+  back-pressure (`begin` waits a slot before reuse) collect it — **not landed this round**:
+  the deferral changes which fence a later `wait` resolves and I would not ship that
+  without its own parity + race-harness run.
+* **A conversion that turned out to be a no-op**: the per-block `block_out` upload is a
+  `Mailbox` memcpy (no submit at all — the code comment already said so), so the natural
+  "record the upload into the batch" idea moves 0 submits in this configuration.
+  `Staging::write` now *records into an open batch* when one exists (correct and
+  strictly fewer waits on the handoff path), but the decode path does not exercise it.
+
+### Also this round
+
+The `gdn-proj` per-call gap did not move: **1230.8 µs on the RX + 1992.8 on the MI50 =
+3 223.6 µs/token**, i.e. 89.5 µs/call, unchanged from §8bc's 97.7 — consistent with the
+count: the gap is not a submit *per call*, it is the in-batch barrier chain plus the
+engine's own record latency inside that interval (the 64 submits are per *token*, not per
+projection).
+
+Parity unchanged: **32/32 at chunk 8 and 32**, top-1 `13.170510`; `cargo test
+--workspace`, clippy `-D warnings`, fmt and `verify.sh` clean. The 8-process gate was
+**not** re-run this round (no kernel changed) — flagging that explicitly rather than
+implying it.
+
+### Next, in order
+
+1. **Land the placed-block wait deferral** (0.7 ms, the only measured-safe conversion) with
+   its own parity + 8-process gate.
+2. **Batch the 18 readback round trips**: they are 18 submits + 18 waits per token for
+   10 KiB each; one staging buffer per *pass* (read all host-lane blocks' lane inputs after
+   the pass's last submit) would convert ~17 waits into one. Needs the lane to run after
+   the pass, which is the same restructure as the interleaved-prefill item.
+3. Re-read the submit count after `--split-blocks`/arena changes: it is now a first-class
+   number on the report line, and it moves with placement (each placed block removes a
+   readback *and* a wait).

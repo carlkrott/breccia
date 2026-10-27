@@ -2796,6 +2796,26 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         sess.dispatches,
         sess.dispatches as f64 / sess.submits.max(1) as f64
     );
+    // **Submit accounting** (§8bg): how many queue submissions the token costs and,
+    // of those, how many the host actually waited for. A wait is what costs 33 us
+    // (research 08), not a submit, so this is the number a pipelining change moves.
+    {
+        let st = breccia_vk::ctx::submit_stats_window();
+        let per = forwards.max(1) as f64;
+        println!(
+            "submits  {:.1}/token · {} total · waited {} ({:.1}/token) · queued {} ({:.1}/token) \
+             · fence waits {} ({:.1}/token, {:.2} ms/token in the wait)",
+            st.submits as f64 / per,
+            st.submits,
+            st.waited,
+            st.waited as f64 / per,
+            st.queued,
+            st.queued as f64 / per,
+            st.waits,
+            st.waits as f64 / per,
+            st.wait_s * 1e3 / per,
+        );
+    }
     // The per-dispatch price from **one** window: `RECORD_NS` and its own dispatch
     // counter are both reset after the prompt, so their ratio is a real number
     // (`docs/research/11` §A6; dividing by `sess.dispatches`, a whole-session count,

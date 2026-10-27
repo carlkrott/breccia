@@ -617,6 +617,87 @@ pub fn submits() -> u64 {
     SUBMITS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// --- submit/wait accounting (§8bg) -----------------------------------------
+//
+// A submission is only *expensive* when the host waits for it: research 08 measured
+// **33.2 us for a fence-waited submit against 8.6 us queued** (submit 8.6 + wait
+// 22-24). `submits()` alone therefore cannot tell a pipelined engine from a
+// synchronous one, so every fence wait is counted here and every submit is counted in
+// both buckets (waited / queued) by pairing it with the next wait on that device.
+//
+// The pairing is deliberately simple and conservative: a submit is classified as
+// *waited* if a fence wait happens before the next submit on the same queue. That is
+// what the engine's `end_submit`+`wait` and `wall_run` shapes produce, and it cannot
+// under-count: a wait always charges the submit it follows.
+pub static FENCE_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Nanoseconds the host spent inside fence waits.
+pub static FENCE_WAIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Submits that were followed by a fence wait before the next submit.
+pub static SUBMITS_WAITED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Submits whose fence was never waited before the next submit (queued / pipelined).
+pub static SUBMITS_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Submits, fence waits, waited vs queued submits, and the wait time — one snapshot,
+/// so a report never mixes counters from different windows.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SubmitStats {
+    pub submits: u64,
+    pub waits: u64,
+    pub waited: u64,
+    pub queued: u64,
+    pub wait_s: f64,
+}
+
+impl SubmitStats {
+    /// `self - earlier`, for a window.
+    pub fn since(&self, earlier: &SubmitStats) -> SubmitStats {
+        SubmitStats {
+            submits: self.submits.saturating_sub(earlier.submits),
+            waits: self.waits.saturating_sub(earlier.waits),
+            waited: self.waited.saturating_sub(earlier.waited),
+            queued: self.queued.saturating_sub(earlier.queued),
+            wait_s: (self.wait_s - earlier.wait_s).max(0.0),
+        }
+    }
+}
+
+static SUBMIT_BASE: std::sync::Mutex<Option<SubmitStats>> = std::sync::Mutex::new(None);
+
+/// Start a new submit/wait window (the engine calls this where its own counters reset,
+/// i.e. after the prompt, so the report is per decode token and not prompt-inflated).
+pub fn reset_submit_stats() {
+    if let Ok(mut b) = SUBMIT_BASE.lock() {
+        *b = Some(submit_stats());
+    }
+}
+
+/// The submit/wait counters since [`reset_submit_stats`].
+pub fn submit_stats_window() -> SubmitStats {
+    let now = submit_stats();
+    match SUBMIT_BASE.lock().ok().and_then(|b| *b) {
+        Some(base) => now.since(&base),
+        None => now,
+    }
+}
+
+/// The submit/wait counters as one snapshot.
+pub fn submit_stats() -> SubmitStats {
+    use std::sync::atomic::Ordering::Relaxed;
+    SubmitStats {
+        submits: SUBMITS.load(Relaxed),
+        waits: FENCE_WAITS.load(Relaxed),
+        waited: SUBMITS_WAITED.load(Relaxed),
+        queued: SUBMITS_QUEUED.load(Relaxed),
+        wait_s: FENCE_WAIT_NS.load(Relaxed) as f64 / 1e9,
+    }
+}
+
+thread_local! {
+    /// Pending submits on this thread that no fence wait has been charged for yet.
+    /// Split by nothing: the classification is per *thread*, which is one stream.
+    static PENDING_SUBMITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Gpu {
     pub fn create(host: &Host, dev: &Dev, index: u32) -> R<Gpu> {
         let instance = &host.instance;
@@ -1382,6 +1463,9 @@ impl Gpu {
     ) -> R<vk::Fence> {
         let (queue, _, _, _) = self.parts(q);
         SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // One more submit that has not been waited for yet; the next fence wait on
+        // this thread charges it (§8bg).
+        PENDING_SUBMITS.with(|p| p.set(p.get() + 1));
         unsafe {
             let fence = vk(
                 self.device
@@ -1465,7 +1549,22 @@ impl Gpu {
     }
 
     pub fn wait_fence(&self, fence: vk::Fence) -> R<()> {
+        let t0 = std::time::Instant::now();
         let ok = wait_fence_bounded(&self.device, fence, "a submitted fence");
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            FENCE_WAITS.fetch_add(1, Relaxed);
+            FENCE_WAIT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+            // Charge every submit since the last wait on this thread to the *waited*
+            // bucket, except the last one (which this wait is for): the shape the
+            // engine actually has is either "submit then wait" (all waited) or
+            // "N submits then one wait" (N-1 queued, 1 waited).
+            let pending = PENDING_SUBMITS.with(|p| p.replace(0));
+            if pending > 0 {
+                SUBMITS_WAITED.fetch_add(1, Relaxed);
+                SUBMITS_QUEUED.fetch_add(pending - 1, Relaxed);
+            }
+        }
         unsafe { self.device.destroy_fence(fence, None) };
         if !ok {
             Self::fault_abort("a submitted fence");

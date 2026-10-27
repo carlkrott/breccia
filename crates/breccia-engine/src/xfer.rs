@@ -259,6 +259,27 @@ impl Staging {
             .src_offset(self.region)
             .dst_offset(0)
             .size(data.len() as u64);
+        // **No fence of its own when a batch is open** (§8bg). The copy only has to be
+        // ordered *before the work that reads it*, and it rides the batch's submit:
+        // host writes to the staging mapping are coherent before that submit, so a
+        // submit+wait here (research 08: 33 us, of which 22-24 is the wait) buys
+        // nothing. The wait survives for the one-shot path, where there is no batch.
+        if breccia_kernels::batch_cmd::is_open() {
+            breccia_kernels::batch_cmd::record_copy(
+                gpu,
+                dst,
+                0,
+                &self.buf,
+                self.region,
+                data.len() as u64,
+            )
+            .map_err(|e| anyhow!("recording the upload: {e}"))?;
+            let secs = t0.elapsed().as_secs_f64();
+            self.bytes_up += data.len() as u64;
+            self.trips_up += 1;
+            self.seconds_up += secs;
+            return Ok(secs);
+        }
         let src = self.buf.buf;
         let dstb = dst.buf;
         gpu.record(Qc::C, |d, cmd| unsafe {

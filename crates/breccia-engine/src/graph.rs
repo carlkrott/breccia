@@ -3125,7 +3125,10 @@ impl<'m> Session<'m> {
 
         // ---- upload the FFN result -------------------------------------------
         self.timers.mark(XFER_UP);
-        // A memcpy into the mailbox: no submit, no fence.
+        // The batch is opened *before* the upload so the host→device copy is
+        // **recorded into it** instead of paying its own submit+fence (§8bg); the
+        // batch's submit is what orders it against the `HC_WRITE` that reads it.
+        self.ensure_batch(dev)?;
         self.venues[dev].block_out.write(&f32_to_bytes(&out))?;
         self.dev_up[dev] += (mc.n_embd * 4) as u64;
 
@@ -3136,7 +3139,6 @@ impl<'m> Session<'m> {
         // submits once. That is what keeps a block at one submission even though
         // the write happens on the host.
         self.timers.mark(HC_WRITE_F);
-        self.ensure_batch(dev)?;
         self.probe_mark(dev, batch_cmd::probe::HC_WRITE);
         {
             let v = &self.venues[dev];
@@ -3801,8 +3803,11 @@ impl<'m> Session<'m> {
         // The GPU-time probe's window starts here too, so its table covers the
         // decode steps and not the prompt.
         self.snapshot_probe();
-        // The prompt passes must not inflate the per-device figures.
+        // The prompt passes must not inflate the per-device figures. The submit/wait
+        // window opens here too, so `submits/token` and `waited/token` cover the
+        // decode steps and not the prompt (§8bg).
         batch_cmd::reset_record_seconds();
+        breccia_vk::ctx::reset_submit_stats();
         self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
         self.dev_down.iter_mut().for_each(|x| *x = 0);
         self.dev_up.iter_mut().for_each(|x| *x = 0);
