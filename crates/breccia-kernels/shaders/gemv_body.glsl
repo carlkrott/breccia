@@ -34,6 +34,27 @@
 #include "ops_math.glsl"
 #endif
 
+#ifdef BRECCIA_HC_GATED_EPILOGUE
+// Fused HC `up` + gated mean + inject partials (§8az). The GEMV half is the
+// ordinary one-token dot product; only the *row mapping* and the *epilogue*
+// differ, which is why this is a build variant of the same shader rather than a
+// new kernel (`AGENTS.md` § "Adding a kernel", lowest-risk class: same bindings,
+// same resources, an added entry point's worth of code).
+#include "ops_math.glsl"
+#ifndef BRECCIA_OWN_BINDINGS
+layout(std430, binding = 4) readonly buffer XnVec { float XN[]; };      // [hc*n_embd]
+layout(std430, binding = 5) readonly buffer InjWVec { uint16_t WINJ[]; }; // [hc, hc*n_embd] BF16
+layout(std430, binding = 6) writeonly buffer PartVec { float P[]; };   // [hc, chunks]
+layout(std430, binding = 7) writeonly buffer MixVec { float MIX[]; };  // [n_embd]
+#endif
+/// BF16 at element index `i`. `WINJ` is a **16-bit** array (one element per
+/// index), unlike `ops_hc_gated_mean.comp`'s `uint[]` word view — reading it as a
+/// word and shifting by `i & 1` would read every odd element as zero.
+float hc_gated_bf16(uint i) {
+    return uintBitsToFloat(uint(WINJ[i]) << 16);
+}
+#endif
+
 layout(local_size_x = 256) in;
 
 #define LANES 32u
@@ -69,13 +90,88 @@ layout(std430, binding = 4) readonly buffer RowMap { uint M[]; };
 #define X_BASE(r) 0u
 #endif
 
+#ifdef BRECCIA_HC_GATED_EPILOGUE
+// One slot per row of the workgroup: slot `s` holds `gate[c][d]` for
+// (c = s / per, d = per*wg + s % per).
+shared float s_hcgate[ROWS_PER_WG];
+
+/// The gated mean, the `gate` store and the `inject` partials, all from the values
+/// the workgroup just computed.
+///
+/// * `mixed[d] = (1/hc) * sum_c xn[c][d] * sigmoid(gate[c][d])` — **the same
+///   four-term order and the same divide** as `ops_hc_gated_mean.comp`, so this
+///   value is bit-identical to the separate dispatch.
+/// * `O` still receives `gate` in its row-major layout, so the workspace keeps its
+///   invariant (nothing on the hot path reads it after the fold).
+/// * `inject` partials: the chunk is this workgroup's `d` range (2 elements at
+///   hc = 4), so the number of partials rises from `n_embd/256` to `n_embd/2` and
+///   the summation *grouping* changes — the only non-bit-identical part of this
+///   fusion (measured and bounded in `docs/phase-4/01-forward-pass.md` §8az).
+void hc_gated_epilogue(uint wg, uint slot) {
+    const uint per = ROWS_PER_WG / ((pc.hc == 0u) ? 1u : pc.hc);
+    const uint lid = gl_LocalInvocationID.x;
+    barrier();
+    // Keep `gate` in the workspace (row-major [hc*n_embd]).
+    if (lid < ROWS_PER_WG) {
+        uint c = lid / per;
+        uint j = lid - c * per;
+        if (c < pc.hc) {
+            O[(c * pc.n_embd) + (per * wg + j)] = s_hcgate[lid];
+        }
+    }
+    // The gated mean, one thread per `d` of this workgroup.
+    if (lid < per) {
+        uint d = per * wg + lid;
+        float acc = 0.0;
+        for (uint c = 0u; c < pc.hc; ++c) {
+            acc += XN[c * pc.n_embd + d] * breccia_sigmoid(s_hcgate[c * per + lid]);
+        }
+        MIX[d] = acc / float(pc.hc);
+    }
+    // inject[c_out][chunk] = sum_{c_src, d in this workgroup} xn[c_src][d] * w[c_out][c_src][d]
+    // One thread per output stream, walking the workgroup's `per` values of `d`
+    // (the whole chunk, so the partial is complete before it is stored — two
+    // threads writing the same slot would each contribute half the sum).
+    const uint d_begin = per * wg;
+    const uint d_end = d_begin + per;
+    if (lid < pc.hc) {
+        float s = 0.0;
+        for (uint d = d_begin; d < d_end; ++d) {
+            for (uint cs = 0u; cs < pc.hc; ++cs) {
+                uint at = lid * (pc.hc * pc.n_embd) + cs * pc.n_embd + d;
+                s += XN[cs * pc.n_embd + d] * hc_gated_bf16(at);
+            }
+        }
+        P[lid * pc.chunks + wg] = s;
+    }
+}
+#endif
+
 void main() {
     uint lane = gl_LocalInvocationID.x % LANES;
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
-    uint row = wg * ROWS_PER_WG + gl_LocalInvocationID.x / LANES;
+    uint slot = gl_LocalInvocationID.x / LANES;
+#ifdef BRECCIA_HC_GATED_EPILOGUE
+    // **Column-blocked row mapping.** The gated mean needs all `hc` streams at one
+    // `d`; the row-major mapping puts them 2560 rows apart, one per workgroup.
+    // Here workgroup `wg` owns `ROWS_PER_WG / hc` consecutive `d` and **all** `hc`
+    // streams, so slot `s` is (stream `s / per`, `d = per*wg + s % per`). Same
+    // workgroup count, same warps per row, same K-walk — only which row a warp
+    // owns changes, which is why the main loop below is untouched.
+    const uint per = ROWS_PER_WG / ((pc.hc == 0u) ? 1u : pc.hc);
+    uint c_s = slot / per;
+    uint j_s = slot - c_s * per;
+    if (c_s >= pc.hc) {
+        return;
+    }
+    uint d_s = per * wg + j_s;
+    uint row = c_s * pc.n_embd + d_s;
+#else
+    uint row = wg * ROWS_PER_WG + slot;
     if (row >= pc.rows) {
         return;
     }
+#endif
 
     const uint u = UNITS >= LANES ? lane : (lane % UNITS);
     const uint b_off = UNITS >= LANES ? 0u : (lane / UNITS);
@@ -154,6 +250,9 @@ void main() {
         facc += subgroupShuffleXor(facc, off);
     }
     if (lane == 0u) {
+#ifdef BRECCIA_HC_GATED_EPILOGUE
+        s_hcgate[slot] = facc;
+#else
 #ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV
         // The bottleneck activation as the GEMV's epilogue: `silu(acc / s)` on
         // exactly the value a separate `ops_act.comp` dispatch would read back
@@ -163,7 +262,11 @@ void main() {
         facc = breccia_silu(facc / pc.ep);
 #endif
         O[sid * pc.rows + row] = facc;
+#endif
     }
+#ifdef BRECCIA_HC_GATED_EPILOGUE
+    hc_gated_epilogue(wg, slot);
+#endif
 }
 
 #endif // BRECCIA_GEMV_BODY_GLSL

@@ -129,6 +129,15 @@ impl Pc {
         }
     }
 
+    /// Build from a raw 32-byte image (a push-constant block that is not a simple
+    /// `u` sequence, e.g. the fused HC variant's 8 words).
+    pub(crate) fn from_bytes(bytes: &[u8; 32]) -> Self {
+        Pc {
+            bytes: *bytes,
+            len: 32,
+        }
+    }
+
     pub(crate) fn u(mut self, v: u32) -> Self {
         let at = self.len;
         if at + 4 <= 32 {
@@ -1610,6 +1619,14 @@ pub struct HcMixer<'g> {
     /// `true` when `Act` rides in the `down` GEMV's epilogue — one dispatch
     /// fewer per HC_READ (`BRECCIA_NO_HC_EPILOGUE=1` restores the separate act).
     fused_act: bool,
+    /// The fused `up` + gated-mean pipeline (§8az): the `up` GEMV with the
+    /// **column-blocked** row mapping and the gated-mean / inject epilogue, so the
+    /// 1-workgroup `gated` dispatch disappears from every HC_READ.
+    /// `BRECCIA_NO_HC_GATED=1` restores the two-dispatch shape.
+    up_gated: Option<Pipe<'g>>,
+    /// Inject partials per token the **fused** path writes (`n_embd / per`), and
+    /// the number `HcWrite` must sum. Unused when `up_gated` is `None`.
+    fused_chunks: usize,
     /// Bound as the gated-mean's inject weight when the mixer has no `inject`
     /// (every declared binding must be bound).
     no_weight: Buf,
@@ -1632,6 +1649,21 @@ impl<'g> HcMixer<'g> {
         hc_lr: usize,
         with_inject: bool,
     ) -> Result<Self> {
+        Self::with_fusion(gpu, ty, n_embd, hc, hc_lr, with_inject, true)
+    }
+
+    /// [`HcMixer::new`] with the `up` + gated-mean fusion chosen explicitly:
+    /// `fuse_gated` is the `BRECCIA_NO_HC_GATED` flag's *inverse*, exposed so the
+    /// conformance suite can build both shapes in one process and compare them.
+    pub fn with_fusion(
+        gpu: &'g Gpu,
+        ty: QuantType,
+        n_embd: usize,
+        hc: usize,
+        hc_lr: usize,
+        with_inject: bool,
+        fuse_gated: bool,
+    ) -> Result<Self> {
         if n_embd == 0 || hc == 0 || hc_lr == 0 {
             return Err(anyhow!("hc mixer needs n_embd, hc, hc_lr > 0"));
         }
@@ -1649,6 +1681,33 @@ impl<'g> HcMixer<'g> {
             HcGatedMean::new(gpu, n_embd, hc)?
         };
         let write = HcWrite::new(gpu, n_embd, hc)?;
+        // The fused `up` + gated-mean build (§8az). It bakes the *artifact's*
+        // inject type (BF16, `docs/specs/qwen4exp-architecture.md` §6.1), so it is
+        // compiled only for a BF16 mixer with the fold enabled; every other
+        // configuration keeps the two-dispatch shape unchanged.
+        let per = crate::gemv::ROWS_PER_WG / hc.max(1);
+        let fused_ok = with_inject
+            && ty == QuantType::Bf16
+            && hc <= crate::gemv::ROWS_PER_WG
+            && crate::gemv::ROWS_PER_WG.is_multiple_of(hc)
+            && n_embd.is_multiple_of(per)
+            && fuse_gated
+            && std::env::var_os("BRECCIA_NO_HC_GATED").is_none();
+        let up_gated = if fused_ok {
+            Some(Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/gemv_bf16_hcgate.spv")),
+                8,
+                "hc up + gated mean",
+            )?)
+        } else {
+            None
+        };
+        let fused_chunks = if up_gated.is_some() {
+            n_embd / per.max(1)
+        } else {
+            0
+        };
         // The bottleneck activation as `down`'s epilogue (§8at): `Act` becomes a
         // wired epilogue in the GEMV that produces `lo_raw`, removing one
         // dispatch per HC_READ. It is bit-identical by construction (the
@@ -1683,6 +1742,8 @@ impl<'g> HcMixer<'g> {
             up,
             fused_inject: with_inject,
             fused_act,
+            up_gated,
+            fused_chunks,
             no_weight,
         })
     }
@@ -1714,8 +1775,28 @@ impl<'g> HcMixer<'g> {
         self.down_split.recommended_splits()
     }
     /// Partial sums per (token, stream) the folded `inject` writes.
+    ///
+    /// The fused path (§8az) writes one partial per workgroup, i.e. per
+    /// `per = ROWS_PER_WG / hc` elements of `d`, so the buffer is larger and
+    /// `HcWrite` sums more terms. Everything that needs the number (workspace
+    /// sizing, `HcWrite`'s push constant) reads it from here.
     pub fn inject_chunks(&self) -> usize {
+        if self.up_gated.is_some() {
+            self.fused_chunks
+        } else {
+            self.gated.chunks()
+        }
+    }
+
+    /// The chunk count of the **separate** gated-mean kernel (the bench paths that
+    /// run it explicitly need this, not the fused count).
+    pub fn gated_chunks(&self) -> usize {
         self.gated.chunks()
+    }
+
+    /// `true` when the `up` + gated-mean fusion is active (§8az).
+    pub fn fused_gated(&self) -> bool {
+        self.up_gated.is_some()
     }
     /// The grouped norm stage (exposed for the bench's stage split).
     pub fn norm(&self) -> &RmsNorm<'g> {
@@ -1830,7 +1911,7 @@ impl<'g> HcMixer<'g> {
     /// [`HcWrite`]; this is the same arithmetic on the host, for tests and for a
     /// debug dump.
     pub fn inject_values(&self, gpu: &Gpu, ws: &HcWorkspace) -> Result<Vec<f32>> {
-        let chunks = self.inject_chunks().max(1);
+        let chunks = self.gated_chunks().max(1);
         let raw = download_f32(gpu, &ws.inject, ws.tokens * self.hc * chunks)?;
         let mut out = vec![0.0f32; ws.tokens * self.hc];
         for t in 0..ws.tokens {
@@ -1864,12 +1945,53 @@ impl<'g> HcMixer<'g> {
             self.act
                 .run(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32)?;
         }
-        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_UP);
-        self.up.run(w.up, &ws.lo, &ws.gate, &ws.map_up, t)?;
-        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_GATED);
         let winj = w.inject.unwrap_or(&self.no_weight);
-        self.gated
-            .run(&ws.xn, &ws.gate, &ws.mixed, winj, &ws.inject, t)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_UP);
+        match &self.up_gated {
+            // **Fused** (§8az): one dispatch for `up`, the gated mean, `gate` and
+            // the inject partials. `mixed` is bit-identical to the separate path
+            // (same four-term order, same divide); the inject *partial chunking*
+            // changes (one partial per workgroup instead of per 256 elements), so
+            // that value differs by rounding only — measured, not assumed.
+            Some(p) if t == 1 => {
+                let mut pc = [0u8; 32];
+                let words: [u32; 8] = [
+                    (self.hc * self.n_embd) as u32, // rows
+                    self.hc_lr as u32,              // cols
+                    self.up.blocks_per_row() as u32,
+                    0, // splits (the fused path is single-pass)
+                    0, // base (unused without the expert map)
+                    self.n_embd as u32,
+                    self.hc as u32,
+                    self.fused_chunks as u32,
+                ];
+                for (i, wd) in words.iter().enumerate() {
+                    pc[4 * i..4 * i + 4].copy_from_slice(&wd.to_le_bytes());
+                }
+                let gx = (self.n_embd / (crate::gemv::ROWS_PER_WG / self.hc)) as u32;
+                p.run(
+                    &[
+                        w.up,
+                        &ws.lo,
+                        &ws.gate,
+                        self.up.tables(),
+                        &ws.xn,
+                        winj,
+                        &ws.inject,
+                        &ws.mixed,
+                    ],
+                    // `Pc` is the ops crate's 32-byte push-constant helper.
+                    &Pc::from_bytes(&pc),
+                    (gx, 1, 1),
+                )?;
+            }
+            _ => {
+                self.up.run(w.up, &ws.lo, &ws.gate, &ws.map_up, t)?;
+                crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_GATED);
+                self.gated
+                    .run(&ws.xn, &ws.gate, &ws.mixed, winj, &ws.inject, t)?;
+            }
+        }
         Ok(())
     }
 

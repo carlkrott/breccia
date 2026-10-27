@@ -4614,3 +4614,139 @@ BRECCIA_NO_GDN_MERGE=1 BRECCIA_TRACE_DISPATCH=1 …                # 1 746 (the 
 timeout 90 env BRECCIA_KERNEL_DEVICE=0000:0e:00.0 \
   cargo test -p breccia-kernels --test attn_conformance -- --test-threads=1
 ```
+
+## 8az. The HC tail is fused: `up` + gated mean in one dispatch (−1 800 µs), and dp4a is advertised but unmeasured here
+
+§8ay measured the HC_READ as `norm 867 · down 1 961 · up 2 776 · gated 1 575` µs/token
+and named two of those (`norm`, `gated`) as **one-workgroup elementwise kernels at 9.0
+and 16.4 µs per launch**. `norm → down` does not pay to fuse (recomputing 10 240
+elements in 160 split-K workgroups costs about what the launch does); `gated → up`
+does, and this round lands it.
+
+### What landed: `gemv_bf16_hcgate` (`BRECCIA_NO_HC_GATED=1` reverts)
+
+A build variant of the existing GEMV (`AGENTS.md` § "Adding a kernel", lowest-risk
+class: same shader, same bindings plus three, an added epilogue). Two things change:
+
+* **Column-blocked row mapping.** The gated mean needs all `hc` streams at one `d`, but
+  the row-major layout puts them 2 560 rows apart — one per workgroup. Workgroup `wg`
+  now owns `per = ROWS_PER_WG / hc = 2` consecutive `d` **and all four streams**, so
+  slot `s` is (stream `s / per`, `d = per·wg + s % per`). Same workgroup count (1 280),
+  same warps per row, same K-walk: only *which* row a warp owns changes.
+* **The epilogue**, from shared memory after one `barrier()`: `mixed[d] = (1/hc) Σ_c
+  xn[c][d]·sigmoid(gate[c][d])` (the same four-term order and the same divide as
+  `ops_hc_gated_mean.comp`), the `gate` store (so the workspace keeps its invariant),
+  and the `inject` partials.
+
+One dispatch replaces two, so the 1-workgroup `gated` kernel leaves the graph.
+
+Measured (dual, 30 resident blocks, gen 16, warm 1, **adjacent arms with `pgrep` = 0
+co-tenants**, GPU probe on):
+
+| | legacy | fused | Δ |
+|---|---:|---:|---:|
+| `hc-up` + `hc-gated` (µs/token) | 4 313.3 | **2 513.0** | **−1 800 (−42 %)** |
+| `hc-read` total (norm+down+up+gated) | 7 142 | **5 311** | −1 831 |
+| `hc-write` (sums 10 → 1 280 partials) | 531 | 705 | +174 |
+| `sum` (GPU execution) | 32 298 | **30 971** | −1 327 |
+| `wait-gpu` | 32 759 | **31 343** | −1 416 |
+| dispatches/token (census) | 1 710 | **1 614** | **−96** (exactly 2 × 48) |
+| single stream, dual | 17.95 tok/s · 55.7 ms | **18.25 tok/s · 54.8 ms** | **+1.7 %** |
+
+The `hc-write` increase is the price of the finer partials; a **four-accumulator strided
+tree** (32 lanes per stream, fixed order, no atomics) took that stage from 1 507 µs
+(single dependent `+=` chain over 40 loads: latency-bound) back to 705 µs. The 4.9 ms
+between the HC fusion's −1 800 and the `sum`'s −1 327 is window noise in unrelated
+stages (`gdn-proj`, `router`, `shared-*` all moved ±100 µs between arms).
+
+### Numerics: `mixed` and `gate` bit-identical, `inject` by rounding only
+
+`conformance::hc_gated_fusion_matches_the_separate_path` builds both shapes in one
+process (BF16, the artifact's type, T = 1, inject on) and compares:
+
+* `mixed` — **0 of 2 560 values differ** (bit-identical: same order, same divide);
+* `gate` — **0 of 10 240 differ** (the dot is unchanged);
+* `inject` — **max relative 3.9e-7**. This is the documented exception: the fused kernel
+  writes one partial per *workgroup* (`n_embd/2 = 1 280`) instead of one per 256
+  elements (`n_embd/256 = 10`), so `HcWrite` sums a different grouping. Deterministic
+  (fixed strided tree, no float atomics), just not the same order — the contract is
+  **≤1e-6 relative on `inject`**, and in the graph it shows as
+  `top-1 13.170561 → 13.170510` (|Δ| = 5.1e-5 on a logit whose top-2 gap is 0.82).
+
+**Parity: 32/32 at chunk 8/16/32/128** (fused and legacy arms, single card) and the
+8-process gate is **GREEN** — `RACE_PROCS=8 RACE_RUNS=1 RACE_GEN=32 RACE_PROMPT=parity
+RACE_WARM=1 scripts/head-handoff-race.sh`; one process was auto-**discarded** when a
+co-tenant appeared during it (the harness re-ran and counted 8 exclusive ones), which
+is the behaviour the guard is for.
+
+### A trap this cost, worth recording
+
+The prefill path copies each token's inject partials into per-token slots
+(`graph.rs`) with a **hardcoded 160-byte length** — exactly `hc × 10 chunks × 4 B`.
+With 1 280 chunks only the first 40 floats were copied, so the chunked-prefill gate
+read `0/32` and `top-1 15` while the dual decode path was perfect. The slots and both
+copy sites now size from `HcMixer::inject_chunks()`, never a constant. (Two shader bugs
+also came first: `WINJ` is a `uint16_t[]` here — one element per index — unlike
+`ops_hc_gated_mean.comp`'s `uint[]` word view, so reading it as a word made every odd
+element zero; and the inject partial was written by two threads that each held half the
+chunk's sum.)
+
+### Item 2: is the element-rate ceiling worth a round? **Yes, but the probe is blocked here**
+
+**Advertised: yes, on both cards.** `VK_KHR_shader_integer_dot_product` rev 1,
+`shaderIntegerDotProduct = true`, and the *accelerated* variants that matter:
+`integerDotProduct4x8BitPackedSignedAccelerated = true` (dp4a), `...PackedUnsigned
+= true`, `8BitSigned = true`; the *mixed-signedness* and accumulating-saturating-32
+variants are false. So `OpSDot`/`OpUDot` on packed int8 is a single instruction here.
+
+**The rate probe did not run, and the reason is the toolchain, not the hardware**: this
+image's shader compilers cannot emit the instruction. `glslc` (shaderc 2026.4) and
+`glslangValidator` (1.4.363) both reject the GLSL extension —
+`'#extension' : extension not supported: GL_EXT_shader_integer_dot_product` (and the
+`GL_KHR_` spelling) — so `dot(i8vec4, i8vec4)` cannot be compiled from GLSL here. A
+hand-written `OpSDot` module via `spirv-as` (v2026.4, SPIR-V 1.6) is the way in and is
+the first task of the round that takes this on. Recorded rather than guessed.
+
+**What the arithmetic says about the prize** (all inputs measured, the ratio is not):
+the current IQ3_S unit is ~35–40 ops per 8 elements (two grid lookups, ~25 integer ops,
+8 FMAs) ≈ **4–5 ops/element**; an MMQ-style kernel is 2 `dp4a` per 8 elements ≈
+0.25 ops/element, a ~16× instruction reduction. But the gain is capped by DRAM: IQ3_S is
+3.44 bpw, and **810 GB/s (the BF16 ceiling measured in §8ax) is 1.9 G elements/ms**,
+against the **351 M elements/ms** the current kernel achieves — so a correct MMQ could
+be up to **5.4×** on IQ3_S. That stage set (`gdn-proj` 3.5 + `gdn-z` 1.8 + `gdn-out` 2.9
++ QSA `qkv` 2.0 ≈ 10.2 ms/token) would fall to ~2 ms, i.e. **~8 ms of a 55 ms token
+(15 %)** — the largest single lever left, and it also covers IQ2_* (the routed experts,
+4.0 ms) for ~2 ms more.
+
+**What a full MMQ-style IQ3_S/IQ2_* kernel would cost, and the contract it would need.**
+The work is: (1) keep the block layout but read each 110 B IQ3_S block as `uvec4`s and
+index the two 8-bit grids as *packed int8 constants* (the `T` table becomes int8, 512
+entries, one `dp4a` operand); (2) apply the 6-bit per-32-element scale as an integer
+multiply-shift, and the sign byte as an XOR, so the accumulator stays int32 until one
+final `float(acc) * d` per 32 elements; (3) for IQ2_* the 10-bit grid indices need a
+sign-extending gather, which is where most of the extra work is. **Rounding differs from
+today's path by construction**: today each of the 8 elements is dequantised to fp32 and
+FMA'd in fp32 (exact products, fp32 accumulation); MMQ accumulates `d·q·x` in int32 and
+scales once, which is *more* exact inside a 32-element group but reorders the sum, so
+bit-identity is not achievable and should not be asked for. The contract I would
+propose: **per-element relative error ≤1e-3 against a f64 reference (the same bar the
+existing `gemv` conformance test uses), `mixed`/logits within 1e-5 of today's path, and
+the 32-token greedy gate unchanged** — plus the 8-process race harness, since a
+quantised-dot kernel is exactly the kind of change that would otherwise hide behind one
+green run.
+
+### Commands
+
+```bash
+# the fusion A/B (adjacent arms, refuses a co-tenant) — the numbers above
+BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
+  --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" \
+  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --gen 16 --runs 1 --threads 16 --warm 1
+BRECCIA_NO_HC_GATED=1 …                                           # the legacy arm
+# bit-identity + the full ops suite, on the headless card
+timeout 90 env BRECCIA_KERNEL_DEVICE=0000:0e:00.0 \
+  cargo test -p breccia-kernels --test ops_conformance -- --test-threads=1
+# the dp4a advertisement (no GPU compute needed)
+vulkaninfo | grep -E "integerDotProduct4x8BitPackedSignedAccelerated|shaderIntegerDotProduct"
+```

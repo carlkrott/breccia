@@ -491,6 +491,116 @@ fn embedding_gather_matches_the_dequant_reference() {
     }
 }
 
+/// The fused `up` + gated-mean variant (§8az) must agree with the two-dispatch
+/// shape: `mixed` **bit-identical** (same four-term order, same divide), `gate`
+/// bit-identical, and `inject` within rounding (its partial *chunking* changes from
+/// one partial per 256 elements to one per workgroup, so the summation grouping —
+/// and only the grouping — differs).
+#[test]
+fn hc_gated_fusion_matches_the_separate_path() {
+    let fx = need_gpu!("hc");
+    let gpu = fx.dev.gpu();
+    let n_embd = 2560usize;
+    let hc = 4usize;
+    let hc_lr = 320usize;
+    let hc_dim = hc * n_embd;
+    // bf16 = the top 16 bits of an f32; both paths get the same bytes.
+    let bf16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    };
+    let gamma = normalish(0x1111, hc_dim)
+        .into_iter()
+        .map(|v| v.abs() + 0.5)
+        .collect::<Vec<f32>>();
+    let w_down = normalish(0x2222, hc_lr * hc_dim);
+    let w_up = normalish(0x3333, hc_dim * hc_lr);
+    let w_inject = normalish(0x4444, hc * hc_dim);
+    let r: Vec<f32> = normalish(0x5555, hc_dim);
+
+    let gbuf = ops::upload_f32(gpu, &gamma).expect("gamma");
+    let dbuf = breccia_kernels::gemv::upload(gpu, &bf16(&w_down)).expect("down");
+    let ubuf = breccia_kernels::gemv::upload(gpu, &bf16(&w_up)).expect("up");
+    let ibuf = breccia_kernels::gemv::upload(gpu, &bf16(&w_inject)).expect("inject");
+    let rbuf = ops::upload_f32(gpu, &r).expect("r");
+    let w = HcWeights {
+        norm: &gbuf,
+        down: &dbuf,
+        up: &ubuf,
+        inject: Some(&ibuf),
+    };
+
+    let mut got = Vec::new();
+
+    for fuse in [false, true] {
+        let mixer = HcMixer::with_fusion(gpu, QuantType::Bf16, n_embd, hc, hc_lr, true, fuse)
+            .expect("mixer");
+        assert_eq!(mixer.fused_gated(), fuse, "fusion switch");
+        let ws = mixer.workspace(gpu, 1).expect("workspace");
+        mixer.read(&ws, &rbuf, &w).expect("hc read");
+        let mixed = ops::download_f32(gpu, &ws.mixed, n_embd).expect("mixed");
+        let gate = ops::download_f32(gpu, &ws.gate, hc_dim).expect("gate");
+        // `HcWrite` turns the partials into the four `2*sigmoid(inject/hc)` weights;
+        // the raw partials are what each path writes, so sum them the same way.
+        let chunks = mixer.inject_chunks();
+        let part = ops::download_f32(gpu, &ws.inject, hc * chunks).expect("inject");
+        let mut inject = Vec::with_capacity(hc);
+        for c in 0..hc {
+            let mut acc = 0.0f32;
+            for k in 0..chunks {
+                acc += part[c * chunks + k];
+            }
+            inject.push(acc);
+        }
+
+        got.push((mixed, gate, inject, chunks));
+        mixer.release(gpu, ws);
+    }
+    let (mixed_a, gate_a, inj_a, chunks_a) = &got[0];
+    let (mixed_b, gate_b, inj_b, chunks_b) = &got[1];
+    assert_eq!(
+        *chunks_a,
+        n_embd / 256,
+        "the separate path keeps its chunking"
+    );
+    assert_eq!(
+        *chunks_b,
+        n_embd / 2,
+        "the fused path is one chunk per workgroup"
+    );
+    let mut mixed_diff = 0;
+    for i in 0..n_embd {
+        if mixed_a[i].to_bits() != mixed_b[i].to_bits() {
+            mixed_diff += 1;
+        }
+    }
+    assert_eq!(
+        mixed_diff, 0,
+        "mixed must be bit-identical ({mixed_diff} differ)"
+    );
+    let mut gate_diff = 0;
+    for i in 0..hc_dim {
+        if gate_a[i].to_bits() != gate_b[i].to_bits() {
+            gate_diff += 1;
+        }
+    }
+    assert_eq!(
+        gate_diff, 0,
+        "gate must be bit-identical ({gate_diff} differ)"
+    );
+    let inj_rel = max_rel(inj_b, &as_f64(inj_a));
+    assert!(
+        inj_rel <= 1e-6,
+        "inject max rel {inj_rel:e} exceeds the 1e-6 contract"
+    );
+    println!(
+        "hc fusion: mixed/gate bit-identical, inject max rel {inj_rel:e} \
+         (chunks {} -> {})",
+        chunks_a, chunks_b
+    );
+}
+
 #[test]
 fn hc_mixer_matches_the_cpu_reference() {
     let fx = need_gpu!("hc");

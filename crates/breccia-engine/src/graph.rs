@@ -732,7 +732,15 @@ impl<'m> Session<'m> {
                             mc.hc_dim() as u64 * 4,
                             &format!("prefill residual slot {t}"),
                         )?);
-                        injects.push(alloc(160, &format!("prefill inject slot {t}"))?);
+                        // `hc * chunks` floats: 10 chunk partials in the incumbent
+                        // shape, one per workgroup (n_embd/2) when the `up`+gated
+                        // fusion writes them (§8az). Sized from the mixer, never a
+                        // constant.
+                        let inject_bytes = (mc.hc * hc.inject_chunks() * 4) as u64;
+                        injects.push(alloc(
+                            inject_bytes.max(160),
+                            &format!("prefill inject slot {t}"),
+                        )?);
                         boxes.push(Mailbox::new(gpu, n * 4)?);
                     }
                 }
@@ -2175,13 +2183,14 @@ impl<'m> Session<'m> {
                 self.record_lane_copies(dev, i)?;
                 let v = &self.venues[dev];
                 let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                let inject_bytes = (mc.hc * v.hc.inject_chunks() * 4) as u64;
                 batch_cmd::record_copy(
                     self.model.devices[dev].gpu(),
                     &v.inject_slots[i],
                     0,
                     &ws.inject,
                     0,
-                    ws.inject.size.min(160),
+                    inject_bytes.min(ws.inject.size).min(v.inject_slots[i].size),
                 )?;
             }
             self.swap_r_in(dev, i);
@@ -2460,7 +2469,7 @@ impl<'m> Session<'m> {
                             0,
                             &ws.inject,
                             0,
-                            ws.inject.size.min(160),
+                            ((mc.hc * v.hc.inject_chunks() * 4) as u64).min(ws.inject.size),
                         ),
                     ],
                 )?;

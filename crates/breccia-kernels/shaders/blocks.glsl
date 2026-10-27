@@ -81,6 +81,14 @@ layout(push_constant) uniform Params {
     // resident arena, in 16-bit words. The GEMV dispatches push 16 bytes and never
     // read it; the multi-user GEMM pushes 20.
     uint base;
+#ifdef BRECCIA_HC_GATED_EPILOGUE
+    // The fused HC `up` + gated-mean variant (§8az) needs the column geometry:
+    // `n_embd` elements per hyper-connection stream, `hc` streams, and the number
+    // of inject partial chunks this build writes (one per workgroup).
+    uint n_embd;
+    uint hc;
+    uint chunks;
+#endif
 #ifdef BRECCIA_GEMV_EPILOGUE_SILU_DIV
     // 6th word, the `_hcact` GEMV builds only: the `silu_div` divisor `s` of the
     // activation applied to the accumulated row value before it is stored (the
