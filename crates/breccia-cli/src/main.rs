@@ -2912,6 +2912,12 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         ),
         Err(e) => return Err(e).context("the head path moved far more than a residual per token"),
     }
+    println!(
+        "\nreadback {} in-batch readback(s) of which {} were read without a waited \
+         submission (must be 0; docs/phase-4 §8ba)",
+        sess.forwards * (48 - sess.placed_blocks) + sess.placed_blocks,
+        sess.readbacks_unfenced
+    );
     println!("\nper device (per generated token):");
     for line in sess.per_device(forwards / runs_n.max(1.0).floor() as usize) {
         println!("  {line}");

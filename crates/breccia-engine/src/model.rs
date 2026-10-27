@@ -1324,9 +1324,14 @@ fn co_tenant_check(devices: &[Device], verbose: bool) -> Result<()> {
         let held = b.heap_bytes.saturating_sub(b.budget + b.usage);
         if held > SLACK {
             let msg = format!(
-                "device {i} ({}): another process holds {} MiB of its VRAM ({held} MiB below the                  heap). Benchmarks taken now are not comparable and a shared card is the only                  condition under which this engine has produced a wrong greedy sequence",
+                "device {i} ({}): another process holds {} MiB of its VRAM (the heap is \
+                 {} MiB, this process may allocate {} MiB). Benchmarks taken now are not \
+                 comparable, and a shared card is the only condition under which this \
+                 engine has produced a wrong greedy sequence",
                 dev.info.pci_address,
-                held >> 20
+                held >> 20,
+                b.heap_bytes >> 20,
+                b.budget >> 20
             );
             if strict {
                 bail!("{msg} (BRECCIA_REQUIRE_QUIET is set)");

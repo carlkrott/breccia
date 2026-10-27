@@ -89,6 +89,7 @@ for p in $(seq 1 "$PROCS"); do
     timeout 900 "$BIN" bench token --devices "$DEVICES" --split-blocks "$SPLIT" \
       --head-device "$CTRL" "${arena_args[@]}" \
       --prompt-ids "$PROMPT" --gen "$GEN" --runs "$RUNS" --threads 16 --warm "$WARM" \
+      --inbatch-read "${RACE_INBATCH:-true}" \
       --json "$OUT/ship-$p.json" >"$OUT/ship-$p.log" 2>&1
     rc=$?
     [ "$rc" -ne 0 ] && { echo "RACE: proc $p FAILED TO RUN (rc=$rc, see $OUT/ship-$p.log)"; exit 4; }
@@ -104,7 +105,7 @@ done
 
 echo "== arm 2: a crossing request must be REFUSED"
 timeout 300 "$BIN" bench token --devices "$DEVICES" --split-blocks "$SPLIT" \
-  --head-device "$CROSS" "${arena_args[@]}" \
+  --head-device "$CROSS" "${arena_args[@]}" --inbatch-read "${RACE_INBATCH:-true}" \
   --prompt-ids "$PROMPT" --gen 2 --runs 1 --threads 16 --warm 0 \
   >"$OUT/cross.log" 2>&1
 cross_rc=$?
