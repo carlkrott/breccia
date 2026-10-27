@@ -435,8 +435,9 @@ pub mod probe {
 
     /// Stage ids. One namespace shared by the engine (`graph.rs`) and the kernel
     /// families that have internal stages (`qsa`, `gdn`), so a mark inside a
-    /// kernel and a mark in the graph land in the same column.
-    pub const MAX: usize = 32;
+    /// kernel and a mark in the graph land in the same column. Append-only: the
+    /// ids are what a probe table is compared against between rounds (§8ax).
+    pub const MAX: usize = 36;
     /// The closing stamp of a submission (not a stage).
     pub const CLOSE: u8 = 255;
 
@@ -469,6 +470,12 @@ pub mod probe {
     pub const HEAD: u8 = 26;
     pub const XFER: u8 = 27;
     pub const PLE: u8 = 28;
+    /// The GDN projections, split (§8ax): `GDN_PROJ` is `attn_qkv`, then `z`
+    /// (the output gate), and the two 48-row `beta`/`alpha` projections, which are
+    /// 6 workgroups each and therefore pure latency.
+    pub const GDN_Z: u8 = 29;
+    pub const GDN_BETA: u8 = 30;
+    pub const GDN_ALPHA: u8 = 31;
 
     /// Column names, indexed by id. `""` is a column that nothing stamps.
     pub const NAMES: [&str; MAX] = [
@@ -501,6 +508,10 @@ pub mod probe {
         "head",
         "xfer",
         "ple",
+        "gdn-z",
+        "gdn-beta",
+        "gdn-alpha",
+        "",
         "",
         "",
         "",

@@ -128,6 +128,21 @@ const SHADERS: &[&str] = &[
 /// `breccia_kernels::gemv::has_hc_epilogue` mirrors this list.
 const EPILOGUE_SHADERS: &[&str] = &["gemv_bf16", "gemv_bf16_moe", "gemv_f32", "gemv_f32_moe"];
 
+/// GEMV stems that get the coalesced-dequant build (`_wide`, §8ax): the quantised
+/// types whose decode unit has a per-element byte-load loop. Listed in the order
+/// they matter for one token of this model — `Q5_K` is the head (4.25 ms/token),
+/// `IQ4_XS` the shared expert, `IQ3_S`/`IQ2_*` the GDN projections and the routed
+/// experts. The fp16/F32/BF16 types already saturate the memory path (98-103 % of
+/// DRAM) and have no byte-load loop, so they are not built.
+const WIDE_SHADERS: &[&str] = &[
+    // The head (Q5_K, 248320x2560, 4.25 ms/token = the worst stage in §8av).
+    "gemv_q5_k",
+    // Added as their decode units are converted (one at a time, each with its own
+    // bit-identity check): IQ4_XS is the shared expert, IQ3_S/IQ2_* the GDN
+    // projections and the routed experts.
+    "gemv_iq4_xs",
+];
+
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=GLSLC");
@@ -153,6 +168,22 @@ fn main() {
         // just before it is stored. A separate pipeline rather than a runtime
         // branch, so the default pipeline keeps byte-identical SPIR-V (the
         // sanctioned shape for a wired kernel change, `AGENTS.md`).
+        // The **coalesced-dequant** build (§8ax): the same GEMV with the
+        // per-element byte loads in the decode unit replaced by one wide load per
+        // half-unit. Over the whole block the arithmetic and the values are
+        // identical (bit-identical conformance), so this is a *wired* change in the
+        // sanctioned sense — a separate pipeline rather than a runtime branch, so
+        // the default build keeps byte-identical SPIR-V and `BRECCIA_GEMV_WIDE`
+        // is a one-flag A/B and revert.
+        if WIDE_SHADERS.contains(name) {
+            compile(
+                &glslc,
+                &out_dir,
+                name,
+                &format!("{name}_wide"),
+                &["BRECCIA_WIDE_DEQUANT"],
+            );
+        }
         if EPILOGUE_SHADERS.contains(name) || *name == "gemv_reduce" {
             compile(
                 &glslc,

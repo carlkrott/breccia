@@ -183,6 +183,60 @@ fn gemv_matches_cpu_dot_for_every_type() {
     }
 }
 
+/// The coalesced-dequant (`_wide`) build is a **pure throughput switch**: for every
+/// type that has one, the GEMV output must be *bit-identical* to the incumbent
+/// per-element build, on the shapes the graph uses (§8ax).
+///
+/// This is the strongest form of the parity argument for a kernel change that
+/// rewrites the decode unit: the same block bytes, the same nibble extraction and
+/// the same fp32 accumulation order, so nothing about the numerics moves and the
+/// 32-token greedy parity of the graph is expected to be unchanged by construction
+/// — this test is what makes that a measurement rather than a claim.
+#[test]
+fn wide_dequant_is_bit_identical_to_the_default() {
+    let fx = need_gpu!();
+    let dev = fx.dev;
+    let mut checked = 0;
+    for ty in types_under_test() {
+        if breccia_kernels::gemv::gemv_wide_spv(ty).is_none() {
+            continue;
+        }
+        for (rows, cols) in shapes_for(ty) {
+            let (packed, x) = real::synthetic_inputs(ty, bench::Shape::new(rows, cols), 0x5eed);
+            let gpu = dev.gpu();
+            let w = breccia_kernels::gemv::upload(gpu, &packed).expect("upload w");
+            let xb =
+                breccia_kernels::gemv::upload(gpu, &bench::f32_to_bytes(&x)).expect("upload x");
+            let out_default = breccia_kernels::gemv::alloc(gpu, (rows * 4) as u64).expect("out");
+            let out_wide = breccia_kernels::gemv::alloc(gpu, (rows * 4) as u64).expect("out");
+            let a = Gemv::with_variant(gpu, ty, rows, cols, breccia_kernels::Accum::F32, false)
+                .expect("default pipeline");
+            let b = Gemv::with_variant(gpu, ty, rows, cols, breccia_kernels::Accum::F32, true)
+                .expect("wide pipeline");
+            a.run(&w, &xb, &out_default).expect("default run");
+            b.run(&w, &xb, &out_wide).expect("wide run");
+            let fa = bench::read_out(dev, &out_default, rows).expect("read a");
+            let fb = bench::read_out(dev, &out_wide, rows).expect("read b");
+            for buf in [&w, &xb, &out_default, &out_wide] {
+                gpu.destroy_buf(buf);
+            }
+            let diff = fa
+                .iter()
+                .zip(fb.iter())
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            assert_eq!(
+                diff, 0,
+                "{ty} {rows}x{cols}: {diff} of {rows} rows differ between the default and the \
+                 wide dequant build"
+            );
+            println!("wide dequant {ty:<8} {rows:>5}x{cols:<5} bit-identical");
+            checked += 1;
+        }
+    }
+    assert!(checked > 0, "no type with a `_wide` build was tested");
+}
+
 #[test]
 fn non_finite_scales_do_not_corrupt_the_device() {
     let fx = need_gpu!();

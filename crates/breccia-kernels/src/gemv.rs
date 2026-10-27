@@ -136,6 +136,23 @@ impl<'g> Gemv<'g> {
         cols: usize,
         accum: Accum,
     ) -> Result<Gemv<'g>> {
+        Self::with_variant(gpu, ty, rows, cols, accum, wide_dequant())
+    }
+
+    /// Compile an explicit **dequant variant**: `wide` selects the coalesced
+    /// (`_wide`) build when this type has one, `false` the incumbent per-element
+    /// one. This is the A/B constructor — [`Gemv::with_accum`] passes
+    /// [`wide_dequant`] (the `BRECCIA_GEMV_WIDE` flag) — and it is what the
+    /// conformance suite uses to prove the two builds are **bit-identical**
+    /// (`wide_dequant_is_bit_identical_to_the_default`).
+    pub fn with_variant(
+        gpu: &'g Gpu,
+        ty: QuantType,
+        rows: usize,
+        cols: usize,
+        accum: Accum,
+        wide: bool,
+    ) -> Result<Gemv<'g>> {
         if rows == 0 || cols == 0 {
             return Err(anyhow!("gemv shape must be non-empty ({rows}x{cols})"));
         }
@@ -145,7 +162,7 @@ impl<'g> Gemv<'g> {
                 gpu.index
             ));
         }
-        let spv = gemv_spv(ty, accum);
+        let spv = gemv_spv_variant(ty, accum, wide);
         let kernel = gpu
             .kernel(spv, 4)
             .map_err(|e| anyhow!("creating the {ty} GEMV pipeline ({accum} accum): {e}"))?;
@@ -824,7 +841,42 @@ macro_rules! spv {
     };
 }
 
-fn gemv_spv(ty: QuantType, accum: Accum) -> &'static [u8] {
+/// Use the **coalesced-dequant** build of the GEMV where one exists (`_wide`,
+/// `docs/phase-4/01` §8ax). That build replaces the decode unit's per-element byte
+/// loads with one wide load per half-unit; the arithmetic and every output value
+/// are **bit-identical** (`conformance::wide_dequant_is_bit_identical_to_the_default`),
+/// so this is a pure throughput switch.
+///
+/// **On by default**: the head alone goes 4.25 → 1.77 ms/token on the MI50-resident
+/// placement (`Q5_K` 248320x2560: 96 → 217 GB/s) and 1.60 → 1.01 ms on the RX
+/// (274 → 433 GB/s, 97 % of that card's measured DRAM peak). `BRECCIA_GEMV_NO_WIDE=1`
+/// restores the per-element build — that is the A/B arm and the revert path.
+///
+/// Cached: the decode path asks once per pipeline construction, never per dispatch.
+pub fn wide_dequant() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_GEMV_NO_WIDE").is_none())
+}
+
+/// The `_wide` build of the GEMV for `ty`, when that type's decode unit has been
+/// converted (see `build.rs::WIDE_SHADERS`). The fp16/F32/BF16 GEMVs have no
+/// byte-load loop and already run at 98-103 % of DRAM, so they never qualify.
+pub fn gemv_wide_spv(ty: QuantType) -> Option<&'static [u8]> {
+    match ty {
+        QuantType::Q5K => Some(spv!("gemv_q5_k_wide")),
+        QuantType::Iq4Xs => Some(spv!("gemv_iq4_xs_wide")),
+        _ => None,
+    }
+}
+
+/// The SPIR-V for `{ty, accum}` in the requested dequant variant. `wide` falls
+/// back to the incumbent build for types with no `_wide` pipeline.
+fn gemv_spv_variant(ty: QuantType, accum: Accum, wide: bool) -> &'static [u8] {
+    if wide && accum == Accum::F32 {
+        if let Some(spv) = gemv_wide_spv(ty) {
+            return spv;
+        }
+    }
     match (ty, accum) {
         (QuantType::Iq2Xxs, Accum::F32) => spv!("gemv_iq2_xxs"),
         (QuantType::Iq2Xxs, Accum::F16) => spv!("gemv_iq2_xxs_f16acc"),
