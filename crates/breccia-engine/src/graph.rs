@@ -1536,7 +1536,22 @@ impl<'m> Session<'m> {
     /// Sample the next token from `logits` with this session's sampler and
     /// sampling settings.
     pub fn sample(&mut self, logits: &[f32]) -> Option<u32> {
-        self.sampler.sample(logits, &self.sampling)
+        let tok = self.sampler.sample(logits, &self.sampling)?;
+        // `BRECCIA_FAULT_DIVERGE_STEP=k`: return a different token at forward `k` of the
+        // measured window, so `scripts/head-race-capture.sh` can be exercised without
+        // waiting for the ~1-in-8 occurrence it exists to catch (§8bd).
+        if std::env::var("BRECCIA_FAULT_DIVERGE_STEP")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            == Some(self.forwards)
+        {
+            eprintln!(
+                "breccia: FAULT INJECTION: diverging at forward {}",
+                self.forwards
+            );
+            return Some((tok + 1) % self.model.cfg.vocab.max(1) as u32);
+        }
+        Some(tok)
     }
 
     /// The device this session's block `b` runs on (for per-card reporting).
@@ -3795,10 +3810,23 @@ impl<'m> Session<'m> {
         let mut last_logits = logits.clone();
         let t_decode = std::time::Instant::now();
         for i in 0..n {
-            let next = self
+            let mut next = self
                 .sampler
                 .sample(&logits, &self.sampling)
                 .ok_or_else(|| anyhow!("the sampler produced no token"))?;
+            // `BRECCIA_FAULT_DIVERGE_STEP=k`: a deliberate divergence at forward `k`, so
+            // `scripts/head-race-capture.sh` can be exercised on demand (§8bd).
+            if std::env::var("BRECCIA_FAULT_DIVERGE_STEP")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                == Some(self.forwards)
+            {
+                eprintln!(
+                    "breccia: FAULT INJECTION: diverging at forward {}",
+                    self.forwards
+                );
+                next = (next + 1) % self.model.cfg.vocab.max(1) as u32;
+            }
             out.push(next);
             if i + 1 == n {
                 break;

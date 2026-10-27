@@ -4393,6 +4393,72 @@ Three places, all where a positional array or a literal size lives:
 Rule to apply from here: **a positional array asserts its length against the field count, and a
 copy size comes from a function, never a literal.**
 
+## 8bd. Capture-on-mismatch landed; the Q8_0 KV cache is **measured, scoped, not landed**
+
+### 1. Capture-on-mismatch (`scripts/head-race-capture.sh`)
+
+The step-0 family is parked; the one thing that would settle it is a *failing process with its
+instruments already on*. That is now one command: the script runs the stability gate, derives
+which processes diverged (from `UNSTABLE proc N`, or — when the window disagrees with the
+*reference* rather than with itself — every process in it), re-runs them **plus the first clean
+process as the control** with
+
+```
+BRECCIA_DUMP_LAYOUT=1 BRECCIA_VERIFY_WEIGHTS=all BRECCIA_FAULT_POISON_LOGITS=1 --dump-logits
+```
+
+and writes to `/var/tmp/users/korphaus/tmp/opencode/head-capture/<UTC timestamp>/{failing,control}/`
+with a `README` naming the gate configuration, the diverged processes and the five things to read
+first. **Exercised for real** with `BRECCIA_FAULT_DIVERGE_STEP=4` (a deliberate divergence at
+forward 4, `head-race-capture.sh` → RED → capture): the failing and control dirs each hold a JSON,
+a log with the layout dump, the 30 802 MiB weight content check, the head/lane coverage lines and
+the readback counter, plus the logits row.
+
+### 2. Q8_0 KV: the capacity arithmetic is measured, the kernels are not written
+
+What exists and is measured (this box, `--ctx` drives the real allocation):
+
+| context | session state+scratch (f16 KV) | per cell (12 QSA layers) |
+|---|---:|---:|
+| 256 | 122 MiB | — |
+| 32 768 | **933 MiB** | 25.6 KiB |
+| 65 536 | **1751 MiB** | 25.6 KiB |
+
+(the 818 MiB delta between 32K and 64K over 32 768 cells = 25.6 KiB/cell across all twelve QSA
+blocks — `k_pool`+`v_pool` at 2 x 256 x 2 B = 1 KiB/cell/block is ~9.2 KiB of it; the rest is the
+per-call workspace that grows with `n_blocks`/`slots`, which is where a q8_0 layout has to be
+sized from a *function*, not from the current constants.)
+
+**Why the kernels are not in this commit.** The change is three new dispatch shapes and a new pool
+layout: `qsa_kv_append.comp` must quantise on write (Q8_0: 32 elements per f32 scale, our existing
+layout), and **both** `qsa_attn_scores.comp` and `qsa_attn_apply.comp` must dequantise inline —
+research 11's MLC note is explicit that dequantising the cache per token (the exllamav2 shape) is
+what makes it *slower*, so the dequant belongs inside the dot product. That is a numerics change
+to the attention path under the one-fresh-shape-per-process / validation-on / MI50-first protocol,
+plus a lossy-quality characterisation (logits `max|Δ|`, top-1 p-delta, 32-token greedy agreement,
+the 8-process gate) before it can be anything but default-off. Landing half of it — a quantiser
+with no in-kernel dequant, or one attention kernel converted and not the other — would be a wrong
+answer on the default path, so it is scheduled as its own round with the plan below rather than
+squeezed in behind a flag nobody measured.
+
+Plan, in the order it must be done (each step is a separate invocation, MI50 first, one shape per
+process):
+
+1. `qsa_kv_append_q8` as a **wired variant** of the existing shader (same bindings, one entry
+   point, a specialisation constant) writing `[cell][32 elems i8 + f32 scale]`; pool size from
+   `q8_kv_bytes(cells, heads, dim)` — a function, and the assertion from §8bc applies.
+2. `qsa_attn_scores_q8` / `qsa_attn_apply_q8` dequantising **in registers inside the dot**, the
+   paged block table untouched (the page table indexes *cells*, so the layout change is local to
+   the per-cell stride).
+3. Quality: logits `max|Δ|` and top-1 p-delta on the parity prompt, 32-token greedy agreement,
+   then the 8-process gate — reported as deviations, not pass/fail, with the contexts where it
+   changes top-1 named.
+4. Capacity + speed re-measured with the same table as above, then 2/4/6 streams.
+
+The measured *target* the work is aiming at: 0.53 x the KV bytes per cell (34 B per 32 elements
+vs 64 B for f16), which is ~495 MiB instead of 933 MiB per agent at 32K, and research 9's
+attention-time ratio (11.7 -> 3.8 ms/token at 32K) on top of it.
+
 ## 9. Exact commands
 
 
