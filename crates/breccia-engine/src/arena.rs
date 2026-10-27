@@ -51,21 +51,30 @@ pub enum ArenaSpec {
 }
 
 impl ArenaSpec {
-    /// Parse the CLI value: `auto` or a comma-separated block list.
-    pub fn parse(s: &str) -> Self {
+    /// Parse the CLI value: `auto` or a comma-separated block list. Every token
+    /// must parse — a typo such as `26;28` must error, not silently drop blocks.
+    /// An empty (or all-whitespace) value is the documented `Off`.
+    pub fn parse(s: &str) -> Result<Self, String> {
         let t = s.trim();
         if t.eq_ignore_ascii_case("auto") {
-            return ArenaSpec::Auto(ArenaOpts::default());
+            return Ok(ArenaSpec::Auto(ArenaOpts::default()));
         }
-        let blocks: Vec<usize> = t
-            .split(',')
-            .filter_map(|x| x.trim().parse::<usize>().ok())
-            .collect();
-        if blocks.is_empty() {
+        let mut blocks = Vec::new();
+        for tok in t.split(',') {
+            let x = tok.trim();
+            if x.is_empty() {
+                continue;
+            }
+            let b = x
+                .parse::<usize>()
+                .map_err(|_| format!("`{x}` is not a block index in `--gpu-experts {s:?}`"))?;
+            blocks.push(b);
+        }
+        Ok(if blocks.is_empty() {
             ArenaSpec::Off
         } else {
             ArenaSpec::List(blocks)
-        }
+        })
     }
 }
 
@@ -481,10 +490,23 @@ mod tests {
     fn the_cli_value_parses_either_way() {
         assert_eq!(
             ArenaSpec::parse("auto"),
-            ArenaSpec::Auto(ArenaOpts::default())
+            Ok(ArenaSpec::Auto(ArenaOpts::default()))
         );
-        assert_eq!(ArenaSpec::parse("0,1, 4"), ArenaSpec::List(vec![0, 1, 4]));
-        assert_eq!(ArenaSpec::parse(""), ArenaSpec::Off);
+        assert_eq!(
+            ArenaSpec::parse("0,1, 4"),
+            Ok(ArenaSpec::List(vec![0, 1, 4]))
+        );
+        // Empty (or all-whitespace) is the documented Off.
+        assert_eq!(ArenaSpec::parse(""), Ok(ArenaSpec::Off));
+        assert_eq!(ArenaSpec::parse("  "), Ok(ArenaSpec::Off));
+        // A bad token must hard-error, naming the token (t_9344ea5e: "26;28"
+        // used to be silently swallowed as [] -> Off, losing blocks 26 and 28).
+        assert_eq!(
+            ArenaSpec::parse("26;28"),
+            Err("`26;28` is not a block index in `--gpu-experts \"26;28\"`".to_string())
+        );
+        assert!(ArenaSpec::parse("a,b").is_err());
+        assert!(ArenaSpec::parse("26;28").is_err());
     }
 
     #[test]

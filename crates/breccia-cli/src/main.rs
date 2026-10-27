@@ -1657,6 +1657,23 @@ fn feed_prompt(
     Ok(logits)
 }
 
+/// `--gpu-experts` groups for the multi-stream harnesses: `;` separates streams,
+/// `,` separates blocks. Each group goes through `ArenaSpec::parse`, so a bad
+/// token errors instead of silently shrinking a stream's resident set.
+fn expert_groups(s: &str) -> Result<Vec<Vec<usize>>> {
+    s.split(';')
+        .map(
+            |g| match breccia_engine::ArenaSpec::parse(g).map_err(anyhow::Error::msg)? {
+                breccia_engine::ArenaSpec::List(v) => Ok(v),
+                breccia_engine::ArenaSpec::Off => Ok(Vec::new()),
+                breccia_engine::ArenaSpec::Auto(_) => {
+                    anyhow::bail!("`auto` is not a per-stream value in --gpu-experts {s:?}")
+                }
+            },
+        )
+        .collect()
+}
+
 /// Two (or more) sequences, one per device, interleaved at the block level.
 ///
 /// The number that matters is the **aggregate** token rate: each stream's own
@@ -1673,19 +1690,10 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     // repeats). Two streams on the same card are allowed: their GPU phases then
     // queue behind each other, which is what the scaling curve measures.
     let expert_sets: Vec<Vec<usize>> = {
-        let groups: Vec<Vec<usize>> = a
-            .gpu_experts
-            .as_ref()
-            .map(|s| {
-                s.split(';')
-                    .map(|g| {
-                        g.split(',')
-                            .filter_map(|t| t.trim().parse::<usize>().ok())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let groups: Vec<Vec<usize>> = match a.gpu_experts.as_ref() {
+            Some(s) => expert_groups(s)?,
+            None => Vec::new(),
+        };
         if groups.is_empty() && n_streams == 2 && devs.len() >= 2 {
             // Measured default for a two-stream pair (§8p): the production mapping's
             // nine hottest blocks. It costs GPU time the RX cannot use otherwise and
@@ -2001,19 +2009,10 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         a.gen
     );
     let groups: Vec<Vec<usize>> = {
-        let g: Vec<Vec<usize>> = a
-            .gpu_experts
-            .as_ref()
-            .map(|s| {
-                s.split(';')
-                    .map(|x| {
-                        x.split(',')
-                            .filter_map(|t| t.trim().parse::<usize>().ok())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let g: Vec<Vec<usize>> = match a.gpu_experts.as_ref() {
+            Some(s) => expert_groups(s)?,
+            None => Vec::new(),
+        };
         (0..n)
             .map(|i| {
                 if g.is_empty() {
@@ -2477,7 +2476,10 @@ fn bench_token(a: TokenArgs) -> Result<()> {
     // `--gpu-experts` is `auto`, an explicit block list, or absent (no arena).
     let arena = match a.gpu_experts.as_deref() {
         None => breccia_engine::ArenaSpec::Off,
-        Some(list) => match breccia_engine::ArenaSpec::parse(list) {
+        Some(list) => match breccia_engine::ArenaSpec::parse(list)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("parsing --gpu-experts {list:?}"))?
+        {
             breccia_engine::ArenaSpec::Auto(_) => {
                 breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
                     display_reserve: a.arena_display_reserve_mib << 20,
