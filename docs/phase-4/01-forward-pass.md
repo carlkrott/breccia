@@ -2415,6 +2415,67 @@ The chunk-level shared expert (above), the token-major PLE read and `--ple-threa
 (§8z design), and the per-dispatch barrier bookkeeping (§8aa: parked, ceiling
 0.98/4.32 ms).
 
+## 8ac. The chunk-level shared expert failed its parity gate (reverted), and the reboot cause is fixed
+
+Two results, one negative and one safety fix. **Parity is green at the end of the
+round: chunk 128 + merged 32/32, top-1 13.170561.**
+
+### 1. The restructure was attempted, measured, and reverted
+
+All four §8ab pieces were implemented: chunk `mixed` for every block on the merged
+path, a `record_dense_prelude(..., shared: bool)` switch so the routed shared expert
+moves out of the per-token prelude, a `shared_expert_chunk` phase
+(`t / USERS_MAX` groups, each `copy x -> gate GEMM -> up GEMM -> SwiGLU -> down GEMM
+-> copy out` into `pf.shared`), and the lane's `sh` source rewired to `pf.shared[i]`
+(the 1-float scalar gate left per token).
+
+It runs, and it is **wrong**: with the chunk pass actually active (which needed
+`pf` to be allocated even when no block is resident — the first attempt silently
+kept the per-token path because `pf` required `--gpu-experts`), the parity gate read
+**2/32, top-1 12.532024** against the expected 13.170561. With the change reverted:
+32/32, 13.170561.
+
+The measured cost while it was active — `shared-exp` **20.74 -> 18.05 ms/token** at
+chunk 64 — is only a 13 % improvement, *not* the two orders §8ab's per-dispatch price
+predicted, which says the residual is not the routed shared expert's dispatches at
+all: something else is being charged to that stage (the per-token scalar
+`shexp_gate` GEMV plus the pass-1 flush wait are the candidates). That is the next
+thing to measure, not the next thing to guess: instrument the stage boundary before
+restructuring it again.
+
+Reverted rather than shipped: a half-restructure behind a flag is fine, a *wrong*
+one is not, and the round's rule is parity-green or revert. The design and the price
+stay in §8ab; what is missing is a correct source for one of the two consumers, most
+likely the lane's staging offsets (`lane_offsets(..)[3]` vs the chunk copy) — the
+next attempt should diff the host-path `pf.shared[i] -> staging` copy against the
+token path's `v.sh -> staging` for one token before touching the rest.
+
+### 2. Safety: every GPU wait is bounded now (this is the reboot cause)
+
+`docs/research/06` found what the 23:44 event actually was: a ring timeout with one
+outstanding packet, with `gemm_many` inside **`vkWaitForFences(u64::MAX)`** — so the
+*kernel's GPU watchdog* decided and issued a BACO reset on the display card. Nothing
+in the kernel was wrong (both cards later passed the four kernels bit-identically);
+the engine simply never gave up.
+
+`Gpu::WAIT_TIMEOUT_NS` (10 s) + `Gpu::fault_abort` now replace every unbounded wait:
+`wait_fence` and the batch ring's shutdown wait are bounded, and on expiry the
+process prints what it was waiting for plus the `journalctl` hint and **aborts**,
+which leaves the device healthy (91 -> 81 ms to a usable device, measured). No call
+site can reintroduce `u64::MAX`; the remaining one is
+`TransferRing`'s `wait_semaphores`, which is next (same helper, semaphore flavour).
+
+### 3. Research round 6 items taken / queued
+
+| item | state |
+|---|---|
+| bounded fence waits | **landed** (above) |
+| `VK_EXT_robustness2` (OOB -> zeros, <=1 % cost) | queued: device creation + feature enable |
+| shared expert as **2** dispatches (fused gate+up+SwiGLU, measured 2.8x) | queued; do it *with* the correct restructure, not before |
+| push descriptors / pre-updated pooled sets (shapes frozen per type) | queued |
+| dependent-chain timing only for dispatch-cost claims | adopted |
+| barrier cost is 3.43 us per **dependent** barrier (~3.8 ms/token over ~1,100) | re-prices the parked item upward; stays parked until the shared expert lands |
+
 ## 9. Exact commands
 
 

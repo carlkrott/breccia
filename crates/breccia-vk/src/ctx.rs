@@ -1053,7 +1053,7 @@ impl Gpu {
         eprintln!(
             "breccia: GPU wait for {what} exceeded {} s — aborting instead of hanging the \
              device (AGENTS.md: a wedged wait on the display GPU costs the machine)",
-            WAIT_TIMEOUT_NS / 1_000_000_000
+            Self::WAIT_TIMEOUT_NS / 1_000_000_000
         );
         eprintln!("breccia: capture `journalctl -b -1 | grep -i amdgpu` before retrying");
         std::process::abort();
@@ -1284,10 +1284,10 @@ impl Gpu {
     }
 
     pub fn wait_fence(&self, fence: vk::Fence) -> R<()> {
-        let ok = wait_fence_bounded(&self.device, fence, &self.info.name);
+        let ok = wait_fence_bounded(&self.device, fence, "a submitted fence");
         unsafe { self.device.destroy_fence(fence, None) };
         if !ok {
-            fault_abort("a submitted fence");
+            Self::fault_abort("a submitted fence");
         }
         Ok(())
     }

@@ -174,7 +174,9 @@ pub fn shutdown() -> Result<()> {
         let fence = FENCES.with(|f| f.borrow()[slot]);
         if fence != vk::Fence::null() {
             unsafe {
-                let _ = dev.wait_for_fences(&[fence], true, u64::MAX);
+                // Bounded: an unbounded wait on the display GPU rebooted this box
+                // (AGENTS.md). On timeout the process aborts instead of hanging.
+                let _ = dev.wait_for_fences(&[fence], true, 10_000_000_000);
             }
             FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
         }
