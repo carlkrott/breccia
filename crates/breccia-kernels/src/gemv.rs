@@ -225,6 +225,19 @@ impl<'g> Gemv<'g> {
         Self::with_variant(gpu, ty, rows, cols, accum, wide_dequant())
     }
 
+    /// Compile the **word-level pack** build (§8bc) explicitly, for the A/B and the
+    /// bit-identity test. Falls back to the default build for types without one.
+    pub fn with_words(
+        gpu: &'g Gpu,
+        ty: QuantType,
+        rows: usize,
+        cols: usize,
+        accum: Accum,
+    ) -> Result<Gemv<'g>> {
+        let spv = gemv_words_spv(ty).unwrap_or_else(|| gemv_spv_variant(ty, accum, false));
+        Self::glsl_variant(gpu, ty, rows, cols, accum, spv, false)
+    }
+
     /// Compile an explicit **dequant variant**: `wide` selects the coalesced
     /// (`_wide`) build when this type has one, `false` the incumbent per-element
     /// one. This is the A/B constructor — [`Gemv::with_accum`] passes
@@ -249,6 +262,20 @@ impl<'g> Gemv<'g> {
             ));
         }
         let spv = gemv_spv_variant(ty, accum, wide);
+        Self::glsl_variant(gpu, ty, rows, cols, accum, spv, wide)
+    }
+
+    /// The shared body of the variant constructors: `spv` is the pipeline's module,
+    /// `dp4a` says whether the int8-dot state should be built.
+    fn glsl_variant(
+        gpu: &'g Gpu,
+        ty: QuantType,
+        rows: usize,
+        cols: usize,
+        accum: Accum,
+        spv: &'static [u8],
+        _wide: bool,
+    ) -> Result<Gemv<'g>> {
         let kernel = gpu
             .kernel(spv, 4)
             .map_err(|e| anyhow!("creating the {ty} GEMV pipeline ({accum} accum): {e}"))?;
@@ -1047,6 +1074,25 @@ macro_rules! spv {
 /// restores the per-element build — that is the A/B arm and the revert path.
 ///
 /// Cached: the decode path asks once per pipeline construction, never per dispatch.
+/// Use the **word-level pack** build (`_words`, §8bc) where
+/// one exists — four codes extracted per instruction and the codebook in LDS. Same
+/// arithmetic, fewer instructions; bit-identical by construction.
+pub fn word_pack() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // **On by default**: bit-identical (`conformance::word_pack_is_bit_identical_*`)
+    // and 2.0x / 1.4x on the IQ4_XS shapes. `BRECCIA_NO_GEMV_WORDS=1` restores the
+    // per-element build, which is the A/B arm and the revert.
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_NO_GEMV_WORDS").is_none())
+}
+
+/// The `_words` build of the GEMV for `ty`, when that type has one.
+pub fn gemv_words_spv(ty: QuantType) -> Option<&'static [u8]> {
+    match ty {
+        QuantType::Iq4Xs => Some(spv!("gemv_iq4_xs_words")),
+        _ => None,
+    }
+}
+
 pub fn wide_dequant() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BRECCIA_GEMV_NO_WIDE").is_none())
@@ -1066,6 +1112,11 @@ pub fn gemv_wide_spv(ty: QuantType) -> Option<&'static [u8]> {
 /// The SPIR-V for `{ty, accum}` in the requested dequant variant. `wide` falls
 /// back to the incumbent build for types with no `_wide` pipeline.
 fn gemv_spv_variant(ty: QuantType, accum: Accum, wide: bool) -> &'static [u8] {
+    if word_pack() && accum == Accum::F32 {
+        if let Some(spv) = gemv_words_spv(ty) {
+            return spv;
+        }
+    }
     if wide && accum == Accum::F32 {
         if let Some(spv) = gemv_wide_spv(ty) {
             return spv;

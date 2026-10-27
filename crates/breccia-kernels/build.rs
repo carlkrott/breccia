@@ -137,6 +137,11 @@ const EPILOGUE_SHADERS: &[&str] = &["gemv_bf16", "gemv_bf16_moe", "gemv_f32", "g
 /// `IQ4_XS` the shared expert, `IQ3_S`/`IQ2_*` the GDN projections and the routed
 /// experts. The fp16/F32/BF16 types already saturate the memory path (98-103 % of
 /// DRAM) and have no byte-load loop, so they are not built.
+/// GEMV stems with a **word-level** decode build (`_words`, §8bc): four codes per
+/// instruction and the codebook in LDS instead of per-element extracts, selects and
+/// SSBO lookups. Bit-identical to the incumbent unit by construction.
+const WORD_SHADERS: &[&str] = &["gemv_iq4_xs"];
+
 const WIDE_SHADERS: &[&str] = &[
     // The head (Q5_K, 248320x2560, 4.25 ms/token = the worst stage in §8av).
     "gemv_q5_k",
@@ -212,6 +217,17 @@ fn main() {
         // sanctioned sense — a separate pipeline rather than a runtime branch, so
         // the default build keeps byte-identical SPIR-V and `BRECCIA_GEMV_WIDE`
         // is a one-flag A/B and revert.
+        // The word-level-pack build (§8bc): `& 0x0F0F0F0F`-style extraction and an
+        // LDS codebook, i.e. the same arithmetic in fewer instructions.
+        if WORD_SHADERS.contains(name) {
+            compile(
+                &glslc,
+                &out_dir,
+                name,
+                &format!("{name}_words"),
+                &["BRECCIA_WORD_PACK"],
+            );
+        }
         if WIDE_SHADERS.contains(name) {
             compile(
                 &glslc,

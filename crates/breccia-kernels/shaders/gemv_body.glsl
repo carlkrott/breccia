@@ -148,6 +148,14 @@ void hc_gated_epilogue(uint wg, uint slot) {
 #endif
 
 void main() {
+#ifdef BRECCIA_WORD_PACK
+    // Fill the LDS codebook once per workgroup (see `blocks.glsl`). Ahead of every
+    // early return, so the barrier is uniform across the workgroup.
+    for (uint i = gl_LocalInvocationID.x; i < 16u; i += 32u) {
+        s_iq4nl[i] = float(int(T[TBL_IQ4NL_VALUES + i]));
+    }
+    barrier();
+#endif
     uint lane = gl_LocalInvocationID.x % LANES;
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
     uint slot = gl_LocalInvocationID.x / LANES;

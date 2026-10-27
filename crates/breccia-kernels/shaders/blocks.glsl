@@ -24,6 +24,17 @@
 #ifndef BRECCIA_BLOCKS_GLSL
 #define BRECCIA_BLOCKS_GLSL
 
+#ifdef BRECCIA_WORD_PACK
+// The 16-entry IQ4_NL codebook, as **floats in LDS** (§8bc). The fp32 path calls
+// `iq4nl_value(q)` = `float(int(T[TBL_IQ4NL_VALUES + q]))` — an SSBO load plus an
+// int-to-float convert, once per element, with a two-level dependency (byte extract
+// -> index -> load). Research 12 measured that dependency as the reason IQ4_XS runs at
+// 47 % of its instruction model (2 lookups -> 100 %, 8 -> 47 %). Copying the same 16
+// values into LDS once per workgroup removes the descriptor path and the convert;
+// the *values* are identical, so every output bit is unchanged.
+shared float s_iq4nl[16];
+#endif
+
 #ifndef BRECCIA_OWN_BINDINGS
 layout(std430, binding = 0) readonly buffer WeightBytes { uint16_t W[]; };
 layout(std430, binding = 1) readonly buffer XVec { vec4 X[]; };
@@ -278,7 +289,22 @@ void dequant_iq4_xs_unit(uint off, uint u, out float v[8]) {
     float dl = f16_at(off) * float(int(ls) - 32);
     uint base = off + 4u + 8u * ib + 4u * (h & 1u); // qs[ib*16 + h*8 .. +8] -> 4 words
     uint hi = h >> 1u;
-#ifdef BRECCIA_WIDE_DEQUANT
+#ifdef BRECCIA_WORD_PACK
+    // **Word-level extraction** (§8bc). The unit's 8 nibbles are the 8 bytes of two
+    // 32-bit words, all taking the same nibble half (`hi`), so one mask (or shift +
+    // mask) per word produces all four codes packed in that word — 2 ops per 4
+    // elements instead of a per-element extract + select — and the multiply reads the
+    // codebook from LDS. Same codes, same `dl`, same multiply: bit-identical.
+    uint mask = 0x0F0F0F0Fu;
+    uint w0 = u32_at(base);
+    uint w1 = u32_at(base + 2u);
+    uint n0 = (hi == 0u) ? (w0 & mask) : ((w0 >> 4u) & mask);
+    uint n1 = (hi == 0u) ? (w1 & mask) : ((w1 >> 4u) & mask);
+    [[unroll]] for (uint j = 0u; j < 8u; ++j) {
+        uint q = byte4(j < 4u ? n0 : n1, j & 3u);
+        v[j] = dl * s_iq4nl[q];
+    }
+#elif defined(BRECCIA_WIDE_DEQUANT)
     // Coalesced form of the same unit (§8ax): the unit's 8 qs bytes are 4 words
     // starting at `base` (8-byte aligned), so two 32-bit loads replace eight
     // two-byte ones whose 8-byte stride touched each sector 8 times. Values are
