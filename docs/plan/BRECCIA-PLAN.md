@@ -55,6 +55,12 @@ PagedAttention (FP16 tail + compressed body, K at higher bits than V), radix-tre
 
 **Gate G (acceptance)** → 4–6 concurrent agents at usable speed without OOM/thrash, solo ≥ 85 tok/s.
 
+## Orientation
+
+`docs/BRIEF.md` is the orientation document: what the engine is, the current measured state,
+what has been tried (including the rejected ideas and why), the measurement and safety rules,
+the reference-engine research, the GitHub workflow, and the ranked plan. Read it first.
+
 ## Coverage audit
 
 `docs/plan/PDF-GAP-ANALYSIS.md` maps every proposal in the originating design conversation
