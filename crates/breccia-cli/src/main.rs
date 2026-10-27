@@ -623,7 +623,7 @@ fn profile(a: ProfileArgs) -> Result<()> {
             if breccia_profile::cache_usable(&cached, &current.fingerprint, a.quick) {
                 print!("{}", breccia_profile::summary_text(&cached));
                 if a.dry_run_plan {
-                    print!("{}", breccia_profile::plan::plan_text(&cached));
+                    print!("{}", breccia_profile::plan::plan_text(&cached, None));
                 }
                 println!(
                     "cached profile reused (fingerprint match): {}",
@@ -643,7 +643,7 @@ fn profile(a: ProfileArgs) -> Result<()> {
         breccia_profile::calibrate(a.quick).context("calibration failed (Vulkan benchmarks)")?;
 
     if a.dry_run_plan {
-        print!("{}", breccia_profile::plan::plan_text(&profile));
+        print!("{}", breccia_profile::plan::plan_text(&profile, None));
         println!("dry run: nothing written (would write {})", path.display());
         return Ok(());
     }

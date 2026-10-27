@@ -73,7 +73,7 @@ fn measured_cells(e: &DeviceEntry) -> String {
 }
 
 /// The whole `--dry-run-plan` output.
-pub fn plan_text(profile: &HwProfile) -> String {
+pub fn plan_text(profile: &HwProfile, expert_pin_bytes: Option<u64>) -> String {
     let mut out = String::new();
     out.push_str("=== breccia profile --dry-run-plan (nothing written) ===\n");
     out.push_str(&format!(
@@ -190,6 +190,18 @@ pub fn plan_text(profile: &HwProfile) -> String {
          \x20 no VK_KHR_cooperative_matrix on RADV 26.2.4 → GEMM via subgroup/FMA kernels; \
          Wave32 selectable on gfx1030 only (size control 32..64), gfx906 locked to Wave64\n",
     );
+    // Pin bytes come in as a parameter: breccia-profile does not depend on the engine.
+    if let Some(bytes) = expert_pin_bytes {
+        let need = if bytes > 8 << 20 {
+            "units need LimitMEMLOCK=infinity"
+        } else {
+            "fits the default 8 MiB mlock limit"
+        };
+        out.push_str(&format!(
+            "\nHost expert import (--host-expert-import ON)\n  imported arena pin: {} → {need}\n",
+            crate::fmt_bytes(bytes)
+        ));
+    }
     out
 }
 
@@ -416,7 +428,7 @@ mod tests {
 
     #[test]
     fn plan_contains_roles_tiers_and_constraints() {
-        let text = plan_text(&profile());
+        let text = plan_text(&profile(), None);
         assert!(text.contains("streaming-compute"), "{text}");
         assert!(text.contains("static-resident"), "{text}");
         assert!(text.contains("13577 MiB weights"), "{text}");
@@ -426,5 +438,19 @@ mod tests {
         assert!(text.contains("Wave64"), "{text}");
         assert!(text.contains("nothing written"), "{text}");
         assert!(text.contains("0x73a5"), "{text}");
+        assert!(!text.contains("imported arena pin"), "{text}");
+    }
+
+    #[test]
+    fn plan_reports_expert_pin_only_when_flag_on() {
+        let on = plan_text(&profile(), Some(16 << 20));
+        assert!(on.contains("imported arena pin: 16.0 MiB"), "{on}");
+        assert!(on.contains("units need LimitMEMLOCK=infinity"), "{on}");
+        let small = plan_text(&profile(), Some(4 << 20));
+        assert!(
+            small.contains("fits the default 8 MiB mlock limit"),
+            "{small}"
+        );
+        assert!(!plan_text(&profile(), None).contains("imported arena pin"));
     }
 }
