@@ -746,35 +746,56 @@ impl Drop for AlignedHost {
     }
 }
 
-/// Returns `(memory_type_bits, verified, h2d_gbps)`.
-fn probe_import(gpu: &Gpu, bytes: u64, align: u64) -> R<(u32, bool, f64)> {
+/// Picks the memory type common to both the host-pointer's importable types and
+/// the imported buffer's requirements, preferring HOST_VISIBLE. `None` when the
+/// two bit sets are disjoint.
+fn pick_import_type(
+    host_bits: u32,
+    buf_bits: u32,
+    mem: &vk::PhysicalDeviceMemoryProperties,
+) -> Option<u32> {
+    find_mem_type(
+        mem,
+        host_bits & buf_bits,
+        vk::MemoryPropertyFlags::empty(),
+        vk::MemoryPropertyFlags::HOST_VISIBLE,
+    )
+}
+
+/// Import a host pointer as device memory backing a new buffer, doing exactly the
+/// import half of the host-pointer probe: allocate the buffer, find a common
+/// memory type, import the host range, and bind it.
+pub fn import_from_host_ptr(
+    gpu: &Gpu,
+    ptr: *mut u8,
+    bytes: u64,
+    usage: vk::BufferUsageFlags,
+) -> R<Buf> {
     let fns = ash::ext::external_memory_host::Device::new(&gpu.instance, &gpu.device);
-    let mut host = AlignedHost::new(bytes, align.max(4096))?;
-    host.fill_pattern();
 
     let mut props = vk::MemoryHostPointerPropertiesEXT::default();
     let r = unsafe {
         (fns.fp().get_memory_host_pointer_properties_ext)(
             gpu.device.handle(),
             vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
-            host.ptr as *const c_void,
+            ptr as *const c_void,
             &mut props,
         )
     };
     r.result()
-        .map_err(|e| format!("host pointer of {bytes} bytes @ align {align}: {e}"))?;
+        .map_err(|e| format!("host pointer of {} bytes @ {:p}: {}", bytes, ptr, e))?;
     if props.memory_type_bits == 0 {
         return Err("driver reported no importable memory type for the host pointer".to_string());
     }
 
     // Buffer whose lifetime is the imported host range. The import handle type must
     // also be declared on the buffer (VUID-vkBindBufferMemory-memory-02985).
-    let imported = unsafe {
+    unsafe {
         let mut ext_mem = vk::ExternalMemoryBufferCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
         let bci = vk::BufferCreateInfo::default()
             .size(bytes)
-            .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+            .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .push_next(&mut ext_mem);
         let buf = vk(
@@ -782,13 +803,7 @@ fn probe_import(gpu: &Gpu, bytes: u64, align: u64) -> R<(u32, bool, f64)> {
             "vkCreateBuffer(import)",
         )?;
         let reqs = gpu.device.get_buffer_memory_requirements(buf);
-        let bits = reqs.memory_type_bits & props.memory_type_bits;
-        let idx = match find_mem_type(
-            &gpu.mem,
-            bits,
-            vk::MemoryPropertyFlags::empty(),
-            vk::MemoryPropertyFlags::HOST_VISIBLE,
-        ) {
+        let idx = match pick_import_type(props.memory_type_bits, reqs.memory_type_bits, &gpu.mem) {
             Some(i) => i,
             None => {
                 gpu.device.destroy_buffer(buf, None);
@@ -800,7 +815,7 @@ fn probe_import(gpu: &Gpu, bytes: u64, align: u64) -> R<(u32, bool, f64)> {
         };
         let mut import = vk::ImportMemoryHostPointerInfoEXT::default()
             .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
-            .host_pointer(host.ptr as *mut c_void);
+            .host_pointer(ptr as *mut c_void);
         let mai = vk::MemoryAllocateInfo::default()
             .allocation_size(reqs.size)
             .memory_type_index(idx)
@@ -817,12 +832,33 @@ fn probe_import(gpu: &Gpu, bytes: u64, align: u64) -> R<(u32, bool, f64)> {
             gpu.device.destroy_buffer(buf, None);
             return Err(format!("vkBindBufferMemory(host import) failed: {e}"));
         }
-        Buf {
+        Ok(Buf {
             buf,
             mem,
             size: bytes,
-        }
-    };
+        })
+    }
+}
+
+/// Returns `(memory_type_bits, verified, h2d_gbps)`.
+fn probe_import(gpu: &Gpu, bytes: u64, align: u64) -> R<(u32, bool, f64)> {
+    let mut host = AlignedHost::new(bytes, align.max(4096))?;
+    host.fill_pattern();
+
+    let mut props = vk::MemoryHostPointerPropertiesEXT::default();
+    let fns = ash::ext::external_memory_host::Device::new(&gpu.instance, &gpu.device);
+    unsafe {
+        (fns.fp().get_memory_host_pointer_properties_ext)(
+            gpu.device.handle(),
+            vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+            host.ptr as *const c_void,
+            &mut props,
+        )
+    }
+    .result()
+    .map_err(|e| format!("host pointer of {bytes} bytes @ align {align}: {e}"))?;
+
+    let imported = import_from_host_ptr(gpu, host.ptr, bytes, vk::BufferUsageFlags::TRANSFER_SRC)?;
 
     let dst = match gpu.buf(
         bytes,
@@ -877,4 +913,34 @@ fn probe_import(gpu: &Gpu, bytes: u64, align: u64) -> R<(u32, bool, f64)> {
     gpu.destroy_buf(&imported);
     let (verified, gbps) = result?;
     Ok((props.memory_type_bits, verified, gbps))
+}
+
+#[cfg(test)]
+mod import_type_tests {
+    use super::*;
+
+    /// Memory types: 0 = DEVICE_LOCAL only, 1 = HOST_VISIBLE, 2 = HOST_VISIBLE|COHERENT.
+    fn mem_props() -> vk::PhysicalDeviceMemoryProperties {
+        let mut mem = vk::PhysicalDeviceMemoryProperties::default();
+        mem.memory_type_count = 3;
+        mem.memory_types[0].property_flags = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        mem.memory_types[1].property_flags = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        mem.memory_types[2].property_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        mem
+    }
+
+    #[test]
+    fn common_bits_pick_the_host_visible_type() {
+        // host pointer importable as type 1, buffer accepts 0|1 -> only 1 is common.
+        assert_eq!(pick_import_type(0b010, 0b011, &mem_props()), Some(1));
+        // common set is {2}: the HOST_VISIBLE preference skips type 0.
+        assert_eq!(pick_import_type(0b110, 0b100, &mem_props()), Some(2));
+    }
+
+    #[test]
+    fn disjoint_bits_give_none() {
+        assert_eq!(pick_import_type(0b001, 0b110, &mem_props()), None);
+        assert_eq!(pick_import_type(0, 0b111, &mem_props()), None);
+    }
 }
