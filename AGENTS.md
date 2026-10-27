@@ -34,7 +34,7 @@ A from-scratch Rust inference engine (`breccia`) plus its Phase-0 measurement ha
 Per-invocation rules, mandatory once a test touches GPU memory:
 
 1. **Wrap every GPU run in `timeout 90`** — a driver hang must not outlive the command.
-2. **A new shader's first conformance run (≤4 shapes) goes on the Radeon VII/MI50 (`0000:0e:00.0`) FIRST — it is the HEADLESS card.** This is the only standing single-device step; everything after it runs dual (see "Dual-GPU first"). The **RX 6950 XT (`0000:03:00.0`) drives the displays** (DP-1, DP-2, HDMI-A-1 connected, `boot_vga=1`) — a reset there loses the desktop. Resolve devices by PCI identity, never by enumeration ordinal. Only run risky code on the RX after the MI50 passes.
+2. **Know which card is which; there is no single-card-first step.** New and risky shaders run on both cards like everything else (see "Dual-GPU first"); the safety comes from rules 1, 4, 5 and the kernel procedure, not from card choice (the 2026-10-26 reset happened on the headless card). The MI50 (`0000:0e:00.0`) is headless. The **RX 6950 XT (`0000:03:00.0`) drives the displays** (DP-1, DP-2, HDMI-A-1 connected, `boot_vga=1`) — a reset there loses the desktop. Resolve devices by PCI identity, never by enumeration ordinal.
    **Determine the display card from sysfs, never from an Xorg log** (a stale log line naming "AMDGPU(0): Radeon VII" misled us for a day):
    ```bash
    for c in /sys/class/drm/card[0-9]; do echo "$c $(cat $c/device/uevent | grep PCI_SLOT_NAME) boot_vga=$(cat $c/device/boot_vga)"; done
@@ -45,7 +45,7 @@ Per-invocation rules, mandatory once a test touches GPU memory:
 4. Enable `VK_LAYER_KHRONOS_validation` for first runs of new shader code and record any VU messages; RADV page faults on illegal command streams are otherwise silent until the box freezes.
 5. Conformance: run **one quant type per invocation** so a fault is attributable; never sweep all types in one go after touching shader includes. GPU tests are opt-in by explicit device: `cargo test` skips them unless `BRECCIA_KERNEL_DEVICE` is set. Safe first run:
    `timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation BRECCIA_KERNEL_DEVICE=0000:0e:00.0 BRECCIA_QTYPE=IQ3_S cargo test -p breccia-kernels --test conformance`
-   then repeat on `0000:03:00.0` only after the MI50 passes.
+   (the conformance harness takes one device per process: run it for `0000:0e:00.0` and `0000:03:00.0` back to back).
 6. After any GPU fault, check `journalctl -b -1` for `amdgpu ... page fault` / `Illegal opcode` and capture the process/thread names before rebooting.
 
 ## Dual-GPU first (policy, 2026-10-26)
@@ -64,8 +64,8 @@ The project goal is **proper dual-GPU usage** (RX 6950 XT + Radeon VII/MI50), no
   cards at `power_dpm_force_performance_level=high` before and after (a ring reset silently drops it to
   `auto`), the most streams the KV budget allows, the longest context the budget allows, and the
   host-RAM budget (~30 GB) used rather than left free.
-- **A single-device run needs a named reason on its card**, one of: (a) a new shader's first conformance
-  run (rule 2 above), (b) a repro or bisect of a failure seen on one device, (c) a double-check of a
+- **A single-device run needs a named reason on its card**, one of: (a) a per-device conformance harness
+  that takes one device per process (run it for both), (b) a repro or bisect of a failure seen on one device, (c) a double-check of a
   failed dual result. Anything else is re-run dual and its single-card number is not reported.
 
 ## Paired research (standing rule, 2026-10-26)
@@ -104,7 +104,7 @@ it and proceed.
    host process — it never reaches the GPU.
 2. **Land it behind a flag, default off**, and keep the incumbent path intact so an A/B and a revert
    are both one flag.
-3. **First validation run on the MI50 (`0000:0e:00.0`, headless)**: one new shader per process,
+3. **Validation run on both cards**: one new shader per process,
    ≤4 fresh dispatched shapes per process, `timeout 90`, `VK_LAYER_KHRONOS_validation` enabled,
    `power_dpm_force_performance_level=high` verified first on both cards (and re-checked after — a ring reset drops
    it to `auto` silently).

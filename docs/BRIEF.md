@@ -138,7 +138,7 @@ sum 30,319 µs   vs   wait-gpu 30,691 µs   (residual ~1 %, so the table explain
 
 | Fact | Detail |
 |---|---|
-| **The RX drives the displays** | `boot_vga=1`, DP-1/DP-2/HDMI-A-1 connected. The **MI50 is headless**. Risky kernels go to the MI50 first. Determine this from sysfs, never from an Xorg log (a stale log cost us a day). |
+| **The RX drives the displays** | `boot_vga=1`, DP-1/DP-2/HDMI-A-1 connected. The **MI50 is headless**. No card-first rule: new kernels run on both (AGENTS.md). Determine this from sysfs, never from an Xorg log (a stale log cost us a day). |
 | A reset can reboot the box | The 2026-10-26 23:44 BACO reset happened on the *headless* card and still took the machine down. Bounded waits + `VK_EXT_robustness2` are the real mitigation. |
 | Btrfs read-ahead | Defaults to 8 MiB → 9× read amplification on expert/PLE records. Pinned to 128 KiB by `breccia-io-tune.timer` (it silently regresses). |
 | `ulimit -l` | 8 MiB hard limit — a pinned host pool needs `LimitMEMLOCK=infinity` in a unit. Pageable import measured the same speed, so this is a correctness-of-pinning issue, not a speed one. |
@@ -223,7 +223,7 @@ after a correctness change is **32 generations, zero wrong**.
 
 1. Every GPU run in `timeout 90`; one GPU process at a time, and that process uses **both** cards
    (default run shape in `AGENTS.md` "Dual-GPU first"; single-device only for a named reason).
-2. **A new shader's first conformance run on the MI50 (headless)**; everything after it runs dual. Determine the
+2. **No single-card-first step**: new shaders run on both cards with the validation layer and ≤4 shapes. Determine the
    display card from sysfs.
 3. Validation layer on for first runs of new shader code; `spirv-val` at build.
 4. **One quant type per invocation; ≤4 fresh dispatched shapes per process**; pipeline
