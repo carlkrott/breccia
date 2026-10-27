@@ -2787,6 +2787,57 @@ lane 40-43 ms/step. The 2.98 tok/s/agent in this window is not a regression — 
 loaded box (`experts(host)` 83 vs 38-48 in quieter windows, `ple` 17.6 on the MI50
 stream); the attribution, not the rate, is the deliverable.
 
+## 8ai. PLE batching is unblocked, not landed: the cap is now a construction parameter
+
+The round's item was the submit reduction (13.6 -> ~2.2 submits per block-chunk,
+~34 ms by research round 7's 62 us per submit). It did not land, and the honest reason
+is a specific data-layout constraint rather than time, so it is written down before
+the next attempt.
+
+### What landed: the blocker §8z named is removed
+
+`xfer::ple_stage_bytes(tokens, hc_dim, n_embd)` is now the rule for a chunked
+session's staging `cap` (`Session::new` takes the max of the single-readback default
+and this), with a unit test that asserts it covers `t * (2*hc_dim + n_embd) * 4` bytes
+for `t = 1, 8, 64, 128` and is not oversized. Before this, `read_batch` refused a
+multi-token PLE readback outright — the cap was ~1 MiB against ~12 MiB at `t = 128` —
+which is *why* the phase could only go token by token. **No behaviour change**, no
+decode path touched, parity untouched.
+
+### What still blocks the batching itself
+
+`ple_step` per token is a **host round trip** by construction: read `R`, `key` and
+`value` back, run the host block (grouped RMSNorm, the conv state, the gated residual),
+write `R` back. Batching needs `t` of those in one pass, and two things do not yet line
+up:
+
+1. **The gather output is per token.** `EmbGather::run(packed, idx, out, batch)` writes
+   one token's 16 rows into a single 2 560-float buffer, and the key/value projections
+   then read that buffer. A chunk version wants `t * 16` rows gathered at once, but the
+   per-token key projection needs a *view* into it at `i * 16` rows — and `Buf` has no
+   offset field (the constraint that shaped the merged pass, §8v). Either the projection
+   becomes an `m = t` `GemmMany` over the stacked rows (needs a multi-user kernel for the
+   PLE key/value types) or each token's rows are copied into the single-token buffer
+   inside the batch (one `record_copy` per token — cheap, and the path that fits today).
+2. **The hash is ordered and `rows_for` mutates state**, so it must run per token in
+   sequence before the batch opens — which means `t` `pack_rows` + uploads. Uploading
+   each token's 1 440 bytes separately would reintroduce `t` submits, so the packed rows
+   must be concatenated into **one** buffer per chunk with a per-token index list, i.e.
+   one `upload` before `ensure_batch` and `t` gather dispatches inside it.
+
+So the shape is settled (one flush, one concatenated upload, `t` gathers + `2t`
+projections + `t` copies recorded in **one** batch, `t/24`-token staging slices for the
+readback, `t` host blocks, one writeback with a region array) and the piece that made it
+not fit in this round is item 1 — the per-token view — which should be done with the
+copy-inside-the-batch route first and the `GemmMany` route only if the copy cost shows.
+
+### State
+
+Submits per block-chunk remain **13.6** (unchanged), `wait-gpu` and `ple` unchanged, so
+**no prefill delta is claimed this round**. Parity unchanged: chunk 128 + merged 32/32,
+top-1 13.170561 (the change is allocation sizing only). No decode path touched, so the
+canonical gate stands at 20.3 +- 1 aggregate, lane 40-43 ms/step.
+
 ## 9. Exact commands
 
 

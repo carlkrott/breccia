@@ -604,6 +604,18 @@ impl<'m> Session<'m> {
             } else {
                 1
             };
+            // A chunked session that will batch PLE reads `t` tokens' residual/key/
+            // value stacks back in one call, so its cap is the chunk's need, not the
+            // single-readback default (§8ai; `ple_stage_bytes` is the tested rule).
+            let stage_cap = if chunk_slots > 1 {
+                stage_cap.max(crate::xfer::ple_stage_bytes(
+                    chunk_slots,
+                    mc.hc_dim(),
+                    mc.n_embd,
+                ))
+            } else {
+                stage_cap
+            };
             stagings.push(Staging::with_block_region(gpu, stage_cap, chunk_slots)?);
             let alloc = |bytes: u64, what: &str| -> Result<Buf> {
                 breccia_kernels::gemv::alloc(gpu, bytes)

@@ -50,6 +50,18 @@ pub struct Staging {
 /// a fence of its own.
 pub const BLOCK_REGION: u64 = 32 << 10;
 
+/// Bytes a chunked session's staging buffer needs for the **PLE** phase's batched
+/// readback: one residual stack, one key stack and one value stack per token.
+///
+/// `read_batch` refuses a total above the buffer's `cap`, and the PLE phase's whole
+/// point is to read `t` tokens back in one call instead of `t` calls, so the cap has
+/// to be a construction parameter rather than the ~1 MiB a single readback needs
+/// (`docs/phase-4` §8z/§8ai). This is the function a test can check without a GPU.
+pub fn ple_stage_bytes(tokens: usize, hc_dim: usize, n_embd: usize) -> u64 {
+    let per_token = (2 * hc_dim + n_embd) as u64 * 4;
+    (tokens as u64).max(1) * per_token + 4096
+}
+
 /// Bytes reserved at the head of a staging buffer for the in-batch readback: one
 /// [`BLOCK_REGION`] per token, so a whole prefill chunk's lane inputs fit.
 pub fn block_region(tokens: usize) -> u64 {
@@ -388,6 +400,25 @@ mod tests {
     /// The staging math is pure: `read_batch` lays items out back to back and the
     /// offsets must tile `total` exactly (a mismatch would silently hand a caller
     /// another buffer's bytes).
+    /// The PLE phase's batched readback needs `t * (2*hc_dim + n_embd) * 4` bytes and
+    /// `read_batch` refuses a total above `cap`, so the chunked session must size its
+    /// staging buffer from this, not from the single-readback default (§8ai).
+    #[test]
+    fn ple_stage_bytes_covers_a_whole_chunk() {
+        let (hc_dim, n_embd) = (10240usize, 2560usize);
+        for t in [1usize, 8, 64, 128] {
+            let want = t as u64 * (2 * hc_dim + n_embd) as u64 * 4;
+            let got = super::ple_stage_bytes(t, hc_dim, n_embd);
+            assert!(
+                got >= want,
+                "t = {t}: {got} B does not cover a {want} B readback"
+            );
+            // and it must not be wildly oversized either
+            assert!(got <= want + 65536, "t = {t}: {got} B is oversized");
+        }
+        assert!(super::ple_stage_bytes(128, hc_dim, n_embd) > 10 << 20);
+    }
+
     #[test]
     fn read_offsets_tile_the_staging_buffer() {
         let items = [(0u64, 4usize), (4, 12), (16, 40)];
