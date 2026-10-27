@@ -82,7 +82,7 @@ Legend: **BUILT** (in the tree, measured) · **PARTIAL** (a piece exists, the pr
 
 | Rank | Item | Measured / priced value | Why here |
 |---|---|---|---|
-| 1 | **`wait-gpu` drain at decode** (33.4 ms of a 59 ms token): per-resource barrier tracking, kernel fusions (plan #18), pre-recorded CB replay | needs ≈ −11 ms to reach 20.79 tok/s on one stream | the lane is now only 13.5 ms and is a serial section; the drain is 57 % of the token |
+| 1 | **`wait-gpu` drain at decode** (33.4 ms of a 58 ms token): attribute it (execution vs overhead), then kernel fusions (plan #18) and/or pre-recorded CB replay | needs ≈ −10 ms to reach 20.79 tok/s on one stream | the lane is now only 13.5 ms and is a serial section; the drain is 57 % of the token |
 | 2 | **Head placement** (`head` 7.1 ms sits on the MI50) | ~−4 ms/token, config-level | nearly free |
 | 3 | **Coverage past 30 blocks** (per-expert LRU, #12) | full block coverage needs ~44 GiB; per-expert is the only route | the ladder's gain was linear in *blocks freed*, not in bytes |
 | 4 | **Quantized KV (#21)** + precision tail | unlocks 4–6 agent slots at 32K–64K (plan Gate G) | gates the whole multi-agent goal |
