@@ -252,6 +252,14 @@ enum BenchKind {
         /// workload table.
         #[arg(long)]
         same_prompt: bool,
+        /// `--gpu-experts auto`: bytes kept free on a device that currently drives
+        /// a display (read from sysfs, not assumed)
+        #[arg(long, default_value_t = 768, value_name = "MIB")]
+        arena_display_reserve_mib: u64,
+        /// `--gpu-experts auto`: bytes kept free on a headless device (session
+        /// scratch ~120 MiB + allocator slack)
+        #[arg(long, default_value_t = 256, value_name = "MIB")]
+        arena_headroom_mib: u64,
     },
     /// Phase 4: the forward-pass graph — one token, then greedy generation
     Token {
@@ -512,6 +520,8 @@ fn run(cli: Cli) -> Result<()> {
                     prefill_chunk,
                     prefill_merged,
                     warm,
+                    arena_display_reserve_mib,
+                    arena_headroom_mib,
                 }),
         } => bench_agents(AgentArgs {
             streams,
@@ -526,6 +536,8 @@ fn run(cli: Cli) -> Result<()> {
             prefill_chunk,
             prefill_merged,
             warm,
+            arena_display_reserve_mib,
+            arena_headroom_mib,
         }),
         Command::Bench {
             kind:
@@ -605,6 +617,8 @@ struct AgentArgs {
     prefill_chunk: usize,
     prefill_merged: bool,
     warm: usize,
+    arena_display_reserve_mib: u64,
+    arena_headroom_mib: u64,
 }
 
 struct ProfileArgs {
@@ -1159,7 +1173,7 @@ mod tests {
                 breccia_engine::ArenaSpec::List(vec![2, 3]),
             ]
         );
-        for bad in ["0,1;foo", "0,1;", "auto;0,1", "0,x,2"] {
+        for bad in ["0,1;foo", "0,1;", "auto;0,1", "0,x,2", "1,x"] {
             assert!(multi_arena_specs(bad, 2, opts).is_err(), "{bad} must error");
         }
     }
@@ -2117,33 +2131,17 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         reference.len(),
         a.gen
     );
-    let groups: Vec<Vec<usize>> = {
-        let g: Vec<Vec<usize>> = a
-            .gpu_experts
-            .as_ref()
-            .map(|s| {
-                s.split(';')
-                    .map(|x| {
-                        x.split(',')
-                            .filter_map(|t| t.trim().parse::<usize>().ok())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        (0..n)
-            .map(|i| {
-                if g.is_empty() {
-                    if n == 2 && devs.len() >= 2 {
-                        vec![0, 1, 2, 4, 8, 18, 20, 22, 23]
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    g.get(i).or_else(|| g.last()).cloned().unwrap_or_default()
-                }
-            })
-            .collect()
+    // Same strict parse and per-stream selection as bench_token_multi.
+    let opts = breccia_engine::ArenaOpts {
+        display_reserve: a.arena_display_reserve_mib << 20,
+        headroom: a.arena_headroom_mib << 20,
+    };
+    let groups: Vec<breccia_engine::ArenaSpec> = match a.gpu_experts.as_deref() {
+        Some(spec) => multi_arena_specs(spec, n, opts)?,
+        None if n == 2 && devs.len() >= 2 => vec![breccia_engine::ArenaSpec::List(vec![
+            0, 1, 2, 4, 8, 18, 20, 22, 23,
+        ])],
+        None => vec![breccia_engine::ArenaSpec::Off],
     };
     let mut models = Vec::with_capacity(n);
     for s in 0..n {
@@ -2156,7 +2154,11 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
                 blocks: None,
                 head_device: breccia_engine::HeadSpec::Auto,
                 profile: None,
-                arena: breccia_engine::ArenaSpec::List(groups[s].clone()),
+                arena: groups
+                    .get(s)
+                    .or_else(|| groups.last())
+                    .cloned()
+                    .unwrap_or(breccia_engine::ArenaSpec::Off),
                 host_expert_import: false,
                 page_hint_trim: false,
                 verbose: s == 0,
