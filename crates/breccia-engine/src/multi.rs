@@ -52,6 +52,9 @@ pub struct StreamReport {
     pub fence_s: f64,
     pub expert_bytes: u64,
     pub last_logits: Vec<f32>,
+    /// Wall seconds of this stream's own prompt pass. The serial chunked path
+    /// times each stream alone; token by token every stream shares the total.
+    pub prefill_seconds: f64,
 }
 
 /// The whole two-stream run.
@@ -132,6 +135,13 @@ impl MultiGeneration {
 /// schedule it changes touches no numerics: block *b*'s dependency chain
 /// is unchanged, only *when* the next block is handed to the queue. Cached.
 fn block_major_env_on(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+/// `BRECCIA_MULTI_PREFILL_CONCURRENT=1`: the chunked prompt pass runs the streams on
+/// parallel threads instead of one after another. Off unless exactly `1`, so the
+/// serial path stays the default.
+fn prefill_concurrent_on(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
@@ -302,14 +312,55 @@ impl<'m> Multi<'m> {
         // Plan from the --prefill-chunk target: prefill_plan applies prefill_cap itself,
         // so passing the cap would plan chunks 2.25x the target and Session::prefill bails.
         let target = self.streams[0].prefill_target;
-        if target > 0 {
+        let mut stream_prefill = vec![0.0f64; ns];
+        let concurrent = prefill_concurrent_on(
+            std::env::var("BRECCIA_MULTI_PREFILL_CONCURRENT")
+                .ok()
+                .as_deref(),
+        );
+        if target > 0 && concurrent {
+            // One scoped thread per stream: the streams' chunks overlap instead of
+            // stream 1 waiting for stream 0's whole prompt.
+            let plan = crate::graph::prefill_plan(prompt.len(), target);
+            let done: Vec<Result<(Vec<f32>, f64)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = self
+                    .streams
+                    .iter_mut()
+                    .map(|sess| {
+                        let plan = &plan;
+                        scope.spawn(move || -> Result<(Vec<f32>, f64)> {
+                            let t_stream = std::time::Instant::now();
+                            let mut pos = 0usize;
+                            let mut lg = Vec::new();
+                            for &len in plan.iter() {
+                                lg = sess.prefill(&prompt[pos..pos + len], pos)?;
+                                pos += len;
+                            }
+                            Ok((lg, t_stream.elapsed().as_secs_f64()))
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("prefill thread panicked"))
+                    .collect()
+            });
+            logits = Vec::with_capacity(ns);
+            for (s, r) in done.into_iter().enumerate() {
+                let (lg, secs) = r?;
+                logits.push(lg);
+                stream_prefill[s] = secs;
+            }
+        } else if target > 0 {
             logits = vec![Vec::new(); ns];
             for (s, sess) in self.streams.iter_mut().enumerate() {
+                let t_stream = std::time::Instant::now();
                 let mut pos = 0usize;
                 for len in crate::graph::prefill_plan(prompt.len(), target) {
                     logits[s] = sess.prefill(&prompt[pos..pos + len], pos)?;
                     pos += len;
                 }
+                stream_prefill[s] = t_stream.elapsed().as_secs_f64();
             }
         } else {
             for (pos, &t) in prompt.iter().enumerate() {
@@ -317,6 +368,10 @@ impl<'m> Multi<'m> {
             }
         }
         let prefill_seconds = prefill_t.elapsed().as_secs_f64();
+        if target == 0 {
+            // Token by token, every stream is fed inside the same loop.
+            stream_prefill.iter_mut().for_each(|p| *p = prefill_seconds);
+        }
         for s in 0..ns {
             self.streams[s].reset_counters()?;
         }
@@ -353,6 +408,7 @@ impl<'m> Multi<'m> {
             st.fence_s = sess.dev_wait_s.iter().sum();
             st.expert_bytes = sess.expert_bytes;
             st.last_logits = logits.get(s).cloned().unwrap_or_default();
+            st.prefill_seconds = stream_prefill[s];
         }
         Ok(MultiGeneration {
             streams,
@@ -366,7 +422,16 @@ impl<'m> Multi<'m> {
 
 #[cfg(test)]
 mod tests {
-    use super::{block_major_env_on, submit_plan, Submit};
+    use super::{block_major_env_on, prefill_concurrent_on, submit_plan, Submit};
+
+    /// Only the literal `1` turns the concurrent prefill on; anything else keeps the serial path.
+    #[test]
+    fn prefill_concurrent_env_gate_is_exactly_one() {
+        assert!(prefill_concurrent_on(Some("1")));
+        for v in [None, Some("0"), Some(""), Some("true"), Some("1 ")] {
+            assert!(!prefill_concurrent_on(v), "{v:?} must be OFF");
+        }
+    }
 
     /// The multi prompt pass must cover the prompt and never plan a chunk above
     /// the session's scratch cap, for every target the sweep uses.

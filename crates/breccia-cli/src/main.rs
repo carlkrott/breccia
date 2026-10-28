@@ -1949,6 +1949,10 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 st.fence_s * 1e3 / g.steps.max(1) as f64,
                 &st.tokens[..st.tokens.len().min(8)]
             );
+            println!(
+                "           prefill {:.3} s on {}",
+                st.prefill_seconds, names[i].0
+            );
         }
         // The probe measures GPU busy time per *device*, so utilisation is per
         // card: with two streams on one card the two sessions' busy times add up.
@@ -2049,12 +2053,14 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 "lane_ms_per_step": g.lane_ms_per_step(),
                 "fence_ms_per_step": g.fence_ms_per_step(),
                 "overlap_efficiency": g.overlap_efficiency(),
-                "streams": g.streams.iter().map(|s| serde_json::json!({
+                "streams": g.streams.iter().enumerate().map(|(i, s)| serde_json::json!({
+                    "device": names[i].0,
                     "tokens": s.tokens,
                     "lane_s": s.lane_s,
                     "lane_covered_s": s.lane_covered_s,
                     "fence_s": s.fence_s,
                     "expert_bytes": s.expert_bytes,
+                    "prefill_seconds": s.prefill_seconds,
                 })).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         });
