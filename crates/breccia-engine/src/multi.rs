@@ -302,6 +302,12 @@ impl<'m> Multi<'m> {
         for s in 0..ns {
             self.streams[s].reset()?;
         }
+        // Coordinator cores (BRECCIA_CPU_PIN): this thread and the prefill scope
+        // threads it spawns. shortcut: prefetch_rows' scoped threads inherit the
+        // same mask; give them their own set if PLE faults show up on the coordinator.
+        if let Some(pin) = breccia_kernels::cpu::cpu_pin().filter(|p| !p.coord.is_empty()) {
+            breccia_kernels::cpu::pin_current(&pin.coord);
+        }
         // Chunked prompt pass (§8s), the multi-stream twin of the single-session
         // `generate`: same tokens, same arithmetic, the grouped expert lane per
         // chunk. `0` stays token by token through `token_all`, the interleaved

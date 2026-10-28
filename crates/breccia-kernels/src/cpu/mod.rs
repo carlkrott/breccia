@@ -189,6 +189,69 @@ pub fn forced_scalar() -> bool {
     })
 }
 
+/// `BRECCIA_CPU_PIN=<workers>[/<coordinator>]`, each a Linux cpulist, e.g.
+/// `1-15,17-31/0,16`: expert worker *i* pins to the *i*-th worker CPU (wrapping),
+/// the multi-stream coordinator to the coordinator set. Unset = no pinning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CpuPin {
+    pub workers: Vec<usize>,
+    pub coord: Vec<usize>,
+}
+
+/// The parsed `BRECCIA_CPU_PIN`, or `None` when unset or malformed (warned).
+pub fn cpu_pin() -> Option<CpuPin> {
+    let v = std::env::var("BRECCIA_CPU_PIN").ok()?;
+    let p = parse_cpu_pin(&v);
+    if p.is_none() {
+        tracing::warn!("ignoring malformed BRECCIA_CPU_PIN={v:?}");
+    }
+    p
+}
+
+pub fn parse_cpu_pin(s: &str) -> Option<CpuPin> {
+    let (w, c) = s.split_once('/').unwrap_or((s, ""));
+    let workers = parse_cpulist(w)?;
+    let coord = if c.trim().is_empty() {
+        Vec::new()
+    } else {
+        parse_cpulist(c)?
+    };
+    (!workers.is_empty()).then_some(CpuPin { workers, coord })
+}
+
+fn parse_cpulist(s: &str) -> Option<Vec<usize>> {
+    let mut out = Vec::new();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b): (usize, usize) = (a.parse().ok()?, b.parse().ok()?);
+                if a > b {
+                    return None;
+                }
+                out.extend(a..=b);
+            }
+            None => out.push(part.parse().ok()?),
+        }
+    }
+    Some(out)
+}
+
+/// Pin the calling thread to `cpus`; threads it spawns later inherit the mask.
+pub fn pin_current(cpus: &[usize]) -> bool {
+    // SAFETY: a zeroed cpu_set_t is the empty set; CPU_SET bounds-checks the index.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        for &c in cpus {
+            libc::CPU_SET(c, &mut set);
+        }
+        let ok = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0;
+        if !ok {
+            tracing::warn!("sched_setaffinity({cpus:?}) failed: {}", std::io::Error::last_os_error());
+        }
+        ok
+    }
+}
+
 /// The path a GEMV should take: [`Path::Avx2`] unless unavailable or forced off.
 ///
 /// Resolved once per GEMV (not per row): the environment lookup is a syscall-free
@@ -278,6 +341,17 @@ fn normalized(path: Path) -> Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_pin_parses_cpulists() {
+        let p = parse_cpu_pin("1-3,8/0,16").unwrap();
+        assert_eq!(p.workers, vec![1, 2, 3, 8]);
+        assert_eq!(p.coord, vec![0, 16]);
+        assert_eq!(parse_cpu_pin("4").unwrap().coord, Vec::<usize>::new());
+        assert!(parse_cpu_pin("3-1").is_none());
+        assert!(parse_cpu_pin("x/0").is_none());
+        assert!(parse_cpu_pin("/0").is_none());
+    }
 
     #[test]
     fn tail_and_alignment_paths_agree() {

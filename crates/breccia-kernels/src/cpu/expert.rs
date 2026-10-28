@@ -391,13 +391,20 @@ impl ExpertPool {
         let (done_tx, rx) = mpsc::channel::<Done>();
         let mut tx = Vec::with_capacity(threads);
         let mut handles = Vec::with_capacity(threads);
+        let pin = crate::cpu::cpu_pin();
         for id in 0..threads {
             let (job_tx, job_rx) = mpsc::channel::<Msg>();
             let done = done_tx.clone();
             let set = Arc::clone(&set);
+            let cpu = pin.as_ref().map(|p| p.workers[id % p.workers.len()]);
             let handle = thread::Builder::new()
                 .name(format!("breccia-expert-{id}"))
-                .spawn(move || worker_loop(&set, path, &job_rx, &done))
+                .spawn(move || {
+                    if let Some(c) = cpu {
+                        crate::cpu::pin_current(&[c]);
+                    }
+                    worker_loop(&set, path, &job_rx, &done)
+                })
                 .expect("spawning an expert worker");
             tx.push(job_tx);
             handles.push(handle);

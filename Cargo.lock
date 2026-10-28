@@ -180,6 +180,7 @@ dependencies = [
  "ash",
  "breccia-format",
  "breccia-vk",
+ "libc",
  "serde",
  "serde_json",
  "thiserror",
