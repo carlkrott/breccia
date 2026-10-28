@@ -2049,7 +2049,11 @@ impl<'m> Session<'m> {
             batch_cmd::skip_next_barrier();
             // Fine-grained attribution (§8ad): this stage measures as 15-21 ms/token
             // while the routed shared expert prices at ~0.9, so time each call.
+            // The blocking GPU wait (the fence in `wall_run` when no batch is
+            // open) sits inside these runs: mark it off SHARED before the first
+            // one, or the breakdown charges the wait to shared-exp compute (§8ae).
             let t0 = std::time::Instant::now();
+            self.timers.mark(WAIT_GPU);
             pipes
                 .get(&lw.moe.gate.key)?
                 .run(&lw.moe.gate.buf, &ws.mixed, &v.shexp_gate)?;
@@ -4271,6 +4275,50 @@ pub fn assert_head(m: &Model) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The (G) shared-expert span (graph.rs, `record_dense_prelude`) must switch
+    /// the current stage to `wait-gpu` BEFORE the first blocking run
+    /// (`pipes.get(..).run(..)` → `wall_run` → fence wait), so the blocking GPU
+    /// wait is not charged to `shared-exp` (§8ae). Marks only re-attribute wall
+    /// time between buckets, so the span's total is conserved.
+    /// shortcut: this is a host-side Timers test only — the real blocking wait
+    /// needs a GPU device, which a unit test cannot own; upgrade when a GPU arm
+    /// can assert the printed split.
+    #[test]
+    fn wait_gpu_mark_precedes_the_blocking_run_and_conserves_the_span() {
+        let mut t = Timers::default();
+        assert!(!t.on, "timing is off by default: default behaviour unchanged");
+        t.mark(WAIT_GPU); // no-op with timing off
+        assert_eq!(t.ns[WAIT_GPU], 0);
+
+        t.on = true;
+        t.start();
+        t.mark(SHARED);
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        // The new mark, exactly where it sits in (G): before the first
+        // blocking `run`.
+        t.mark(WAIT_GPU);
+        assert_eq!(
+            t.stage, WAIT_GPU,
+            "the (G) span must be in wait-gpu when the first blocking run executes"
+        );
+        std::thread::sleep(std::time::Duration::from_micros(200));
+        // The next stage mark closes the wait-gpu bucket, as the EXPERTS mark
+        // (or finish_block's WAIT_GPU mark) does after the span.
+        t.mark(EXPERTS);
+        t.stop();
+        assert!(t.ns[SHARED] > 0, "shared-exp keeps the compute it is given");
+        assert!(t.ns[WAIT_GPU] > 0, "wait-gpu captures the wait before the run");
+        assert!(t.ns[EXPERTS] < 1_000, "the closing mark owns ~no time here");
+        let total = t.total_s();
+        let split = (t.ns[SHARED] + t.ns[WAIT_GPU]) as f64 / 1e9;
+        assert!(
+            (total - split).abs() < 1e-6,
+            "split {split}s must equal the span total {total}s (tiny mark/stop scheduler gap is fine)"
+        );
+    }
+
     /// The chunk planner is pure, and the number it removes is measured: a
     /// 132-token prompt at `--prefill-chunk 64` used to be `64 + 64 + 4`, where the
     /// 4-token tail ran at 658 ms/token against 88 (`docs/research/07` §C1.3). The
