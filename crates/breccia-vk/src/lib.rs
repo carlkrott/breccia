@@ -24,6 +24,7 @@
 pub mod bench;
 pub mod ctx;
 pub mod pci;
+pub mod pagecache;
 pub mod probe;
 pub mod report;
 pub mod transfer;

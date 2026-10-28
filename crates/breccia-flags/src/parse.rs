@@ -178,6 +178,10 @@ pub fn parse_llama_server_args(argv: &[String]) -> Result<LaunchPlan, FlagError>
                 seen.mark("host_expert_import", name, position)?;
                 plan.host_expert_import = frame.bool_flag()?;
             }
+            "--page-hint-trim" => {
+                seen.mark("page_hint_trim", name, position)?;
+                plan.page_hint_trim = frame.bool_flag()?;
+            }
 
             // ---- context / KV ---------------------------------------------------
             "-c" | "--ctx-size" => {
@@ -702,6 +706,18 @@ mod tests {
         let plan = parse_str("--host-expert-import=false").unwrap();
         assert!(!plan.host_expert_import);
         let err = parse_str("--host-expert-import --host-expert-import").unwrap_err();
+        assert!(err.to_string().contains("duplicates"), "{err}");
+    }
+
+    #[test]
+    fn page_hint_trim_flag_parses_and_renders() {
+        assert!(!parse_str("").unwrap().page_hint_trim); // default OFF
+        let plan = parse_str("--page-hint-trim").unwrap();
+        assert!(plan.page_hint_trim);
+        assert!(plan
+            .render_args()
+            .contains(&"--page-hint-trim".to_string()));
+        let err = parse_str("--page-hint-trim --page-hint-trim").unwrap_err();
         assert!(err.to_string().contains("duplicates"), "{err}");
     }
 

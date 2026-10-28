@@ -71,6 +71,11 @@ pub struct LaunchPlan {
     /// `VK_EXT_external_memory_host` (D4). Default OFF; no engine consumer yet.
     pub host_expert_import: bool,
 
+    /// `--page-hint-trim` — R29 card 1: drop the page-cache pages behind
+    /// arena-uploaded expert ranges (DONTNEED) and WILLNEED the streamed
+    /// host-lane ranges after upload. Default OFF.
+    pub page_hint_trim: bool,
+
     /// `-c` — context size in tokens.
     pub ctx_size: Option<u32>,
 
@@ -287,6 +292,9 @@ impl LaunchPlan {
         }
         if self.host_expert_import {
             out.push("--host-expert-import".to_string());
+        }
+        if self.page_hint_trim {
+            out.push("--page-hint-trim".to_string());
         }
         if let Some(ctx) = self.ctx_size {
             push_pair(&mut out, "-c", &ctx.to_string());
@@ -530,6 +538,7 @@ mod tests {
             lm: Some("none".to_string()),
             no_host: true,
             host_expert_import: true,
+            page_hint_trim: true,
             ctx_size: Some(200_000),
             kv_unified: true,
             parallel: Some(1),
@@ -579,6 +588,7 @@ mod tests {
             "none",
             "--no-host",
             "--host-expert-import",
+            "--page-hint-trim",
             "-c",
             "200000",
             "-kvu",

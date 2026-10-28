@@ -366,6 +366,11 @@ enum BenchKind {
         /// `LimitMEMLOCK=infinity` for the streaming set). Default OFF.
         #[arg(long)]
         host_expert_import: bool,
+        /// R29 card 1: after the arena upload, drop the uploaded source pages
+        /// (fadvise DONTNEED) and WILLNEED the streamed/host-lane expert
+        /// ranges. Default OFF.
+        #[arg(long)]
+        page_hint_trim: bool,
     },
 }
 fn main() {
@@ -552,6 +557,7 @@ fn run(cli: Cli) -> Result<()> {
                     warm,
                     then_prompt_ids,
                     host_expert_import,
+                    page_hint_trim,
                 }),
         } => bench_token(TokenArgs {
             gen,
@@ -581,6 +587,7 @@ fn run(cli: Cli) -> Result<()> {
             warm,
             then_prompt_ids,
             host_expert_import,
+            page_hint_trim,
         }),
     }
 }
@@ -1661,6 +1668,8 @@ struct TokenArgs {
     then_prompt_ids: Option<String>,
     /// D4: import host-lane expert bytes via VK_EXT_external_memory_host
     host_expert_import: bool,
+    /// R29 card 1: page-cache hints around the expert upload
+    page_hint_trim: bool,
 }
 
 /// Prompt ids from `--prompt-ids` or `--prompt-ids-file` (comma/space separated).
@@ -1823,6 +1832,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 profile: None,
                 arena,
                 host_expert_import: a.host_expert_import,
+                page_hint_trim: a.page_hint_trim,
                 verbose: s == 0,
             },
         )
@@ -2142,6 +2152,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
                 profile: None,
                 arena: breccia_engine::ArenaSpec::List(groups[s].clone()),
                 host_expert_import: false,
+                page_hint_trim: false,
                 verbose: s == 0,
             },
         )
@@ -2620,6 +2631,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             profile: None,
             arena,
             host_expert_import: a.host_expert_import,
+            page_hint_trim: a.page_hint_trim,
             verbose: true,
         },
     )
