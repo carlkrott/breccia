@@ -100,7 +100,7 @@ Options:
 | 1 | `cargo run -p breccia-cli -- profile --quick --json /tmp/hw_profile_test.json` | fresh quick calibration, 3 devices enumerated, wrote `/tmp/hw_profile_test.json` | **3.40 s** |
 | 2 | `cargo run -p breccia-cli -- profile` | full calibration, wrote `~/.config/breccia/hw_profile.json` | **13.0 s** (earlier full runs 13.0–13.2 s) |
 | 3 | `cargo run -p breccia-cli -- profile --reprofile` | forced full recalibration (numbers in §5) | **13.05 s** |
-| 4 | `cargo run -p breccia-cli -- profile` | `cached profile reused (fingerprint match): /home/korphaus/.config/breccia/hw_profile.json` | **0.067 s** (~195× vs a full run) |
+| 4 | `cargo run -p breccia-cli -- profile` | `cached profile reused (fingerprint match): <HOME>/.config/breccia/hw_profile.json` | **0.067 s** (~195× vs a full run) |
 | 5 | `cargo run -p breccia-cli -- profile --print-fingerprint` ×2 | identical hash both times | 0.078 s each |
 | 6 | `MESA_VK_DEVICE_SELECT='1002:164e!' breccia profile --print-fingerprint` | trap warning printed **and still 3 devices enumerated**; same fingerprint as an unpinned run | — |
 | 7 | `breccia profile --dry-run-plan` | role table + placement sketch from the cache, `nothing written`, ends with `cached profile reused` | 0.07 s |
@@ -177,7 +177,7 @@ or a downclock artifact — see §7.
   report `connected`; MI50 render-only → 15.98 GiB), combined **30.46 GiB ≥ 13 577 MiB** IQ3_XXS
   GPU weights (reference placement `docs/phase-0/05`), expert-parallel default, MI50 excluded from
   streaming, Tier-2 `start 16 / max 24 GiB, watermark MemAvailable < 6 GiB` with the measured
-  **8 MiB mlock limit ⇒ `LimitMEMLOCK=infinity`**, Tier-3 `/mnt/agent-storage-a` cap 100 GiB,
+  **8 MiB mlock limit ⇒ `LimitMEMLOCK=infinity`**, Tier-3 `<STORAGE_ROOT_A>` cap 100 GiB,
   `O_DIRECT 390 MB/s`, plus the Gate-A constraints (no cooperative matrix, Wave32/64 split).
 
 ## 7. Host probe (live values in `hw_profile.json`)
@@ -185,14 +185,14 @@ or a downclock artifact — see §7.
 CPU `AMD Ryzen 9 7950X` 16C/32T · NUMA 1 · RAM **58.43 GiB** (62 739 529 728 B), MemAvailable
 32–33 GB at probe time · **effective mlock limit 8 388 608 B (8 MiB)** → confirms phase-0/04 ·
 zram `/dev/zram0` 58.43 GiB · `io_uring`: **available** (`/proc/sys/fs/io_uring_disabled` absent
-on this kernel, i.e. no restriction) · storage: `/mnt/agent-storage-a` 671.71 GiB free
-(**O_DIRECT 390 MB/s**, 64 MiB in 0.17 s), `/mnt/agent-storage-b` 430.51 GiB, `/` 120.73 GiB ·
+on this kernel, i.e. no restriction) · storage: `<STORAGE_ROOT_A>` 671.71 GiB free
+(**O_DIRECT 390 MB/s**, 64 MiB in 0.17 s), `<STORAGE_ROOT_B>` 430.51 GiB, `/` 120.73 GiB ·
 competing GPU processes recorded in `notes` (see §8).
 
 **XDG check (requested):** this session has **both `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` empty**,
 and `grep -r XDG_CACHE_HOME crates/` returns **0 hits** — the CLI reads only `XDG_CONFIG_HOME`
 (`breccia-profile/src/lib.rs::default_profile_path`) with a `~/.config` fallback, and both real
-runs above wrote to `/home/korphaus/.config/breccia/hw_profile.json` as intended. The reported
+runs above wrote to `<HOME>/.config/breccia/hw_profile.json` as intended. The reported
 `XDG_CACHE_HOME` resolution issue is therefore **not reproducible and not a defect in this code —
 confirmed stale-environment artifact**.
 
@@ -223,10 +223,10 @@ confirmed stale-environment artifact**.
 
 | Path | Content |
 |---|---|
-| `/var/tmp/users/korphaus/tmp/opencode/final-{quick,quick-fresh,full,reprofile,cached}.log` | final-code run logs (§4) |
-| `/var/tmp/users/korphaus/tmp/opencode/clock-sampler-reprofile.log` | 160 × 250 ms sclk/mclk/busy samples during `--reprofile` |
-| `/var/tmp/users/korphaus/tmp/opencode/mesa-trap-evidence.txt` | forced-`MESA_VK_DEVICE_SELECT` run (warning + 3 devices + cached hit) |
-| `/var/tmp/users/korphaus/tmp/opencode/profile-quick.log` | pre-restart run that caught the trap in the wild |
+| `<SCRATCH>/opencode/final-{quick,quick-fresh,full,reprofile,cached}.log` | final-code run logs (§4) |
+| `<SCRATCH>/opencode/clock-sampler-reprofile.log` | 160 × 250 ms sclk/mclk/busy samples during `--reprofile` |
+| `<SCRATCH>/opencode/mesa-trap-evidence.txt` | forced-`MESA_VK_DEVICE_SELECT` run (warning + 3 devices + cached hit) |
+| `<SCRATCH>/opencode/profile-quick.log` | pre-restart run that caught the trap in the wild |
 | `~/.config/breccia/hw_profile.json` | canonical profile (schema v1, regenerable) |
 | `/tmp/hw_profile_test.json` | `--quick --json` profile used by the verification sequence |
 | `harnesses/vk-probe/` | untouched predecessor; measurements re-validated against it |

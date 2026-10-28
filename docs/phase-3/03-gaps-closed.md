@@ -13,7 +13,7 @@ Follow-ups from `docs/phase-3/02-expert-batching-quants.md` §7 items 1, 4 and 5
 
 Date: 2026-10-26 · GPUs idle at the start of every run (`pgrep llama-server` empty,
 `gpu_busy_percent` 0 / 3 on the RX and 0 on the MI50) · no service was started or
-stopped · artifacts in `/var/tmp/users/korphaus/tmp/opencode/p3-gaps/`.
+stopped · artifacts in `<SCRATCH>/opencode/p3-gaps/`.
 
 **Status: all three closed.** `cargo build/test --workspace`,
 `cargo clippy -p breccia-kernels -p breccia-vk -p breccia-cli --all-targets --

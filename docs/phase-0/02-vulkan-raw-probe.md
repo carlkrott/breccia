@@ -10,7 +10,7 @@ verdict — this document only records what RADV measured on this machine.
 
 ```bash
 # build (clean, no warnings; glslc + spirv-val run in build.rs for every shader)
-cd /home/korphaus/projects/Breccia/harnesses/vk-probe
+cd <REPO_ROOT>/harnesses/vk-probe
 cargo build --release
 
 # validation pass — 0 validation errors on both discrete GPUs (also run repeatedly

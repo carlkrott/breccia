@@ -7,7 +7,7 @@ Fresh measurements of the current production configuration. This is the scorecar
 | Item | Value |
 |---|---|
 | Service | `qwen-dual.service` (owned by gpu-manager; started for this window) |
-| Binary | `/home/korphaus/llama.cpp-qwen4exp-mmap/build-hip-q5kv/bin/llama-server` |
+| Binary | `<LLAMA_ROOT>/build-hip-q5kv/bin/llama-server` |
 | Backend | ROCm/HIP, `--device ROCm0,ROCm1 -ngl 99 -ts 9,15` + per-block `-ot` expert map |
 | Model | `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` shard 1 (43.8 GiB GGUF, mmap) |
 | Context | `-c 200000 -np 1`, KV `q4_0/q4_0`, `-fa on`, `-kvu` |
@@ -37,7 +37,7 @@ python3 harnesses/bench_decode.py --url http://127.0.0.1:8160 \
 
 An earlier run before service restart measured 20.37 tok/s (same flags) — variance ±0.5 tok/s.
 
-## Context / historical comparison (from `/home/korphaus/projects/qwen-dual/results.md`)
+## Context / historical comparison (from `<QWEN_DUAL_ROOT>/results.md`)
 
 | Run | Decode | Notes |
 |---|---|---|

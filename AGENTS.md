@@ -1,6 +1,6 @@
 # Breccia — repository rules
 
-Host rules in `/home/korphaus/AGENTS.md` and workspace rules in `/home/korphaus/projects/AGENTS.md` apply. This file adds repo-local constraints.
+Host rules in `<HOME>/AGENTS.md` and workspace rules in `<REPO_ROOT>/../AGENTS.md` apply. This file adds repo-local constraints.
 
 ## What this repo is
 
@@ -19,7 +19,7 @@ A from-scratch Rust inference engine (`breccia`) plus its Phase-0 measurement ha
 
 - GPUs: RX 6950 XT (gfx1030, Wave32, RADV + ROCm) + MI50/Radeon VII (gfx906, Wave64, RADV + ROCm) + Raphael iGPU (unused).
 - Model: `Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS` GGUF shards in `/srv/strata-data/models/IQ3_XXS/` (read-only reference; never copy or move weight files).
-- Existing engines on this machine: `/home/korphaus/projects/strata`, `/home/korphaus/llama.cpp-qwen4exp-mmap` (HIP + Vulkan builds).
+- Existing engines on this machine: `<STRATA_ROOT>`, `<LLAMA_ROOT>` (HIP + Vulkan builds).
 - `qwen-dual.service` and `strata-rx.service` are owned by `gpu-manager`. They may be started/stopped for benchmark windows when gpu-manager is inactive, but **restore prior state when the window closes** and record what was stopped in the phase report.
 - `d1-mi50.service` may be stopped for benchmark windows (user-authorized).
 
@@ -74,7 +74,7 @@ Every time an implementation or test subagent is launched, launch **one paired r
 1. audits Vulkan parameters/features/extensions we are not using, tied to the current bottleneck (driver caps, memory types, pipeline/shader features, subgroup and int-dot paths, RADV knobs), and
 2. audits **one** inference engine not yet covered, extracting workflows, methods and specific advantages to adapt, with a measurable sketch.
 
-Output goes to `docs/research/NN-<engine>.md`; the rotation and coverage table live in `docs/research/README.md`. Research subagents are read-only and never modify engine code. Implementation agents cite the research item they consume. Scratch benchmark harnesses belong in `/var/tmp/users/korphaus/tmp/opencode/research-harnesses/` — **not** in the repo; only the findings and the exact commands go into the doc.
+Output goes to `docs/research/NN-<engine>.md`; the rotation and coverage table live in `docs/research/README.md`. Research subagents are read-only and never modify engine code. Implementation agents cite the research item they consume. Scratch benchmark harnesses belong in `<SCRATCH>/opencode/research-harnesses/` — **not** in the repo; only the findings and the exact commands go into the doc.
 
 ## Grouped rounds (standing rule, 2026-10-26)
 

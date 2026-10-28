@@ -120,7 +120,7 @@ Structure is plausible; §4 shows it is not yet the *reference's* structure.
 ## 4. Parity: met
 
 Reference: the production HIP server
-(`/home/korphaus/llama.cpp-qwen4exp-mmap/build-hip-q5kv`, `sudo -n`, port 8164,
+(`<LLAMA_ROOT>/build-hip-q5kv`, `sudo -n`, port 8164,
 `-cmoe -lzm on --no-op-host -ub 256`, `-ctk f16 -ctv f16` to match our f16 cache,
 `-c 4096`), driven by `/tokenize` + `/completion` with `temperature 0, top_k 1,
 top_p 1, repeat_penalty 1, ignore_eos` and `return_tokens`/`n_probs`.
@@ -960,7 +960,7 @@ policy-level finding of this pass.
 Commands (one GPU process at a time; the warm pass is what makes a run comparable):
 
 ```bash
-D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+D=<SCRATCH>/opencode/p4-token
 # the gate: 32 greedy tokens against the server's recorded sequence, both placements
 python3 $D/parity-check.py ./target/release/breccia 0000:03:00.0,0000:0e:00.0 dual048
 # alternating A/B of two builds in one window (page-cache/thermal discipline)
@@ -1085,7 +1085,7 @@ model with more than one device.
 Commands (one GPU process; both cards in it, which is the point):
 
 ```bash
-D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+D=<SCRATCH>/opencode/p4-token
 # the two-stream number (parity is checked from the JSON afterwards)
 timeout 900 ./target/release/breccia bench token --streams 2 \
   --devices 0000:0e:00.0,0000:03:00.0 --prompt-ids-file $D/parity-server.json.ids \
@@ -1200,7 +1200,7 @@ What would raise the plateau, with the numbers:
 Commands:
 
 ```bash
-D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+D=<SCRATCH>/opencode/p4-token
 # the two-stream gate: nine expert blocks per stream (the default), in-batch reads
 timeout 1200 ./target/release/breccia bench token --streams 2 \
   --devices 0000:0e:00.0,0000:03:00.0 --prompt-ids-file $D/parity-server.json.ids \
@@ -1334,7 +1334,7 @@ What actually raises the agent table, in order:
 Commands:
 
 ```bash
-D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+D=<SCRATCH>/opencode/p4-token
 # the agent table (mixed prompts) and the parity run (all agents = the reference)
 timeout 1800 ./target/release/breccia bench agents --streams 4 --gen 16 --prefix 300 \
   --devices 0000:0e:00.0,0000:03:00.0 --threads 32 --json $D/ag4.json
@@ -2140,7 +2140,7 @@ the lane.
 ```bash
 timeout 1200 ./target/release/breccia bench token --streams 2 \
   --devices 0000:0e:00.0,0000:03:00.0 \
-  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --prompt-ids-file <SCRATCH>/opencode/p4-token/parity-server.json.ids \
   --gen 32 --runs 1        # threads now default to the logical CPU count
 ```
 
@@ -3013,7 +3013,7 @@ spare GPU compute.
 ```bash
 # clocks (both cards must read `high`), then the ladder
 for f in /sys/class/drm/card*/device/power_dpm_force_performance_level; do cat "$f"; done
-D=/var/tmp/users/korphaus/tmp/opencode/p4-token
+D=<SCRATCH>/opencode/p4-token
 timeout 900 ./target/release/breccia bench token \
   --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 \
   --gpu-experts "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,28,29,30,31,32,33,34,35,36,37,38,39,40,41" \
@@ -3612,7 +3612,7 @@ on the **display card** (`BRECCIA_KERNEL_DEVICE=0000:0e:00.0`, Radeon VII/gfx906
 ### Parity (the gate): 32/32 at every chunk, top-1 unchanged
 
 `bench token --devices 0000:03:00.0 --prompt-ids <27-token reference> --gen 32`, 32 greedy
-tokens compared against `/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json`:
+tokens compared against `<SCRATCH>/opencode/p4-token/parity-server.json`:
 
 | `--prefill-chunk` | 8 | 16 | 32 | 128 |
 |---|---|---|---|---|
@@ -3813,7 +3813,7 @@ reproduces the hand-tuned rate and beats it slightly (18.0 vs 17.93 tok/s, lane 
 
 ```bash
 L="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,28,29,30,31,32,33,34,35,36,37,38,39,40,41"
-P=/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids
+P=<SCRATCH>/opencode/p4-token/parity-server.json.ids
 timeout 700 ./target/release/breccia bench token \
   --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$L" \
   --prompt-ids-file $P --gen 32 --runs 1 --threads 16 --warm 1
@@ -3928,7 +3928,7 @@ step; treat 1/32 as possible until then.
 ### Commands
 
 ```bash
-P=/var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids
+P=<SCRATCH>/opencode/p4-token/parity-server.json.ids
 L="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,28,29,30,31,32,33,34,35,36,37,38,39,40,41"
 # the default: arena by rule, head by role (PCI address shown for the same card)
 timeout 500 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 \
@@ -4407,7 +4407,7 @@ process as the control** with
 BRECCIA_DUMP_LAYOUT=1 BRECCIA_VERIFY_WEIGHTS=all BRECCIA_FAULT_POISON_LOGITS=1 --dump-logits
 ```
 
-and writes to `/var/tmp/users/korphaus/tmp/opencode/head-capture/<UTC timestamp>/{failing,control}/`
+and writes to `<SCRATCH>/opencode/head-capture/<UTC timestamp>/{failing,control}/`
 with a `README` naming the gate configuration, the diverged processes and the five things to read
 first. **Exercised for real** with `BRECCIA_FAULT_DIVERGE_STEP=4` (a deliberate divergence at
 forward 4, `head-race-capture.sh` → RED → capture): the failing and control dirs each hold a JSON,
@@ -4701,8 +4701,8 @@ windows, not concurrent: `pgrep -c -x breccia` was 0 before each run in this rou
 Commands:
 
 ```bash
-D=/var/tmp/users/korphaus/tmp/opencode/p4-token
-O=/var/tmp/users/korphaus/tmp/opencode/kvq8v
+D=<SCRATCH>/opencode/p4-token
+O=<SCRATCH>/opencode/kvq8v
 
 # the new kernels, headless card first, validation on, one geometry per process
 timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
@@ -4754,11 +4754,11 @@ timeout 240 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
 # one token + per-layer digests + the logits row for a parity diff
 timeout 300 ./target/release/breccia bench token --devices 0000:0e:00.0 \
   --prompt-ids "760" --gen 2 --runs 1 --debug-layers \
-  --dump-logits /var/tmp/users/korphaus/tmp/opencode/p4-token/ours-top.txt --top-logits 64 \
-  --json /var/tmp/users/korphaus/tmp/opencode/p4-token/trace2.json
+  --dump-logits <SCRATCH>/opencode/p4-token/ours-top.txt --top-logits 64 \
+  --json <SCRATCH>/opencode/p4-token/trace2.json
 
 # the warm 3-device comparison (one GPU process at a time)
-/var/tmp/users/korphaus/tmp/opencode/p4-token/warm-compare.sh
+<SCRATCH>/opencode/p4-token/warm-compare.sh
 
 # where a synchronous dispatch's time goes
 timeout 180 ./target/release/breccia --help >/dev/null
@@ -4768,15 +4768,15 @@ timeout 180 ./target/release/examples/dispatch_overhead 0000:03:00.0
 # the parity reference (needs /dev/kfd: sudo -n), then stop it before benching
 sudo -n env GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 LLAMA_MMAP_FADVISE=random \
   LLAMA_MMAP_CPU_MADVISE=random \
-  /home/korphaus/llama.cpp-qwen4exp-mmap/build-hip-q5kv/bin/llama-server \
+  <LLAMA_ROOT>/build-hip-q5kv/bin/llama-server \
   -m /srv/strata-data/models/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
   --device ROCm0,ROCm1 -ngl 99 -ts 9,15 -cmoe --moe-cache-mib 0 -lzm on -lm none \
   --no-host -c 4096 -np 1 -ctk f16 -ctv f16 -fa on -cram 0 -ctxcp 1 -t 16 -tb 16 \
   --host 127.0.0.1 --port 8164 --jinja --metrics --fit off --no-op-offload -ub 256
-python3 /var/tmp/users/korphaus/tmp/opencode/p4-token/parity.py 32   # /tokenize + /completion
+python3 <SCRATCH>/opencode/p4-token/parity.py 32   # /tokenize + /completion
 ```
 
-Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p4-token/`): `cmp-{mi50,rx,dual}.{json,log}`
+Artifacts (`<SCRATCH>/opencode/p4-token/`): `cmp-{mi50,rx,dual}.{json,log}`
 (the 3-device table), `cmp-dual.json`, `trace1.json` / `trace2.json`
 (pre-fix / post-fix per-layer digests), `one.log`, `parity-server.json`
 (+`.ids`, the prompt ids and the server's 32 greedy tokens), `ref-short.json`
@@ -4961,15 +4961,15 @@ so this number no longer depends on `sess.dispatches`.
 timeout 300 env BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
   --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts \
   "0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,28,29,30,31,32,33,34,35,36,37,38,39,40,41" \
-  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --prompt-ids-file <SCRATCH>/opencode/p4-token/parity-server.json.ids \
   --gen 16 --runs 1 --threads 16 --warm 1
 # probe overhead: alternate BRECCIA_GPU_TIME=1 with it unset, same command
 # timer strip: alternate BRECCIA_RECORD_PROFILE=1 with it unset, --gen 8 --warm 0
 # parity (single card: chunked prefill needs one device), 8 arms, all 32/32
 timeout 400 env BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
   --devices 0000:03:00.0 --prefill-chunk 32 --gen 32 --runs 1 --threads 16 --warm 1 \
-  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
-  --json /var/tmp/users/korphaus/tmp/opencode/probe-gate/one-on-32.json
+  --prompt-ids-file <SCRATCH>/opencode/p4-token/parity-server.json.ids \
+  --json <SCRATCH>/opencode/probe-gate/one-on-32.json
 ```
 
 Safety: no shader was touched and no new dispatch shape was dispatched. All runs were
@@ -5113,7 +5113,7 @@ done
 # the engine A/B (probe on; one flag reverts)
 BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
   --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" \
-  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --prompt-ids-file <SCRATCH>/opencode/p4-token/parity-server.json.ids \
   --gen 16 --runs 1 --threads 16 --warm 1                       # wide (default)
 BRECCIA_GEMV_NO_WIDE=1 BRECCIA_GPU_TIME=1 ./target/release/breccia bench token …  # A/B
 # bit-identity + full conformance for one type, on the headless card
@@ -5227,7 +5227,7 @@ order-sensitive; `build.rs` prints `rerun-if-changed` for **every** `.comp`/`.gl
 # the census + the table, both arms (a co-tenant makes the wall clock meaningless)
 BRECCIA_TRACE_DISPATCH=1 ./target/release/breccia bench token \
   --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" \
-  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --prompt-ids-file <SCRATCH>/opencode/p4-token/parity-server.json.ids \
   --gen 8 --runs 1 --threads 16 --warm 1                        # 1 710 dispatches/token
 BRECCIA_NO_GDN_MERGE=1 BRECCIA_TRACE_DISPATCH=1 …                # 1 746 (the A/B arm)
 # bit-identity + the full GDN reference suite, on the headless card
@@ -5361,7 +5361,7 @@ green run.
 # the fusion A/B (adjacent arms, refuses a co-tenant) — the numbers above
 BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
   --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" \
-  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --prompt-ids-file <SCRATCH>/opencode/p4-token/parity-server.json.ids \
   --gen 16 --runs 1 --threads 16 --warm 1
 BRECCIA_NO_HC_GATED=1 …                                           # the legacy arm
 # bit-identity + the full ops suite, on the headless card
@@ -5488,7 +5488,7 @@ BRECCIA_GEMV_DP4A=1 ./target/release/breccia bench gemv --device 0000:0e:00.0 --
 # the in-graph arm (flag on) — top-1 moves, which is why it stays off
 BRECCIA_GEMV_DP4A=1 BRECCIA_GPU_TIME=1 ./target/release/breccia bench token \
   --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" \
-  --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids \
+  --prompt-ids-file <SCRATCH>/opencode/p4-token/parity-server.json.ids \
   --gen 16 --runs 1 --threads 16 --warm 1
 ```
 
@@ -5588,7 +5588,7 @@ placement change would need the arena and the lane re-planned together, which is
 
 ```bash
 # instructions per unit (host only, research 12's method; harness not in the repo)
-cd /var/tmp/users/korphaus/tmp/opencode/research-harnesses/r14-words && ./count.sh
+cd <SCRATCH>/opencode/research-harnesses/r14-words && ./count.sh
 #   iq4xs_wide 151  iq4xs_words 172  iq3s_wide 195  q5k_wide 220  baseline 28
 # the per-card kernel numbers
 ./target/release/breccia bench gemv --device 0000:0e:00.0 --real --tensor blk.0.attn_qkv.weight
@@ -5781,7 +5781,7 @@ flag-**on** by default, which is why it could not be left in the tree).
 (4) *Not started*: the tiny-stage sweep (`hc-norm`/`hc-gated`/`final-hc`/`moe-swiglu`/
 `rope`/`kv-append`/`router`) and IQ3_S word-level.
 (5) *Next command*:
-`BRECCIA_GPU_TIME=1 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" --prompt-ids-file /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids --gen 16 --runs 1 --threads 16 --warm 1`
+`BRECCIA_GPU_TIME=1 ./target/release/breccia bench token --devices 0000:03:00.0,0000:0e:00.0 --split-blocks 28,20 --gpu-experts "$(seq -s, 0 15),$(seq -s, 28 41)" --prompt-ids-file <SCRATCH>/opencode/p4-token/parity-server.json.ids --gen 16 --runs 1 --threads 16 --warm 1`
 (the incumbent `gdn-scan` row is 2 768 µs/token; anything above ~1 500 is a regression).
 (6) *Suspects in the reverted kernel, in order*: the `v_base + j` read (it must be the
 same `j` and the same `h_v` stride as the serial kernel), the `q_base`/`k_base` `gh`

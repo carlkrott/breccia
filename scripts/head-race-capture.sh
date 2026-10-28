@@ -12,7 +12,7 @@
 #      the control — with
 #        BRECCIA_DUMP_LAYOUT=1  BRECCIA_VERIFY_WEIGHTS=all
 #        BRECCIA_FAULT_POISON_LOGITS=1  --dump-logits
-#      into /var/tmp/users/korphaus/tmp/opencode/head-capture/<UTC timestamp>/
+#      into $SCRATCH/head-capture/<UTC timestamp>/
 #      (failing/ and control/ side by side, plus a README with the commands);
 #   3. exit with the gate's status.
 #
@@ -26,7 +26,7 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 
-CAPTURE_ROOT=${CAPTURE_ROOT:-/var/tmp/users/korphaus/tmp/opencode/head-capture}
+CAPTURE_ROOT=${CAPTURE_ROOT:-${SCRATCH:?SCRATCH must point at the scratch dir}/head-capture}
 BIN=${RACE_BIN:-./target/release/breccia}
 DEVICES=${RACE_DEVICES:-0000:03:00.0,0000:0e:00.0}
 SPLIT=${RACE_SPLIT:-28,20}
@@ -39,7 +39,7 @@ PROMPT_MODE=${RACE_PROMPT:-short}
 INBATCH=${RACE_INBATCH:-true}
 
 case "$PROMPT_MODE" in
-  parity) PROMPT=$(cat /var/tmp/users/korphaus/tmp/opencode/p4-token/parity-server.json.ids) ;;
+  parity) PROMPT=$(cat "${SCRATCH:?}/p4-token/parity-server.json.ids") ;;
   *)      PROMPT="760,13017,1433" ;;
 esac
 arena_args=()

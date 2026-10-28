@@ -27,7 +27,7 @@ DEVICES=${RACE_DEVICES:-0000:03:00.0,0000:0e:00.0}
 SPLIT=${RACE_SPLIT:-28,20}
 GEN=${RESET_GEN:-12}
 ARENA=${RACE_ARENA:-none}
-OUT=${RESET_OUT:-/var/tmp/users/korphaus/tmp/opencode/session-reset}
+OUT=${RESET_OUT:-${SCRATCH:?SCRATCH must point at the scratch dir}/session-reset}
 mkdir -p "$OUT"
 
 # Three prompt pairs: long→short, short→long, equal. The "long" prompt is the 27-id

@@ -10,8 +10,8 @@
     "competing_gpu_processes": [
       "1467366 npm exec comfyui-mcp",
       "1467436 npm exec comfyui-mcp",
-      "1467602 node /home/korphaus/.npm/_npx/8af3af54f44861ce/node_modules/.bin/comfyui-mcp",
-      "1467633 node /home/korphaus/.npm/_npx/8af3af54f44861ce/node_modules/.bin/comfyui-mcp"
+      "1467602 node <HOME>/.npm/_npx/8af3af54f44861ce/node_modules/.bin/comfyui-mcp",
+      "1467633 node <HOME>/.npm/_npx/8af3af54f44861ce/node_modules/.bin/comfyui-mcp"
     ]
   },
   "results": [

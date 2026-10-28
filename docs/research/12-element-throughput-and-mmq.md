@@ -48,7 +48,7 @@ per 8-element unit per lane, so a probe that calls it once and stores the result
 
 ```bash
 # host only: no device, no dispatch. Harness (not in the repo):
-cd /var/tmp/users/korphaus/tmp/opencode/research-harnesses/r12-instr-mix
+cd <SCRATCH>/opencode/research-harnesses/r12-instr-mix
 # probe_common.tmpl = #version 450 + the two extension pragmas + blocks.glsl include,
 # layout(local_size_x=32), one DEQUANT_UNIT(...) call, sum the 8 values, one store.
 glslc -O --target-env=vulkan1.3 -I crates/breccia-kernels/shaders -I . out/<type>.comp -o out/<type>.spv
@@ -529,7 +529,7 @@ placement rule becomes part of the same commit.
 
 ## Sources
 
-* New this round (host only, no GPU): `/var/tmp/users/korphaus/tmp/opencode/research-harnesses/r12-instr-mix/`
+* New this round (host only, no GPU): `<SCRATCH>/opencode/research-harnesses/r12-instr-mix/`
   — `gen.sh` / the inline Python in §A1, `out/*.spv`, `out/*.dis`, `out/counts.json`.
   Reproduce: `glslc -O --target-env=vulkan1.3 -I <repo>/crates/breccia-kernels/shaders …`.
 * Our code: `crates/breccia-kernels/shaders/blocks.glsl` (all decode units; `_wide`

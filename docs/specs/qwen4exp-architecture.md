@@ -5,9 +5,9 @@ Target: a new inference engine (Breccia) implementing this model from scratch.
 Everything below is derived from code and artifacts on this machine, cited as `path:line`.
 Two roots are used throughout:
 
-* **LC** = `/home/korphaus/llama.cpp-qwen4exp-mmap` (llama.cpp fork, HIP/Vulkan builds at
+* **LC** = `<LLAMA_ROOT>` (llama.cpp fork, HIP/Vulkan builds at
   `build-hip-q5kv`, `build-hip-mmap`)
-* **ST** = `/home/korphaus/projects/strata` (C++/HIP engine that runs this model in production)
+* **ST** = `<STRATA_ROOT>` (C++/HIP engine that runs this model in production)
 
 and the artifact:
 

@@ -55,7 +55,7 @@ spirv-val foo.spv
 | Hazard | Effect | Workaround (encoded in `harnesses/bench_attrib.sh`) |
 |---|---|---|
 | `MESA_VK_DEVICE_SELECT=1002:164e!` in session env | Hides both discrete GPUs from **every** Vulkan process → silent iGPU-only runs (Vulkan 8× slower, llama-bench still reports success) | `env -u MESA_VK_DEVICE_SELECT` for any Vulkan command; `vulkaninfo` sanity check first |
-| korphaus not in `gpu-compute` group (`/dev/kfd` is root:gpu-compute) | HIP/HSA init silently fails → CPU fallback **mislabelled `ROCm`** by llama-bench | run HIP tools via `sudo -n` (passwordless), or through systemd units (they add `SupplementaryGroups=gpu-compute`) |
+| user not in `gpu-compute` group (`/dev/kfd` is root:gpu-compute) | HIP/HSA init silently fails → CPU fallback **mislabelled `ROCm`** by llama-bench | run HIP tools via `sudo -n` (passwordless), or through systemd units (they add `SupplementaryGroups=gpu-compute`) |
 | Setting `CUDA_VISIBLE_DEVICES`+`HIP_VISIBLE_DEVICES`+`ROCR_VISIBLE_DEVICES` together | Double-masking → HIP init fails outright (index 1 of a 1-device set is empty) | set **only** `CUDA_VISIBLE_DEVICES` |
 | `llama-bench -d N` does not isolate a device | Layer-split stays active across all visible GPUs; results identical for every `-d` | pin with visibility env, confirm with busy% sampling |
 | `ulimit -l` = 8 MiB | Any pinned (Tier-2) buffer pool fails at alloc time | units need `LimitMEMLOCK=infinity` (Strata precedent) |
@@ -78,9 +78,9 @@ and hung the machine. Rules now enforced (also in `AGENTS.md`):
 
 | Build | Path | Backend |
 |---|---|---|
-| llama.cpp qwen4exp HIP | `/home/korphaus/llama.cpp-qwen4exp-mmap/build-hip-q5kv/bin/llama-server` | ROCm, used by `qwen-dual.service` |
-| llama.cpp qwen4exp Vulkan | `/home/korphaus/llama.cpp-qwen4exp-mmap/build-vulkan/bin/llama-server` | RADV — the 2.56 tok/s data point |
-| Strata engine | `/home/korphaus/projects/strata` (`strata-iq3_xxs.json`) | HIP |
+| llama.cpp qwen4exp HIP | `<LLAMA_ROOT>/build-hip-q5kv/bin/llama-server` | ROCm, used by `qwen-dual.service` |
+| llama.cpp qwen4exp Vulkan | `<LLAMA_ROOT>/build-vulkan/bin/llama-server` | RADV — the 2.56 tok/s data point |
+| Strata engine | `<STRATA_ROOT>` (`strata-iq3_xxs.json`) | HIP |
 | distro llama.cpp | `/usr/bin/llama-server` (libggml-hip) | ROCm (init currently fails — tracked in phase-0) |
 
 ## Conventions

@@ -47,7 +47,7 @@ device API 1.4.354; cards `0000:0e:00.0` (Radeon VII / MI50, gfx906) and `0000:0
 
 ## A.1 Method (and one measurement that had to be thrown away)
 
-`harnesses`-style scratch probe, `/var/tmp/users/korphaus/tmp/opencode/p5ple/vkgather/`
+`harnesses`-style scratch probe, `<SCRATCH>/opencode/p5ple/vkgather/`
 (reuses `vk-probe`'s `ctx.rs` plumbing verbatim: instance/device setup, buffers, descriptor sets,
 `vkCmdWriteTimestamp` bracketing). Two shaders (`gather_b16.comp`, `gather_v4.comp`,
 `gather_b16ilp4.comp`), plus the copy-engine arms.
@@ -504,14 +504,14 @@ metric: µs/group resident vs streamed, streamed share per token, tok/s
 # Appendix — provenance
 
 Probe sources and raw logs (scratch, not committed):
-`/var/tmp/users/korphaus/tmp/opencode/p5ple/` — `vkgather/` (Rust, Vulkan; `src/main.rs`, copied
+`<SCRATCH>/opencode/p5ple/` — `vkgather/` (Rust, Vulkan; `src/main.rs`, copied
 `src/ctx.rs` from `harnesses/vk-probe`, shaders `gather_b16.comp`, `gather_b16ilp4.comp`,
 `gather_v4.comp`), `p2io.c`, `run-mi50.log`, `run-rx.log`, `run-mi50-validation.log`.
 
 Reproduce:
 
 ```bash
-cd /var/tmp/users/korphaus/tmp/opencode/p5ple/vkgather && cargo build --release
+cd <SCRATCH>/opencode/p5ple/vkgather && cargo build --release
 timeout 90 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
   ./target/release/vkgather --pci 0000:0e:00.0     # MI50 first, always
 timeout 90 ./target/release/vkgather --pci 0000:03:00.0   # RX only after MI50 is clean

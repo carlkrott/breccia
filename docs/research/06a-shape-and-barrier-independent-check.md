@@ -3,7 +3,7 @@
 **Round:** paired research 6 (second harness, 2026-10-27 00:0x). **Read-only**: no engine crate touched.
 **Why a separate file:** `06-vulkan-gemm-shapes-and-ncnn.md` (the round's main deliverable) was already
 written by a parallel harness when this one finished; this file is the *independent* arm — a different
-harness (`/var/tmp/users/korphaus/tmp/opencode/research-harnesses/vk-gemm-shapes`), a different quant
+harness (`<SCRATCH>/opencode/research-harnesses/vk-gemm-shapes`), a different quant
 (**IQ4_XS**, which `06` did not measure: its sweep is Q4_K), and one result that changes a price in
 `06` §3. It does not restate `06`; where the two agree, it says so in one line.
 
@@ -168,7 +168,7 @@ and costs ≤1 % on the real GEMM. This harness was built with a deliberate out-
 ## 5. Reproduction (harness kept out of the repo, per AGENTS.md)
 
 ```
-H=/var/tmp/users/korphaus/tmp/opencode/research-harnesses/vk-gemm-shapes   # standalone ash crate
+H=<SCRATCH>/opencode/research-harnesses/vk-gemm-shapes   # standalone ash crate
 cd $H && cargo build --release
 ./target/release/vk-gemm-shapes sweep   --pci 0000:03:00.0 \
     --cells wg256_r8_l32_s32,wg128_r4_l32_s32,wg64_r2_l32_s32,wg64_r1_l64_s64   # <=4 shapes/process
@@ -180,4 +180,4 @@ The binary refuses more than four fresh pipelines per invocation, prints the mea
 end, and takes min-of-5 batches of ~20 ms after a ~1.2 s clock ramp. `shaders/sweep_gemm.comp` is the
 parameterised GEMM (`-DWG_SIZE -DLPR -DROWS_PER_WG -DSG`); `shaders/oob.comp` is the OOB probe (§3,
 robust arm only). Raw transcripts: `results/shapes-iq4xs.txt`, `results/barrier.txt`
-(`/var/tmp/users/korphaus/tmp/opencode/research-harnesses/vk-gemm-shapes/results/`).
+(`<SCRATCH>/opencode/research-harnesses/vk-gemm-shapes/results/`).

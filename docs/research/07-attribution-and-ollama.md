@@ -315,10 +315,10 @@ correction; never for a measured throughput number.
   `timestampValidBits = 0` — a stamp recorded in a CB submitted to that queue is
   undefined. The engine's `Qc::X` (transfer) queue must not carry stamps.
 
-## A7. Scratch protocols (in `/var/tmp/users/korphaus/tmp/opencode/research-harnesses/r07-attrib`)
+## A7. Scratch protocols (in `<SCRATCH>/opencode/research-harnesses/r07-attrib`)
 
 ```bash
-cd /var/tmp/users/korphaus/tmp/opencode/research-harnesses/r07-attrib
+cd <SCRATCH>/opencode/research-harnesses/r07-attrib
 cargo build --release --offline          # ash 0.38, glslangValidator + spirv-val in build.rs
 timeout 90 ./target/release/r07-attrib --device NAVI21 caps
 timeout 90 ./target/release/r07-attrib --device NAVI21 query       # per-stamp cost + perturbation
@@ -488,7 +488,7 @@ The first pass (Part A/B above) answered "what can attribute GPU time here". Thi
 was relaunched against a **different, live puzzle** — *"the chunked-prefill stage table
 accounts for only ~60 ms of a ~155–166 ms agent-token; ~95–105 ms is unattributed"* — and
 re-measured the same tools independently from a second harness
-(`/var/tmp/users/korphaus/tmp/opencode/research-harnesses/rl7-attrib`, own crate, copies
+(`<SCRATCH>/opencode/research-harnesses/rl7-attrib`, own crate, copies
 `harnesses/vk-probe/src/ctx.rs` verbatim). Same box, same card, same discipline.
 
 It adds three things and confirms one:
@@ -695,7 +695,7 @@ Same clone (`6c15b26`), same conclusion (Go supervisor over `llama-server` per m
 
 ```bash
 # C2 numbers (0.79 s per full sweep)
-cd /var/tmp/users/korphaus/tmp/opencode/research-harnesses/rl7-attrib
+cd <SCRATCH>/opencode/research-harnesses/rl7-attrib
 timeout 120 env VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ./target/release/rl7-attrib tools
 timeout 90 ./target/release/rl7-attrib perf        # CRASHES by design of the driver bug
 
