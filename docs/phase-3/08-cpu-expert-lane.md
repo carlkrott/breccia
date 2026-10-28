@@ -11,7 +11,7 @@ GGUF data — **0.84 GB of expert reads per token, ≈17.5 GB/s sustained** at t
 
 Date: 2026-10-26 · CPU-only work: no GPU touched, no server started or stopped,
 no GPU service was running or altered · artifacts in
-`/var/tmp/users/korphaus/tmp/opencode/p3cpu/`.
+`<SCRATCH>/opencode/p3cpu/`.
 
 **Status: complete, and above the parity bar.**
 `cargo build/test --workspace`, `cargo clippy -p breccia-kernels -p breccia-cli

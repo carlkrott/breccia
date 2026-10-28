@@ -5,7 +5,7 @@ take chunked prefill from **13.6 submits per block-chunk to ~2**, on the headles
 6950 XT alone; Part B audits **DeepSpeed-Inference** (rotation #7).
 
 **Read-only outside this file** — no engine code was touched. Scratch harness:
-`/var/tmp/users/korphaus/tmp/opencode/research-harnesses/r08-submits/` (ash 0.38 + a C
+`<SCRATCH>/opencode/research-harnesses/r08-submits/` (ash 0.38 + a C
 probe for `VK_EXT_device_generated_commands`), never inside the repo.
 
 ## TL;DR
@@ -100,7 +100,7 @@ gap was really *3 dispatches + the boundary*. This round uses disjoint slots per
 confirms each boundary two ways (interior stamps and a whole-span difference).
 
 ```bash
-cd /var/tmp/users/korphaus/tmp/opencode/research-harnesses/r08-submits
+cd <SCRATCH>/opencode/research-harnesses/r08-submits
 cargo build --release --offline
 timeout 90  ./target/release/r08-submits --device NAVI21 caps        # queue family, CB slots
 timeout 90  ./target/release/r08-submits --device NAVI21 --n 12 dep  # ordering across CBs
@@ -471,7 +471,7 @@ is behind our Phase-6 plan (paged blocks + swap maps + prefix checkpoints from r
 * Harness `r08-submits` (ash 0.38, `glslangValidator` + `spirv-val` in `build.rs`; modes
   `caps|dep|topo|replay|cbup|overlap`), probe `probe/dgc.c` against system
   `vulkan_core.h`. Everything under
-  `/var/tmp/users/korphaus/tmp/opencode/research-harnesses/r08-submits/`.
+  `<SCRATCH>/opencode/research-harnesses/r08-submits/`.
 * Device: RX 6950 XT `0000:03:00.0` only (headless). The MI50/Radeon VII `0000:0e:00.0`
   drives the displays and was **never** used this round.
 * Window: `gpu-manager`, `qwen-dual.service`, `strata-rx.service`, `d1-mi50.service` all

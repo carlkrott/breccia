@@ -18,7 +18,7 @@ All measurements are the RX 6950 XT (`0000:03:00.0`, headless), one process at a
 wrapped, `power_dpm_force_performance_level` verified `high` in every run header, and the MI50
 (`0000:0e:00.0`, the **display** card) was never touched. The harness records only; it submits once at
 the end as a liveness check. Scratch code:
-`/var/tmp/users/korphaus/tmp/opencode/research-harnesses/r11-record-floor/` (not in the repo).
+`<SCRATCH>/opencode/research-harnesses/r11-record-floor/` (not in the repo).
 
 ---
 
@@ -34,7 +34,7 @@ The *difference* between adjacent rows is the marginal price of one call, which 
 cumulative rather than independent.
 
 ```
-cd /var/tmp/users/korphaus/tmp/opencode/research-harnesses/r11-record-floor
+cd <SCRATCH>/opencode/research-harnesses/r11-record-floor
 cargo build --release
 timeout 90 ./target/release/r11-record-floor caps                    # device + capability readout
 timeout 120 env R11_DBUF=1 ./target/release/r11-record-floor record   # the floor table

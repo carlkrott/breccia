@@ -312,7 +312,7 @@ which is a driver allocation.** `04` isolated that allocation as the whole diffe
 212 ns of record time per dispatch.
 
 **What the driver gives us** (verified from a `vulkaninfo` dump taken on this host, all three devices —
-`/var/tmp/users/korphaus/tmp/opencode/vinfo.txt`, not re-probed this round):
+`<SCRATCH>/opencode/vinfo.txt`, not re-probed this round):
 
 | capability | status on RX / MI50 / iGPU | what it buys |
 |---|---|---|
@@ -596,10 +596,10 @@ E1 because it makes iterating on fusions cheaper, but do not count it as a win.
 
 * Our code: `crates/breccia-kernels/src/{dispatch_batch.rs,batch.rs,gemv.rs,proj.rs,gdn/mod.rs,qsa/mod.rs,ops/mod.rs}`,
   `crates/breccia-engine/src/{graph.rs,config.rs}`.
-* Capability surface: `/var/tmp/users/korphaus/tmp/opencode/vinfo.txt` + `rx_ext.txt` (vulkaninfo, all
+* Capability surface: `<SCRATCH>/opencode/vinfo.txt` + `rx_ext.txt` (vulkaninfo, all
   three devices, taken 2026-10-27 00:05 — **not re-probed this round**); driver string check on
   `/usr/lib/libvulkan_radeon.so` for the same extension set.
-* Live numbers: `/var/tmp/users/korphaus/tmp/opencode/p4-token/an32.json` (17.19 tok/s, 58.16 ms/token,
+* Live numbers: `<SCRATCH>/opencode/p4-token/an32.json` (17.19 tok/s, 58.16 ms/token,
   `wait-gpu` 32.47, lane 13.36).
 * Prior rounds: `04` (launch count, indirect), `06`/`06a` (barrier ladder, `bpr` law, fusion prices),
   `07` (attribution, timestamp rules), `08` (submit/CB economics, secondary-CB barriers, replay),

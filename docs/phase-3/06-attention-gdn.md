@@ -7,7 +7,7 @@ before the forward-pass graph — plus the measured win item #1 from
 Date: 2026-10-26 · both GPUs idle at the start of every run
 (`gpu_busy_percent` 0 / 2, `pgrep llama-server` empty) · no service was started or
 stopped (`qwen-dual`, `strata-rx`, `d1-mi50`: inactive before and after) ·
-artifacts in `/var/tmp/users/korphaus/tmp/opencode/p3-attn/`.
+artifacts in `<SCRATCH>/opencode/p3-attn/`.
 
 **Status: complete.** `cargo build/test --workspace`, `cargo clippy
 --workspace --all-targets -- -D warnings`, `cargo fmt --check`: green. GDN is
@@ -582,7 +582,7 @@ for OP in gdn qsa hc; do
 done                    # 0 validation messages, 221 cells (14 + 33 + 80 per GPU)
 ```
 
-Artifacts (`/var/tmp/users/korphaus/tmp/opencode/p3-attn/`):
+Artifacts (`<SCRATCH>/opencode/p3-attn/`):
 `conf-{mi50,rx}-{gdn,qsa}.log` (4 conformance logs), `final-{mi50,rx}-<op>.log`
 (16 re-run op logs + 2 `hc` with `--nocapture`), `benchlog-{mi50,rx}-<op>.log`
 (6 bench logs), `bench-{mi50,rx}-<op>.json` (6 JSONs).

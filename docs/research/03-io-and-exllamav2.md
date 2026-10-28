@@ -75,7 +75,7 @@ is the mathematical optimum for a region ≫ 128 KiB, and the measurements agree
 
 ### What llama.cpp's two env knobs actually do (source read, not guessed)
 
-`Reference Projects/llama.cpp` (upstream) and the qwen4exp fork `/home/korphaus/llama.cpp-qwen4exp-mmap`
+`Reference Projects/llama.cpp` (upstream) and the qwen4exp fork `<LLAMA_ROOT>`
 (the binary our parity gate runs against):
 
 * **`LLAMA_MMAP_FADVISE=normal|random`** — a *local fork patch* (`src/llama-mmap.cpp:488-497`), not
@@ -292,7 +292,7 @@ Environment notes for reproduction: kernel `6.18.55-2-cachyos-lts`; `/srv` on bt
 64 MiB L3 per CCD; 58 GB RAM. No GPU service was running or touched (`qwen-dual`, `strata-rx`,
 `d1-mi50` all inactive before and after); `drop_caches` was used between reps and the page cache was
 allowed to refill (it self-heals). The probe sources and raw outputs are in
-`/var/tmp/users/korphaus/tmp/opencode/p5io/` (`ioprobe.c`, `pleprobe.c`, `layout.py`, `sweep*.sh`,
+`<SCRATCH>/opencode/p5io/` (`ioprobe.c`, `pleprobe.c`, `layout.py`, `sweep*.sh`,
 `out*.txt`).
 
 ---
@@ -460,7 +460,7 @@ for arm in 8192 128 8192 128; do
   sudo sh -c "echo $arm > /sys/class/bdi/btrfs-1/read_ahead_kb"
   sudo sh -c 'sync; echo 1 > /proc/sys/vm/drop_caches'
   ./target/release/breccia bench agents --streams 4 --prefix 300 --prefill-chunk 256 \
-      --json /var/tmp/users/korphaus/tmp/opencode/ra-$arm-$(date +%s).json
+      --json <SCRATCH>/opencode/ra-$arm-$(date +%s).json
 done
 sudo sh -c 'echo 8192 > /sys/class/bdi/btrfs-1/read_ahead_kb'   # restore
 ```

@@ -4,7 +4,7 @@ Standard trunk-based development with short-lived branches, Conventional Commits
 
 ## Repository identity
 
-- Local root: `/home/korphaus/projects/Breccia` (its own repo — **not** part of the `$HOME` repo that contains it).
+- Local root: `<REPO_ROOT>` (its own repo — **not** part of the `$HOME` repo that contains it).
 - GitHub remote: **`origin` = https://github.com/carlkrott/breccia** — **PUBLIC** since 2026-10-26
   (user approved publication and the public switch; `gh` auth as `carlkrott`, SSH key also works).
 - **History was rewritten on 2026-10-26** before going public: dropped the accidentally-committed

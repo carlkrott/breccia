@@ -142,7 +142,7 @@ sum 30,319 µs   vs   wait-gpu 30,691 µs   (residual ~1 %, so the table explain
 | A reset can reboot the box | The 2026-10-26 23:44 BACO reset happened on the *headless* card and still took the machine down. Bounded waits + `VK_EXT_robustness2` are the real mitigation. |
 | Btrfs read-ahead | Defaults to 8 MiB → 9× read amplification on expert/PLE records. Pinned to 128 KiB by `breccia-io-tune.timer` (it silently regresses). |
 | `ulimit -l` | 8 MiB hard limit — a pinned host pool needs `LimitMEMLOCK=infinity` in a unit. Pageable import measured the same speed, so this is a correctness-of-pinning issue, not a speed one. |
-| `/mnt/agent-storage-a` is a SATA SSD | 0.39 GB/s — wrong place for an expert tier. The system NVMe is the real Tier-3 (~5.9 GB/s at QD8). |
+| `<STORAGE_ROOT_A>` is a SATA SSD | 0.39 GB/s — wrong place for an expert tier. The system NVMe is the real Tier-3 (~5.9 GB/s at QD8). |
 | Missing hardware features | `VK_KHR_cooperative_matrix` absent on both cards; `VK_KHR_performance_query` advertises 17 counters then **segfaults**; DGC compute creation works but **execution faults**. |
 
 ---
@@ -268,7 +268,7 @@ measured recommendation: `docs/research/01`–`12`. The most consequential:
   merges (`--no-ff`, conflicts resolved by keeping both sides' new sections).
 - `wip/four-gemms-crash-20261026` preserves the work interrupted by the 2026-10-26 reboot.
 - Untracked/ignored: `Reference Projects/`, `target/`, model weights, scratch harnesses
-  (those live in `/var/tmp/users/korphaus/tmp/opencode/research-harnesses/`, never the repo).
+  (those live in `<SCRATCH>/opencode/research-harnesses/`, never the repo).
 
 ---
 
