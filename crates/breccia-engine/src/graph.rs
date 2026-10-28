@@ -2058,6 +2058,10 @@ impl<'m> Session<'m> {
                 .get(&lw.moe.gate.key)?
                 .run(&lw.moe.gate.buf, &ws.mixed, &v.shexp_gate)?;
             sub[0] = t0.elapsed().as_secs_f64();
+            // The gate run is where the blocking fence wait landed; re-anchor to
+            // shared-exp so only the wait, not the remaining shared-expert runs,
+            // is priced as wait-gpu (R28-1: 5162653 relabelled the whole span).
+            self.timers.mark(SHARED);
             self.probe_mark(dev, batch_cmd::probe::SH_UP);
             let t0 = std::time::Instant::now();
             pipes
@@ -4316,6 +4320,31 @@ mod tests {
         assert!(
             (total - split).abs() < 1e-6,
             "split {split}s must equal the span total {total}s (tiny mark/stop scheduler gap is fine)"
+        );
+    }
+
+    /// R28-1: the wait-gpu mark before the first blocking run must be
+    /// re-anchored back to shared-exp before the *next* run, or the whole
+    /// span prices as wait-gpu and SHARED reads ~0 — a relabel, not a
+    /// finding. Checks the source order because a unit Timers test cannot
+    /// own the blocking fence a real GPU run needs.
+    #[test]
+    fn shared_is_reanchored_after_the_first_blocking_run() {
+        let src = include_str!("graph.rs");
+        let span = src
+            .split("shared expert + its scalar sigmoid gate")
+            .nth(1)
+            .expect("the shared-expert span");
+        let span = &span[..span.find("Ok(BlockDigests").expect("the span's end")];
+        let gate = span
+            .find("&v.shexp_gate)?;")
+            .expect("the first blocking run");
+        let rest = &span[gate..];
+        let up = rest.find("&v.shexp_up)?;").expect("the up run");
+        assert!(
+            rest[..up].contains("mark(SHARED)"),
+            "the shared-expert span must re-anchor mark(SHARED) between the gate run and \
+             the up run, or wait-gpu relabels the shared-expert compute"
         );
     }
 
