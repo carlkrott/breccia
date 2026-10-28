@@ -480,6 +480,11 @@ fn kind_name(m: &Model, b: usize) -> String {
     }
 }
 
+// SAFETY: concurrent prefill moves each Session into exactly one scoped thread
+// (`iter_mut`), so its raw Vulkan/mapped pointers are never touched from two
+// threads at once. Shared references are not sent.
+unsafe impl Send for Session<'_> {}
+
 /// A loaded, ready-to-run session: pipelines, state, and the host expert pool.
 pub struct Session<'m> {
     pub model: &'m Model,
