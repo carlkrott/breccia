@@ -1099,6 +1099,15 @@ mod tests {
         assert!(!parse(&[]));
         assert!(parse(&["--host-expert-import"]));
     }
+
+    /// Defect: `--gpu-experts auto` was dropped on the multi path (every stream got
+    /// an empty list). Red first: this must fail until `auto` is routed through
+    /// `ArenaSpec::parse`.
+    #[test]
+    fn multi_auto_is_not_dropped() {
+        assert!(multi_is_auto(Some("auto")));
+        assert!(!multi_is_auto(Some("0,1")));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,29 +1672,59 @@ fn feed_prompt(
 /// latency is the block-pair time and does not improve, but every expert lane now
 /// runs while the other stream's GPU phase is executing
 /// (`docs/phase-4/01-forward-pass.md` §8o).
+/// `--gpu-experts` for the multi-stream path: `;` separates streams, `,` lists
+/// blocks. `auto` is not a block list — it is `ArenaSpec::Auto` per stream (the
+/// measured-free-VRAM rule resolves it per stream on that stream's own device);
+/// dropping it silently turned every arena off (defect r367-plateau, r367-b2-trace).
+fn multi_expert_groups(spec: Option<&str>) -> Vec<Vec<usize>> {
+    spec.map(|s| {
+        s.split(';')
+            .map(|g| {
+                g.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .collect()
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// True if `--gpu-experts` asks for the measured rule on the multi path.
+fn multi_is_auto(spec: Option<&str>) -> bool {
+    spec.map(|s| s.split(';').all(|g| g.trim().eq_ignore_ascii_case("auto")))
+        .unwrap_or(false)
+}
+
 fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     let n_streams = a.streams;
+    if prompt.len() + a.gen + 1 > a.ctx {
+        anyhow::bail!(
+            "prompt {} + gen {} + 1 exceeds --ctx {}",
+            prompt.len(),
+            a.gen,
+            a.ctx
+        );
+    }
     let devs: Vec<String> = a.devices.clone();
     if devs.is_empty() {
         anyhow::bail!("--streams {n_streams} needs at least one --devices entry");
     }
     // `--gpu-experts` is a per-stream list; `;` separates streams (the last group
     // repeats). Two streams on the same card are allowed: their GPU phases then
-    // queue behind each other, which is what the scaling curve measures.
+    // queue behind each other, which is what the scaling curve measures. `auto`
+    // asks for the measured-free-VRAM rule; a non-numeric group is an error
+    // (hard-parse like the single path), and a numeric spelling that survives
+    // only because `filter_map` dropped its tokens never silently becomes "off".
     let expert_sets: Vec<Vec<usize>> = {
-        let groups: Vec<Vec<usize>> = a
-            .gpu_experts
-            .as_ref()
-            .map(|s| {
-                s.split(';')
-                    .map(|g| {
-                        g.split(',')
-                            .filter_map(|t| t.trim().parse::<usize>().ok())
-                            .collect()
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let groups = multi_expert_groups(a.gpu_experts.as_deref());
+        if let Some(spec) = a.gpu_experts.as_deref() {
+            if !multi_is_auto(Some(spec))
+                && !spec.trim().is_empty()
+                && groups.iter().all(|g| g.is_empty())
+            {
+                anyhow::bail!("--gpu-experts {spec:?} parsed to no blocks: use a comma list like 0,1,2 or 'auto'");
+            }
+        }
         if groups.is_empty() && n_streams == 2 && devs.len() >= 2 {
             // Measured default for a two-stream pair (§8p): the production mapping's
             // nine hottest blocks. It costs GPU time the RX cannot use otherwise and
@@ -1714,6 +1753,14 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     #[allow(clippy::needless_range_loop)]
     for s in 0..n_streams {
         let dev = devs[s % devs.len()].clone();
+        let arena = if multi_is_auto(a.gpu_experts.as_deref()) {
+            breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
+                display_reserve: a.arena_display_reserve_mib << 20,
+                headroom: a.arena_headroom_mib << 20,
+            })
+        } else {
+            breccia_engine::ArenaSpec::List(expert_sets[s].clone())
+        };
         let model = breccia_engine::Model::load(
             glob,
             &breccia_engine::LoadOptions {
@@ -1722,7 +1769,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 blocks: None,
                 head_device: breccia_engine::HeadSpec::Auto,
                 profile: None,
-                arena: breccia_engine::ArenaSpec::List(expert_sets[s].clone()),
+                arena,
                 host_expert_import: a.host_expert_import,
                 verbose: s == 0,
             },
