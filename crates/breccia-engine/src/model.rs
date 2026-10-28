@@ -754,6 +754,11 @@ impl Model {
 
         let upload_seconds: f64 = per_device_upload.iter().sum();
 
+        // R29-1: hint the page cache now that the arena bytes are on the device.
+        if opts.page_hint_trim {
+            page_hint_experts(&shards, &placed, cfg.n_layers);
+        }
+
         // D4c: build the locked host arena once at load when the consumer flag is
         // ON — one blob per expert-role tensor (gate/up/down) of every block that
         // stayed on the host lane, filled from the shard files by pread. An
@@ -1131,6 +1136,34 @@ impl<'g> PipelineSet<'g> {
     /// Weight bytes of every pipeline's shape (one dispatch's read).
     pub fn shape_bytes(&self) -> u64 {
         self.map.keys().map(|k| k.weight_bytes()).sum()
+    }
+}
+
+/// R29-1 (`--page-hint-trim`): after the arena upload, drop the page-cache pages
+/// behind the uploaded expert tensors (DONTNEED) and readahead the host-lane ones
+/// (WILLNEED). Hints only: a failed hint never changes a decoded token.
+fn page_hint_experts(
+    shards: &ShardSet,
+    placed: &std::collections::BTreeMap<usize, PlacedExperts>,
+    n_layers: usize,
+) {
+    for b in 0..n_layers {
+        for role in ["gate", "up", "down"] {
+            let name = format!("blk.{b}.ffn_{role}_exps.weight");
+            let (Some(t), Some(si)) = (shards.tensor(&name), shards.shard_of(&name)) else {
+                continue;
+            };
+            let Ok(f) = std::fs::File::open(shards.parts()[si].path()) else {
+                continue;
+            };
+            let r = t.file_range();
+            let len = r.end - r.start;
+            let _ = if placed.contains_key(&b) {
+                breccia_vk::pagecache::drop_range(&f, r.start, len)
+            } else {
+                breccia_vk::pagecache::willneed_range(&f, r.start, len)
+            };
+        }
     }
 }
 

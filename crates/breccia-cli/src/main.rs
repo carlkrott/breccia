@@ -2607,7 +2607,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             profile: None,
             arena,
             host_expert_import: a.host_expert_import,
-            page_hint_trim: false,
+            page_hint_trim: a.page_hint_trim,
             verbose: true,
         },
     )
