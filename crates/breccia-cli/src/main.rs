@@ -1717,7 +1717,7 @@ fn multi_arena_specs(
                 );
             }
         }
-        out.push(ArenaSpec::parse(g));
+        out.push(ArenaSpec::parse(g).map_err(anyhow::Error::msg)?);
     }
     Ok(out)
 }
@@ -2539,15 +2539,18 @@ fn bench_token(a: TokenArgs) -> Result<()> {
     // `--gpu-experts` is `auto`, an explicit block list, or absent (no arena).
     let arena = match a.gpu_experts.as_deref() {
         None => breccia_engine::ArenaSpec::Off,
-        Some(list) => match breccia_engine::ArenaSpec::parse(list) {
-            breccia_engine::ArenaSpec::Auto(_) => {
-                breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
+        Some(list) => {
+            let mut arena = breccia_engine::ArenaSpec::parse(list)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("parsing --gpu-experts {list:?}"))?;
+            if let breccia_engine::ArenaSpec::Auto(_) = arena {
+                arena = breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
                     display_reserve: a.arena_display_reserve_mib << 20,
                     headroom: a.arena_headroom_mib << 20,
-                })
+                });
             }
-            other => other,
-        },
+            arena
+        }
     };
     let model = breccia_engine::Model::load(
         &glob,
