@@ -2436,23 +2436,16 @@ impl<'m> Session<'m> {
                     distinct as f64 / t as f64
                 );
                 if let Some(path) = std::env::var_os("BRECCIA_TRACE_ROUTE_FILE") {
-                    use std::io::Write;
                     let path = std::path::PathBuf::from(path);
-                    let mut file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                        .with_context(|| format!("opening route trace {}", path.display()))?;
                     for i in 0..t {
-                        write!(file, "{} {}", pos0 + i, b)
-                            .with_context(|| format!("writing route trace {}", path.display()))?;
-                        for (&expert, &weight) in self.pf_ids[i].iter().zip(&self.pf_weights[i]) {
-                            write!(file, " {expert}:{weight:.9}").with_context(|| {
-                                format!("writing route trace {}", path.display())
-                            })?;
-                        }
-                        writeln!(file)
-                            .with_context(|| format!("writing route trace {}", path.display()))?;
+                        append_route_row(
+                            &path,
+                            false,
+                            pos0 + i,
+                            b,
+                            &self.pf_ids[i],
+                            &self.pf_weights[i],
+                        )?;
                     }
                 }
             }
@@ -3211,6 +3204,17 @@ impl<'m> Session<'m> {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
             .collect();
         let weights = f32_from_bytes(&raw[2]);
+        // A2 decode-side route rows: same sidecar, `d`-marked (append_route_row doc).
+        if let Some(path) = std::env::var_os("BRECCIA_TRACE_ROUTE_FILE") {
+            append_route_row(
+                &std::path::PathBuf::from(path),
+                true,
+                self.pos,
+                b,
+                &ids,
+                &weights,
+            )?;
+        }
         let shared = f32_from_bytes(&raw[3]);
         let g = f32::from_le_bytes([raw[4][0], raw[4][1], raw[4][2], raw[4][3]]);
         let gate = 1.0 / (1.0 + (-g).exp());
@@ -4184,6 +4188,36 @@ fn prefetch_rows(table: &[u8], rows: &[u32], row_bytes: usize) {
 /// full chunk). So the number of chunks is the thing to minimise, and
 /// `ceil(len / target)` leaves a tiny tail whenever `len` is a little over a
 /// multiple of the target (`132 = 64 + 64 + 4`). The slack lets the planner use
+/// `ceil(len / cap)` chunks instead — two chunks of 66 for that prompt — at the
+/// cost of 50 % more chunk scratch (~100 KiB/token), which is noise beside the
+/// weights.
+pub(crate) fn append_route_row(
+    path: &std::path::Path,
+    decode: bool,
+    token: usize,
+    layer: usize,
+    ids: &[usize],
+    weights: &[f32],
+) -> Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("opening route trace {}", path.display()))?;
+    if decode {
+        write!(file, "d").with_context(|| format!("writing route trace {}", path.display()))?;
+    }
+    write!(file, "{token} {layer}")
+        .with_context(|| format!("writing route trace {}", path.display()))?;
+    for (&expert, &weight) in ids.iter().zip(weights) {
+        write!(file, " {expert}:{weight:.9}")
+            .with_context(|| format!("writing route trace {}", path.display()))?;
+    }
+    writeln!(file).with_context(|| format!("writing route trace {}", path.display()))?;
+    Ok(())
+}
+
 /// `ceil(len / cap)` chunks instead — two chunks of 66 for that prompt — at the
 /// cost of 50 % more chunk scratch (~100 KiB/token), which is noise beside the
 /// weights.

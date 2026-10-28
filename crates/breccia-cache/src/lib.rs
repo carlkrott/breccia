@@ -459,9 +459,12 @@ impl RouteRow {
             return Ok(None);
         }
         let mut f = line.split_whitespace();
+        // Decode rows carry a leading `d ` marker (bundle-b2-decode); skip it —
+        // the prefill row format stays byte-identical.
         let token: u64 = f
             .next()
             .context("missing token")?
+            .trim_start_matches('d')
             .parse()
             .context("bad token")?;
         let layer: usize = f
@@ -718,6 +721,9 @@ mod tests {
         assert!(blocks[0].skew > blocks[1].skew);
         assert_eq!(blocks[1].zipf, 0.0);
         assert!(RouteRow::parse("3 0 1").is_err());
+        // Decode rows are `d<token> <layer> ...` and must parse to the same token.
+        let d = RouteRow::parse("d7 2 1:0.500000000").unwrap().unwrap();
+        assert_eq!((d.token, d.layer), (7, 2));
         std::fs::remove_file(&p).ok();
     }
 
