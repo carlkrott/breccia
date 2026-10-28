@@ -535,7 +535,7 @@ pub struct Session<'m> {
     /// ([`prefill_cap`]); the planner uses the target to split a prompt.
     pub prefill_chunk: usize,
     /// The `--prefill-chunk` target the cap came from ([`prefill_plan`]).
-    prefill_target: usize,
+    pub(crate) prefill_target: usize,
     /// See [`SessionCfg::prefill_merged`].
     pub prefill_merged: bool,
     /// Host-side per-token routing for the chunk's grouped lane, and the chunk's

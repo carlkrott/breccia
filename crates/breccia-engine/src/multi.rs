@@ -299,12 +299,14 @@ impl<'m> Multi<'m> {
         // is what `Multi::new` already requires).
         let mut logits = Vec::new();
         let prefill_t = std::time::Instant::now();
-        let chunk = self.streams[0].prefill_chunk;
-        if chunk > 0 {
+        // Plan from the --prefill-chunk target: prefill_plan applies prefill_cap itself,
+        // so passing the cap would plan chunks 2.25x the target and Session::prefill bails.
+        let target = self.streams[0].prefill_target;
+        if target > 0 {
             logits = vec![Vec::new(); ns];
             for (s, sess) in self.streams.iter_mut().enumerate() {
                 let mut pos = 0usize;
-                for len in crate::graph::prefill_plan(prompt.len(), chunk) {
+                for len in crate::graph::prefill_plan(prompt.len(), target) {
                     logits[s] = sess.prefill(&prompt[pos..pos + len], pos)?;
                     pos += len;
                 }
@@ -365,6 +367,23 @@ impl<'m> Multi<'m> {
 #[cfg(test)]
 mod tests {
     use super::{block_major_env_on, submit_plan, Submit};
+
+    /// The multi prompt pass must cover the prompt and never plan a chunk above
+    /// the session's scratch cap, for every target the sweep uses.
+    #[test]
+    fn multi_prefill_plan_fits_session_cap() {
+        for target in [64usize, 128, 256] {
+            let cap = crate::graph::prefill_cap(target);
+            for len in 1..=2048usize {
+                let plan = crate::graph::prefill_plan(len, target);
+                assert_eq!(plan.iter().sum::<usize>(), len, "len {len} target {target}");
+                assert!(
+                    plan.iter().all(|&c| c <= cap),
+                    "len {len} target {target}: {plan:?} exceeds cap {cap}"
+                );
+            }
+        }
+    }
 
     /// Only the literal `1` enables: `0`, empty and anything else must read as
     /// OFF, or an OFF|ON|OFF plateau's OFF arm would silently run ON.
