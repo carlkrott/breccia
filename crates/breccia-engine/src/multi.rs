@@ -145,6 +145,11 @@ fn prefill_concurrent_on(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+/// Only the literal `1` decodes the streams in their own threads (no block lockstep).
+fn decode_concurrent_on(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
 fn block_major_order() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| block_major_env_on(std::env::var("BRECCIA_BLOCK_MAJOR").ok().as_deref()))
@@ -389,8 +394,59 @@ impl<'m> Multi<'m> {
         let t0 = std::time::Instant::now();
         let mut steps = 0usize;
         let mut steps_s: Vec<f64> = Vec::with_capacity(n);
+        let concurrent_decode = ns > 1
+            && decode_concurrent_on(
+                std::env::var("BRECCIA_MULTI_DECODE_CONCURRENT")
+                    .ok()
+                    .as_deref(),
+            );
+        if concurrent_decode {
+            // One thread per stream, no block lockstep: the shared pool's Mutex still
+            // runs one lane at a time, but each stream's fence waits, readbacks and
+            // submits now overlap the other stream's lane instead of queueing behind it.
+            let firsts = std::mem::take(&mut logits);
+            let done: Vec<Result<(Vec<u32>, Vec<f32>, Vec<f64>)>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = self
+                    .streams
+                    .iter_mut()
+                    .zip(firsts)
+                    .map(|(sess, mut lg)| {
+                        scope.spawn(move || -> Result<(Vec<u32>, Vec<f32>, Vec<f64>)> {
+                            let mut toks = Vec::with_capacity(n);
+                            let mut times = Vec::with_capacity(n);
+                            let mut pos = prompt.len();
+                            for i in 0..n {
+                                let t = sess.sample(&lg).unwrap_or(0);
+                                toks.push(t);
+                                if i + 1 == n {
+                                    break;
+                                }
+                                let t_step = std::time::Instant::now();
+                                lg = sess.token(t, pos, None)?;
+                                times.push(t_step.elapsed().as_secs_f64());
+                                pos += 1;
+                            }
+                            Ok((toks, lg, times))
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("decode thread panicked"))
+                    .collect()
+            });
+            for (s, r) in done.into_iter().enumerate() {
+                let (toks, lg, times) = r?;
+                streams[s].tokens = toks;
+                logits.push(lg);
+                if s == 0 {
+                    steps = times.len();
+                    steps_s = times;
+                }
+            }
+        }
         #[allow(clippy::explicit_counter_loop)]
-        for i in 0..n {
+        for i in 0..if concurrent_decode { 0 } else { n } {
             let next: Vec<u32> = (0..ns)
                 .map(|s| self.streams[s].sample(&logits[s]).unwrap_or(0))
                 .collect();
@@ -434,6 +490,8 @@ mod tests {
     #[test]
     fn prefill_concurrent_env_gate_is_exactly_one() {
         assert!(prefill_concurrent_on(Some("1")));
+        assert!(super::decode_concurrent_on(Some("1")));
+        assert!(!super::decode_concurrent_on(None) && !super::decode_concurrent_on(Some("0")));
         for v in [None, Some("0"), Some(""), Some("true"), Some("1 ")] {
             assert!(!prefill_concurrent_on(v), "{v:?} must be OFF");
         }
