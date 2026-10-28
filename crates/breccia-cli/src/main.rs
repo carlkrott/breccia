@@ -1099,6 +1099,28 @@ mod tests {
         assert!(!parse(&[]));
         assert!(parse(&["--host-expert-import"]));
     }
+
+    /// Defect: `--gpu-experts auto` was dropped on the multi path (every stream got
+    /// an empty list). Every multi group must resolve through `ArenaSpec::parse`,
+    /// and a bad token or empty group must error, never become an arena-off stream.
+    #[test]
+    fn multi_arena_specs_are_strict() {
+        let opts = breccia_engine::ArenaOpts::default();
+        assert_eq!(
+            multi_arena_specs("auto", 2, opts).unwrap(),
+            vec![breccia_engine::ArenaSpec::Auto(opts)]
+        );
+        assert_eq!(
+            multi_arena_specs("0,1;2,3", 2, opts).unwrap(),
+            vec![
+                breccia_engine::ArenaSpec::List(vec![0, 1]),
+                breccia_engine::ArenaSpec::List(vec![2, 3]),
+            ]
+        );
+        for bad in ["0,1;foo", "0,1;", "auto;0,1", "0,x,2"] {
+            assert!(multi_arena_specs(bad, 2, opts).is_err(), "{bad} must error");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,61 +1679,94 @@ fn feed_prompt(
     Ok(logits)
 }
 
-/// `--gpu-experts` groups for the multi-stream harnesses: `;` separates streams,
-/// `,` separates blocks. Each group goes through `ArenaSpec::parse`, so a bad
-/// token errors instead of silently shrinking a stream's resident set.
-fn expert_groups(s: &str) -> Result<Vec<Vec<usize>>> {
-    s.split(';')
-        .map(
-            |g| match breccia_engine::ArenaSpec::parse(g).map_err(anyhow::Error::msg)? {
-                breccia_engine::ArenaSpec::List(v) => Ok(v),
-                breccia_engine::ArenaSpec::Off => Ok(Vec::new()),
-                breccia_engine::ArenaSpec::Auto(_) => {
-                    anyhow::bail!("`auto` is not a per-stream value in --gpu-experts {s:?}")
-                }
-            },
-        )
-        .collect()
-}
-
 /// Two (or more) sequences, one per device, interleaved at the block level.
 ///
 /// The number that matters is the **aggregate** token rate: each stream's own
 /// latency is the block-pair time and does not improve, but every expert lane now
 /// runs while the other stream's GPU phase is executing
 /// (`docs/phase-4/01-forward-pass.md` §8o).
+/// `--gpu-experts` for the multi-stream path: `;` separates streams, `,` lists
+/// blocks, and `auto` alone gives every stream the measured-free-VRAM rule.
+/// Every group goes through `ArenaSpec::parse`; a bad token or an empty group is
+/// an error, never a silently-empty (arena-off) stream (defect r367-plateau).
+fn multi_arena_specs(
+    spec: &str,
+    n_streams: usize,
+    opts: breccia_engine::ArenaOpts,
+) -> anyhow::Result<Vec<breccia_engine::ArenaSpec>> {
+    use breccia_engine::ArenaSpec;
+    let groups: Vec<&str> = spec.split(';').map(str::trim).collect();
+    if groups.iter().all(|g| g.eq_ignore_ascii_case("auto")) {
+        // shortcut: streams size their arena in load order against the free VRAM left at their turn, so two streams on one card share by load order, not an even split; upgrade if a dual-card receipt shows imbalance.
+        let _ = n_streams;
+        return Ok(vec![ArenaSpec::Auto(opts)]);
+    }
+    let mut out = Vec::with_capacity(groups.len());
+    for g in &groups {
+        if g.is_empty() {
+            anyhow::bail!("--gpu-experts {spec:?}: empty stream group");
+        }
+        if g.eq_ignore_ascii_case("auto") {
+            anyhow::bail!("--gpu-experts {spec:?}: 'auto' cannot be mixed with block lists");
+        }
+        for t in g.split(',') {
+            if t.trim().parse::<usize>().is_err() {
+                anyhow::bail!(
+                    "--gpu-experts {spec:?}: {:?} is not a block number",
+                    t.trim()
+                );
+            }
+        }
+        out.push(ArenaSpec::parse(g));
+    }
+    Ok(out)
+}
+
 fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     let n_streams = a.streams;
+    if prompt.len() + a.gen + 1 > a.ctx {
+        anyhow::bail!(
+            "prompt {} + gen {} + 1 exceeds --ctx {}",
+            prompt.len(),
+            a.gen,
+            a.ctx
+        );
+    }
     let devs: Vec<String> = a.devices.clone();
     if devs.is_empty() {
         anyhow::bail!("--streams {n_streams} needs at least one --devices entry");
     }
     // `--gpu-experts` is a per-stream list; `;` separates streams (the last group
     // repeats). Two streams on the same card are allowed: their GPU phases then
-    // queue behind each other, which is what the scaling curve measures.
-    let expert_sets: Vec<Vec<usize>> = {
-        let groups: Vec<Vec<usize>> = match a.gpu_experts.as_ref() {
-            Some(s) => expert_groups(s)?,
-            None => Vec::new(),
-        };
-        if groups.is_empty() && n_streams == 2 && devs.len() >= 2 {
-            // Measured default for a two-stream pair (§8p): the production mapping's
-            // nine hottest blocks. It costs GPU time the RX cannot use otherwise and
-            // buys ~17 ms/step of host lane, worth +2.5 tok/s aggregate. It does not
-            // fit once two streams share a card, so it is not used above two streams.
-            vec![vec![0, 1, 2, 4, 8, 18, 20, 22, 23]; n_streams]
-        } else {
-            (0..n_streams)
-                .map(|i| {
-                    groups
-                        .get(i)
-                        .or_else(|| groups.last())
-                        .cloned()
-                        .unwrap_or_default()
-                })
-                .collect()
+    // queue behind each other, which is what the scaling curve measures. `auto`
+    // asks for the measured-free-VRAM rule; a non-numeric group is an error
+    // (hard-parse like the single path), and a numeric spelling that survives
+    // only because `filter_map` dropped its tokens never silently becomes "off".
+    let groups: Vec<breccia_engine::ArenaSpec> = match a.gpu_experts.as_deref() {
+        Some(spec) => {
+            let opts = breccia_engine::ArenaOpts {
+                display_reserve: a.arena_display_reserve_mib << 20,
+                headroom: a.arena_headroom_mib << 20,
+            };
+            multi_arena_specs(spec, n_streams, opts)?
         }
+        // Measured default for a two-stream pair (§8p): the production mapping's
+        // nine hottest blocks. It does not fit once two streams share a card, so it
+        // is not used above two streams.
+        None if n_streams == 2 && devs.len() >= 2 => vec![breccia_engine::ArenaSpec::List(vec![
+            0, 1, 2, 4, 8, 18, 20, 22, 23,
+        ])],
+        None => vec![breccia_engine::ArenaSpec::Off],
     };
+    let stream_specs: Vec<breccia_engine::ArenaSpec> = (0..n_streams)
+        .map(|s| {
+            groups
+                .get(s)
+                .or_else(|| groups.last())
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect();
     println!(
         "breccia bench token --streams {n_streams}: {} prompt ids, {} to generate each, \
          one device per stream",
@@ -1722,6 +1777,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     #[allow(clippy::needless_range_loop)]
     for s in 0..n_streams {
         let dev = devs[s % devs.len()].clone();
+        let arena = stream_specs[s].clone();
         let model = breccia_engine::Model::load(
             glob,
             &breccia_engine::LoadOptions {
@@ -1730,7 +1786,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 blocks: None,
                 head_device: breccia_engine::HeadSpec::Auto,
                 profile: None,
-                arena: breccia_engine::ArenaSpec::List(expert_sets[s].clone()),
+                arena,
                 host_expert_import: a.host_expert_import,
                 verbose: s == 0,
             },
@@ -1775,16 +1831,14 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         multi.streams[0].session_bytes() >> 20
     );
     for (i, (name, pci)) in names.iter().enumerate() {
-        let pe = &expert_sets[i];
-        println!(
-            "  stream {i}  {name:<40} {pci}  {} expert block(s) on the device{}",
-            pe.len(),
-            if pe.is_empty() {
-                String::new()
-            } else {
-                format!(" {:?}", pe)
+        let what = match &stream_specs[i] {
+            breccia_engine::ArenaSpec::List(v) => format!("{} expert block(s) {:?}", v.len(), v),
+            breccia_engine::ArenaSpec::Auto(_) => {
+                "expert arena sized by measured free VRAM".to_string()
             }
-        );
+            breccia_engine::ArenaSpec::Off => "0 expert block(s)".to_string(),
+        };
+        println!("  stream {i}  {name:<40} {pci}  {what}");
     }
 
     // ---- warm passes: `--warm N` full generations before the window ----------
@@ -2009,10 +2063,19 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         a.gen
     );
     let groups: Vec<Vec<usize>> = {
-        let g: Vec<Vec<usize>> = match a.gpu_experts.as_ref() {
-            Some(s) => expert_groups(s)?,
-            None => Vec::new(),
-        };
+        let g: Vec<Vec<usize>> = a
+            .gpu_experts
+            .as_ref()
+            .map(|s| {
+                s.split(';')
+                    .map(|x| {
+                        x.split(',')
+                            .filter_map(|t| t.trim().parse::<usize>().ok())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         (0..n)
             .map(|i| {
                 if g.is_empty() {
@@ -2476,10 +2539,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
     // `--gpu-experts` is `auto`, an explicit block list, or absent (no arena).
     let arena = match a.gpu_experts.as_deref() {
         None => breccia_engine::ArenaSpec::Off,
-        Some(list) => match breccia_engine::ArenaSpec::parse(list)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("parsing --gpu-experts {list:?}"))?
-        {
+        Some(list) => match breccia_engine::ArenaSpec::parse(list) {
             breccia_engine::ArenaSpec::Auto(_) => {
                 breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
                     display_reserve: a.arena_display_reserve_mib << 20,

@@ -102,12 +102,36 @@ impl Sampler {
         if order.is_empty() {
             return None;
         }
-        order.sort_by(|&a, &b| {
+        let cmp = |&a: &usize, &b: &usize| {
             logits[b]
                 .partial_cmp(&logits[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.cmp(&b))
-        });
+        };
+        // shortcut: partial select only when a bounded top_k makes it pay,
+        // upgrade to a partial softmax scan if profilinng shows the partition
+        // is still hot at very large vocabularies.
+        if let Some(k) = cfg.top_k.checked_sub(1).filter(|&k| k < order.len() - 1) {
+            order.select_nth_unstable_by(k, cmp);
+            let (head, tail) = order.split_at_mut(k + 1);
+            head.sort_unstable_by(cmp);
+            let _ = tail;
+            let order = head;
+            return self.draw_from(order, logits, cfg, inv_t);
+        }
+        order.sort_by(cmp);
+        self.draw_from(&order, logits, cfg, inv_t)
+    }
+
+    /// Draw the next token from an already-ordered candidate list.
+    fn draw_from(
+        &mut self,
+        order: &[usize],
+        logits: &[f32],
+        cfg: &Sampling,
+        inv_t: f64,
+    ) -> Option<u32> {
+        let mut order: Vec<usize> = order.to_vec();
         if cfg.top_k > 0 && cfg.top_k < order.len() {
             order.truncate(cfg.top_k);
         }
