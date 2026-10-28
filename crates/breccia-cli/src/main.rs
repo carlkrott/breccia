@@ -1047,9 +1047,44 @@ fn serve(dry_run: bool, args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// Whether a GPU timestamp probe is on. `Session::gpu_busy_s` returns 0 when it
+/// is not, which the multi-stream reports used to print as "0% utilised".
+fn gpu_busy_measured() -> bool {
+    std::env::var_os("BRECCIA_GPU_TIME").is_some() || breccia_kernels::batch_cmd::probe::enabled()
+}
+
+const NOT_MEASURED: &str = "not measured (set BRECCIA_GPU_TIME=1)";
+
+fn busy_summary(measured: bool, busy_s: f64, wall_s: f64) -> String {
+    if !measured {
+        return NOT_MEASURED.into();
+    }
+    format!(
+        "{:.0} ms of {:.0} ms = {:.0}% utilised",
+        busy_s * 1e3,
+        wall_s * 1e3,
+        busy_s / wall_s.max(1e-9) * 100.0
+    )
+}
+
+fn busy_per_step(measured: bool, busy_s: f64, steps: u64) -> String {
+    if !measured {
+        return NOT_MEASURED.into();
+    }
+    format!("{:.1} ms/step", busy_s * 1e3 / steps.max(1) as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmeasured_busy_never_prints_a_percentage() {
+        assert!(!busy_summary(false, 0.0, 2.0).contains('%'));
+        assert!(!busy_per_step(false, 0.0, 8).contains("ms/step"));
+        assert!(busy_summary(true, 1.0, 2.0).contains("50% utilised"));
+        assert_eq!(busy_per_step(true, 0.8, 8), "100.0 ms/step");
+    }
 
     #[test]
     fn pci_spec_is_normalised() {
@@ -1914,17 +1949,9 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             }
         }
         for (name, _pci, streams_on_it, b) in &per_card {
-            let util = if g.decode_seconds > 0.0 {
-                b / g.decode_seconds * 100.0
-            } else {
-                0.0
-            };
             println!(
-                "  card      {name:<40} streams {streams_on_it:?}  GPU busy {:.0} ms of \
-                 {:.0} ms = {:.0}% utilised",
-                b * 1e3,
-                g.decode_seconds * 1e3,
-                util
+                "  card      {name:<40} streams {streams_on_it:?}  GPU busy {}",
+                busy_summary(gpu_busy_measured(), *b, g.decode_seconds)
             );
         }
         println!(
@@ -1940,8 +1967,8 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             breccia_kernels::batch_cmd::wait_seconds() * 1e3 / g.steps.max(1) as f64
         );
         println!(
-            "  aggregate GPU busy {:.1} ms/step across {} card(s)",
-            busy_total * 1e3 / g.steps.max(1) as f64,
+            "  aggregate GPU busy {} across {} card(s)",
+            busy_per_step(gpu_busy_measured(), busy_total, g.steps as u64),
             per_card.len()
         );
         runs.push(g);
@@ -2410,13 +2437,13 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
             .map(|x| x.0.clone())
             .unwrap_or_default();
         println!(
-            "card     {name:<40} agents {streams_on_it:?}  GPU {:.0}% utilised",
-            b / decode_seconds.max(1e-9) * 100.0
+            "card     {name:<40} agents {streams_on_it:?}  GPU busy {}",
+            busy_summary(gpu_busy_measured(), *b, decode_seconds)
         );
     }
     println!(
-        "         aggregate GPU busy {:.1} ms/step over {} card(s)",
-        busy_total * 1e3 / steps.max(1) as f64,
+        "         aggregate GPU busy {} over {} card(s)",
+        busy_per_step(gpu_busy_measured(), busy_total, steps as u64),
         per_card.len()
     );
     let parity = if a.same_prompt {
