@@ -325,6 +325,10 @@ pub struct LoadOptions {
     /// Zero-copy host expert import via `VK_EXT_external_memory_host` (`--host-expert-import`,
     /// D4). Off by default: not yet consumed by the loader until D3 lands behind it.
     pub host_expert_import: bool,
+    /// R29 card 1 (`--page-hint-trim`): after the arena upload, DONTNEED the
+    /// uploaded ranges (drop those source pages) and WILLNEED the host-lane
+    /// expert ranges. Off by default.
+    pub page_hint_trim: bool,
     pub verbose: bool,
 }
 
@@ -338,6 +342,7 @@ impl Default for LoadOptions {
             profile: None,
             arena: ArenaSpec::Off,
             host_expert_import: false,
+            page_hint_trim: false,
             verbose: true,
         }
     }
