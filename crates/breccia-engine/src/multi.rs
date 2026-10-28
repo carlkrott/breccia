@@ -65,6 +65,9 @@ pub struct MultiGeneration {
     /// Wall seconds of each decode step: every stream produces one token in it,
     /// so this is the per-token latency each agent felt.
     pub steps_s: Vec<f64>,
+    /// Wall seconds the prompt pass took (token by token, or chunked when the
+    /// session was built with a `--prefill-chunk`).
+    pub prefill_seconds: f64,
 }
 
 impl MultiGeneration {
@@ -222,6 +225,12 @@ impl<'m> Multi<'m> {
     /// Decode timing covers only the forwards that produced generated tokens, so
     /// the prompt is not part of the token rate (same rule as the single-stream
     /// bench).
+    ///
+    /// Parity note: with a `--prefill-chunk` set the prompt pass uses `prefill`
+    /// over `prefill_plan` instead of token-by-token `token_all`; the arithmetic
+    /// is the same grouped-lane forward (§8s), so greedy tokens should match.
+    /// That chunk-0-vs-64 parity check needs a model fixture, which the repo does
+    /// not ship — it runs on a real model, e.g. via the C3 sweep arms.
     pub fn generate(&mut self, prompt: &[u32], n: usize) -> Result<MultiGeneration> {
         if prompt.is_empty() {
             bail!("the prompt is empty");
@@ -230,10 +239,29 @@ impl<'m> Multi<'m> {
         for s in 0..ns {
             self.streams[s].reset()?;
         }
+        // Chunked prompt pass (§8s), the multi-stream twin of the single-session
+        // `generate`: same tokens, same arithmetic, the grouped expert lane per
+        // chunk. `0` stays token by token through `token_all`, the interleaved
+        // path (chunked prefill needs a single-device session per stream, which
+        // is what `Multi::new` already requires).
         let mut logits = Vec::new();
-        for (pos, &t) in prompt.iter().enumerate() {
-            logits = self.token_all(&vec![t; ns], pos)?;
+        let prefill_t = std::time::Instant::now();
+        let chunk = self.streams[0].prefill_chunk;
+        if chunk > 0 {
+            logits = vec![Vec::new(); ns];
+            for (s, sess) in self.streams.iter_mut().enumerate() {
+                let mut pos = 0usize;
+                for len in crate::graph::prefill_plan(prompt.len(), chunk) {
+                    logits[s] = sess.prefill(&prompt[pos..pos + len], pos)?;
+                    pos += len;
+                }
+            }
+        } else {
+            for (pos, &t) in prompt.iter().enumerate() {
+                logits = self.token_all(&vec![t; ns], pos)?;
+            }
         }
+        let prefill_seconds = prefill_t.elapsed().as_secs_f64();
         for s in 0..ns {
             self.streams[s].reset_counters()?;
         }
@@ -276,6 +304,7 @@ impl<'m> Multi<'m> {
             decode_seconds,
             steps,
             steps_s,
+            prefill_seconds,
         })
     }
 }

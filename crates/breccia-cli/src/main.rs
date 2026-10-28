@@ -1818,6 +1818,16 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             g.fence_ms_per_step(),
             g.overlap_efficiency() * 100.0
         );
+        println!(
+            "  prefill  {:.3} s ({:.0} tok/s/stream; {} path)",
+            g.prefill_seconds,
+            prompt.len() as f64 / g.prefill_seconds.max(1e-9),
+            if a.prefill_chunk > 0 {
+                "chunked"
+            } else {
+                "token by token"
+            }
+        );
         for (i, st) in g.streams.iter().enumerate() {
             println!(
                 "  stream {i}  {} tokens  lane {:.1} ms/step ({:.0}% under the other stream's GPU)  \
@@ -1935,6 +1945,8 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 "stream_ms_per_token": g.stream_ms_per_token(),
                 "steps": g.steps,
                 "decode_seconds": g.decode_seconds,
+                "prefill_seconds": g.prefill_seconds,
+                "prefill_tokens_per_s_per_stream": prompt.len() as f64 / g.prefill_seconds.max(1e-9),
                 "lane_ms_per_step": g.lane_ms_per_step(),
                 "fence_ms_per_step": g.fence_ms_per_step(),
                 "overlap_efficiency": g.overlap_efficiency(),
