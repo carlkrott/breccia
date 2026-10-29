@@ -1,0 +1,41 @@
+breccia-vk: transfer bench (full mode) on device(s) [0, 1] of 3 enumerated
+  note: other processes hold /dev/dri: ["1196981:chromium", "1197088:chromium", "3591:llama-server", "4918:plasmashell", "5114:Xwayland", "5466:claude-desktop", "5901:claude-desktop", "6201:cowork-linux-he"]
+  [0] logical device 'AMD Radeon RX 6950 XT (RADV NAVI21)' created: compute=queue family 0, transfer=family 1 index 0 (distinct_transfer_queue_family), enabled optional extensions=[VK_EXT_external_memory_host, VK_EXT_robustness2, VK_EXT_memory_budget, VK_EXT_calibrated_timestamps]
+  [0] external_memory_host: listed=true enabled=true align=4096 import=ok verified=true h2d=28.7 GB/s
+  [0] ring  16 MiB x4 slots: 28.1 GB/s DMA (0.33 s, 558 rounds), 27.5 GB/s with host staging
+  [0] ring  64 MiB x4 slots: 28.6 GB/s DMA (0.34 s, 147 rounds), 21.2 GB/s with host staging
+  [0] ring 256 MiB x3 slots: 28.8 GB/s DMA (0.34 s, 36 rounds), 17.5 GB/s with host staging
+  [0] churn: 415 rounds / 4108 MiB, depth 6: stream 0.192 s vs compute-only 0.186 s, transfer-only 0.156 s -> overlap 96.4%, consumer stall 0.00 ms/MB
+  [1] logical device 'AMD Radeon Pro VII (RADV VEGA20)' created: compute=queue family 0, transfer=family 1 index 0 (distinct_transfer_queue_family), enabled optional extensions=[VK_EXT_external_memory_host, VK_EXT_robustness2, VK_EXT_memory_budget, VK_EXT_calibrated_timestamps]
+  [1] external_memory_host: listed=true enabled=true align=4096 import=ok verified=true h2d=5.7 GB/s
+  [1] ring  16 MiB x4 slots: 5.4 GB/s DMA (0.35 s, 112 rounds), 5.4 GB/s with host staging
+  [1] ring  64 MiB x4 slots: 5.6 GB/s DMA (0.35 s, 29 rounds), 5.5 GB/s with host staging
+  [1] ring 256 MiB x3 slots: 5.7 GB/s DMA (0.38 s, 8 rounds), 5.5 GB/s with host staging
+  [1] churn: 415 rounds / 4108 MiB, depth 6: stream 1.288 s vs compute-only 0.953 s, transfer-only 0.799 s -> overlap 58.2%, consumer stall 0.08 ms/MB
+
+transfer harness (full mode, schema v1), 2 device(s)
+  host 7995x-cachyos · instance API 1.4.363 · 2026-10-29T17:56:37Z
+
+[0] AMD Radeon RX 6950 XT (RADV NAVI21)
+  pci 0000:03:00.0 · radv 26.2.5 · DISCRETE_GPU
+  queues: compute family 0 (1q) · transfer family 1 (4q, index 0) · distinct_transfer_queue_family
+  timeline semaphores: supported=true used=true
+  external memory host: listed=true enabled=true align=4096 B import=ok (verified) · 28.7 GB/s zero-copy H2D
+  ring  16 MiB x4 slots:  28.15 GB/s DMA,  27.50 GB/s with host staging (558 rounds, 554 slot stalls, 0.328 s blocked)
+  ring  64 MiB x4 slots:  28.62 GB/s DMA,  21.17 GB/s with host staging (147 rounds, 143 slot stalls, 0.334 s blocked)
+  ring 256 MiB x3 slots:  28.76 GB/s DMA,  17.47 GB/s with host staging (36 rounds, 33 slot stalls, 0.308 s blocked)
+  churn (415 rounds, 4108 MiB, depth 6): stream 0.192 s · compute-only 0.186 s · transfer-only 0.156 s
+  overlap 96.4% · consumer stall 0.00 ms/MB (0.006 s total) · effective H2D 22.49 GB/s (full rate 27.69 GB/s)
+
+[1] AMD Radeon Pro VII (RADV VEGA20)
+  pci 0000:0e:00.0 · radv 26.2.5 · DISCRETE_GPU
+  queues: compute family 0 (1q) · transfer family 1 (4q, index 0) · distinct_transfer_queue_family
+  timeline semaphores: supported=true used=true
+  external memory host: listed=true enabled=true align=4096 B import=ok (verified) · 5.7 GB/s zero-copy H2D
+  ring  16 MiB x4 slots:   5.42 GB/s DMA,   5.40 GB/s with host staging (112 rounds, 108 slot stalls, 0.334 s blocked)
+  ring  64 MiB x4 slots:   5.59 GB/s DMA,   5.53 GB/s with host staging (29 rounds, 25 slot stalls, 0.300 s blocked)
+  ring 256 MiB x3 slots:   5.68 GB/s DMA,   5.49 GB/s with host staging (8 rounds, 5 slot stalls, 0.236 s blocked)
+  churn (415 rounds, 4108 MiB, depth 6): stream 1.288 s · compute-only 0.953 s · transfer-only 0.799 s
+  overlap 58.2% · consumer stall 0.08 ms/MB (0.334 s total) · effective H2D 3.34 GB/s (full rate 5.39 GB/s)
+
+wrote /var/tmp/breccia-coord/out/xfer-bw.json
