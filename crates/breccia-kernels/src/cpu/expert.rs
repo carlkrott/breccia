@@ -20,8 +20,9 @@
 //! finishes first.
 
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use breccia_format::{ExpertBlock, ExpertRole, ExpertSlices, ShardSet};
@@ -303,6 +304,8 @@ pub struct ExpertPool {
     /// Distinct experts the last [`ExpertPool::moe_topk_chunk`] call touched (the
     /// number the merged-MoE byte budget is built on, §8u).
     pub last_distinct: usize,
+    /// Phase timing since the caller last reset it (`BRECCIA_LANE_STATS=1`).
+    pub lane_stats: LaneStats,
     tx: Vec<Sender<Msg>>,
     rx: Receiver<Done>,
     handles: Vec<JoinHandle<()>>,
@@ -357,6 +360,35 @@ struct Shard {
 
 struct Done {
     results: Vec<(usize, Vec<f32>)>,
+    /// Nanoseconds the worker spent on the batch (0 unless [`lane_stats_on`]).
+    busy_ns: u64,
+}
+
+/// `BRECCIA_LANE_STATS=1`: time every pool phase (coord plan Phase 0).
+pub fn lane_stats_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_LANE_STATS").is_ok_and(|v| v == "1"))
+}
+
+/// Sums over pool phases: wall is first send to last reply, busy is per worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LaneStats {
+    pub phases: u64,
+    pub wall_s: f64,
+    pub max_busy_s: f64,
+    pub mean_busy_s: f64,
+}
+
+impl LaneStats {
+    /// Share of phase wall not covered by the slowest worker: dispatch, wake-up
+    /// and reply cost.
+    pub fn sync_share(&self) -> f64 {
+        if self.wall_s > 0.0 {
+            (self.wall_s - self.max_busy_s) / self.wall_s
+        } else {
+            0.0
+        }
+    }
 }
 
 /// Rows per shard below which splitting costs more than it balances.
@@ -413,6 +445,7 @@ impl ExpertPool {
         Self {
             threads,
             last_distinct: 0,
+            lane_stats: LaneStats::default(),
             tx,
             rx,
             handles,
@@ -429,13 +462,14 @@ impl ExpertPool {
     /// Round-robin keeps the per-worker task counts within one of each other,
     /// and every shard of a phase has the same number of rows, so that is
     /// balanced work.
-    fn run_phase(&self, tasks: Vec<Shard>) -> Result<Vec<Option<Vec<f32>>>> {
+    fn run_phase(&mut self, tasks: Vec<Shard>) -> Result<Vec<Option<Vec<f32>>>> {
         let n = tasks.len();
         let mut slots: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
         let mut buckets: Vec<Vec<Shard>> = (0..self.threads).map(|_| Vec::new()).collect();
         for (i, task) in tasks.into_iter().enumerate() {
             buckets[i % self.threads].push(task);
         }
+        let t0 = lane_stats_on().then(Instant::now);
         let mut busy = 0usize;
         for (w, batch) in buckets.into_iter().enumerate() {
             if batch.is_empty() {
@@ -446,16 +480,26 @@ impl ExpertPool {
                 .map_err(|_| anyhow::anyhow!("expert worker {w} is gone"))?;
             busy += 1;
         }
+        let (mut max_ns, mut sum_ns) = (0u64, 0u64);
         for _ in 0..busy {
             let done = self
                 .rx
                 .recv()
                 .map_err(|_| anyhow::anyhow!("expert pool result channel closed"))?;
+            max_ns = max_ns.max(done.busy_ns);
+            sum_ns += done.busy_ns;
             for (seq, values) in done.results {
                 if let Some(slot) = slots.get_mut(seq) {
                     *slot = Some(values);
                 }
             }
+        }
+        if let (Some(t0), true) = (t0, busy > 0) {
+            let st = &mut self.lane_stats;
+            st.phases += 1;
+            st.wall_s += t0.elapsed().as_secs_f64();
+            st.max_busy_s += max_ns as f64 / 1e9;
+            st.mean_busy_s += sum_ns as f64 / 1e9 / busy as f64;
         }
         Ok(slots)
     }
@@ -868,6 +912,7 @@ fn worker_loop(set: &ShardSet, path: Path, rx: &Receiver<Msg>, done: &Sender<Don
         match msg {
             Msg::Exit => break,
             Msg::Batch(batch) => {
+                let t0 = lane_stats_on().then(Instant::now);
                 let mut results = Vec::with_capacity(batch.tasks.len());
                 for shard in batch.tasks {
                     let Some(values) = run_shard(set, path, &shard) else {
@@ -875,7 +920,8 @@ fn worker_loop(set: &ShardSet, path: Path, rx: &Receiver<Msg>, done: &Sender<Don
                     };
                     results.push((shard.seq, values));
                 }
-                if done.send(Done { results }).is_err() {
+                let busy_ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
+                if done.send(Done { results, busy_ns }).is_err() {
                     break;
                 }
             }

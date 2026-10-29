@@ -54,7 +54,8 @@ pub use bench::{
     PARITY_BAR_GBPS,
 };
 pub use expert::{
-    expert_ffn, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch, LayerPlan, RolePlan,
+    expert_ffn, lane_stats_on, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch,
+    LaneStats, LayerPlan, RolePlan,
 };
 
 /// `gemv_into` for **m users at once**: row `r`'s weight block is dequantised once
@@ -246,7 +247,10 @@ pub fn pin_current(cpus: &[usize]) -> bool {
         }
         let ok = libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0;
         if !ok {
-            tracing::warn!("sched_setaffinity({cpus:?}) failed: {}", std::io::Error::last_os_error());
+            tracing::warn!(
+                "sched_setaffinity({cpus:?}) failed: {}",
+                std::io::Error::last_os_error()
+            );
         }
         ok
     }

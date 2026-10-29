@@ -2067,15 +2067,21 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 "lane_ms_per_step": g.lane_ms_per_step(),
                 "fence_ms_per_step": g.fence_ms_per_step(),
                 "overlap_efficiency": g.overlap_efficiency(),
-                "streams": g.streams.iter().enumerate().map(|(i, s)| serde_json::json!({
-                    "device": names[i].0,
-                    "tokens": s.tokens,
-                    "lane_s": s.lane_s,
-                    "lane_covered_s": s.lane_covered_s,
-                    "fence_s": s.fence_s,
-                    "expert_bytes": s.expert_bytes,
-                    "prefill_seconds": s.prefill_seconds,
-                })).collect::<Vec<_>>(),
+                "streams": g.streams.iter().enumerate().map(|(i, s)| {
+                    let mut v = serde_json::json!({
+                        "device": names[i].0,
+                        "tokens": s.tokens,
+                        "lane_s": s.lane_s,
+                        "lane_covered_s": s.lane_covered_s,
+                        "fence_s": s.fence_s,
+                        "expert_bytes": s.expert_bytes,
+                        "prefill_seconds": s.prefill_seconds,
+                    });
+                    if let Some(ls) = &s.lane_stats {
+                        v["lane_stats"] = serde_json::json!(ls);
+                    }
+                    v
+                }).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         });
         if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -2775,6 +2781,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             prompt_ids: prompt.clone(),
             generated: gen.tokens.clone(),
             expert_bytes_per_token: gen.bytes_per_token(),
+            lane_stats: sess.lane_report(),
         };
         for (i, (_, ms)) in sess.timers.table(gen.forwards).iter().enumerate() {
             stages_acc[i] += ms;

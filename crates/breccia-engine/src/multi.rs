@@ -55,6 +55,7 @@ pub struct StreamReport {
     /// Wall seconds of this stream's own prompt pass. The serial chunked path
     /// times each stream alone; token by token every stream shares the total.
     pub prefill_seconds: f64,
+    pub lane_stats: Option<crate::LaneReport>,
 }
 
 /// The whole two-stream run.
@@ -471,6 +472,7 @@ impl<'m> Multi<'m> {
             st.expert_bytes = sess.expert_bytes;
             st.last_logits = logits.get(s).cloned().unwrap_or_default();
             st.prefill_seconds = stream_prefill[s];
+            st.lane_stats = sess.lane_report();
         }
         Ok(MultiGeneration {
             streams,

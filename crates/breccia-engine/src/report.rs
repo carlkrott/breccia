@@ -23,6 +23,26 @@ pub struct RunReport {
     pub generated: Vec<u32>,
     /// Expert weight bytes the host lane read, divided by the forwards.
     pub expert_bytes_per_token: u64,
+    /// `BRECCIA_LANE_STATS=1` only (absent otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_stats: Option<LaneReport>,
+}
+
+/// Coord plan Phase 0 counters over one decode (`BRECCIA_LANE_STATS=1`). The pool
+/// figures are the **shared** pool's, so every stream of a multi run repeats them.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct LaneReport {
+    pub phases: u64,
+    pub phase_wall_s: f64,
+    pub phase_max_busy_s: f64,
+    pub phase_mean_busy_s: f64,
+    /// (wall − max busy) / wall.
+    pub sync_share: f64,
+    /// This session's seconds waiting to acquire the pool.
+    pub lock_wait_s: f64,
+    /// Per device of this session: batch submit seconds and count.
+    pub submit_s: Vec<f64>,
+    pub submit_n: Vec<u64>,
 }
 
 /// The whole run: load, geometry, per-run numbers.

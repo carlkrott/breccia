@@ -67,7 +67,9 @@ pub use head::{HeadChoice, HeadSpec};
 pub use model::{LoadOptions, LoadStats, Model};
 pub use multi::{Multi, MultiGeneration, StreamReport};
 pub use placement::{DeviceSpec, Placement};
-pub use report::{LogitSummary, RunReport, StageRow, TokenReport, TOKEN_SCHEMA_VERSION};
+pub use report::{
+    LaneReport, LogitSummary, RunReport, StageRow, TokenReport, TOKEN_SCHEMA_VERSION,
+};
 pub use sampler::{Sampler, Sampling};
 pub use stats::{Checksum, LayerTrace};
 

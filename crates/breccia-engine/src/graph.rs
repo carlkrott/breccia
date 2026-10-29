@@ -35,7 +35,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use breccia_vk::ctx::Buf;
 
 use breccia_kernels::batch_cmd;
-use breccia_kernels::cpu::{self, ExpertPool};
+use breccia_kernels::cpu::{self, lane_stats_on, ExpertPool, LaneStats};
 use breccia_kernels::ops::{
     f32_from_bytes, f32_to_bytes, EmbGather, HcMixer, HcWeights, HcWorkspace, Router, SwiGlu,
 };
@@ -527,6 +527,11 @@ pub struct Session<'m> {
     /// **another stream's** GPU work was in flight — the overlap efficiency.
     pub lane_s: f64,
     pub lane_covered_s: f64,
+    /// `BRECCIA_LANE_STATS=1`: seconds waiting to acquire the shared expert
+    /// pool, and per device the seconds and count of batch submits.
+    pub lock_wait_s: f64,
+    pub dev_submit_s: Vec<f64>,
+    pub dev_submit_n: Vec<u64>,
     /// Submits and recorded dispatches, for the report's before/after.
     pub submits: u64,
     pub dispatches: u64,
@@ -1112,6 +1117,9 @@ impl<'m> Session<'m> {
             anchor_at: None,
             gpu_busy_s: vec![0.0; model.devices.len()],
             dev_wait_s: vec![0.0; model.devices.len()],
+            lock_wait_s: 0.0,
+            dev_submit_s: vec![0.0; model.devices.len()],
+            dev_submit_n: vec![0; model.devices.len()],
             dev_down: vec![0; model.devices.len()],
             dev_up: vec![0; model.devices.len()],
             placed_blocks: model.placed.len(),
@@ -1160,8 +1168,10 @@ impl<'m> Session<'m> {
             self.timers.count_batch(rec);
             let gpu = self.model.devices[d].gpu();
             self.probe_stamp(d, true)?;
+            let t_sub = lane_stats_on().then(std::time::Instant::now);
             let seg = batch_cmd::end_submit(gpu, None)
                 .map_err(|e| anyhow!("closing the dispatch batch on device {d}: {e}"))?;
+            self.note_submit(d, t_sub);
             self.submits += 1;
             self.dispatches += u64::from(rec);
             self.pending_seg = Some(seg);
@@ -1206,6 +1216,42 @@ impl<'m> Session<'m> {
 
     /// Submit the open batch without waiting; the fence is kept in
     /// [`Session::pending_seg`] so [`Session::finish_block`] can wait for it.
+    fn note_submit(&mut self, d: usize, t: Option<std::time::Instant>) {
+        if let Some(t) = t {
+            self.dev_submit_s[d] += t.elapsed().as_secs_f64();
+            self.dev_submit_n[d] += 1;
+        }
+    }
+
+    /// Zero the `BRECCIA_LANE_STATS` counters, the shared pool's included.
+    pub fn reset_lane_stats(&mut self) {
+        self.lock_wait_s = 0.0;
+        self.dev_submit_s.iter_mut().for_each(|x| *x = 0.0);
+        self.dev_submit_n.iter_mut().for_each(|x| *x = 0);
+        if let Ok(mut p) = self.pool.lock() {
+            p.lane_stats = LaneStats::default();
+        }
+    }
+
+    /// The Phase 0 counters since the last [`Session::reset_lane_stats`], or
+    /// `None` when `BRECCIA_LANE_STATS` is off.
+    pub fn lane_report(&self) -> Option<crate::LaneReport> {
+        if !lane_stats_on() {
+            return None;
+        }
+        let st: LaneStats = self.pool.lock().map(|p| p.lane_stats).unwrap_or_default();
+        Some(crate::LaneReport {
+            phases: st.phases,
+            phase_wall_s: st.wall_s,
+            phase_max_busy_s: st.max_busy_s,
+            phase_mean_busy_s: st.mean_busy_s,
+            sync_share: st.sync_share(),
+            lock_wait_s: self.lock_wait_s,
+            submit_s: self.dev_submit_s.clone(),
+            submit_n: self.dev_submit_n.clone(),
+        })
+    }
+
     fn submit_batch(&mut self) -> Result<()> {
         let Some(d) = self.pending_batch.take() else {
             return Ok(());
@@ -1214,8 +1260,10 @@ impl<'m> Session<'m> {
         let rec = batch_cmd::recorded();
         self.timers.count_batch(rec);
         self.probe_stamp(d, true)?;
+        let t_sub = lane_stats_on().then(std::time::Instant::now);
         let seg = batch_cmd::end_submit(gpu, None)
             .map_err(|e| anyhow!("submitting the block on device {d}: {e}"))?;
+        self.note_submit(d, t_sub);
         self.submits += 1;
         self.dispatches += u64::from(rec);
         self.pending_seg = Some(seg);
@@ -1367,6 +1415,7 @@ impl<'m> Session<'m> {
         self.expert_bytes = 0;
         self.lane_s = 0.0;
         self.lane_covered_s = 0.0;
+        self.reset_lane_stats();
         self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
         self.dev_down.iter_mut().for_each(|x| *x = 0);
         self.dev_up.iter_mut().for_each(|x| *x = 0);
@@ -2429,12 +2478,14 @@ impl<'m> Session<'m> {
                     weights: &self.pf_weights[i],
                 })
                 .collect();
-            let bytes = self
-                .pool
-                .lock()
-                .expect("the expert pool's lock")
+            let t_lock = lane_stats_on().then(std::time::Instant::now);
+            let mut pool = self.pool.lock().expect("the expert pool's lock");
+            let waited = t_lock.map_or(0.0, |t| t.elapsed().as_secs_f64());
+            let bytes = pool
                 .moe_topk_chunk(&m.layers[b].experts, &routes, &self.pf_mixed, &mut out)
                 .with_context(|| format!("the grouped expert lane on block {b}"))?;
+            drop(pool);
+            self.lock_wait_s += waited;
             self.expert_bytes += bytes as u64;
             let distinct = self
                 .pool
@@ -3236,12 +3287,17 @@ impl<'m> Session<'m> {
         self.timers.mark(EXPERTS);
         let mut out = vec![0f32; mc.n_embd];
         let t_lane = std::time::Instant::now();
-        let bytes = self
-            .pool
-            .lock()
-            .expect("the expert pool's lock")
+        let mut pool = self.pool.lock().expect("the expert pool's lock");
+        let waited = if lane_stats_on() {
+            t_lane.elapsed().as_secs_f64()
+        } else {
+            0.0
+        };
+        let bytes = pool
             .moe_topk(&m.layers[b].experts, &ids, &weights, &mixed, &mut out)
             .with_context(|| format!("the expert lane on block {b}"))?;
+        drop(pool);
+        self.lock_wait_s += waited;
         let lane = t_lane.elapsed().as_secs_f64();
         self.lane_s += lane;
         if covered {
@@ -3942,6 +3998,7 @@ impl<'m> Session<'m> {
         // decode steps and not the prompt (§8bg).
         batch_cmd::reset_record_seconds();
         breccia_vk::ctx::reset_submit_stats();
+        self.reset_lane_stats();
         self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
         self.dev_down.iter_mut().for_each(|x| *x = 0);
         self.dev_up.iter_mut().for_each(|x| *x = 0);
@@ -4351,7 +4408,10 @@ mod tests {
     #[test]
     fn wait_gpu_mark_precedes_the_blocking_run_and_conserves_the_span() {
         let mut t = Timers::default();
-        assert!(!t.on, "timing is off by default: default behaviour unchanged");
+        assert!(
+            !t.on,
+            "timing is off by default: default behaviour unchanged"
+        );
         t.mark(WAIT_GPU); // no-op with timing off
         assert_eq!(t.ns[WAIT_GPU], 0);
 
@@ -4372,7 +4432,10 @@ mod tests {
         t.mark(EXPERTS);
         t.stop();
         assert!(t.ns[SHARED] > 0, "shared-exp keeps the compute it is given");
-        assert!(t.ns[WAIT_GPU] > 0, "wait-gpu captures the wait before the run");
+        assert!(
+            t.ns[WAIT_GPU] > 0,
+            "wait-gpu captures the wait before the run"
+        );
         assert!(t.ns[EXPERTS] < 1_000, "the closing mark owns ~no time here");
         let total = t.total_s();
         let split = (t.ns[SHARED] + t.ns[WAIT_GPU]) as f64 / 1e9;
