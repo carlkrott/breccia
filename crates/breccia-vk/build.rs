@@ -15,7 +15,7 @@ fn main() {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
     let glslc = std::env::var("GLSLC").unwrap_or_else(|_| "glslc".to_string());
 
-    let shaders = ["bandwidth", "fma_fp32", "fma_fp16", "slot_consumer"];
+    let shaders = ["bandwidth", "fma_fp32", "fma_fp16", "slot_consumer", "rans_decode"];
     for name in shaders {
         let src = format!("shaders/{name}.comp");
         let spv = out_dir.join(format!("{name}.spv"));

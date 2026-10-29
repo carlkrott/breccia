@@ -22,6 +22,7 @@
 //! warning in [`probe::ProbeOutcome::warnings`] (also asserted by a unit test).
 
 pub mod bench;
+pub mod codec_bench;
 pub mod ctx;
 pub mod pci;
 pub mod pagecache;
@@ -30,6 +31,7 @@ pub mod report;
 pub mod transfer;
 pub mod transfer_bench;
 
+pub use codec_bench::{run_codec_bench, CodecBenchOptions, CodecReport, CODEC_SCHEMA_VERSION};
 pub use ctx::{api_version_string, driver_version_string, BarrierScope, Dev, Host};
 pub use probe::{run_discovery, run_probe, ProbeOptions, ProbeOutcome};
 pub use report::*;

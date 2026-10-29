@@ -1,0 +1,112 @@
+// Static interleaved rANS decode (compression fabric F2, docs/coord/codecframes.py).
+//
+// One invocation per lane; lane i owns raw u32 words i, i+L, i+2L, ... so the output
+// writes are coalesced while each lane walks its own stream. 12-bit probabilities,
+// 32-bit state in [2^16, 2^32), 16-bit renorm (one renorm per symbol is enough).
+// mode 0: four byte symbols per word, context = ctxmap[byte offset % blk].
+// mode 1: bf16 pairs; the two exponents are coded (context 0), sign+mantissa come
+//         from a raw byte plane after the streams.
+// Image: u32 offsets[L+1] | lane streams (u16: state lo, state hi, renorm words...) | plane.
+// Tables: u32 ctxmap[64] (u8 x 256) | per context: lut u32[1024] (u8 x 4096), fc u32[256]
+// (freq | cum << 16). Copied to LDS once per workgroup.
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) readonly buffer Tabs { uint tabs[]; };
+layout(set = 0, binding = 1) readonly buffer Img { uint img[]; };
+layout(set = 0, binding = 2) writeonly buffer Out { uint outw[]; };
+
+layout(push_constant) uniform Push {
+    uint lanes;
+    uint wpl;          // raw u32 words per lane
+    uint stream_base;  // u32 index of the first stream word (lanes + 1)
+    uint plane_base;   // u32 index of the bf16 sign+mantissa plane (mode 1)
+    uint blk;          // context period in bytes (mode 0)
+    uint mode;
+    uint n_ctx;        // <= MAX_CTX
+} pc;
+
+const uint MAX_CTX = 4u;
+const uint CTX_WORDS = 1280u;  // 1024 lut + 256 fc
+shared uint t[64u + MAX_CTX * CTX_WORDS];
+
+uint x;
+uint wp;   // next u32 index to load from this lane's stream
+uint cur;  // u32 being consumed, low half first
+uint nxt;  // prefetched word: its load latency hides behind >= 2 renorms
+bool hi;
+
+uint next16() {
+    uint v;
+    if (hi) {
+        v = cur >> 16;
+        cur = nxt;
+        nxt = img[wp];   // may read up to 2 words past the stream; buffers are padded
+        wp += 1u;
+    } else {
+        v = cur & 0xFFFFu;
+    }
+    hi = !hi;
+    return v;
+}
+
+uint dec(uint c) {
+    uint slot = x & 4095u;
+    uint base = 64u + c * CTX_WORDS;
+    uint s = (t[base + (slot >> 2)] >> (8u * (slot & 3u))) & 0xFFu;
+    uint fc = t[base + 1024u + s];
+    x = (fc & 0xFFFFu) * (x >> 12) + slot - (fc >> 16);
+    if (x < 65536u) x = (x << 16) | next16();
+    return s;
+}
+
+void main() {
+    uint n = 64u + pc.n_ctx * CTX_WORDS;
+    for (uint k = gl_LocalInvocationID.x; k < n; k += 256u) t[k] = tabs[k];
+    barrier();
+
+    // mode bit 8 (bench diag only): fold the output into one word per lane instead of storing it
+    bool store = (pc.mode & 256u) == 0u;
+    uint mode = pc.mode & 255u;
+    uint fold = 0u;
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.lanes) return;
+    uint sbase = pc.stream_base + img[i];
+    x = img[sbase];
+    cur = img[sbase + 1u];
+    nxt = img[sbase + 2u];
+    wp = sbase + 3u;
+    hi = false;
+
+    if (mode == 0u) {
+        uint p = (4u * i) % pc.blk;               // byte offset % blk of word i
+        uint step = (4u * pc.lanes) % pc.blk;
+        for (uint w = 0u; w < pc.wpl; ++w) {
+            uint word = 0u;
+            uint q = p;
+            for (uint b = 0u; b < 4u; ++b) {
+                uint c = (t[q >> 2] >> (8u * (q & 3u))) & 0xFFu;
+                word |= dec(c) << (8u * b);
+                q += 1u;
+                if (q >= pc.blk) q -= pc.blk;
+            }
+            if (store) outw[i + w * pc.lanes] = word; else fold ^= word;
+            p += step;
+            if (p >= pc.blk) p -= pc.blk;
+        }
+    } else {
+        for (uint w = 0u; w < pc.wpl; ++w) {
+            uint g = i + w * pc.lanes;
+            uint e0 = dec(0u);
+            uint e1 = dec(0u);
+            uint sm = (img[pc.plane_base + (g >> 1)] >> (16u * (g & 1u))) & 0xFFFFu;
+            uint s0 = sm & 0xFFu;
+            uint s1 = sm >> 8;
+            uint v0 = ((s0 >> 7) << 15) | (e0 << 7) | (s0 & 0x7Fu);
+            uint v1 = ((s1 >> 7) << 15) | (e1 << 7) | (s1 & 0x7Fu);
+            if (store) outw[g] = v0 | (v1 << 16); else fold ^= v0 | (v1 << 16);
+        }
+    }
+    if (!store) outw[i] = fold;
+}

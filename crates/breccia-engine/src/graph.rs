@@ -510,6 +510,8 @@ pub struct Session<'m> {
     /// Forward passes run since the last reset (the decode denominator).
     pub forwards: usize,
     pub expert_bytes: u64,
+    /// `BRECCIA_DUMP_STATE` snapshots written so far (`dump_state`).
+    dumps: usize,
     /// Device whose dispatch batch is currently open (`None` = none). At most
     /// one, because the batching flag is per thread while each device owns its
     /// own command buffer.
@@ -1040,6 +1042,7 @@ impl<'m> Session<'m> {
                 ..Default::default()
             },
             forwards: 0,
+            dumps: 0,
             expert_bytes: 0,
             pending_batch: None,
             pending_seg: None,
@@ -1773,6 +1776,50 @@ impl<'m> Session<'m> {
     /// The device the head runs on (for the report).
     pub fn head_device(&self) -> usize {
         self.model.head_device()
+    }
+
+    /// `BRECCIA_DUMP_STATE=<dir>` (compression fabric F0b): after decode position `pos`,
+    /// write every GDN state + conv history and the live QSA K/V pages as raw device
+    /// bytes, `p<pos>-b<block>-<part>.bin`. Every `BRECCIA_DUMP_EVERY` positions (64),
+    /// at most `BRECCIA_DUMP_MAX` snapshots (8). Bench/lab only: it stalls the token.
+    fn dump_state(&mut self, pos: usize) -> Result<()> {
+        let Ok(dir) = std::env::var("BRECCIA_DUMP_STATE") else { return Ok(()) };
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (every, max) = (env("BRECCIA_DUMP_EVERY", 64).max(1), env("BRECCIA_DUMP_MAX", 8));
+        if pos % every != 0 || self.dumps >= max {
+            return Ok(());
+        }
+        self.dumps += 1;
+        self.flush()?;
+        std::fs::create_dir_all(&dir)?;
+        let m = self.model;
+        use breccia_kernels::{gdn, qsa};
+        // exact byte counts: Buf sizes carry allocation padding
+        let pages = (pos + 1).div_ceil(qsa::PAGE_CELLS);
+        let gdn_state = gdn::MODEL_S * gdn::MODEL_H_V * gdn::MODEL_S * 4;
+        let gdn_conv = (gdn::MODEL_D_CONV - 1) * gdn::CONV_CHANNELS * 4;
+        let k_live = qsa::sizes::f16_pool_bytes(pages) as usize;
+        for b in 0..m.cfg.n_layers {
+            let gpu = m.devices[m.device_of(b)].gpu();
+            let mut parts: Vec<(&str, &Buf, usize)> = Vec::new();
+            if let Some(st) = &self.gdn_state[b] {
+                parts.push(("gdn_state", &st.state, gdn_state));
+                parts.push(("gdn_conv", &st.conv, gdn_conv));
+            }
+            if let Some(st) = &self.qsa_state[b] {
+                let (v_name, v_live) = match st.v_layout {
+                    qsa::VLayout::F16 => ("qsa_v", k_live),
+                    qsa::VLayout::Q8_0 => ("qsa_vq8", qsa::sizes::q8v_pool_bytes(pages) as usize),
+                };
+                parts.push(("qsa_k", &st.k_pool, k_live));
+                parts.push((v_name, &st.v_pool, v_live));
+            }
+            for (name, buf, n) in parts {
+                let bytes = breccia_kernels::gemv::download(gpu, buf, n.min(buf.size as usize))?;
+                std::fs::write(format!("{dir}/p{pos:06}-b{b:02}-{name}.bin"), bytes)?;
+            }
+        }
+        Ok(())
     }
 
     /// `BRECCIA_DUMP_LAYOUT=1`: the per-device buffer layout (size + Vulkan handles) as
@@ -4064,6 +4111,7 @@ impl<'m> Session<'m> {
             }
             let dbg = if i == 0 { trace.take() } else { None };
             logits = self.token(next, pos, dbg)?;
+            self.dump_state(pos)?;
             pos += 1;
             if first_step_logits.is_empty() {
                 first_step_logits = logits.clone();

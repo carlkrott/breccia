@@ -96,6 +96,21 @@ enum BenchKind {
         #[arg(long)]
         quick: bool,
     },
+    /// Compression fabric F2/F3: GPU rANS decode rate and delivered GB/s through the ring
+    Codec {
+        /// .brcf frame files from docs/coord/codecframes.py (repeatable)
+        #[arg(long = "frames", value_name = "PATH", required = true)]
+        frames: Vec<PathBuf>,
+        /// Device by cached-profile index or PCI address (repeatable)
+        #[arg(long = "device", value_name = "PROFILE_INDEX|PCI")]
+        device: Vec<String>,
+        /// Write the full JSON report here
+        #[arg(long, value_name = "PATH")]
+        json: Option<PathBuf>,
+        /// Short benchmark windows (noisier numbers)
+        #[arg(long)]
+        quick: bool,
+    },
     /// Phase 3: fused dequant+GEMV decode kernels — GB/s vs bytes read
     Gemv {
         /// Quant type, repeatable (default: every implemented type)
@@ -409,6 +424,7 @@ fn run(cli: Cli) -> Result<()> {
             println!(
                 "bench: available harnesses\n  \
                  breccia bench transfer [--device <idx|pci>]... [--json PATH] [--quick]\n  \
+                 breccia bench codec --frames F.brcf... [--device <idx|pci>]... [--json PATH] [--quick]\n  \
                  breccia bench gemv [--type IQ3_S]... [--rows N --cols N] [--device <idx|pci>]... \\\n                 \
                  [--json PATH] [--quick] [--real [--layer N] [--role gate|up|down] [--expert E]]\n                 \
                  [--experts 1,2,4,8,10,16] [--accum f32|f16]\n  \
@@ -429,6 +445,15 @@ fn run(cli: Cli) -> Result<()> {
                     quick,
                 }),
         } => bench_transfer(device, json, quick),
+        Command::Bench {
+            kind:
+                Some(BenchKind::Codec {
+                    frames,
+                    device,
+                    json,
+                    quick,
+                }),
+        } => bench_codec(frames, device, json, quick),
         Command::Bench {
             kind:
                 Some(BenchKind::Gemv {
@@ -755,6 +780,36 @@ fn bench_transfer(specs: Vec<String>, json: Option<PathBuf>, quick: bool) -> Res
 
     print_transfer_summary(&report);
     if let Some(path) = &json {
+        println!("\nwrote {}", path.display());
+    }
+    Ok(())
+}
+
+fn bench_codec(
+    frames: Vec<PathBuf>,
+    specs: Vec<String>,
+    json: Option<PathBuf>,
+    quick: bool,
+) -> Result<()> {
+    let profile = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+        .ok()
+        .flatten();
+    let mut devices = Vec::new();
+    for spec in &specs {
+        devices.push(selector_for(spec, profile.as_ref())?);
+    }
+    let report = breccia_vk::run_codec_bench(&breccia_vk::CodecBenchOptions {
+        quick,
+        devices,
+        frames,
+    })
+    .context("codec benchmark failed")?;
+    if let Some(path) = &json {
+        let text = serde_json::to_string_pretty(&report).context("serializing codec report")?;
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        }
+        std::fs::write(path, text + "\n").with_context(|| format!("writing {}", path.display()))?;
         println!("\nwrote {}", path.display());
     }
     Ok(())

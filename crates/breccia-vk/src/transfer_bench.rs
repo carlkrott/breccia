@@ -14,7 +14,7 @@ use crate::ctx::{api_version_string, Dev, Gpu, Host, Kernel, Qc, R};
 use crate::report::DeviceId;
 use crate::transfer::{probe_host_memory, HostMemoryCaps, RingConfig, RingStats, TransferRing};
 
-const SPV_SLOT_CONSUMER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/slot_consumer.spv"));
+pub(crate) const SPV_SLOT_CONSUMER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/slot_consumer.spv"));
 
 /// Bump when the JSON shape changes incompatibly.
 pub const TRANSFER_SCHEMA_VERSION: u32 = 1;
@@ -40,7 +40,7 @@ pub struct TransferBenchOptions {
     pub devices: Vec<DeviceSelector>,
 }
 
-fn select_devices(devices: &[Dev], opts: &TransferBenchOptions) -> Result<Vec<u32>, String> {
+pub(crate) fn select_devices(devices: &[Dev], opts: &TransferBenchOptions) -> Result<Vec<u32>, String> {
     if opts.devices.is_empty() {
         let discrete: Vec<u32> = devices
             .iter()
@@ -573,11 +573,11 @@ fn bench_ring_throughput(gpu: &Gpu, quick: bool) -> R<RingThroughput> {
 // Churn simulation (the M3 shape)
 // ---------------------------------------------------------------------------
 
-struct ConsumerCal {
-    iters_per_mib: u32,
+pub(crate) struct ConsumerCal {
+    pub(crate) iters_per_mib: u32,
     read_seconds_16mib: f64,
-    slope_seconds_per_iter: f64,
-    target_ms_per_mib: f64,
+    pub(crate) slope_seconds_per_iter: f64,
+    pub(crate) target_ms_per_mib: f64,
 }
 
 fn blob_sequence(total_bytes: u64) -> Vec<u64> {
@@ -597,7 +597,7 @@ fn blob_sequence(total_bytes: u64) -> Vec<u64> {
     out
 }
 
-fn push4(a: u32, b: u32, c: u32, d: u32) -> [u8; 16] {
+pub(crate) fn push4(a: u32, b: u32, c: u32, d: u32) -> [u8; 16] {
     let mut out = [0u8; 16];
     out[0..4].copy_from_slice(&a.to_le_bytes());
     out[4..8].copy_from_slice(&b.to_le_bytes());
@@ -607,7 +607,7 @@ fn push4(a: u32, b: u32, c: u32, d: u32) -> [u8; 16] {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn record_dispatch(
+pub(crate) fn record_dispatch(
     d: &ash::Device,
     cmd: vk::CommandBuffer,
     k: &Kernel,
@@ -899,7 +899,7 @@ fn bench_churn(gpu: &Gpu, quick: bool, h2d_hint_gbps: f64) -> R<Churn> {
 /// Two-point calibration of the consumer kernel: `iters = 0` gives the read cost,
 /// a nominal iteration count gives the FMA slope. `iters_per_mib` then makes the
 /// compute leg ≈ the measured DMA leg for the same number of MiB.
-fn calibrate_consumer(
+pub(crate) fn calibrate_consumer(
     gpu: &Gpu,
     k: &Kernel,
     set0: vk::DescriptorSet,
@@ -955,13 +955,13 @@ fn calibrate_consumer(
 // ---------------------------------------------------------------------------
 // Environment helpers
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_default()
 }
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -989,7 +989,7 @@ fn requested_layers() -> Vec<String> {
 }
 
 /// Processes currently holding a DRM node (measurement-quality evidence).
-fn gpu_users() -> Vec<String> {
+pub(crate) fn gpu_users() -> Vec<String> {
     let me = std::process::id();
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -1028,7 +1028,7 @@ fn gpu_users() -> Vec<String> {
 }
 
 /// `1761464400` → `"2026-10-26T01:00:00Z"` (Howard Hinnant's civil-from-days).
-fn iso8601_utc(unix_s: u64) -> String {
+pub(crate) fn iso8601_utc(unix_s: u64) -> String {
     let z = (unix_s / 86_400) as i64 + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
