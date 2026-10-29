@@ -363,6 +363,26 @@ pub struct Timing {
 /// the next is being recorded.
 pub const BATCH_CMDS: usize = 6;
 
+/// `BRECCIA_SHARED_DEVICE=1` (G1, `docs/coord/G1-shared-device.md`): several
+/// sessions on several threads share one [`Gpu`], so the one-shot and ring command
+/// buffers come from a per-thread pool ([`Gpu::ring_cmd`]) instead of the device's
+/// own. Off: unchanged.
+pub fn shared_device() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_SHARED_DEVICE").as_deref() == Ok("1"))
+}
+
+/// One thread's command pools on a shared device: Vulkan needs a pool externally
+/// synchronised, so each thread records from its own.
+struct ThreadCmds {
+    thread: std::thread::ThreadId,
+    pool_c: vk::CommandPool,
+    /// `[one-shot, ring[0], …]`, the same layout as [`Gpu::cmds_c`].
+    cmds_c: Vec<vk::CommandBuffer>,
+    pool_x: vk::CommandPool,
+    cmd_x: vk::CommandBuffer,
+}
+
 /// A timeline semaphore, used as a **mid-batch sync point**: a submission can
 /// signal a value part-way through a block's work and the host can wait for it
 /// while the rest of that work is still executing.
@@ -488,6 +508,15 @@ pub struct Gpu {
     /// `vkGetCalibratedTimestampsEXT`, when the device advertises
     /// `VK_EXT_calibrated_timestamps` (both cards here do, rev 2).
     pub calibrated: Option<CalibratedTimestampsFn>,
+    /// Held around every `vkQueueSubmit*` and `vkDeviceWaitIdle`: a queue needs
+    /// external sync, and a shared device ([`shared_device`]) submits from several
+    /// threads. Uncontended (one thread per device) it costs a few ns per submit.
+    pub queue_lock: std::sync::Mutex<()>,
+    /// Per-thread pools on a shared device, freed in [`Gpu::destroy`].
+    /// shortcut: one entry per thread that ever recorded here (each `generate`
+    /// spawns fresh scoped threads); reuse dead entries if a long-running server
+    /// shares a device.
+    thread_cmds: std::sync::Mutex<Vec<ThreadCmds>>,
 }
 
 /// `vkCmdPipelineBarrier2` with the lifetime erased.
@@ -972,6 +1001,8 @@ impl Gpu {
             pipeline_barrier2,
             barrier_scope,
             calibrated,
+            queue_lock: std::sync::Mutex::new(()),
+            thread_cmds: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -1016,11 +1047,65 @@ impl Gpu {
         })
     }
 
-    fn parts(&self, q: Qc) -> (vk::Queue, vk::CommandBuffer, vk::QueryPool, bool) {
-        match q {
-            Qc::C => (self.queue_c, self.cmd_c, self.timer_c, self.ts_ok_c),
-            Qc::X => (self.queue_x, self.cmd_x, self.timer_x, self.ts_ok_x),
+    /// `(queue, one-shot command buffer, timer, timestamps ok)`. On a shared device
+    /// the buffer is this thread's own; the timer stays the device's (bench-only
+    /// `time_*` path).
+    fn parts(&self, q: Qc) -> R<(vk::Queue, vk::CommandBuffer, vk::QueryPool, bool)> {
+        let cmd = match q {
+            _ if shared_device() => self.thread_cmd(q, 0)?,
+            Qc::C => self.cmd_c,
+            Qc::X => self.cmd_x,
+        };
+        Ok(match q {
+            Qc::C => (self.queue_c, cmd, self.timer_c, self.ts_ok_c),
+            Qc::X => (self.queue_x, cmd, self.timer_x, self.ts_ok_x),
+        })
+    }
+
+    /// Batch ring slot `slot`'s command buffer (`dispatch_batch`): the device's own,
+    /// or this thread's on a shared device.
+    pub fn ring_cmd(&self, slot: usize) -> R<vk::CommandBuffer> {
+        if shared_device() {
+            self.thread_cmd(Qc::C, 1 + slot)
+        } else {
+            Ok(self.cmds_c[1 + slot])
         }
+    }
+
+    /// This thread's buffer `i` of `[one-shot, ring…]` (C) or its one-shot (X),
+    /// creating the thread's pools on first use.
+    fn thread_cmd(&self, q: Qc, i: usize) -> R<vk::CommandBuffer> {
+        let me = std::thread::current().id();
+        let mut v = self.thread_cmds.lock().unwrap_or_else(|e| e.into_inner());
+        let t = match v.iter().position(|t| t.thread == me) {
+            Some(p) => &v[p],
+            None => {
+                let (pool_c, cmds_c) = make_cmd_pool_n(&self.device, self.family_c, 1 + BATCH_CMDS)?;
+                let (pool_x, cmd_x) = match make_cmd_pool(&self.device, self.family_x) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        unsafe { self.device.destroy_command_pool(pool_c, None) };
+                        return Err(e);
+                    }
+                };
+                v.push(ThreadCmds {
+                    thread: me,
+                    pool_c,
+                    cmds_c,
+                    pool_x,
+                    cmd_x,
+                });
+                &v[v.len() - 1]
+            }
+        };
+        Ok(match q {
+            Qc::C => t.cmds_c[i],
+            Qc::X => t.cmd_x,
+        })
+    }
+
+    pub(crate) fn queue_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.queue_lock.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // --- buffers -------------------------------------------------------------
@@ -1437,13 +1522,13 @@ impl Gpu {
 
     /// Record `f` into the queue's command buffer and return it (already ended).
     pub fn record<F: FnOnce(&ash::Device, vk::CommandBuffer)>(&self, q: Qc, f: F) -> R<()> {
-        let (_, cmd, _, _) = self.parts(q);
+        let (_, cmd, _, _) = self.parts(q)?;
         self.reset_record(cmd, f)
     }
 
     /// Submit the queue's recorded command buffer; returns a fence to wait on.
     pub fn submit(&self, q: Qc) -> R<vk::Fence> {
-        let (_, cmd, _, _) = self.parts(q);
+        let (_, cmd, _, _) = self.parts(q)?;
         self.submit_cmd(q, cmd, None)
     }
 
@@ -1461,7 +1546,10 @@ impl Gpu {
         cmd: vk::CommandBuffer,
         signal: Option<(&Timeline, u64)>,
     ) -> R<vk::Fence> {
-        let (queue, _, _, _) = self.parts(q);
+        let queue = match q {
+            Qc::C => self.queue_c,
+            Qc::X => self.queue_x,
+        };
         SUBMITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // One more submit that has not been waited for yet; the next fence wait on
         // this thread charges it (§8bg).
@@ -1472,6 +1560,7 @@ impl Gpu {
                     .create_fence(&vk::FenceCreateInfo::default(), None),
                 "vkCreateFence",
             )?;
+            let _q = self.queue_guard();
             let r = match signal {
                 None => {
                     let cmds = [cmd];
@@ -1607,7 +1696,7 @@ impl Gpu {
         record: &mut F,
         iters: u32,
     ) -> R<Timing> {
-        let (_, cmd, timer, ts_ok) = self.parts(q);
+        let (_, cmd, timer, ts_ok) = self.parts(q)?;
         unsafe {
             self.device.reset_query_pool(timer, 0, 2);
         }
@@ -1666,6 +1755,7 @@ impl Gpu {
     }
 
     pub fn wait_idle(&self) -> R<()> {
+        let _q = self.queue_guard();
         unsafe { vk(self.device.device_wait_idle(), "vkDeviceWaitIdle") }
     }
 
@@ -1774,6 +1864,10 @@ impl Gpu {
     pub fn destroy(self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            for t in self.thread_cmds.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+                self.device.destroy_command_pool(t.pool_x, None);
+                self.device.destroy_command_pool(t.pool_c, None);
+            }
             self.device.destroy_query_pool(self.timer_x, None);
             self.device.destroy_query_pool(self.timer_c, None);
             self.device.destroy_command_pool(self.pool_x, None);

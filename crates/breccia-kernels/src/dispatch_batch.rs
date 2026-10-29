@@ -155,11 +155,19 @@ struct Open {
     dev: vk::Device,
     slot: usize,
     count: u32,
+    /// The slot's command buffer, fixed at [`begin`]: the device's own ring buffer,
+    /// or this thread's on a shared device (`Gpu::ring_cmd`). Held here so the
+    /// per-dispatch path does no lookup.
+    cmd: vk::CommandBuffer,
 }
 
 fn open_slot(gpu: &Gpu) -> Option<usize> {
+    open_cmd(gpu).map(|(slot, _)| slot)
+}
+
+fn open_cmd(gpu: &Gpu) -> Option<(usize, vk::CommandBuffer)> {
     let dev = gpu.device.handle();
-    OPEN.with(|o| o.borrow().iter().find(|x| x.dev == dev).map(|x| x.slot))
+    OPEN.with(|o| o.borrow().iter().find(|x| x.dev == dev).map(|x| (x.slot, x.cmd)))
 }
 
 fn bump_open(gpu: &Gpu) {
@@ -918,7 +926,7 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
     }
     SLOT_DEV.with(|d| d.borrow_mut()[slot] = Some(gpu.device.clone()));
     DEVICES.with(|d| d.borrow_mut()[slot] = dev);
-    let cmd = gpu.cmds_c[1 + slot];
+    let cmd = gpu.ring_cmd(slot).map_err(|e| anyhow!("batch command buffer: {e}"))?;
     unsafe {
         gpu.device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
@@ -936,6 +944,7 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
             dev: gpu.device.handle(),
             slot,
             count: 0,
+            cmd,
         })
     });
     Ok(())
@@ -949,20 +958,17 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
 /// done while the second one runs.
 pub fn end_submit(gpu: &Gpu, signal: Option<(&Timeline, u64)>) -> Result<Segment> {
     let dev = gpu.device.handle();
-    let slot = OPEN.with(|o| {
+    let Some((slot, cmd)) = OPEN.with(|o| {
         let mut o = o.borrow_mut();
-        match o.iter().position(|x| x.dev == dev) {
-            Some(i) => o.remove(i).slot,
-            None => usize::MAX,
-        }
-    });
-    if slot == usize::MAX {
+        let i = o.iter().position(|x| x.dev == dev)?;
+        let x = o.remove(i);
+        Some((x.slot, x.cmd))
+    }) else {
         return Err(anyhow!(
             "no dispatch batch is open on device {} of this thread",
             gpu.index
         ));
-    }
-    let cmd = gpu.cmds_c[1 + slot];
+    };
     // **Cross-submission edge.** The tracker prunes the barrier *after* a dispatch
     // when nothing in the batch reads it, so the batch must close with everything
     // written visible to whatever the next submission (or the host) reads — queue
@@ -1133,8 +1139,8 @@ pub fn record_copy(
             dst.size
         ));
     }
-    let slot = open_slot(gpu).ok_or_else(|| anyhow!("record_copy without an open batch"))?;
-    let cmd = gpu.cmds_c[1 + slot];
+    let (_, cmd) =
+open_cmd(gpu).ok_or_else(|| anyhow!("record_copy without an open batch"))?;
     let region = vk::BufferCopy::default()
         .src_offset(src_off)
         .dst_offset(dst_off)
@@ -1177,8 +1183,8 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
         }
         return Ok(());
     }
-    let slot = open_slot(gpu).ok_or_else(|| anyhow!("record_copies without an open batch"))?;
-    let cmd = gpu.cmds_c[1 + slot];
+    let (_, cmd) =
+open_cmd(gpu).ok_or_else(|| anyhow!("record_copies without an open batch"))?;
     // A region array is per source *and* per destination buffer: Vulkan's
     // `cmd_copy_buffer` takes one (src, dst) pair, so group by pair and emit one
     // packet per group with every region of that group inside it.
@@ -1245,8 +1251,8 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
 /// compare against its fence wait: the difference between them is the
 /// submission latency the host pays on top of the GPU's work.
 pub fn record_timestamp(gpu: &Gpu, pool: vk::QueryPool, query: u32) -> Result<()> {
-    let slot = open_slot(gpu).ok_or_else(|| anyhow!("record_timestamp without an open batch"))?;
-    let cmd = gpu.cmds_c[1 + slot];
+    let (_, cmd) =
+open_cmd(gpu).ok_or_else(|| anyhow!("record_timestamp without an open batch"))?;
     unsafe {
         gpu.device
             .cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, query);
@@ -1261,9 +1267,8 @@ pub fn record_barrier_to_host(gpu: &Gpu) -> Result<()> {
     if !is_open() {
         return Err(anyhow!("record_barrier_to_host without an open batch"));
     }
-    let slot =
-        open_slot(gpu).ok_or_else(|| anyhow!("record_barrier_to_host without an open batch"))?;
-    let cmd = gpu.cmds_c[1 + slot];
+    let (_, cmd) =
+open_cmd(gpu).ok_or_else(|| anyhow!("record_barrier_to_host without an open batch"))?;
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -1347,9 +1352,8 @@ pub(crate) fn record(
     // dispatch (`docs/research/11` §A2); they are now behind `BRECCIA_RECORD_PROFILE`
     // (checked once, cached), which takes the path from 266 to ~70 ns.
     let t0 = std::time::Instant::now();
-    let slot =
-        open_slot(gpu).ok_or_else(|| anyhow!("recording a dispatch without an open batch"))?;
-    let cmd = gpu.cmds_c[1 + slot];
+    let (slot, cmd) =
+open_cmd(gpu).ok_or_else(|| anyhow!("recording a dispatch without an open batch"))?;
     let pool = POOLS.with(|p| p.borrow()[slot]);
     if pool == vk::DescriptorPool::null() {
         return Err(anyhow!("recording a dispatch without an open batch"));

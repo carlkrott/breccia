@@ -332,6 +332,7 @@ impl<'a> TransferRing<'a> {
             vk(dev.end_command_buffer(cmd), "vkEndCommandBuffer")?;
         }
 
+        let _q = self.gpu.queue_guard();
         submit_one(
             dev,
             self.gpu.queue_x,
@@ -408,6 +409,7 @@ impl<'a> TransferRing<'a> {
             recorded?;
         }
 
+        let _q = self.gpu.queue_guard();
         submit_one(
             dev,
             self.gpu.queue_c,
@@ -521,7 +523,10 @@ impl<'a> TransferRing<'a> {
     pub fn destroy(self) {
         let dev = &self.gpu.device;
         unsafe {
-            let _ = dev.device_wait_idle();
+            let _ = {
+                let _q = self.gpu.queue_guard();
+                dev.device_wait_idle()
+            };
             dev.destroy_semaphore(self.release, None);
             dev.destroy_semaphore(self.arrive, None);
             dev.destroy_command_pool(self.cmd_pool_c, None);

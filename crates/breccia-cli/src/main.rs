@@ -1831,9 +1831,42 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         prompt.len(),
         a.gen
     );
+    // G1 (`BRECCIA_SHARED_DEVICE=1`, docs/coord/G1-shared-device.md): streams on
+    // the same card share one loaded model instead of each loading a copy, which
+    // spills the second copy to GTT. Off: one model per stream, as before.
+    let mut owner: Vec<usize> = (0..n_streams).collect();
+    if breccia_vk::ctx::shared_device() {
+        for s in 0..n_streams {
+            let dev = &devs[s % devs.len()];
+            if let Some(f) = (0..s).find(|&f| &devs[f % devs.len()] == dev) {
+                if stream_specs[f] != stream_specs[s] {
+                    anyhow::bail!(
+                        "BRECCIA_SHARED_DEVICE=1: streams {f} and {s} share {dev} but ask for \
+                         different --gpu-experts"
+                    );
+                }
+                owner[s] = f;
+            }
+        }
+        // Two sessions on one device must run on separate threads: the lockstep
+        // decode and the token-by-token prompt pass interleave them on one thread,
+        // and the second `dispatch_batch::begin` on that device then fails.
+        if owner.iter().enumerate().any(|(s, &o)| o != s)
+            && (std::env::var("BRECCIA_MULTI_DECODE_CONCURRENT").as_deref() != Ok("1")
+                || a.prefill_chunk == 0)
+        {
+            anyhow::bail!(
+                "BRECCIA_SHARED_DEVICE=1 with two streams on one card needs \
+                 BRECCIA_MULTI_DECODE_CONCURRENT=1 and --prefill-chunk > 0"
+            );
+        }
+    }
     let mut models = Vec::with_capacity(n_streams);
     #[allow(clippy::needless_range_loop)]
     for s in 0..n_streams {
+        if owner[s] != s {
+            continue;
+        }
         let dev = devs[s % devs.len()].clone();
         let arena = stream_specs[s].clone();
         let model = breccia_engine::Model::load(
@@ -1857,7 +1890,9 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         breccia_engine::graph::assert_head(&model)?;
         models.push(model);
     }
-    let refs: Vec<&breccia_engine::Model> = models.iter().collect();
+    // `models` holds the owners in stream order, so owner `o` sits at its rank.
+    let rank = |o: usize| (0..o).filter(|&i| owner[i] == i).count();
+    let refs: Vec<&breccia_engine::Model> = owner.iter().map(|&o| &models[rank(o)]).collect();
     let cfg = breccia_engine::SessionCfg {
         ctx_capacity: a.ctx,
         threads: a.threads.unwrap_or(0),
