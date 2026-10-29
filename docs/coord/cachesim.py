@@ -47,6 +47,9 @@ def topn_upper(streams, cap):
 if __name__ == '__main__':
     budget = float(sys.argv[1])
     streams = [load(p) for p in sys.argv[2:]]
+    # self-check: a cache that never evicts misses only first touches
+    refs = [(b, e) for s in streams for tok in s[:min(len(x) for x in streams)] for b, es in tok for e in es]
+    assert abs(lru(streams, len(refs), 0) - (1 - len(set(refs)) / len(refs))) < 1e-9
     cap = int(budget / MIB_PER_EXPERT)
     blocks = int(budget // (512 * MIB_PER_EXPERT))
     print(f'budget {budget:.0f} MiB = {cap} experts = {blocks} whole blocks; streams {len(streams)}')

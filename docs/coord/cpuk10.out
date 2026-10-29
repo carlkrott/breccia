@@ -1,0 +1,26 @@
+
+CPU expert lane — 7995x-cachyos · 2026-10-29T18:00:28Z · 16 physical / 32 logical cores · 30 threads · path avx2
+  model /srv/strata-data/models/IQ3_XXS/*-0000?-of-00002.gguf (2 shards, 75.829 GB total, 42.913 GB experts) · 48 layers measured · 512 experts/block · n_embd 2560 · n_ff 640
+  per-type (1 thread, 96 experts/cell, best of 3 reps):
+  type   role    rows   cols      bytes avx2 GB/s    scalar  speedup
+  IQ4_NL down    2560    640    88.5 MB      3.19      0.78    4.07x
+  Q2_0   down    2560    640    44.2 MB      2.53      0.46    5.52x
+  IQ2_S  gate     640   2560    50.4 MB      3.29      0.13   25.15x
+  IQ2_XS gate     640   2560    45.5 MB      3.07      0.11   26.89x
+  IQ2_XXS gate     640   2560    40.6 MB      2.95      0.11   27.51x
+  IQ3_S  gate     640   2560    67.6 MB      3.75      0.16   24.07x
+  IQ3_XXS gate     640   2560    60.2 MB      4.25      0.15   27.75x
+  IQ2_S  up       640   2560    50.4 MB      3.35      0.13   25.66x
+  IQ2_XS up       640   2560    45.5 MB      2.97      0.11   25.93x
+  IQ2_XXS up       640   2560    40.6 MB      3.10      0.11   28.74x
+  IQ3_S  up       640   2560    67.6 MB      3.66      0.15   23.79x
+  IQ3_XXS up       640   2560    60.2 MB      4.29      0.15   27.98x
+  token passes (48 blocks × top-10 experts):
+  label       thr  bytes/tok    cold ms    best ms       GB/s     tok/s      bar
+  avx2-1t       1   838.1 MB      482.4      261.8       3.20       3.8      18%
+  avx2-pool    30   838.1 MB       27.5       22.7      36.97      44.1     211%
+  scalar-1t     1   838.1 MB     4537.7     4513.0       0.19       0.2       1%
+  · weights are read straight from the breccia_format mmap (no copy, no upload); 838.1 MB of 42.913 GB expert bytes are touched by one 48-layer top-10 token
+  · parity bar: 17.5 GB/s sustained host expert reads (docs/phase-3/07-moe-cache-ab.md: 20.79 tok/s baseline, 0.84 GB/token)
+  · SwiGLU (SiLU(gate)·up) runs inside the gate/up shard that owns the rows, i.e. fused with that GEMV phase; the single-threaded `expert_ffn` reference path runs it as a separate pass (0.57 ms/token if it were serial, and it is not on the critical path)
+  · per-type cells are single-threaded (kernel ceiling); the token cells show the pool
