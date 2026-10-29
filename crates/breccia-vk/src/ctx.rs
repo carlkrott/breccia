@@ -477,6 +477,9 @@ pub struct Gpu {
     pub family_x: u32,
     pub queue_x_index: u32,
     pub xfer_mode: XferMode,
+    /// `family_x` can run compute stages (false on a transfer-only SDMA family, which
+    /// RADV exposes with `RADV_PERFTEST=transfer_queue`): its barriers must not name them.
+    pub x_compute: bool,
 
     pub pool_c: vk::CommandPool,
     pub cmd_c: vk::CommandBuffer,
@@ -988,6 +991,7 @@ impl Gpu {
             family_x,
             queue_x_index,
             xfer_mode,
+            x_compute: dev.families[family_x as usize].queue_flags.contains(vk::QueueFlags::COMPUTE),
             pool_c,
             cmd_c,
             cmds_c,

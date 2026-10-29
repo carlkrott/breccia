@@ -132,6 +132,9 @@ pub struct TransferRing<'a> {
     gates: Vec<Gate>,
     value: u64,
     stats: RingStats,
+    /// diag: (pool, query) for the next `submit_copy` to stamp its copy begin/end
+    /// at `query`, `query + 1`; taken (cleared) by that submit.
+    pub ts_copy: Option<(vk::QueryPool, u32)>,
 }
 
 impl<'a> TransferRing<'a> {
@@ -207,6 +210,7 @@ impl<'a> TransferRing<'a> {
             gates: vec![Gate::None; n],
             value: 0,
             stats: RingStats::default(),
+            ts_copy: None,
         })
     }
 
@@ -293,12 +297,16 @@ impl<'a> TransferRing<'a> {
             vk(dev.begin_command_buffer(cmd, &bi), "vkBeginCommandBuffer")?;
 
             // Previous consumer read (or this slot's earlier copy) -> transfer write.
+            // A transfer-only family cannot name shader access; the release semaphore
+            // already orders the other queue's reads before this write.
+            let x_compute = self.gpu.x_compute;
+            let src = if x_compute {
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE
+            } else {
+                vk::AccessFlags::TRANSFER_WRITE
+            };
             let start = vk::MemoryBarrier::default()
-                .src_access_mask(
-                    vk::AccessFlags::SHADER_READ
-                        | vk::AccessFlags::SHADER_WRITE
-                        | vk::AccessFlags::TRANSFER_WRITE,
-                )
+                .src_access_mask(src)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
             dev.cmd_pipeline_barrier(
                 cmd,
@@ -314,21 +322,31 @@ impl<'a> TransferRing<'a> {
                 dst_offset: 0,
                 size: bytes,
             }];
+            let ts = self.ts_copy.take();
+            if let Some((pool, q)) = ts {
+                dev.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, pool, q);
+            }
             dev.cmd_copy_buffer(cmd, self.staging[s].buf, self.slots[s].buf, &region);
+            if let Some((pool, q)) = ts {
+                dev.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, q + 1);
+            }
             // Make the write available to the compute stage on the other queue; the
-            // arrive semaphore provides the execution dependency.
-            let end = vk::MemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-            dev.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[end],
-                &[],
-                &[],
-            );
+            // arrive semaphore provides the execution dependency (and, on a
+            // transfer-only family, the availability: its signal covers all prior writes).
+            if x_compute {
+                let end = vk::MemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                dev.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[end],
+                    &[],
+                    &[],
+                );
+            }
             vk(dev.end_command_buffer(cmd), "vkEndCommandBuffer")?;
         }
 

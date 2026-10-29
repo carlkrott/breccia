@@ -77,6 +77,16 @@ pub struct ClassResult {
     /// and when only the decode runs (256 B copies over images already in the slots).
     pub image_dma_raw_gbps: f64,
     pub ring_decode_gbps: f64,
+    /// Multithreaded CPU decode of the same frames (the CPU-receiver rate), and its check.
+    #[serde(default)]
+    pub cpu_decode_gbps: f64,
+    #[serde(default)]
+    pub cpu_decode_bit_exact: bool,
+    /// BRECCIA_CODEC_LINK only: frame-size copies on the transfer queue, host <-> device.
+    #[serde(default)]
+    pub h2d_gbps: f64,
+    #[serde(default)]
+    pub d2h_gbps: f64,
     pub arms: Vec<ArmPoint>,
     pub error: Option<String>,
 }
@@ -367,12 +377,23 @@ fn bench_class(gpu: &Gpu, f: &Frames, quick: bool) -> ClassResult {
         needed_decode_gbps: 0.0,
         image_dma_raw_gbps: 0.0,
         ring_decode_gbps: 0.0,
+        cpu_decode_gbps: 0.0,
+        cpu_decode_bit_exact: false,
+        h2d_gbps: 0.0,
+        d2h_gbps: 0.0,
         arms: vec![],
         error: None,
     };
     if let Err(e) = bench_class_inner(gpu, f, quick, &mut r) {
         r.error = Some(e);
     }
+    let (g, ok) = cpu_decode_rate(f, if quick { 0.3 } else { 1.0 });
+    r.cpu_decode_gbps = g;
+    r.cpu_decode_bit_exact = ok;
+    println!(
+        "    cpu decode {g:.2} GB/s (bit-exact {ok}); link H2D {:.2} D2H {:.2} GB/s",
+        r.h2d_gbps, r.d2h_gbps
+    );
     println!(
         "  {}: ratio {:.4}, decode {:.2} GB/s (bit-exact {}), raw DMA {:.2} GB/s, need > {:.2}, \
          ring image-DMA-only {:.2}, ring decode-only {:.2}{}",
@@ -474,6 +495,8 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
         let nobar: u8 = std::env::var("BRECCIA_CODEC_BAR").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         // diag only: 1 decode without the output store, 2 fill 16 MiB of outs[s] after the consumer
         let extra = std::cell::Cell::new(0u8);
+        // diag only (BRECCIA_CODEC_TS): (query pool, blobs) the run stamps into
+        let tsp: std::cell::Cell<Option<(vk::QueryPool, u32)>> = std::cell::Cell::new(None);
         let res = (|| -> R<()> {
             let stage_all = |ring: &TransferRing<'_>, codec: bool| -> R<()> {
                 for s in 0..slots {
@@ -496,9 +519,19 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                         1 => img_len[s as usize],
                         _ => 256,
                     };
+                    let tp = tsp.get();
+                    if let Some((p, _)) = tp {
+                        ring.ts_copy = Some((p, 2 * b));
+                    }
                     ring.submit_copy(s, bytes, v)?;
                     if codec || iters.is_some() {
                         ring.submit_compute(s, v, |d, cmd| {
+                            let stamp = |stage, k: u32| {
+                                if let Some((p, nb)) = tp {
+                                    unsafe { d.cmd_write_timestamp(cmd, stage, p, 2 * nb + 3 * b + k) };
+                                }
+                            };
+                            stamp(vk::PipelineStageFlags::TOP_OF_PIPE, 0);
                             if codec {
                                 if nobar == 0 {
                                     unsafe { Gpu::barrier_all(d, cmd) };
@@ -515,6 +548,7 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                                 }
                                 record_decode(d, cmd, &kd, dsets.sets[s as usize], &push, lanes);
                             }
+                            stamp(vk::PipelineStageFlags::BOTTOM_OF_PIPE, 1);
                             if let Some(it) = iters {
                                 if nobar == 2 {
                                     unsafe { Gpu::barrier_all(d, cmd) };
@@ -525,6 +559,7 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                                     unsafe { d.cmd_fill_buffer(cmd, outs[s as usize].buf, 0, raw_len, 0) };
                                 }
                             }
+                            stamp(vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2);
                             Ok(())
                         })?;
                     }
@@ -605,6 +640,66 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 }
             }
 
+            if let Some(secs) = std::env::var("BRECCIA_CODEC_LINK").ok().and_then(|v| v.parse::<f64>().ok()) {
+                let dev = dev_buf(gpu, raw_len)?;
+                let host = bufs[0].buf;
+                let rate = |up: bool| -> R<f64> {
+                    let (src, dst) = if up { (host, dev.buf) } else { (dev.buf, host) };
+                    let t = gpu.run_timed(Qc::X, secs, |d, cmd, k| unsafe {
+                        Gpu::barrier_all(d, cmd);
+                        for _ in 0..k {
+                            d.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: raw_len }]);
+                            Gpu::barrier_all(d, cmd);
+                        }
+                    })?;
+                    Ok(raw_len as f64 / t.per_iter_s / 1e9)
+                };
+                // GPU->GPU host-bounce runs: one direction per process (LINK_DIR), started together (LINK_AT, unix secs)
+                let dir = std::env::var("BRECCIA_CODEC_LINK_DIR").unwrap_or_default();
+                if let Some(at) = std::env::var("BRECCIA_CODEC_LINK_AT").ok().and_then(|v| v.parse::<f64>().ok()) {
+                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                    std::thread::sleep(std::time::Duration::from_secs_f64((at - now).max(0.0)));
+                }
+                let res: R<(f64, f64)> = (|| Ok((
+                    if dir != "d2h" { rate(true)? } else { 0.0 },
+                    if dir != "h2d" { rate(false)? } else { 0.0 },
+                )))();
+                gpu.destroy_buf(&dev);
+                (r.h2d_gbps, r.d2h_gbps) = res?;
+            }
+            if std::env::var_os("BRECCIA_CODEC_TS").is_some() && blobs as usize * 5 <= 1024 {
+                // per-submit GPU stamps: copy [2b, 2b+1], compute [2B+3b .. +2] = begin, after decode, end
+                let q = blobs * 5;
+                let pool = gpu.query_pool(q)?;
+                let target = (1u64 << 20) as f64 / (r.raw_dma_gbps * 1e9) * 0.5;
+                let cal = calibrate_consumer(gpu, &kc, rs.sets[0], threads, groups, target)?;
+                let it5 = Some(((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32);
+                tsp.set(Some((pool, blobs)));
+                let arms: [(&str, u8, bool, Option<u32>); 6] = [
+                    ("raw copy only", 0, false, None),
+                    ("image copy only", 1, false, None),
+                    ("image copy + decode", 1, true, None),
+                    ("raw copy + x0.5 consumer", 0, false, it5),
+                    ("image copy + x0.5 consumer", 1, false, it5),
+                    ("image copy + decode + x0.5 consumer", 1, true, it5),
+                ];
+                let res = (|| -> R<()> {
+                    for (name, copy, dec, it) in arms {
+                        stage_all(&ring, copy == 1)?;
+                        run(&mut ring, &ds, copy, dec, it)?; // warm-up
+                        gpu.reset_queries(pool, q);
+                        let g = run(&mut ring, &ds, copy, dec, it)?;
+                        let compute = dec || it.is_some();
+                        let ticks = gpu.timestamp_stamps(pool, if compute { q } else { 2 * blobs })?;
+                        println!("    ts {name}: {g:.3} GB/s  {}", timeline(&ticks, blobs as usize, slots as usize, compute, gpu.timestamp_period_ns));
+                    }
+                    Ok(())
+                })();
+                tsp.set(None);
+                gpu.destroy_query_pool(pool);
+                res?;
+            }
+
             for &factor in &FACTORS {
                 let iters = if factor > 0.0 {
                     let target = (1u64 << 20) as f64 / (r.raw_dma_gbps * 1e9) * factor;
@@ -654,6 +749,140 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
     cleanup(gpu, &bufs, &kd, &kc);
     bufs.clear();
     res
+}
+
+/// Summary of one stamped run: medians over the steady state (b >= slots), in ms.
+/// cw = compute start - own copy end; cidle = compute start - max(prev compute end, own copy end);
+/// gate = copy start - release of the slot (compute end of b - slots); ov = share of copy time
+/// overlapped by any compute interval.
+fn timeline(t: &[u64], blobs: usize, slots: usize, compute: bool, period_ns: f64) -> String {
+    let t0 = t[..2 * blobs].iter().copied().min().unwrap_or(0);
+    let ms = |k: usize| (t[k].wrapping_sub(t0)) as f64 * period_ns / 1e6;
+    let (cb, ce) = (|b: usize| ms(2 * b), |b: usize| ms(2 * b + 1));
+    let k = |b: usize, j: usize| ms(2 * blobs + 3 * b + j);
+    let med = |mut v: Vec<f64>| -> f64 {
+        if v.is_empty() {
+            return f64::NAN;
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v[v.len() / 2]
+    };
+    let ss = slots.min(blobs - 1)..blobs;
+    let span = (0..blobs).map(|b| if compute { k(b, 2) } else { ce(b) }).fold(0.0, f64::max);
+    let mut out = format!(
+        "per-blob {:.3} ms  copy {:.3}  copy-idle {:.3}",
+        span / blobs as f64,
+        med(ss.clone().map(|b| ce(b) - cb(b)).collect()),
+        med(ss.clone().map(|b| cb(b) - ce(b - 1)).collect()),
+    );
+    if compute {
+        let mut ov = 0.0;
+        let mut tot = 0.0;
+        for b in 0..blobs {
+            let (a, z) = (cb(b), ce(b));
+            tot += z - a;
+            // compute intervals are serial on one queue, so they do not overlap each other
+            ov += (0..blobs).map(|j| (z.min(k(j, 2)) - a.max(k(j, 0))).max(0.0)).sum::<f64>();
+        }
+        let bad = (0..blobs).filter(|&b| k(b, 0) < ce(b)).count();
+        out += &format!(
+            "  decode {:.3}  consumer {:.3}  cw {:.3}  cidle {:.3}  gate {:.3}  ov {:.2}  order-violations {bad}",
+            med(ss.clone().map(|b| k(b, 1) - k(b, 0)).collect()),
+            med(ss.clone().map(|b| k(b, 2) - k(b, 1)).collect()),
+            med(ss.clone().map(|b| k(b, 0) - ce(b)).collect()),
+            med(ss.clone().map(|b| k(b, 0) - ce(b).max(k(b - 1, 2))).collect()),
+            med(ss.clone().map(|b| cb(b) - k(b - slots, 2)).collect()),
+            ov / tot.max(1e-12),
+        );
+    }
+    out
+}
+
+/// CPU twin of `rans_decode.comp`: lanes split over all cores, each thread steps its lanes
+/// word by word so the strided output stores stay contiguous per thread.
+fn cpu_decode(f: &Frames, img: &[u8], out: &mut [u32], threads: usize) {
+    let w: Vec<u32> = img.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let lanes = f.lanes as usize;
+    let wpl = f.wpl() as usize;
+    let tab = &f.tables;
+    let ctxmap = &tab[..256];
+    let lut = |c: usize| &tab[256 + c * CTX_BYTES..][..4096];
+    let fc = |c: usize, s: usize| u32::from_le_bytes(tab[256 + c * CTX_BYTES + 4096 + 4 * s..][..4].try_into().unwrap());
+    let sb = lanes + 1;
+    let plane = sb + w[lanes] as usize; // plane_base, as in Frames::push
+    let blk = f.blk as usize;
+    struct P(*mut u32);
+    unsafe impl Sync for P {}
+    let outp = P(out.as_mut_ptr());
+    let per = lanes.div_ceil(threads);
+    std::thread::scope(|sc| {
+        for t0 in (0..lanes).step_by(per) {
+            let (w, outp) = (&w, &outp);
+            sc.spawn(move || {
+                let ls = t0..(t0 + per).min(lanes);
+                // per lane: state, next u16 index, byte offset % blk
+                let mut x: Vec<u32> = ls.clone().map(|i| w[sb + w[i] as usize]).collect();
+                let mut k: Vec<usize> = ls.clone().map(|i| 2 * (sb + w[i] as usize + 1)).collect();
+                let mut p: Vec<usize> = ls.clone().map(|i| (4 * i) % blk).collect();
+                let step = (4 * lanes) % blk;
+                let mut dec = |j: usize, c: usize| -> u32 {
+                    let slot = x[j] & 4095;
+                    let s = lut(c)[slot as usize] as usize;
+                    let e = fc(c, s);
+                    x[j] = (e & 0xFFFF) * (x[j] >> 12) + slot - (e >> 16);
+                    if x[j] < 65536 {
+                        let h = (w[k[j] / 2] >> (16 * (k[j] & 1))) & 0xFFFF;
+                        x[j] = (x[j] << 16) | h;
+                        k[j] += 1;
+                    }
+                    s as u32
+                };
+                for wi in 0..wpl {
+                    for (j, i) in ls.clone().enumerate() {
+                        let g = i + wi * lanes;
+                        let v = if f.mode == 0 {
+                            let mut word = 0u32;
+                            let mut q = p[j];
+                            for bb in 0..4 {
+                                word |= dec(j, ctxmap[q] as usize) << (8 * bb);
+                                q = if q + 1 >= blk { q + 1 - blk } else { q + 1 };
+                            }
+                            p[j] = if p[j] + step >= blk { (p[j] + step) % blk } else { p[j] + step };
+                            word
+                        } else {
+                            let (e0, e1) = (dec(j, 0), dec(j, 0));
+                            let sm = (w[plane + g / 2] >> (16 * (g & 1))) & 0xFFFF;
+                            let (s0, s1) = (sm & 0xFF, sm >> 8);
+                            let v0 = ((s0 >> 7) << 15) | (e0 << 7) | (s0 & 0x7F);
+                            let v1 = ((s1 >> 7) << 15) | (e1 << 7) | (s1 & 0x7F);
+                            v0 | (v1 << 16)
+                        };
+                        unsafe { *outp.0.add(g) = v };
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// CPU receiver decode rate over all frames (raw GB/s) and whether every frame matched.
+fn cpu_decode_rate(f: &Frames, secs: f64) -> (f64, bool) {
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let mut out = vec![0u32; f.frame_raw / 4];
+    let mut ok = true;
+    for (img, raw) in &f.frames {
+        cpu_decode(f, img, &mut out, threads);
+        ok &= out.iter().flat_map(|v| v.to_le_bytes()).eq(raw.iter().copied());
+    }
+    let t0 = Instant::now();
+    let mut bytes = 0usize;
+    while t0.elapsed().as_secs_f64() < secs {
+        for (img, _) in &f.frames {
+            cpu_decode(f, img, &mut out, threads);
+            bytes += f.frame_raw;
+        }
+    }
+    (bytes as f64 / t0.elapsed().as_secs_f64() / 1e9, ok)
 }
 
 fn cleanup(gpu: &Gpu, bufs: &[Buf], kd: &Kernel, kc: &Kernel) {
