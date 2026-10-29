@@ -769,7 +769,15 @@ impl Model {
         // mlock failure degrades OFF (streaming lane continues), never aborts.
         let imported_experts = if opts.host_expert_import {
             match build_imported_experts(&shards, &placed, cfg.n_layers) {
-                Ok(a) => Some(a),
+                Ok(a) => {
+                    eprintln!(
+                        "breccia: host-expert-import: {} blocks pinned, {:.2} GiB (cap {:.2} GiB)",
+                        a.1.len(),
+                        a.0.pin_bytes() as f64 / (1u64 << 30) as f64,
+                        host_import_cap() as f64 / (1u64 << 30) as f64
+                    );
+                    Some(a)
+                }
                 Err(e) => {
                     eprintln!("breccia: host-expert-import off: {e}");
                     None
@@ -1253,8 +1261,16 @@ fn w(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<W> {
 
 /// Cap on the locked anonymous host arena. D6a2 (0f7610d) imported every
 /// streamed block (~37 GiB anon on the 40 GiB IQ3_XXS model) and was OOM-killed.
-// shortcut: fixed 16 GiB, not a CLI/env knob; make it a LoadOptions field when tuned.
+// Per Model: at x4b the RX and MI50 owners each build one, so pinned = 2x this.
+// shortcut: env knob BRECCIA_HOST_IMPORT_CAP_GIB, make it a LoadOptions field when tuned.
 const HOST_IMPORT_CAP_BYTES: u64 = 16 << 30;
+
+fn host_import_cap() -> u64 {
+    std::env::var("BRECCIA_HOST_IMPORT_CAP_GIB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map_or(HOST_IMPORT_CAP_BYTES, |g| (g * (1u64 << 30) as f64) as u64)
+}
 
 /// Pick which streamed blocks get imported: the longest in-order prefix of
 /// `(block, bytes)` whose total fits `cap`. A prefix keeps the blob ordinal
@@ -1315,7 +1331,7 @@ fn build_imported_experts(
         .iter()
         .map(|(b, v)| (*b, v.iter().map(|s| s.len).sum()))
         .collect();
-    let keep = select_import_blocks(&sizes, HOST_IMPORT_CAP_BYTES).len();
+    let keep = select_import_blocks(&sizes, host_import_cap()).len();
     let blocks: Vec<usize> = per_block.iter().take(keep).map(|x| x.0).collect();
     let srcs: Vec<BlobSource> = per_block.into_iter().take(keep).flat_map(|x| x.1).collect();
     if srcs.is_empty() {
