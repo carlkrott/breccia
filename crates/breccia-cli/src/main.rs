@@ -1905,6 +1905,21 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         pool: None,
     };
     let mut multi = breccia_engine::Multi::new(&refs, &cfg).context("building the streams")?;
+    // `BRECCIA_BENCH_MIXED_PROMPTS=1`: stream 0 keeps the reference prompt, the others
+    // get `synthetic_prefix` of the same length (seeded by stream index), so routing
+    // differs per stream the way real agents' does; identical prompts route
+    // identically and the later streams re-read experts from L3.
+    let mixed = std::env::var_os("BRECCIA_BENCH_MIXED_PROMPTS").is_some_and(|v| v == "1");
+    let vocab = models[0].cfg.vocab as u32;
+    let prompts: Vec<Vec<u32>> = (0..n_streams)
+        .map(|s| {
+            if s == 0 || !mixed {
+                prompt.to_vec()
+            } else {
+                synthetic_prefix(prompt, prompt.len(), 0x9e37_79b9 ^ ((s as u32) * 8191), vocab)
+            }
+        })
+        .collect();
     for s in multi.streams.iter_mut() {
         s.sampling = breccia_engine::Sampling {
             temperature: a.temperature,
@@ -1943,7 +1958,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     for k in 0..warm_runs.max(1) {
         let r0 = io_read_mib();
         let w = multi
-            .generate(prompt, a.gen.min(8))
+            .generate_each(&prompts, a.gen.min(8))
             .with_context(|| format!("warm pass {k}"))?;
         let r1 = io_read_mib();
         println!(
@@ -1961,7 +1976,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     let mut runs = Vec::with_capacity(a.runs.max(1));
     for run in 0..a.runs.max(1) {
         let g = multi
-            .generate(prompt, a.gen)
+            .generate_each(&prompts, a.gen)
             .with_context(|| format!("the two-stream run {run}"))?;
         println!(
             "run {run}  {:>6.2} tok/s aggregate  {:>6.2} tok/s/stream  {:>6.2} ms/stream-token  \
@@ -2077,15 +2092,24 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         .last()
         .map(|g| g.streams.windows(2).all(|w| w[0].tokens == w[1].tokens))
         .unwrap_or(false);
-    println!(
-        "parity   every stream generated the same {} tokens: {same}",
-        runs.last().map(|g| g.streams[0].tokens.len()).unwrap_or(0)
-    );
+    if mixed {
+        // Mixed prompts differ by design: check each stream repeats itself run to run.
+        let steady = runs.windows(2).all(|w| {
+            w[0].streams.iter().zip(&w[1].streams).all(|(x, y)| x.tokens == y.tokens)
+        });
+        println!("parity   mixed prompts; every stream repeated its tokens in every run: {steady}");
+    } else {
+        println!(
+            "parity   every stream generated the same {} tokens: {same}",
+            runs.last().map(|g| g.streams[0].tokens.len()).unwrap_or(0)
+        );
+    }
 
     if let Some(path) = &a.json {
         let value = serde_json::json!({
             "streams": n_streams,
             "prompt_ids": prompt,
+            "mixed_prompts": mixed,
             "aggregate_tokens_per_s": agg,
             "stream_tokens_per_s": per,
             "stream_ms_per_token": lat,

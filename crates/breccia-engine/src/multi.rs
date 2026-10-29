@@ -301,10 +301,24 @@ impl<'m> Multi<'m> {
     /// That chunk-0-vs-64 parity check needs a model fixture, which the repo does
     /// not ship — it runs on a real model, e.g. via the C3 sweep arms.
     pub fn generate(&mut self, prompt: &[u32], n: usize) -> Result<MultiGeneration> {
-        if prompt.is_empty() {
+        let prompts = vec![prompt.to_vec(); self.streams.len()];
+        self.generate_each(&prompts, n)
+    }
+
+    /// [`Multi::generate`] with one prompt per stream. The prompts must have one
+    /// length, so every stream decodes at the same positions.
+    pub fn generate_each(&mut self, prompts: &[Vec<u32>], n: usize) -> Result<MultiGeneration> {
+        let ns = self.streams.len();
+        if prompts.len() != ns {
+            bail!("{} prompts for {ns} streams", prompts.len());
+        }
+        let plen = prompts[0].len();
+        if plen == 0 {
             bail!("the prompt is empty");
         }
-        let ns = self.streams.len();
+        if prompts.iter().any(|p| p.len() != plen) {
+            bail!("the stream prompts differ in length");
+        }
         for s in 0..ns {
             self.streams[s].reset()?;
         }
@@ -333,12 +347,13 @@ impl<'m> Multi<'m> {
         if target > 0 && concurrent {
             // One scoped thread per stream: the streams' chunks overlap instead of
             // stream 1 waiting for stream 0's whole prompt.
-            let plan = crate::graph::prefill_plan(prompt.len(), target);
+            let plan = crate::graph::prefill_plan(plen, target);
             let done: Vec<Result<(Vec<f32>, f64)>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = self
                     .streams
                     .iter_mut()
-                    .map(|sess| {
+                    .zip(prompts)
+                    .map(|(sess, prompt)| {
                         let plan = &plan;
                         scope.spawn(move || -> Result<(Vec<f32>, f64)> {
                             let t_stream = std::time::Instant::now();
@@ -368,15 +383,16 @@ impl<'m> Multi<'m> {
             for (s, sess) in self.streams.iter_mut().enumerate() {
                 let t_stream = std::time::Instant::now();
                 let mut pos = 0usize;
-                for len in crate::graph::prefill_plan(prompt.len(), target) {
-                    logits[s] = sess.prefill(&prompt[pos..pos + len], pos)?;
+                for len in crate::graph::prefill_plan(plen, target) {
+                    logits[s] = sess.prefill(&prompts[s][pos..pos + len], pos)?;
                     pos += len;
                 }
                 stream_prefill[s] = t_stream.elapsed().as_secs_f64();
             }
         } else {
-            for (pos, &t) in prompt.iter().enumerate() {
-                logits = self.token_all(&vec![t; ns], pos)?;
+            for pos in 0..plen {
+                let ids: Vec<u32> = prompts.iter().map(|p| p[pos]).collect();
+                logits = self.token_all(&ids, pos)?;
             }
         }
         let prefill_seconds = prefill_t.elapsed().as_secs_f64();
@@ -391,7 +407,7 @@ impl<'m> Multi<'m> {
         self.t_finish = 0.0;
         self.t_submit = 0.0;
         let mut streams: Vec<StreamReport> = vec![StreamReport::default(); ns];
-        let mut pos = prompt.len();
+        let mut pos = plen;
         let t0 = std::time::Instant::now();
         let mut steps = 0usize;
         let mut steps_s: Vec<f64> = Vec::with_capacity(n);
@@ -415,7 +431,7 @@ impl<'m> Multi<'m> {
                         scope.spawn(move || -> Result<(Vec<u32>, Vec<f32>, Vec<f64>)> {
                             let mut toks = Vec::with_capacity(n);
                             let mut times = Vec::with_capacity(n);
-                            let mut pos = prompt.len();
+                            let mut pos = plen;
                             // The GPU-time probe accumulates per thread: base and
                             // capture on this one, or the report reads 0.
                             sess.snapshot_probe();
