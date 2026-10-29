@@ -90,6 +90,9 @@ def expert_tensor(mm, base, name, ty, dims, n_exp):
         raw_bits = 4 if nib else 8
         h0 = xent0(a, b, k); h1 = xent1(a, b, k)
         f = {'raw_bits': raw_bits, 'x0': round(h0, 4), 'x1_prev': round(h1, 4)}
+        npos = len(idx) * (2 if nib else 1)   # byte (or nibble) position within the field
+        pos = lambda n: (np.arange(n) % npos).astype(np.int64)
+        f['x_pos'] = round(xentc(a, pos(len(a)), b, pos(len(b)), k, npos), 4)
         if fname == 'grid' and ty in (18, 16):   # grid | sub-block scale nibble (top 4 bits of each ss u32)
             ss = 'ss'; sidx = fields[ss]
             def scale_ctx(blk):
@@ -108,9 +111,9 @@ def expert_tensor(mm, base, name, ty, dims, n_exp):
             f['zstd_split'] = round(zr((d & 255).astype(np.uint8).tobytes() + (d >> 8).astype(np.uint8).tobytes()), 4)
             f['zstd_delta_split'] = round(zr((dd & 255).astype(np.uint8).tobytes() + (dd >> 8).astype(np.uint8).tobytes()), 4)
         n_sym = len(idx) * (2 if nib else 1)
-        best = min(v for kk, v in f.items() if kk.startswith('x') and kk != 'xexp_eq') if fname != 'd' else \
-            8 * min(f['zstd_raw'], f['zstd_split'], f['zstd_delta_split'])
-        total_bits0 += n_sym * (raw_bits if fname == 'd' else min(h0, raw_bits))
+        # deployable = static tables only (zstd on d is reference, not a frame codec)
+        best = min(v for kk, v in f.items() if kk.startswith('x') and kk != 'xexp_eq')
+        total_bits0 += n_sym * min(h0, raw_bits)
         total_best += n_sym * min(best, raw_bits)
         res['fields'][fname] = f
     res['ratio_order0'] = round(total_bits0 / (8 * bsz), 5)
