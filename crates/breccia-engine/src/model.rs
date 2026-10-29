@@ -787,10 +787,12 @@ impl Model {
             .unwrap_or(0);
         if let (Some((arena, blocks)), true) = (&imported_experts, gpu_import_n > 0) {
             let mut done = Vec::new();
+            let gtt_copy = std::env::var("BRECCIA_HOST_IMPORT_GTT").is_ok_and(|v| v == "1");
+            let mut gtt_bytes = 0u64;
             for (i, &b) in blocks.iter().enumerate().take(gpu_import_n) {
                 let dev = placement.device_of(b);
                 let gpu = devices[dev].gpu();
-                if !gpu.external_memory_host {
+                if !gtt_copy && !gpu.external_memory_host {
                     eprintln!("breccia: host-import-gpu: blk.{b} device {dev} lacks VK_EXT_external_memory_host");
                     continue;
                 }
@@ -802,14 +804,23 @@ impl Model {
                             .tensor(&name)
                             .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
                         let (ptr, len) = arena.blob_import_range(3 * i + r).map_err(|e| anyhow!(e))?;
-                        let buf = breccia_vk::transfer::import_from_host_ptr(
-                            gpu,
-                            ptr,
-                            len,
-                            ash::vk::BufferUsageFlags::STORAGE_BUFFER
-                                | ash::vk::BufferUsageFlags::TRANSFER_SRC,
-                        )
-                        .map_err(|e| anyhow!("{name}: {e}"))?;
+                        let usage = ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                            | ash::vk::BufferUsageFlags::TRANSFER_SRC;
+                        // BRECCIA_HOST_IMPORT_GTT=1: copy into driver GTT instead of a userptr
+                        // import (amdgpu revalidates live userptr BOs on every submit).
+                        let buf = if gtt_copy {
+                            use ash::vk::MemoryPropertyFlags as M;
+                            let b = gpu
+                                .buf(len, usage, M::HOST_VISIBLE | M::HOST_COHERENT | M::HOST_CACHED, M::empty())
+                                .map_err(|e| anyhow!("{name}: GTT alloc: {e}"))?;
+                            gpu.write_host(&b, unsafe { std::slice::from_raw_parts(ptr, len as usize) })
+                                .map_err(|e| anyhow!("{name}: GTT fill: {e}"))?;
+                            gtt_bytes += len;
+                            b
+                        } else {
+                            breccia_vk::transfer::import_from_host_ptr(gpu, ptr, len, usage)
+                                .map_err(|e| anyhow!("{name}: {e}"))?
+                        };
                         ws.push(W { buf, key: PipeKey::of(&t)? });
                     }
                     let [g, u, d]: [W; 3] = ws.try_into().map_err(|_| anyhow!("three roles"))?;
@@ -831,8 +842,9 @@ impl Model {
                 }
             }
             eprintln!(
-                "breccia: host-import-gpu: {} block(s) GPU-read from host pages: {:?}",
+                "breccia: host-import-gpu: {} block(s) GPU-read from {}: {:?}",
                 done.len(),
+                if gtt_copy { format!("driver GTT copies ({:.2} GiB, not charged to the cgroup)", gtt_bytes as f64 / (1u64 << 30) as f64) } else { "host pages (userptr)".into() },
                 done
             );
         }
