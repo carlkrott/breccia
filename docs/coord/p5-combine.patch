@@ -1,0 +1,400 @@
+diff --git a/crates/breccia-engine/src/graph.rs b/crates/breccia-engine/src/graph.rs
+index 0bdee0f..b13ddda 100644
+--- a/crates/breccia-engine/src/graph.rs
++++ b/crates/breccia-engine/src/graph.rs
+@@ -503,6 +503,8 @@ pub struct Session<'m> {
+     /// per token — 24 round trips a token, ~19 ms.
+     qsa_ws: Vec<Option<QsaWorkspace>>,
+     pool: std::sync::Arc<std::sync::Mutex<ExpertPool>>,
++    /// The pool's combining queue (`BRECCIA_POOL_COMBINE=1`).
++    combine: std::sync::Arc<cpu::CombineQueue>,
+     ple: Option<PleHost>,
+     sampler: Sampler,
+     pub sampling: Sampling,
+@@ -1013,6 +1015,7 @@ impl<'m> Session<'m> {
+                 cpu::path(),
+             ))),
+         };
++        let combine = pool.lock().expect("the expert pool's lock").combine_queue();
+         let ple = match &model.ple {
+             Some(p) => Some(PleHost::new(
+                 mc,
+@@ -1032,6 +1035,7 @@ impl<'m> Session<'m> {
+             qsa_state,
+             qsa_ws,
+             pool,
++            combine,
+             ple,
+             sampler: Sampler::new(Sampling::default().seed),
+             sampling: Sampling::default(),
+@@ -3318,16 +3322,29 @@ impl<'m> Session<'m> {
+         self.timers.mark(EXPERTS);
+         let mut out = vec![0f32; mc.n_embd];
+         let t_lane = std::time::Instant::now();
+-        let mut pool = self.pool.lock().expect("the expert pool's lock");
+-        let waited = if lane_stats_on() {
+-            t_lane.elapsed().as_secs_f64()
++        let (bytes, waited) = if cpu::pool_combine_on() {
++            cpu::moe_topk_combined(
++                &self.pool,
++                &self.combine,
++                &m.layers[b].experts,
++                &ids,
++                &weights,
++                &mixed,
++                &mut out,
++            )
++            .with_context(|| format!("the expert lane on block {b}"))?
+         } else {
+-            0.0
++            let mut pool = self.pool.lock().expect("the expert pool's lock");
++            let waited = if lane_stats_on() {
++                t_lane.elapsed().as_secs_f64()
++            } else {
++                0.0
++            };
++            let bytes = pool
++                .moe_topk(&m.layers[b].experts, &ids, &weights, &mixed, &mut out)
++                .with_context(|| format!("the expert lane on block {b}"))?;
++            (bytes, waited)
+         };
+-        let bytes = pool
+-            .moe_topk(&m.layers[b].experts, &ids, &weights, &mixed, &mut out)
+-            .with_context(|| format!("the expert lane on block {b}"))?;
+-        drop(pool);
+         self.lock_wait_s += waited;
+         let lane = t_lane.elapsed().as_secs_f64();
+         self.lane_s += lane;
+diff --git a/crates/breccia-kernels/src/cpu/expert.rs b/crates/breccia-kernels/src/cpu/expert.rs
+index 524a252..6a23280 100644
+--- a/crates/breccia-kernels/src/cpu/expert.rs
++++ b/crates/breccia-kernels/src/cpu/expert.rs
+@@ -309,6 +309,7 @@ pub struct ExpertPool {
+     tx: Vec<Sender<Msg>>,
+     rx: Receiver<Done>,
+     handles: Vec<JoinHandle<()>>,
++    combine: Arc<CombineQueue>,
+ }
+ 
+ /// One worker's work for one phase.
+@@ -449,6 +450,7 @@ impl ExpertPool {
+             tx,
+             rx,
+             handles,
++            combine: Arc::default(),
+         }
+     }
+ 
+@@ -525,80 +527,208 @@ impl ExpertPool {
+         if ids.is_empty() {
+             return Ok(0);
+         }
+-        let k = ids.len();
+-        let (n_ff, n_embd) = (plan.n_ff, plan.n_embd);
+-        let x = Arc::new(x.to_vec());
++        let mut reqs = [TopkReq::new(plan, ids, weights, x, out)];
++        self.moe_topk_many(&mut reqs)?;
++        out.copy_from_slice(&reqs[0].out);
++        Ok(plan.expert_kernel_bytes() * ids.len())
++    }
++
++    /// [`ExpertPool::moe_topk`] for several tokens' blocks at once (any block,
++    /// any stream): one phase-1 and one phase-2 run for all of them, so the
++    /// dispatch/wake cost is paid once per drain instead of once per request.
++    ///
++    /// Every request keeps the per-token arithmetic: each row is its own GEMV
++    /// (the row split does not change a row's value) and each request's `out`
++    /// accumulates its experts in router order, so the result is bit-identical
++    /// to calling `moe_topk` per request.
++    fn moe_topk_many(&mut self, reqs: &mut [TopkReq]) -> Result<()> {
++        let k: usize = reqs.iter().map(|r| r.ids.len()).sum();
++        if k == 0 {
++            return Ok(());
++        }
++        let n_ff = reqs.iter().map(|r| r.plan.n_ff).min().unwrap_or(0);
++        let n_embd = reqs.iter().map(|r| r.plan.n_embd).min().unwrap_or(0);
+ 
+         // ---- phase 1: gate+up+SwiGLU rows of every selected expert --------
+         let s1 = choose_shards(k, self.threads, n_ff);
+-        let mut first: Vec<(usize, usize, usize)> = Vec::new();
+-        for j in 0..k {
+-            for s in 0..s1 {
+-                let (r0, r1) = shard_rows(n_ff, s, s1);
+-                first.push((j, r0, r1));
++        let mut first: Vec<(usize, usize, usize, usize)> = Vec::new();
++        for (r, req) in reqs.iter().enumerate() {
++            for j in 0..req.ids.len() {
++                for s in 0..s1 {
++                    let (r0, r1) = shard_rows(req.plan.n_ff, s, s1);
++                    first.push((r, j, r0, r1));
++                }
+             }
+         }
+         let tasks1: Vec<Shard> = first
+             .iter()
+             .enumerate()
+-            .map(|(seq, &(j, r0, r1))| Shard {
++            .map(|(seq, &(r, j, r0, r1))| Shard {
+                 seq,
+-                expert: ids[j],
+-                plan: *plan,
++                expert: reqs[r].ids[j],
++                plan: reqs[r].plan,
+                 kind: ShardKind::GateUp,
+                 r0,
+                 r1,
+-                x: Arc::clone(&x),
++                x: Arc::clone(&reqs[r].x),
+                 x_off: 0,
+                 users: no_users(),
+             })
+             .collect();
+         let done1 = self.run_phase(tasks1)?;
+-        let mut act = vec![0f32; k * n_ff];
+-        for (seq, &(j, r0, r1)) in first.iter().enumerate() {
++        let mut acts: Vec<Vec<f32>> = reqs
++            .iter()
++            .map(|r| vec![0f32; r.ids.len() * r.plan.n_ff])
++            .collect();
++        for (seq, &(r, j, r0, r1)) in first.iter().enumerate() {
+             let values = done1[seq]
+                 .as_ref()
+                 .with_context(|| format!("phase-1 shard {seq} never returned"))?;
+-            act[j * n_ff + r0..j * n_ff + r1].copy_from_slice(values);
++            let n_ff = reqs[r].plan.n_ff;
++            acts[r][j * n_ff + r0..j * n_ff + r1].copy_from_slice(values);
+         }
+ 
+         // ---- phase 2: down rows, weighted and accumulated ------------------
+-        let act = Arc::new(act);
++        let acts: Vec<Arc<Vec<f32>>> = acts.into_iter().map(Arc::new).collect();
+         let s2 = choose_shards(k, self.threads, n_embd);
+-        let mut second: Vec<(usize, usize, usize)> = Vec::new();
+-        for j in 0..k {
+-            for s in 0..s2 {
+-                let (r0, r1) = shard_rows(n_embd, s, s2);
+-                second.push((j, r0, r1));
++        let mut second: Vec<(usize, usize, usize, usize)> = Vec::new();
++        for (r, req) in reqs.iter().enumerate() {
++            for j in 0..req.ids.len() {
++                for s in 0..s2 {
++                    let (r0, r1) = shard_rows(req.plan.n_embd, s, s2);
++                    second.push((r, j, r0, r1));
++                }
+             }
+         }
+         let tasks2: Vec<Shard> = second
+             .iter()
+             .enumerate()
+-            .map(|(seq, &(j, r0, r1))| Shard {
++            .map(|(seq, &(r, j, r0, r1))| Shard {
+                 seq,
+-                expert: ids[j],
+-                plan: *plan,
++                expert: reqs[r].ids[j],
++                plan: reqs[r].plan,
+                 kind: ShardKind::Down,
+                 r0,
+                 r1,
+-                x: Arc::clone(&act),
+-                x_off: j * n_ff,
++                x: Arc::clone(&acts[r]),
++                x_off: j * reqs[r].plan.n_ff,
+                 users: no_users(),
+             })
+             .collect();
+         let done2 = self.run_phase(tasks2)?;
+-        for (seq, &(j, r0, _r1)) in second.iter().enumerate() {
++        // `second` is in (request, j, shard) order: each request's rows
++        // accumulate their experts in router order, as in the per-token path.
++        for (seq, &(r, j, r0, _r1)) in second.iter().enumerate() {
+             let values = done2[seq]
+                 .as_ref()
+                 .with_context(|| format!("phase-2 shard {seq} never returned"))?;
+-            let w = weights[j];
++            let req = &mut reqs[r];
++            let w = req.weights[j];
+             for (i, v) in values.iter().enumerate() {
+-                out[r0 + i] += w * v;
++                req.out[r0 + i] += w * v;
+             }
+         }
+-        Ok(plan.expert_kernel_bytes() * k)
++        Ok(())
++    }
++
++    /// The queue [`moe_topk_combined`] posts to; clone it once per caller.
++    pub fn combine_queue(&self) -> Arc<CombineQueue> {
++        Arc::clone(&self.combine)
++    }
++}
++
++/// `BRECCIA_POOL_COMBINE=1`: per-token callers post to the pool's queue and the
++/// lock holder runs every queued request in one phase pair (coord plan Phase 5).
++pub fn pool_combine_on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var("BRECCIA_POOL_COMBINE").is_ok_and(|v| v == "1"))
++}
++
++/// One queued per-token request: owned, because the thread that runs it is
++/// whichever caller holds the pool lock.
++struct TopkReq {
++    plan: LayerPlan,
++    ids: Vec<usize>,
++    weights: Vec<f32>,
++    x: Arc<Vec<f32>>,
++    /// Starts as the caller's `out`; the routed sum is added to it.
++    out: Vec<f32>,
++}
++
++impl TopkReq {
++    fn new(plan: &LayerPlan, ids: &[usize], weights: &[f32], x: &[f32], out: &[f32]) -> Self {
++        Self {
++            plan: *plan,
++            ids: ids.to_vec(),
++            weights: weights.to_vec(),
++            x: Arc::new(x.to_vec()),
++            out: out.to_vec(),
++        }
++    }
++}
++
++/// Where a combined request's result lands (filled under the pool lock).
++type ReplySlot = Arc<std::sync::Mutex<Option<std::result::Result<Vec<f32>, String>>>>;
++
++/// Requests posted but not yet run, shared by every caller of one pool.
++#[derive(Default)]
++pub struct CombineQueue {
++    pending: std::sync::Mutex<Vec<(TopkReq, ReplySlot)>>,
++}
++
++/// [`ExpertPool::moe_topk`] through the combining queue: post the request, take
++/// the pool lock, and either find it already run by the previous holder or run
++/// it together with everything else queued. Returns `(bytes, seconds spent
++/// before this caller's request started or was found done)`.
++///
++/// No request is lost: it is queued before the lock is taken, and a holder
++/// fills every slot it drained before it releases the lock, so a caller that
++/// finds its slot empty under the lock still has its request in the queue.
++pub fn moe_topk_combined(
++    pool: &std::sync::Mutex<ExpertPool>,
++    queue: &CombineQueue,
++    plan: &LayerPlan,
++    ids: &[usize],
++    weights: &[f32],
++    x: &[f32],
++    out: &mut [f32],
++) -> Result<(usize, f64)> {
++    if ids.len() != weights.len() {
++        bail!("{} expert ids vs {} weights", ids.len(), weights.len());
+     }
++    if ids.is_empty() {
++        return Ok((0, 0.0));
++    }
++    let bytes = plan.expert_kernel_bytes() * ids.len();
++    let slot: ReplySlot = Arc::default();
++    let t0 = Instant::now();
++    queue
++        .pending
++        .lock()
++        .expect("the combine queue's lock")
++        .push((TopkReq::new(plan, ids, weights, x, out), Arc::clone(&slot)));
++    let mut guard = pool.lock().expect("the expert pool's lock");
++    let waited = t0.elapsed().as_secs_f64();
++    let reply = slot.lock().expect("a combine slot").take();
++    let reply = match reply {
++        Some(r) => r,
++        None => {
++            let drained = std::mem::take(&mut *queue.pending.lock().expect("the combine queue's lock"));
++            let (mut reqs, slots): (Vec<TopkReq>, Vec<ReplySlot>) = drained.into_iter().unzip();
++            let run = guard.moe_topk_many(&mut reqs).map_err(|e| format!("{e:#}"));
++            for (req, s) in reqs.into_iter().zip(&slots) {
++                *s.lock().expect("a combine slot") = Some(run.clone().map(|()| req.out));
++            }
++            slot.lock()
++                .expect("a combine slot")
++                .take()
++                .context("combined request was not in the drained queue")?
++        }
++    };
++    drop(guard);
++    let values = reply.map_err(|e| anyhow::anyhow!("combined expert lane: {e}"))?;
++    out.copy_from_slice(&values);
++    Ok((bytes, waited))
+ }
+ 
+ /// The shared empty user list: the single-token path must not allocate per shard
+diff --git a/crates/breccia-kernels/src/cpu/mod.rs b/crates/breccia-kernels/src/cpu/mod.rs
+index 9267e91..95909ac 100644
+--- a/crates/breccia-kernels/src/cpu/mod.rs
++++ b/crates/breccia-kernels/src/cpu/mod.rs
+@@ -54,8 +54,8 @@ pub use bench::{
+     PARITY_BAR_GBPS,
+ };
+ pub use expert::{
+-    expert_ffn, lane_stats_on, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch,
+-    LaneStats, LayerPlan, RolePlan,
++    expert_ffn, lane_stats_on, moe_topk_combined, moe_topk_sequential, pool_combine_on, silu,
++    ChunkRoute, CombineQueue, ExpertPool, FfnScratch, LaneStats, LayerPlan, RolePlan,
+ };
+ 
+ /// `gemv_into` for **m users at once**: row `r`'s weight block is dequantised once
+diff --git a/crates/breccia-kernels/tests/cpu_experts.rs b/crates/breccia-kernels/tests/cpu_experts.rs
+index 37a7740..34b7b4e 100644
+--- a/crates/breccia-kernels/tests/cpu_experts.rs
++++ b/crates/breccia-kernels/tests/cpu_experts.rs
+@@ -24,8 +24,8 @@ use std::time::Instant;
+ 
+ use breccia_format::{ExpertRole, ExpertSlices, ShardSet};
+ use breccia_kernels::cpu::{
+-    expert_ffn, gemv_into, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch,
+-    LayerPlan, Path,
++    expert_ffn, gemv_into, moe_topk_combined, moe_topk_sequential, silu, ChunkRoute, ExpertPool,
++    FfnScratch, LayerPlan, Path,
+ };
+ use breccia_kernels::{real, reference, QuantType};
+ 
+@@ -360,6 +360,43 @@ fn topk_pool_is_bit_identical_to_the_single_threaded_path() {
+     }
+ }
+ 
++/// The combining queue: four threads post different blocks' requests at once;
++/// whichever holds the lock runs them merged, and every result must be
++/// bit-identical to the single-threaded path.
++#[test]
++fn combined_pool_is_bit_identical_to_the_single_threaded_path() {
++    let Some(set) = open_model() else { return };
++    let layout = set.layout().expect("layout");
++    let plans: Vec<LayerPlan> = layout
++        .blocks()
++        .take(4)
++        .map(|b| LayerPlan::from_block(&set, b).expect("plan"))
++        .collect();
++    let pool = std::sync::Mutex::new(ExpertPool::new(Arc::clone(&set), 30, Path::Avx2));
++    let queue = pool.lock().unwrap().combine_queue();
++    std::thread::scope(|sc| {
++        for (t, plan) in plans.iter().enumerate() {
++            let (set, pool, queue) = (&set, &pool, &queue);
++            sc.spawn(move || {
++                let ids: Vec<usize> = (0..10).map(|j| (t * 31 + j * 47) % plan.n_experts).collect();
++                let weights: Vec<f32> = (1..=10).map(|j| 1.0 / (j as f32 * (3.0 + t as f32))).collect();
++                let x = fixed_x(plan.n_embd);
++                let mut want = vec![0f32; plan.n_embd];
++                moe_topk_sequential(set, Path::Avx2, plan, &ids, &weights, &x, &mut want)
++                    .expect("seq");
++                for round in 0..20 {
++                    let mut out = vec![0f32; plan.n_embd];
++                    moe_topk_combined(pool, queue, plan, &ids, &weights, &x, &mut out)
++                        .expect("combined");
++                    for (k, (a, b)) in out.iter().zip(&want).enumerate() {
++                        assert_eq!(a.to_bits(), b.to_bits(), "thread {t} round {round} element {k}");
++                    }
++                }
++            });
++        }
++    });
++}
++
+ /// The grouped chunk lane (prefill) against the per-token lane.
+ ///
+ /// The grouped path reads each expert's rows once and serves every token that
