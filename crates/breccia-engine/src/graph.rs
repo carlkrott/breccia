@@ -2717,8 +2717,9 @@ impl<'m> Session<'m> {
             );
             m.imported_experts.as_ref().and_then(|arena| {
                 // Blob order skips VRAM-resident blocks: the ordinal is b minus
-                // every placed block below it.
-                let streamed_before = b - m.placed.range(..b).count();
+                // every VRAM-placed block below it (host-imported ones keep blobs).
+                let streamed_before =
+                    b - m.placed.range(..b).filter(|(_, pe)| !pe.host_imported).count();
                 // The arena is a capped prefix of the streamed blocks; later ones
                 // keep streaming from the mmap.
                 if 3 * streamed_before + 3 > arena.blobs().len() {
@@ -4624,7 +4625,7 @@ mod tests {
                 len: 3072,
             })
             .collect();
-        let mut arena = HostArena::new(6 * 3072).expect("mlock under limit");
+        let mut arena = HostArena::new(HostArena::padded_total(&src)).expect("mlock under limit");
         arena.fill(&src, &files).expect("pread fill");
 
         // Mixed case mirroring the builder: block 0 placed, blocks 1..2 streamed

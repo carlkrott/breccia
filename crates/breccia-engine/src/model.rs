@@ -68,6 +68,9 @@ pub struct PlacedExperts {
     pub gate: W,
     pub up: W,
     pub down: W,
+    /// D3: the weights are the host arena's pages imported into the GPU address
+    /// space (read over PCIe), not a VRAM copy; the arena still holds their blobs.
+    pub host_imported: bool,
 }
 
 impl PlacedExperts {
@@ -719,6 +722,7 @@ impl Model {
                             gate,
                             up,
                             down,
+                            host_imported: false,
                         },
                     );
                 }
@@ -774,6 +778,65 @@ impl Model {
         } else {
             None
         };
+        // D3: run the first n arena blocks on the GPU straight from the host pages
+        // (zero-copy), as resident experts: no readback, CPU lane or upload.
+        // shortcut: env knob, make it a LoadOptions field when it graduates.
+        let gpu_import_n: usize = std::env::var("BRECCIA_HOST_IMPORT_GPU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if let (Some((arena, blocks)), true) = (&imported_experts, gpu_import_n > 0) {
+            let mut done = Vec::new();
+            for (i, &b) in blocks.iter().enumerate().take(gpu_import_n) {
+                let dev = placement.device_of(b);
+                let gpu = devices[dev].gpu();
+                if !gpu.external_memory_host {
+                    eprintln!("breccia: host-import-gpu: blk.{b} device {dev} lacks VK_EXT_external_memory_host");
+                    continue;
+                }
+                let got: Result<[W; 3]> = (|| {
+                    let mut ws = Vec::with_capacity(3);
+                    for (r, role) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().enumerate() {
+                        let name = format!("blk.{b}.{role}.weight");
+                        let t = shards
+                            .tensor(&name)
+                            .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
+                        let (ptr, len) = arena.blob_import_range(3 * i + r).map_err(|e| anyhow!(e))?;
+                        let buf = breccia_vk::transfer::import_from_host_ptr(
+                            gpu,
+                            ptr,
+                            len,
+                            ash::vk::BufferUsageFlags::STORAGE_BUFFER
+                                | ash::vk::BufferUsageFlags::TRANSFER_SRC,
+                        )
+                        .map_err(|e| anyhow!("{name}: {e}"))?;
+                        ws.push(W { buf, key: PipeKey::of(&t)? });
+                    }
+                    let [g, u, d]: [W; 3] = ws.try_into().map_err(|_| anyhow!("three roles"))?;
+                    Ok([g, u, d])
+                })();
+                match got {
+                    Ok([gate, up, down]) => {
+                        keys.insert(gate.key);
+                        keys.insert(up.key);
+                        keys.insert(down.key);
+                        placed.insert(
+                            b,
+                            PlacedExperts { block: b, device: dev, gate, up, down, host_imported: true },
+                        );
+                        done.push(b);
+                    }
+                    // A partial import leaks at most two Bufs until exit; the block stays on the host lane.
+                    Err(e) => eprintln!("breccia: host-import-gpu: blk.{b} stays on the host lane: {e:#}"),
+                }
+            }
+            eprintln!(
+                "breccia: host-import-gpu: {} block(s) GPU-read from host pages: {:?}",
+                done.len(),
+                done
+            );
+        }
+        let imported_experts = imported_experts.map(|(a, _)| a);
 
         let dense_bytes: u64 = layers.iter().map(|l| l.bytes).sum::<u64>()
             + out_hc_norm.size
@@ -1205,7 +1268,7 @@ fn build_imported_experts(
     shards: &ShardSet,
     placed: &std::collections::BTreeMap<usize, PlacedExperts>,
     n_layers: usize,
-) -> std::result::Result<crate::host_arena::HostArena, String> {
+) -> std::result::Result<(crate::host_arena::HostArena, Vec<usize>), String> {
     use crate::host_arena::{BlobSource, HostArena};
     use std::fs::File;
     use std::sync::{Arc, Mutex};
@@ -1241,11 +1304,12 @@ fn build_imported_experts(
         .map(|(b, v)| (*b, v.iter().map(|s| s.len).sum()))
         .collect();
     let keep = select_import_blocks(&sizes, HOST_IMPORT_CAP_BYTES).len();
+    let blocks: Vec<usize> = per_block.iter().take(keep).map(|x| x.0).collect();
     let srcs: Vec<BlobSource> = per_block.into_iter().take(keep).flat_map(|x| x.1).collect();
     if srcs.is_empty() {
         return Err("no streamed block fits the host import cap; nothing to import".into());
     }
-    let total: u64 = srcs.iter().map(|s| s.len).sum();
+    let total = HostArena::padded_total(&srcs);
 
     // One open handle per shard, indexed by BlobSource.file.
     let mut files: Vec<Arc<Mutex<File>>> = Vec::with_capacity(shards.parts().len());
@@ -1259,7 +1323,7 @@ fn build_imported_experts(
     arena
         .fill(&srcs, &files)
         .map_err(|e| format!("fill host expert arena: {e}"))?;
-    Ok(arena)
+    Ok((arena, blocks))
 }
 
 /// Several tensors of the **same quant type and column count**, concatenated along

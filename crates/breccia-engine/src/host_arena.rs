@@ -1,8 +1,8 @@
 //! Anonymously mapped, `mlock`'d expert arena for the host lane (stage D2).
 //!
 //! The host lane streams routed experts off the mmap per token. This arena
-//! holds the same blobs in one anonymous `MAP_PRIVATE` + `MAP_LOCKED`
-//! allocation — never file-backed, so `amdgpu_ttm.c` accepts the vma as
+//! holds the same blobs in one anonymous allocation (`alloc_zeroed` plus
+//! `mlock`) — never file-backed, so `amdgpu_ttm.c` accepts the vma as
 //! USERPTR_ANONLY for a later `VK_EXT_external_memory_host` import (D3) —
 //! filled once at load via `pread`/`read_exact` from GGUF `file_range()`
 //! offsets.
@@ -18,6 +18,16 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
+
+const PAGE: u64 = 4096;
+/// Bytes a GEMV may read past a weight's end (`gemv::alloc` pads by the same).
+const TAIL: u64 = breccia_kernels::gemv::TAIL_PAD;
+
+/// Arena bytes one blob of `len` occupies: its bytes plus the GEMV tail slack,
+/// rounded to the page so the next blob starts page-aligned.
+fn slot(len: u64) -> u64 {
+    (len + TAIL).next_multiple_of(PAGE)
+}
 
 /// One expert blob placed in the arena: `[start, end)` bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,7 +53,7 @@ pub struct BlobSource {
     pub len: u64,
 }
 
-/// The arena: one page-rounded, page-aligned, `MAP_LOCKED` allocation plus the
+/// The arena: one page-rounded, page-aligned, `mlock`'d allocation plus the
 /// blob ranges carved out of it. Fixed after `fill`; read-only afterwards.
 pub struct HostArena {
     ptr: *mut u8,
@@ -60,8 +70,8 @@ unsafe impl Sync for HostArena {}
 impl HostArena {
     /// Allocate `total` bytes anonymous + `MAP_LOCKED`.
     pub fn new(total: u64) -> Result<Self, String> {
-        let page = 4096usize;
-        let len = total.div_ceil(page as u64) as usize * page;
+        let page = PAGE as usize;
+        let len = total.div_ceil(PAGE) as usize * page;
         if len == 0 {
             return Err("cannot build an empty host arena".into());
         }
@@ -101,13 +111,22 @@ impl HostArena {
         &self.blobs
     }
 
-    /// Carve blobs from `src` (in order), filling the arena with one
-    /// contiguous layout: blob i lands at `[cursor, cursor + src[i].len)`.
+    /// Arena bytes `fill` needs for `src`: every blob starts on a page and keeps
+    /// zeroed GEMV tail slack, so each one can be imported on its own as a weight
+    /// buffer (D3: pointer and size 4096-aligned).
+    pub fn padded_total(src: &[BlobSource]) -> u64 {
+        src.iter().map(|s| slot(s.len)).sum()
+    }
+
+    /// Carve blobs from `src` (in order): blob i lands at the next page
+    /// boundary, `[cursor, cursor + src[i].len)`, followed by zeroed tail slack
+    /// up to the next page.
     /// `files` must be opened shard handles indexed by `BlobSource::file`.
     pub fn fill(&mut self, src: &[BlobSource], files: &[Arc<Mutex<File>>]) -> Result<(), String> {
         let mut layout = Vec::with_capacity(src.len());
         let mut cursor = 0u64;
         for s in src {
+            cursor = cursor.next_multiple_of(PAGE);
             if s.file >= files.len() {
                 return Err(format!(
                     "blob source names shard {}, only {} opened",
@@ -119,7 +138,7 @@ impl HostArena {
                 start: cursor,
                 end: cursor + s.len,
             });
-            cursor += s.len;
+            cursor += slot(s.len);
         }
         if cursor > self.len as u64 {
             return Err(format!(
@@ -128,15 +147,12 @@ impl HostArena {
             ));
         }
         let arena = self.as_mut_slice();
-        let mut dst = 0usize;
         for (s, blob) in src.iter().zip(layout.iter()) {
             let mut f = files[s.file].lock().unwrap();
             f.seek(SeekFrom::Start(s.offset))
                 .map_err(|e| e.to_string())?;
-            let buf = &mut arena[dst..dst + s.len as usize];
+            let buf = &mut arena[blob.start as usize..blob.end as usize];
             f.read_exact(buf).map_err(|e| e.to_string())?;
-            dst += s.len as usize;
-            debug_assert_eq!(blob.end - blob.start, s.len);
         }
         self.blobs = layout;
         Ok(())
@@ -150,6 +166,18 @@ impl HostArena {
             return Err(format!("blob {i} [{s}, {e}) outside arena of {}", self.len));
         }
         Ok(&self.bytes()[s..e])
+    }
+
+    /// Page-aligned pointer and page-rounded length (blob plus tail slack) of
+    /// blob `i`, for a `VK_EXT_external_memory_host` import. The pad bytes are zero.
+    pub fn blob_import_range(&self, i: usize) -> Result<(*mut u8, u64), String> {
+        let b = self.blobs.get(i).ok_or_else(|| format!("no blob {i}"))?;
+        let len = slot(b.len());
+        if b.start % PAGE != 0 || b.start + len > self.len as u64 {
+            return Err(format!("blob {i} [{}, +{len}) is not an importable range", b.start));
+        }
+        // SAFETY: start + len <= self.len, checked above.
+        Ok((unsafe { self.ptr.add(b.start as usize) }, len))
     }
 
     fn bytes(&self) -> &[u8] {
@@ -210,15 +238,15 @@ mod tests {
                 len: 4096,
             },
         ];
-        let mut a = HostArena::new(3 * 4096).expect("mlock under limit");
-        assert_eq!(a.pin_bytes(), 3 * 4096, "page-rounded, no overpin");
+        let mut a = HostArena::new(HostArena::padded_total(&src)).expect("mlock under limit");
+        assert_eq!(a.pin_bytes(), 6 * 4096, "a page-sized blob plus its tail slack is two pages");
         a.fill(&src, &files).expect("pread fill");
         assert_eq!(a.blobs().len(), 3);
         assert_eq!(
             a.blobs()[2],
             ArenaBlob {
-                start: 8192,
-                end: 12288
+                start: 16384,
+                end: 20480
             }
         );
         for (i, blob) in a.blobs().iter().enumerate() {
@@ -262,5 +290,25 @@ mod tests {
             .contains("holds"),
             "overfill must be a checked error"
         );
+    }
+
+    #[test]
+    fn odd_blobs_start_on_pages_and_import_ranges_are_aligned() {
+        let dir = std::env::temp_dir().join("breccia-host-arena-pad-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = temp_shard(&dir, &[3000, 5000]);
+        let files = vec![Arc::new(Mutex::new(File::open(&path).unwrap()))];
+        let src = vec![
+            BlobSource { file: 0, offset: 0, len: 3000 },
+            BlobSource { file: 0, offset: 3000, len: 5000 },
+        ];
+        assert_eq!(HostArena::padded_total(&src), 4096 + 8192);
+        let mut a = HostArena::new(HostArena::padded_total(&src)).expect("mlock under limit");
+        a.fill(&src, &files).expect("pread fill");
+        assert_eq!(a.blobs()[1], ArenaBlob { start: 4096, end: 9096 });
+        assert!(a.blob(1).unwrap().iter().all(|b| *b == 2));
+        let (p0, l0) = a.blob_import_range(0).unwrap();
+        let (p1, l1) = a.blob_import_range(1).unwrap();
+        assert_eq!((p0 as usize % 4096, l0, p1 as usize - p0 as usize, l1), (0, 4096, 4096, 8192));
     }
 }

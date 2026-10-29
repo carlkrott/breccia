@@ -1,0 +1,42 @@
+// Texture-unit probe: does the sampler do useful non-quant work?
+// mode 0: MAX-reduction sampler at a texel corner = max of a 2x2 block in one fetch.
+// mode 1: the same max from 4 buffer loads + 3 max ops (shader baseline).
+// mode 2: plain bilinear at fraction (0.3, 0.6), not 8-bit exact (weight precision check).
+// reps > 1 re-reads a cache-resident image to measure issue rate, not DRAM.
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D tmax;
+layout(set = 0, binding = 1) uniform sampler2D tlin;
+layout(set = 0, binding = 2) readonly buffer Src { float src[]; };
+layout(set = 0, binding = 3) writeonly buffer Dst { float dst[]; };
+
+layout(push_constant) uniform Push {
+    uint w;
+    uint h;
+    uint mode;
+    uint reps;
+} pc;
+
+void main() {
+    uvec2 o = gl_GlobalInvocationID.xy;
+    uvec2 on = uvec2(pc.w / 2u, pc.h / 2u);
+    if (o.x >= on.x || o.y >= on.y) return;
+    vec2 inv = 1.0 / vec2(pc.w, pc.h);
+    float acc = -1.0 / 0.0;
+    for (uint r = 0u; r < pc.reps; ++r) {
+        uvec2 p = ((o + uvec2(r * 7u, r * 13u)) % on) * 2u;
+        float v;
+        if (pc.mode == 0u) {
+            v = textureLod(tmax, (vec2(p) + 1.0) * inv, 0.0).r;
+        } else if (pc.mode == 1u) {
+            uint i = p.y * pc.w + p.x;
+            v = max(max(src[i], src[i + 1u]), max(src[i + pc.w], src[i + pc.w + 1u]));
+        } else {
+            v = textureLod(tlin, (vec2(p) + vec2(0.8, 1.1)) * inv, 0.0).r;
+        }
+        acc = max(acc, v);
+    }
+    dst[o.y * on.x + o.x] = acc;
+}
