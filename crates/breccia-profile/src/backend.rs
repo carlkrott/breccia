@@ -166,7 +166,7 @@ mod tests {
         let ids = VulkanBackend.discover().expect("discovery");
         assert!(ids.len() >= 3, "expected 3 devices, got {}", ids.len());
         assert!(ids.iter().any(|i| i.device_id == "0x73a5"), "RX 6950 XT");
-        assert!(ids.iter().any(|i| i.device_id == "0x66af"), "Radeon VII");
+        assert!(ids.iter().any(|i| matches!(i.device_id.as_str(), "0x66af" | "0x66a1")), "Radeon VII / Pro VII");
         for id in &ids {
             assert!(!id.uuid.is_empty(), "{} has no uuid", id.name);
             assert!(!id.pci_topology.is_empty(), "{} has no topology", id.name);

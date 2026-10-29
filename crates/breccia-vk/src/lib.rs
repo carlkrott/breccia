@@ -80,8 +80,8 @@ mod tests {
         );
         assert!(
             devs.iter()
-                .any(|d| d.vendor_id == 0x1002 && d.device_id == 0x66af),
-            "Radeon VII (1002:66af) missing — MESA_VK_DEVICE_SELECT not cleared?"
+                .any(|d| d.vendor_id == 0x1002 && matches!(d.device_id, 0x66af | 0x66a1)),
+            "Radeon VII / Pro VII (1002:66af|66a1) missing — MESA_VK_DEVICE_SELECT not cleared?"
         );
         for d in &devs {
             assert!(!d.uuid.is_empty(), "device {} has no deviceUUID", d.name);

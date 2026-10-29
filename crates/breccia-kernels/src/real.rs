@@ -744,7 +744,7 @@ pub fn run_batch(dev: &Device, opts: &GemvBenchOptions) -> Result<Vec<BatchCell>
 fn reference_for(device_id: &str) -> (Option<f64>, Option<String>) {
     match device_id {
         "1002:73a5" => (Some(445.0), Some("RX 6950 XT, 445 GB/s reference".into())),
-        "1002:66af" => (
+        "1002:66af" | "1002:66a1" => (
             Some(825.0),
             Some("Radeon VII / MI50, 825 GB/s reference".into()),
         ),

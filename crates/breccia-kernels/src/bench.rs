@@ -30,7 +30,8 @@ use crate::quant::QuantType;
 fn reference_bandwidth_gbps(device_id: &str) -> Option<(f64, &'static str)> {
     match device_id {
         "1002:73a5" => Some((445.0, "RX 6950 XT (measured 462 GB/s Phase-0 §2)")),
-        "1002:66af" => Some((825.0, "Radeon VII / MI50 (measured 826 GB/s Phase-0 §2)")),
+        // 66a1: the MI50 reflashed to the Radeon Pro VII VBIOS (2026-10-29), same silicon.
+        "1002:66af" | "1002:66a1" => Some((825.0, "Radeon VII / MI50 (measured 826 GB/s Phase-0 §2)")),
         _ => None,
     }
 }

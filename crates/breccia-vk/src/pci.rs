@@ -223,7 +223,7 @@ mod tests {
     /// assumes), so it is printed rather than asserted.
     #[test]
     fn the_display_fact_is_answerable_per_card() {
-        for (vid, did) in [(0x1002u32, 0x73a5u32), (0x1002, 0x66af)] {
+        for (vid, did) in [(0x1002u32, 0x73a5u32), (0x1002, 0x66af), (0x1002, 0x66a1)] {
             let Some(addr) = find_address_by_ids(vid, did) else {
                 continue; // the artifact is host-specific; skip what is absent
             };
