@@ -595,6 +595,10 @@ pub struct Session<'m> {
     /// The same snapshot for the interval **counts** (they must be differenced with
     /// the same base as the nanoseconds, or the table's `n` is a process total).
     probe_base_n: Vec<[u32; batch_cmd::probe::MAX]>,
+    /// The probe's per-device totals captured on the decoding thread
+    /// ([`Session::capture_probe`]): the accumulators are thread-local, so after a
+    /// concurrent decode thread exits the reading thread would otherwise see none.
+    probe_cap: Option<Vec<([u64; batch_cmd::probe::MAX], [u32; batch_cmd::probe::MAX])>>,
     /// Latest `VK_EXT_calibrated_timestamps` sample per device (one per second of
     /// the probe run) — the anchor that puts query ticks on the host clock.
     anchor: Vec<Option<breccia_vk::ctx::Calibration>>,
@@ -1113,6 +1117,7 @@ impl<'m> Session<'m> {
             },
             probe_base: vec![[0u64; batch_cmd::probe::MAX]; model.devices.len()],
             probe_base_n: vec![[0u32; batch_cmd::probe::MAX]; model.devices.len()],
+            probe_cap: None,
             anchor: vec![None; model.devices.len()],
             anchor_at: None,
             gpu_busy_s: vec![0.0; model.devices.len()],
@@ -1376,7 +1381,7 @@ impl<'m> Session<'m> {
         if batch_cmd::probe::enabled() {
             let mut out = Vec::new();
             for (i, gpu) in self.device_gpus().into_iter().enumerate() {
-                let (ns, _) = batch_cmd::probe::totals(gpu);
+                let (ns, _) = self.probe_totals(i, gpu);
                 let base = self
                     .probe_base
                     .get(i)
@@ -1428,7 +1433,8 @@ impl<'m> Session<'m> {
 
     /// Remember the GPU-time probe's cumulative per-stage totals, so the table
     /// covers the measured decode window and not the prompt.
-    fn snapshot_probe(&mut self) {
+    pub fn snapshot_probe(&mut self) {
+        self.probe_cap = None;
         if !batch_cmd::probe::enabled() {
             return;
         }
@@ -1445,6 +1451,31 @@ impl<'m> Session<'m> {
             if let Some(slot) = self.probe_base_n.get_mut(i) {
                 *slot = n;
             }
+        }
+    }
+
+    /// Keep this thread's probe totals for readers on another thread (call on the
+    /// decoding thread before it exits; pair with [`Session::snapshot_probe`] at its
+    /// start so the base is the same thread's).
+    pub fn capture_probe(&mut self) {
+        if batch_cmd::probe::enabled() {
+            self.probe_cap = Some(
+                self.device_gpus()
+                    .into_iter()
+                    .map(batch_cmd::probe::totals)
+                    .collect(),
+            );
+        }
+    }
+
+    fn probe_totals(
+        &self,
+        i: usize,
+        gpu: &breccia_vk::ctx::Gpu,
+    ) -> ([u64; batch_cmd::probe::MAX], [u32; batch_cmd::probe::MAX]) {
+        match &self.probe_cap {
+            Some(c) => c[i],
+            None => batch_cmd::probe::totals(gpu),
         }
     }
 
@@ -1473,7 +1504,7 @@ impl<'m> Session<'m> {
             let mut per: Vec<(f64, u32)> = Vec::with_capacity(gpus.len());
             let mut total = 0.0;
             for (i, gpu) in gpus.iter().enumerate() {
-                let (ns, cnt) = batch_cmd::probe::totals(gpu);
+                let (ns, cnt) = self.probe_totals(i, gpu);
                 let base = self
                     .probe_base
                     .get(i)

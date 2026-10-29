@@ -416,6 +416,9 @@ impl<'m> Multi<'m> {
                             let mut toks = Vec::with_capacity(n);
                             let mut times = Vec::with_capacity(n);
                             let mut pos = prompt.len();
+                            // The GPU-time probe accumulates per thread: base and
+                            // capture on this one, or the report reads 0.
+                            sess.snapshot_probe();
                             for i in 0..n {
                                 let t = sess.sample(&lg).unwrap_or(0);
                                 toks.push(t);
@@ -427,6 +430,7 @@ impl<'m> Multi<'m> {
                                 times.push(t_step.elapsed().as_secs_f64());
                                 pos += 1;
                             }
+                            sess.capture_probe();
                             Ok((toks, lg, times))
                         })
                     })
