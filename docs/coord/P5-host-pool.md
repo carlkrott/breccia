@@ -83,3 +83,16 @@ Combining pool (`BRECCIA_POOL_COMBINE=1`, `p5-combine.patch`, binary `breccia-cm
 
 FAIL. Merging is opportunistic: a holder finds on average ~1.25 requests queued, not the ~3 the estimate assumed, because the streams rarely post at the same moment. Sync share falls 4 points but worker busy rises ~0.2 s, and the phase wall saves ~0.3 s of ~13.5 s decode. Per-stream `lane_s` falls ~0.5 s, but tok/s does not move, and RX busy (rocm-smi samples with any GPU > 20 %, crude) stays within 3 points in every arm, so the saving is not lost in the pool. Where it goes (mixed prompts both sides, warm runs 2-3, `unit-mx-x4b.log` vs `unit-cmb-x4b.log`): lane 142.4/146.9 -> 137.7/138.6 ms/step (-6), fence 142.2/141.7 -> 150.9/150.5 ms/step (+9), RX probe busy 79/79 -> 78/78 % with the same ~10.5 s GPU busy. The host time saved reappears as fence wait: at x4b the streams now wait on the GPU instead of the pool, so the RX side is binding. Any other host-side saving (per-byte kernel included) is expected to be absorbed the same way at x4b (UNVERIFIED inference); 2b dense-only lockstep (fewer RX dense reads) ranks ahead of the kernel lever. In combine mode `lock_wait_s` runs from queue push to lock, which includes time another holder spent on this request: not comparable with the flag-off figure. Bigger merges need the streams to arrive together, i.e. 2b lockstep; the patch is input for that, not live code.
 
+
+## Scheduler and host import (2026-10-29 17:46, Carl OK; `matrix-hiscx.sh`, binary `breccia-mx`, mixed prompts on x3r9/x4b)
+scx_lavd on (lv1) -> `scxctl stop` = kernel EEVDF (eev) -> `systemctl restart scx_loader` = lavd again (lv2); parity True in every arm.
+
+| arm | lv1 (lavd) | eev (EEVDF) | lv2 (lavd) | eev vs lavd |
+|---|---|---|---|---|
+| x1r | 17.33 | 15.71 | 17.32 | -9.4 % |
+| x3r9 (CC SH MX) | 39.74 | 34.45 | 39.68 | -13.3 % |
+| x4b (CC SH MX) | 47.36 | 40.11 | 47.39 | -15.3 % |
+
+**Keep scx_lavd.** The loss grows with stream count (more runnable threads than the 32 logical CPUs), and lavd reproduces within 0.1 %. The ~25 % pinning gain at 8-16 threads in the microbench is scheduler placement under lavd at partial load. It does not apply at the 30-thread live point.
+
+Host expert import (`--host-expert-import`; the ~17.1 GB arena now mlocks after the user-manager `LimitMEMLOCK=infinity` drop-in), x1r: hi1 17.44 vs hi0 17.31, parity True, memory peak 20.6 vs 27.2 GB, submits and fence wait per token unchanged. The arena only feeds the GPU stream-slot fill (prefill path, graph.rs `fill_stream_slot`), so decode is not expected to move. A long-prompt prefill arm is the real test (not run).
