@@ -443,3 +443,121 @@ fn dense_shared_expert_gemm_matches_the_gemv() {
     gpu.destroy_buf(&w);
     let _ = vk::WHOLE_SIZE;
 }
+
+/// The int8-dot GEMM (`run_at_q8`, §11j) against the fp32 multi-user GEMM on a real
+/// expert: per-user results identical across `m` (users are independent, z slices
+/// included), normwise error vs fp32 within q8 rounding, and the time per dispatch
+/// next to fp32's (the go/no-go for the engine path). `BRECCIA_GEMM_TYPE` picks
+/// the type (IQ3_S only so far); RX first.
+#[test]
+fn q8_gemm_tracks_the_fp32_gemm() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("q8_gemm: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let want_ty = match std::env::var("BRECCIA_GEMM_TYPE").as_deref() {
+        Ok("IQ3_S") => QuantType::Iq3S,
+        _ => {
+            eprintln!("q8_gemm: SKIPPED - set BRECCIA_GEMM_TYPE=IQ3_S");
+            return;
+        }
+    };
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else {
+        eprintln!("q8_gemm: no device for {selector}");
+        return;
+    };
+    let Ok(set) = ShardSet::open_glob(MODEL_GLOB) else {
+        eprintln!("q8_gemm: skipping, no model");
+        return;
+    };
+    let layout = set.layout().expect("layout");
+    let plan = layout
+        .blocks()
+        .map(|b| LayerPlan::from_block(&set, b).expect("plan"))
+        .find(|p| p.role(ExpertRole::Gate.name()).ty == want_ty)
+        .expect("a block with that gate type");
+    let gpu = &dev.gpu;
+    let (rows, cols) = (plan.n_ff, plan.n_embd);
+    let mut gemm = GemmMany::new(gpu, want_ty).expect("gemm pipeline");
+    gemm.set_users_per_z(USERS_MAX);
+    assert!(gemm.has_q8());
+    let quant = breccia_kernels::Q8Quantize::new(gpu).expect("quantiser");
+    let slices = plan.slices(&set, 7).expect("slices");
+    let w = breccia_kernels::gemv::upload(gpu, slices.gate).expect("upload weights");
+    const N: usize = 16;
+    let mut seed = 0x1234_5678u32;
+    let xs: Vec<f32> = (0..N * cols)
+        .map(|_| {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+        })
+        .collect();
+    let x = breccia_kernels::ops::upload_f32(gpu, &xs).expect("upload x");
+    let xq = alloc(gpu, (N * cols) as u64).expect("q8 buffer");
+    let xd = alloc(gpu, (N * cols / 16) as u64).expect("scale buffer");
+    quant.run(&x, &xq, &xd, N * cols).expect("quantise");
+    let out = alloc(gpu, (N * rows * 4) as u64).expect("out buffer");
+
+    gemm.run(&w, &x, &out, rows, cols, N).expect("fp32 gemm");
+    let want = breccia_kernels::ops::download_f32(gpu, &out, N * rows).expect("download");
+    gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, N, 0).expect("q8 gemm");
+    let full = breccia_kernels::ops::download_f32(gpu, &out, N * rows).expect("download");
+
+    let (mut num, mut den) = (0f64, 0f64);
+    for i in 0..N * rows {
+        num += ((full[i] - want[i]) as f64).powi(2);
+        den += (want[i] as f64).powi(2);
+    }
+    let rel = (num / den).sqrt();
+    let mut same_bits = true;
+    for m in [1usize, 2, 4, 8, 12, 16] {
+        gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, m, 0).expect("q8 gemm");
+        let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("download");
+        same_bits &= got.iter().zip(&full).all(|(a, b)| a.to_bits() == b.to_bits());
+        let tf = gemm.run_timed(&w, &x, &out, rows, cols, m, 0.2).expect("timed");
+        let tq = gemm
+            .run_timed_q8(&w, &xq, &xd, &out, rows, cols, m, 0.2)
+            .expect("timed q8");
+        println!(
+            "{} gate m = {m}: fp32 {:.1} us, q8 {:.1} us ({:.2}x)",
+            want_ty.name(),
+            tf.per_iter_s * 1e6,
+            tq.per_iter_s * 1e6,
+            tf.per_iter_s / tq.per_iter_s
+        );
+    }
+    // Users per z slice: more, smaller slices = more workgroups. Results must
+    // not change (each user's accumulation is independent of the slicing).
+    for upz in [1usize, 2, 4, 8] {
+        gemm.set_users_per_z(upz);
+        for m in [8usize, 16] {
+            gemm.run(&w, &x, &out, rows, cols, m).expect("fp32 gemm");
+            let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("download");
+            same_bits &= got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits());
+            gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, m, 0).expect("q8 gemm");
+            let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("download");
+            same_bits &= got.iter().zip(&full).all(|(a, b)| a.to_bits() == b.to_bits());
+            let tf = gemm.run_timed(&w, &x, &out, rows, cols, m, 0.2).expect("timed");
+            let tq = gemm
+                .run_timed_q8(&w, &xq, &xd, &out, rows, cols, m, 0.2)
+                .expect("timed q8");
+            println!(
+                "{} gate upz = {upz} m = {m}: fp32 {:.1} us, q8 {:.1} us",
+                want_ty.name(),
+                tf.per_iter_s * 1e6,
+                tq.per_iter_s * 1e6
+            );
+        }
+    }
+    println!(
+        "{} gate: q8 vs fp32 normwise relative {rel:.3e}, per-user bit-identical across m: {same_bits}",
+        want_ty.name()
+    );
+    assert!(same_bits, "q8 results must not depend on m");
+    assert!(rel < 2e-2, "q8 GEMM off by {rel:.3e} normwise");
+    for b in [&out, &xd, &xq, &x, &w] {
+        gpu.destroy_buf(b);
+    }
+    drop(guard);
+}

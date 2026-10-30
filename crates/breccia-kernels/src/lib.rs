@@ -70,7 +70,7 @@ pub use gdn::{Gdn, GdnProjections, GdnState, GdnWeights, GdnWorkspace};
 pub use gemv::{dequant_to_f32, Accum, Gemv, GemvTiming};
 pub use moe::{MoeCombine, MoeFanIn, MoeMap};
 pub use ops::bench::{run_ops_bench, OpKind, OpsBenchOptions, OpsReport};
-pub use ops::{HcMixer, HcWeights, HcWorkspace, RmsNorm, Rope, RopeTable, Router};
+pub use ops::{HcMixer, HcWeights, HcWorkspace, Q8Quantize, RmsNorm, Rope, RopeTable, Router};
 pub use proj::Proj;
 pub use qsa::{Qsa, QsaProjections, QsaState, QsaWeights, QsaWorkspace};
 pub use quant::QuantType;

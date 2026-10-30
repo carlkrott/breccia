@@ -7,6 +7,7 @@
 // `up` roles as two dispatches plus the existing SwiGLU pass.
 #define QK 256u
 #define BLOCK_WORDS 37u
+#define BRECCIA_GEMM_MANY
 #include "blocks.glsl"
 #define DEQUANT_UNIT dequant_iq2_xs_unit
 #include "gemm_body.glsl"

@@ -6,6 +6,7 @@
 // Multi-user fused dequant + mat-vector for Q2_0 (`down` role), §8v.
 #define QK 64u
 #define BLOCK_WORDS 9u
+#define BRECCIA_GEMM_MANY
 #include "blocks.glsl"
 #define DEQUANT_UNIT dequant_q2_0_unit
 #include "gemm_body.glsl"

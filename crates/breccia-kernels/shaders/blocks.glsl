@@ -92,6 +92,12 @@ layout(push_constant) uniform Params {
     // resident arena, in 16-bit words. The GEMV dispatches push 16 bytes and never
     // read it; the multi-user GEMM pushes 20.
     uint base;
+#ifdef BRECCIA_GEMM_MANY
+    // 6th word, multi-user GEMM only (§11j): users per z slice (0 = USERS_MAX).
+    // Fewer users per slice = more workgroups; the m = 8 dispatch has only
+    // rows/8 workgroups (80 for a 640-row expert) and is occupancy-bound.
+    uint upz;
+#endif
 #ifdef BRECCIA_HC_GATED_EPILOGUE
     // The fused HC `up` + gated-mean variant (§8az) needs the column geometry:
     // `n_embd` elements per hyper-connection stream, `hc` streams, and the number

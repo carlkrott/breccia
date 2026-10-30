@@ -1,0 +1,48 @@
+#version 450
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : enable
+// Multi-user `iq3_s` GEMM on int8 dot products (§11j, `BRECCIA_GEMM_DP4A=1`):
+// the gate/up roles of the IQ3_S expert blocks.
+#define QK 256u
+#define BLOCK_WORDS 55u
+#define BRECCIA_GEMM_MANY
+#include "blocks.glsl"
+
+/// The four int8 codes of `word` with signs from `sgn` bits [bit, bit+4) applied,
+/// repacked as a dp4a operand (as `gemv_iq3s_q8.comp`).
+int codes4(uint word, uint sgn, uint bit) {
+    int v = int(word);
+    int c0 = int(bitfieldExtract(v, 0, 8));
+    int c1 = int(bitfieldExtract(v, 8, 8));
+    int c2 = int(bitfieldExtract(v, 16, 8));
+    int c3 = int(bitfieldExtract(v, 24, 8));
+    int m0 = ((sgn >> (bit + 0u)) & 1u) != 0u ? -c0 : c0;
+    int m1 = ((sgn >> (bit + 1u)) & 1u) != 0u ? -c1 : c1;
+    int m2 = ((sgn >> (bit + 2u)) & 1u) != 0u ? -c2 : c2;
+    int m3 = ((sgn >> (bit + 3u)) & 1u) != 0u ? -c3 : c3;
+    return (m0 & 0xFF) | ((m1 & 0xFF) << 8) | ((m2 & 0xFF) << 16) | ((m3 & 0xFF) << 24);
+}
+
+/// `dequant_iq3_s_unit` without the float expansion: codes + the unit's scale.
+void dequant_iq3_s_unit_i8(uint off, uint u, out int c0, out int c1, out float d) {
+    uint ib32 = u >> 2u;
+    uint l = u & 3u;
+    uint qhb = byte2(off + 33u + (ib32 >> 1u), ib32 & 1u);
+    uint sc = byte2(off + 53u + (ib32 >> 2u), (ib32 >> 1u) & 1u);
+    uint nib = (ib32 & 1u) == 0u ? (sc & 0x0fu) : (sc >> 4u);
+    d = f16_at(off) * (1.0 + 2.0 * float(nib));
+    uint qa = u32_at(off + 1u + 4u * ib32 + 2u * (l >> 1u));
+    uint g1 = byte4(qa, 2u * (l & 1u)) | ((qhb << (8u - 2u * l)) & 256u);
+    uint g2 = byte4(qa, 2u * (l & 1u) + 1u) | ((qhb << (7u - 2u * l)) & 256u);
+    uint sb = 4u * ib32 + l;
+    uint sgn = byte2(off + 37u + (sb >> 1u), sb & 1u);
+    c0 = codes4(grid_iq3s(g1), sgn, 0u);
+    c1 = codes4(grid_iq3s(g2), sgn, 4u);
+}
+
+#define DEQUANT_UNIT_I8 dequant_iq3_s_unit_i8
+#include "gemm_q8_body.glsl"

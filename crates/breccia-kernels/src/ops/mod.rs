@@ -725,6 +725,41 @@ impl<'g> SwiGlu<'g> {
     }
 }
 
+/// q8_1 activation quantiser (`ops_q8_quantize`): `k` f32 -> `k` int8 + one f16
+/// scale per 32 elements, symmetric absmax/127. The input of the int8 GEMMs
+/// ([`crate::gemm::GemmMany::run_at_q8`], §11j).
+pub struct Q8Quantize<'g> {
+    pipe: Pipe<'g>,
+}
+
+impl<'g> Q8Quantize<'g> {
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Ok(Q8Quantize {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_q8_quantize.spv")),
+                3,
+                "q8_quantize",
+            )?,
+        })
+    }
+
+    /// Quantise `x[..k]` into `q8[..k]` (int8) and `d[..k/32]` (f16); `k % 32 == 0`.
+    pub fn run(&self, x: &Buf, q8: &Buf, d: &Buf, k: usize) -> Result<()> {
+        if k == 0 || k % 32 != 0 {
+            return Err(anyhow!("q8 quantise needs k a non-zero multiple of 32, got {k}"));
+        }
+        let groups = k / 32;
+        // The shader indexes by gl_GlobalInvocationID.x only: no y fold.
+        let gx = groups.div_ceil(8);
+        if gx > WG_X_MAX as usize {
+            return Err(anyhow!("q8 quantise: {k} elements exceed one x-dispatch"));
+        }
+        let pc = Pc::new().u(k as u32).u(groups as u32);
+        self.pipe.run(&[x, q8, d], &pc, (gx as u32, 1, 1))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 4. Softmax
 // ---------------------------------------------------------------------------

@@ -53,8 +53,9 @@ void main() {
     }
     // Users past USERS_MAX ride the z dimension: workgroup z owns users
     // [z*USERS_MAX, z*USERS_MAX + m). One-group dispatches (z = 0) are unchanged.
-    uint u0 = gl_WorkGroupID.z * USERS_MAX;
-    uint m = min(max(pc_users, 1u) - u0, USERS_MAX);
+    uint upz = pc.upz == 0u ? USERS_MAX : min(pc.upz, USERS_MAX);
+    uint u0 = gl_WorkGroupID.z * upz;
+    uint m = min(max(pc_users, 1u) - u0, upz);
 
     const uint u = UNITS >= LANES ? lane : (lane % UNITS);
     const uint b_off = UNITS >= LANES ? 0u : (lane / UNITS);

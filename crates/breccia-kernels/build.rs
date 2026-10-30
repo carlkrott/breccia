@@ -39,6 +39,7 @@ const SHADERS: &[&str] = &[
     "gemm_iq2_s",
     "gemm_iq3_xxs",
     "gemm_iq3_s",
+    "gemm_iq3_s_q8",
     "gemm_iq4_xs",
     "gemm_q4_k",
     "gemm_q5_k",

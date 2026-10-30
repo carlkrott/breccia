@@ -25,7 +25,22 @@ pub struct GemmMany<'g> {
     ty: QuantType,
     gpu: &'g Gpu,
     kernel: breccia_vk::ctx::Kernel,
+    /// The int8-dot variant (q8_1 activations, §11j), for the types that have one.
+    q8: Option<breccia_vk::ctx::Kernel>,
+    /// Users per z slice (1..=USERS_MAX): fewer = more workgroups per dispatch.
+    upz: usize,
     tables: Buf,
+}
+
+/// `BRECCIA_GEMM_UPZ` (1..=8), the default users per z slice.
+fn default_upz() -> usize {
+    static UPZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *UPZ.get_or_init(|| {
+        std::env::var("BRECCIA_GEMM_UPZ")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .map_or(USERS_MAX, |n: usize| n.clamp(1, USERS_MAX))
+    })
 }
 
 impl<'g> GemmMany<'g> {
@@ -56,10 +71,24 @@ impl<'g> GemmMany<'g> {
         let kernel = gpu
             .kernel(spv, 4)
             .map_err(|e| anyhow!("creating the {ty} multi-user GEMM pipeline: {e}"))?;
+        let q8_spv: Option<&[u8]> = match ty {
+            QuantType::Iq3S => Some(include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq3_s_q8.spv"))),
+            _ => None,
+        };
+        let q8 = match q8_spv.map(|spv| gpu.kernel(spv, 6)).transpose() {
+            Ok(k) => k,
+            Err(e) => {
+                gpu.destroy_kernel(&kernel);
+                return Err(anyhow!("creating the {ty} int8 GEMM pipeline: {e}"));
+            }
+        };
         let tables = match upload(gpu, &table_bytes()) {
             Ok(b) => b,
             Err(e) => {
                 gpu.destroy_kernel(&kernel);
+                if let Some(k) = &q8 {
+                    gpu.destroy_kernel(k);
+                }
                 return Err(e.context("uploading the quant tables"));
             }
         };
@@ -67,12 +96,24 @@ impl<'g> GemmMany<'g> {
             ty,
             gpu,
             kernel,
+            q8,
+            upz: default_upz(),
             tables,
         })
     }
 
     pub fn ty(&self) -> QuantType {
         self.ty
+    }
+
+    /// Users per z slice (clamped to 1..=USERS_MAX); see [`default_upz`].
+    pub fn set_users_per_z(&mut self, n: usize) {
+        self.upz = n.clamp(1, USERS_MAX);
+    }
+
+    /// Whether [`GemmMany::run_at_q8`] exists for this type.
+    pub fn has_q8(&self) -> bool {
+        self.q8.is_some()
     }
 
     /// Blocks per row for `cols`.
@@ -86,13 +127,15 @@ impl<'g> GemmMany<'g> {
         self.blocks_per_row(cols) * self.ty.block_elems()
     }
 
-    fn pc(rows: usize, cols: usize, bpr: usize, users: usize, base_words: u32) -> [u8; 20] {
-        let mut pc = [0u8; 20];
+    fn pc(&self, rows: usize, cols: usize, users: usize, base_words: u32) -> [u8; 24] {
+        let bpr = self.blocks_per_row(cols);
+        let mut pc = [0u8; 24];
         pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
         pc[4..8].copy_from_slice(&(cols as u32).to_le_bytes());
         pc[8..12].copy_from_slice(&(bpr as u32).to_le_bytes());
         pc[12..16].copy_from_slice(&(users as u32).to_le_bytes());
         pc[16..20].copy_from_slice(&base_words.to_le_bytes());
+        pc[20..24].copy_from_slice(&(self.upz as u32).to_le_bytes());
         pc
     }
 
@@ -125,29 +168,77 @@ impl<'g> GemmMany<'g> {
         if users == 0 {
             return Err(anyhow!("users must be at least 1"));
         }
-        let pc = Self::pc(rows, cols, self.blocks_per_row(cols), users, base_words);
+        let pc = self.pc(rows, cols, users, base_words);
+        self.dispatch(&self.kernel, &[w, x, out, &self.tables], &pc, rows, users)
+    }
+
+    /// [`GemmMany::run_at`] on int8 dot products: `xq` holds `users * cols` int8
+    /// (row-major per user) and `xd` one f16 scale per 32 of them, as
+    /// [`crate::Q8Quantize`] writes. Needs `cols` a multiple of the block size.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_at_q8(
+        &self,
+        w: &Buf,
+        xq: &Buf,
+        xd: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        base_words: u32,
+    ) -> Result<()> {
+        let (kernel, pc) = self.q8_launch(rows, cols, users, base_words)?;
+        // Binding 1 (the fp32 X the body does not read) is bound to xq.
+        self.dispatch(kernel, &[w, xq, out, &self.tables, xq, xd], &pc, rows, users)
+    }
+
+    fn q8_launch(
+        &self,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        base_words: u32,
+    ) -> Result<(&breccia_vk::ctx::Kernel, [u8; 24])> {
+        let kernel = self
+            .q8
+            .as_ref()
+            .ok_or_else(|| anyhow!("no int8 GEMM for {}", self.ty))?;
+        if users == 0 {
+            return Err(anyhow!("users must be at least 1"));
+        }
+        if cols % self.ty.block_elems() != 0 {
+            return Err(anyhow!(
+                "int8 GEMM needs cols ({cols}) a multiple of {}",
+                self.ty.block_elems()
+            ));
+        }
+        Ok((kernel, self.pc(rows, cols, users, base_words)))
+    }
+
+    fn dispatch(
+        &self,
+        kernel: &breccia_vk::ctx::Kernel,
+        bufs: &[&Buf],
+        pc: &[u8; 24],
+        rows: usize,
+        users: usize,
+    ) -> Result<()> {
         let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
         let gx = groups.min(WG_X_MAX);
         let gy = groups.div_ceil(WG_X_MAX);
-        // More than USERS_MAX users: one z slice of the dispatch per USERS_MAX.
-        let gz = users.div_ceil(USERS_MAX) as u32;
+        // One z slice of the dispatch per `upz` users.
+        let gz = users.div_ceil(self.upz) as u32;
         // Inside a dispatch batch the dispatch is **recorded** (the same rule
         // `Pipe::run`, `Gemv::run` and `GemvBatch::run` follow): a chunked prefill
         // records ~200 expert groups per block, and one submit+wait each would be
         // 40-60 µs of round trip per GEMM.
         if crate::dispatch_batch::is_open() {
-            return crate::dispatch_batch::record(
-                self.gpu,
-                &self.kernel,
-                &[w, x, out, &self.tables],
-                &pc,
-                (gx, gy, gz),
-            );
+            return crate::dispatch_batch::record(self.gpu, kernel, bufs, pc, (gx, gy, gz));
         }
+        let handles: Vec<vk::Buffer> = bufs.iter().map(|b| b.buf).collect();
         self.gpu
-            .bind_kernel(&self.kernel, &[w.buf, x.buf, out.buf, self.tables.buf])
+            .bind_kernel(kernel, &handles)
             .map_err(|e| anyhow!("{e}"))?;
-        let kernel = &self.kernel;
         self.gpu
             .wall_run(Qc::C, |d, cmd| unsafe {
                 d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, kernel.pipe);
@@ -159,7 +250,7 @@ impl<'g> GemmMany<'g> {
                     &[kernel.set],
                     &[],
                 );
-                d.cmd_push_constants(cmd, kernel.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+                d.cmd_push_constants(cmd, kernel.layout, vk::ShaderStageFlags::COMPUTE, 0, pc);
                 d.cmd_dispatch(cmd, gx, gy, gz);
             })
             .map_err(|e| anyhow!("{e}"))?;
@@ -178,14 +269,44 @@ impl<'g> GemmMany<'g> {
         users: usize,
         target_s: f64,
     ) -> Result<GemvTiming> {
-        let pc = Self::pc(rows, cols, self.blocks_per_row(cols), users, 0);
+        let pc = self.pc(rows, cols, users, 0);
+        self.timed(&self.kernel, &[w, x, out, &self.tables], &pc, rows, users, target_s)
+    }
+
+    /// Timed variant of [`GemmMany::run_at_q8`] (base 0).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_timed_q8(
+        &self,
+        w: &Buf,
+        xq: &Buf,
+        xd: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        target_s: f64,
+    ) -> Result<GemvTiming> {
+        let (kernel, pc) = self.q8_launch(rows, cols, users, 0)?;
+        self.timed(kernel, &[w, xq, out, &self.tables, xq, xd], &pc, rows, users, target_s)
+    }
+
+    fn timed(
+        &self,
+        kernel: &breccia_vk::ctx::Kernel,
+        bufs: &[&Buf],
+        pc: &[u8; 24],
+        rows: usize,
+        users: usize,
+        target_s: f64,
+    ) -> Result<GemvTiming> {
+        let handles: Vec<vk::Buffer> = bufs.iter().map(|b| b.buf).collect();
         self.gpu
-            .bind_kernel(&self.kernel, &[w.buf, x.buf, out.buf, self.tables.buf])
+            .bind_kernel(kernel, &handles)
             .map_err(|e| anyhow!("{e}"))?;
         let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
         let gx = groups.min(WG_X_MAX);
         let gy = groups.div_ceil(WG_X_MAX);
-        let kernel = &self.kernel;
+        let gz = users.div_ceil(self.upz) as u32;
         let t = self
             .gpu
             .run_timed(Qc::C, target_s, |d, cmd, n| {
@@ -205,9 +326,9 @@ impl<'g> GemmMany<'g> {
                             kernel.layout,
                             vk::ShaderStageFlags::COMPUTE,
                             0,
-                            &pc,
+                            pc,
                         );
-                        d.cmd_dispatch(cmd, gx, gy, 1);
+                        d.cmd_dispatch(cmd, gx, gy, gz);
                         Gpu::barrier_all(d, cmd);
                     }
                 }
@@ -230,6 +351,9 @@ impl<'g> GemmMany<'g> {
 impl Drop for GemmMany<'_> {
     fn drop(&mut self) {
         self.gpu.destroy_kernel(&self.kernel);
+        if let Some(k) = &self.q8 {
+            self.gpu.destroy_kernel(k);
+        }
         self.gpu.destroy_buf(&self.tables);
     }
 }

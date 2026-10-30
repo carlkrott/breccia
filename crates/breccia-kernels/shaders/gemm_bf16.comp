@@ -10,6 +10,7 @@
 //
 #define QK 8u
 #define BLOCK_WORDS 8u
+#define BRECCIA_GEMM_MANY
 #include "blocks.glsl"
 #define DEQUANT_UNIT dequant_bf16_unit
 #include "gemm_body.glsl"

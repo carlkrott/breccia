@@ -12,6 +12,7 @@
 //
 #define QK 256u
 #define BLOCK_WORDS 68u
+#define BRECCIA_GEMM_MANY
 #include "blocks.glsl"
 #define DEQUANT_UNIT dequant_iq4_xs_unit
 #include "gemm_body.glsl"
