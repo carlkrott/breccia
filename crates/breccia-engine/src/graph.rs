@@ -251,6 +251,11 @@ pub struct PfChunk {
     down: Buf,
     /// `[T, n_embd]`, the fan-in's output.
     out: Buf,
+    /// `[T, n_ff_shared]` gate, up and SwiGLU of the chunk-level shared expert
+    /// (`BRECCIA_PF_SHCHUNK`).
+    sh_g: Buf,
+    sh_u: Buf,
+    sh_a: Buf,
     /// **Streamed** (non-resident) experts: `STREAM_SLOTS` host-visible slots, each
     /// laid out `[gate | up | down]`, so one host memcpy per distinct expert
     /// replaces the lane's per-token dequantisation (§8x). The slot is copied to
@@ -291,6 +296,9 @@ impl PfChunk {
                 &self.act,
                 &self.down,
                 &self.out,
+                &self.sh_g,
+                &self.sh_u,
+                &self.sh_a,
                 &self.stream.buf,
                 &self.sf_gate,
                 &self.sf_up,
@@ -567,6 +575,9 @@ pub struct Session<'m> {
     pf_stream_bytes: u64,
     pf_stream_fill_s: f64,
     pf_stream_wait_s: f64,
+    /// Merged pass 1 only: the prelude leaves the shared expert's gate/up/SwiGLU/
+    /// down out, and the pass runs them once over the chunk (`BRECCIA_PF_SHCHUNK`).
+    shared_deferred: bool,
     /// Host seconds spent faulting PLE table rows in for the whole chunk.
     pf_ple_prefetch_s: f64,
     /// Fine-grained `shared-exp` attribution (§8ad): gate, up, swiglu, down, scalar
@@ -872,6 +883,7 @@ impl<'m> Session<'m> {
                 let k = mc.n_expert_used;
                 let nb = mc.n_embd as u64 * 4;
                 let nfb = mc.n_ff as u64 * 4;
+                let nsb = mc.n_ff_shared as u64 * 4;
                 let users = breccia_kernels::gemm::USERS_MAX as u64;
                 // Streamed experts: the largest role blob among the blocks that
                 // are **not** resident (the resident ones address the arena).
@@ -902,6 +914,9 @@ impl<'m> Session<'m> {
                     act: alloc(users * nfb, "prefill expert act")?,
                     down: alloc(users * nb, "prefill expert down")?,
                     out: alloc(chunk as u64 * nb, "prefill merged out")?,
+                    sh_g: alloc(chunk as u64 * nsb, "prefill chunk shared gate")?,
+                    sh_u: alloc(chunk as u64 * nsb, "prefill chunk shared up")?,
+                    sh_a: alloc(chunk as u64 * nsb, "prefill chunk shared act")?,
                     // Two halves, so the host fills one while the GPU copies the other.
                     stream: Mailbox::new(gpu, 2 * STREAM_SLOTS as u64 * slot_stride)?,
                     sf_gate: alloc(gb.max(16), "streamed expert gate")?,
@@ -1080,6 +1095,7 @@ impl<'m> Session<'m> {
             pf_stream_bytes: 0,
             pf_stream_fill_s: 0.0,
             pf_stream_wait_s: 0.0,
+            shared_deferred: false,
             pf_ple_prefetch_s: 0.0,
             sh_sub: [0.0; 6],
             pf_wall_s: 0.0,
@@ -2192,41 +2208,45 @@ impl<'m> Session<'m> {
             let v = &self.venues[dev];
             let pipes = &v.pipes;
             let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-            // `gate` and `up` both read `ws.mixed` and write disjoint outputs, so
-            // the fence between them is dead: drop *gate's* trailing fence (§8z).
-            batch_cmd::skip_next_barrier();
-            // Fine-grained attribution (§8ad): this stage measures as 15-21 ms/token
-            // while the routed shared expert prices at ~0.9, so time each call.
-            // The blocking GPU wait (the fence in `wall_run` when no batch is
-            // open) sits inside these runs: mark it off SHARED before the first
-            // one, or the breakdown charges the wait to shared-exp compute (§8ae).
-            let t0 = std::time::Instant::now();
-            self.timers.mark(WAIT_GPU);
-            pipes
-                .get(&lw.moe.gate.key)?
-                .run(&lw.moe.gate.buf, &ws.mixed, &v.shexp_gate)?;
-            sub[0] = t0.elapsed().as_secs_f64();
-            // The gate run is where the blocking fence wait landed; re-anchor to
-            // shared-exp so only the wait, not the remaining shared-expert runs,
-            // is priced as wait-gpu (R28-1: 5162653 relabelled the whole span).
-            self.timers.mark(SHARED);
-            self.probe_mark(dev, batch_cmd::probe::SH_UP);
-            let t0 = std::time::Instant::now();
-            pipes
-                .get(&lw.moe.up.key)?
-                .run(&lw.moe.up.buf, &ws.mixed, &v.shexp_up)?;
-            sub[1] = t0.elapsed().as_secs_f64();
-            self.probe_mark(dev, batch_cmd::probe::SH_SWIGLU);
-            let t0 = std::time::Instant::now();
-            v.swiglu
-                .run(&v.shexp_gate, &v.shexp_up, &v.shexp_act, mc.n_ff)?;
-            sub[2] = t0.elapsed().as_secs_f64();
-            self.probe_mark(dev, batch_cmd::probe::SH_DOWN);
-            let t0 = std::time::Instant::now();
-            pipes
-                .get(&lw.moe.down.key)?
-                .run(&lw.moe.down.buf, &v.shexp_act, &v.sh)?;
-            sub[3] = t0.elapsed().as_secs_f64();
+            // Merged pass 1 with BRECCIA_PF_SHCHUNK: the four runs below happen once
+            // per chunk instead (`prefill_block_merged`); only the scalar gate stays.
+            if !self.shared_deferred {
+                // `gate` and `up` both read `ws.mixed` and write disjoint outputs, so
+                // the fence between them is dead: drop *gate's* trailing fence (§8z).
+                batch_cmd::skip_next_barrier();
+                // Fine-grained attribution (§8ad): this stage measures as 15-21 ms/token
+                // while the routed shared expert prices at ~0.9, so time each call.
+                // The blocking GPU wait (the fence in `wall_run` when no batch is
+                // open) sits inside these runs: mark it off SHARED before the first
+                // one, or the breakdown charges the wait to shared-exp compute (§8ae).
+                let t0 = std::time::Instant::now();
+                self.timers.mark(WAIT_GPU);
+                pipes
+                    .get(&lw.moe.gate.key)?
+                    .run(&lw.moe.gate.buf, &ws.mixed, &v.shexp_gate)?;
+                sub[0] = t0.elapsed().as_secs_f64();
+                // The gate run is where the blocking fence wait landed; re-anchor to
+                // shared-exp so only the wait, not the remaining shared-expert runs,
+                // is priced as wait-gpu (R28-1: 5162653 relabelled the whole span).
+                self.timers.mark(SHARED);
+                self.probe_mark(dev, batch_cmd::probe::SH_UP);
+                let t0 = std::time::Instant::now();
+                pipes
+                    .get(&lw.moe.up.key)?
+                    .run(&lw.moe.up.buf, &ws.mixed, &v.shexp_up)?;
+                sub[1] = t0.elapsed().as_secs_f64();
+                self.probe_mark(dev, batch_cmd::probe::SH_SWIGLU);
+                let t0 = std::time::Instant::now();
+                v.swiglu
+                    .run(&v.shexp_gate, &v.shexp_up, &v.shexp_act, mc.n_ff)?;
+                sub[2] = t0.elapsed().as_secs_f64();
+                self.probe_mark(dev, batch_cmd::probe::SH_DOWN);
+                let t0 = std::time::Instant::now();
+                pipes
+                    .get(&lw.moe.down.key)?
+                    .run(&lw.moe.down.buf, &v.shexp_act, &v.sh)?;
+                sub[3] = t0.elapsed().as_secs_f64();
+            }
             self.probe_mark(dev, batch_cmd::probe::SH_SCALAR);
             let t0 = std::time::Instant::now();
             pipes.get(&lw.moe.shexp_gate.key)?.run(
@@ -2847,37 +2867,53 @@ impl<'m> Session<'m> {
         // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
         let overlap = std::env::var_os("BRECCIA_PF_OVERLAP").is_some();
 
+        // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
+        // The chunk-level shared expert needs a multi-user GEMM for all three roles.
+        let shared_chunk = std::env::var_os("BRECCIA_PF_SHCHUNK").is_some() && {
+            let moe = &m.layers[b].moe;
+            let pipes = &self.venues[dev].pipes;
+            [&moe.gate, &moe.up, &moe.down]
+                .iter()
+                .all(|w| pipes.gemm(w.key.ty).is_some())
+        };
+
         // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
         self.ensure_batch(dev)?;
+        self.shared_deferred = shared_chunk;
         for i in 0..t {
             self.swap_r_in(dev, i);
-            self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace)?;
+            let prelude = self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace);
+            if let Err(e) = prelude {
+                self.shared_deferred = false;
+                return Err(e);
+            }
             {
                 let v = &self.venues[dev];
                 let pf = v.pf.as_ref().expect("the merged prefill scratch");
                 let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
                 let kb = (k * 4) as u64;
                 let nb = (n_embd * 4) as u64;
-                // Six copies, one region array (and one barrier) per token.
-                batch_cmd::record_copies(
-                    gpu,
-                    &[
-                        (&pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb),
-                        (&pf.w, i as u64 * kb, &v.router_w, 0, kb),
-                        (&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb),
-                        (&pf.shared, i as u64 * nb, &v.sh, 0, nb),
-                        (&pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4),
-                        // The ffn `HC_WRITE` moves to pass 2, so this token's
-                        // inject partials have to survive the rest of the chunk.
-                        (
-                            &v.inject_slots[i],
-                            0,
-                            &ws.inject,
-                            0,
-                            ((mc.hc * v.hc.inject_chunks() * 4) as u64).min(ws.inject.size),
-                        ),
-                    ],
-                )?;
+                let inject = (
+                    &v.inject_slots[i],
+                    0,
+                    &ws.inject,
+                    0,
+                    ((mc.hc * v.hc.inject_chunks() * 4) as u64).min(ws.inject.size),
+                );
+                // Six copies, one region array (and one barrier) per token. The
+                // ffn `HC_WRITE` moves to pass 2, so this token's inject partials
+                // (the last region) have to survive the rest of the chunk.
+                let mut regions = vec![
+                    (&pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb),
+                    (&pf.w, i as u64 * kb, &v.router_w, 0, kb),
+                    (&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb),
+                    (&pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4),
+                    inject,
+                ];
+                if !shared_chunk {
+                    regions.push((&pf.shared, i as u64 * nb, &v.sh, 0, nb));
+                }
+                batch_cmd::record_copies(gpu, &regions)?;
             }
             self.swap_r_in(dev, i);
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
@@ -2888,6 +2924,21 @@ impl<'m> Session<'m> {
                     self.ensure_batch(dev)?;
                 }
             }
+        }
+        self.shared_deferred = false;
+        // The shared expert for the whole chunk: one dispatch per role, `t` users
+        // over `pf.mixed`; the down GEMM writes `pf.shared` in the fan-in's layout.
+        if shared_chunk {
+            self.timers.mark(SHARED);
+            let moe = &m.layers[b].moe;
+            let v = &self.venues[dev];
+            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            let n_sh = mc.n_ff_shared;
+            let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked above");
+            g(&moe.gate).run(&moe.gate.buf, &pf.mixed, &pf.sh_g, n_sh, n_embd, t)?;
+            g(&moe.up).run(&moe.up.buf, &pf.mixed, &pf.sh_u, n_sh, n_embd, t)?;
+            v.swiglu.run(&pf.sh_g, &pf.sh_u, &pf.sh_a, t * n_sh)?;
+            g(&moe.down).run(&moe.down.buf, &pf.sh_a, &pf.shared, n_embd, n_sh, t)?;
         }
         batch_cmd::record_barrier_to_host(gpu)?;
         self.submit_batch()?;

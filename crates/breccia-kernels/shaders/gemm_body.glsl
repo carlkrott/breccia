@@ -51,7 +51,10 @@ void main() {
     if (row >= pc.rows) {
         return;
     }
-    uint m = min(max(pc_users, 1u), USERS_MAX);
+    // Users past USERS_MAX ride the z dimension: workgroup z owns users
+    // [z*USERS_MAX, z*USERS_MAX + m). One-group dispatches (z = 0) are unchanged.
+    uint u0 = gl_WorkGroupID.z * USERS_MAX;
+    uint m = min(max(pc_users, 1u) - u0, USERS_MAX);
 
     const uint u = UNITS >= LANES ? lane : (lane % UNITS);
     const uint b_off = UNITS >= LANES ? 0u : (lane / UNITS);
@@ -78,7 +81,7 @@ void main() {
         vec4 v0 = vec4(v[0], v[1], v[2], v[3]);
         vec4 v1 = vec4(v[4], v[5], v[6], v[7]);
         for (uint j = 0u; j < m; ++j) {
-            uint xb = (j * pc.cols + e) >> 2u;
+            uint xb = ((u0 + j) * pc.cols + e) >> 2u;
             float s;
             if (b < full) {
                 s = dot(v0, X[xb]) + dot(v1, X[xb + 1u]);
@@ -89,7 +92,7 @@ void main() {
                     if (idx < pc.cols) {
                         // element `idx & 3` of the vec4 word; X is the same
                         // zero-padded buffer the single-user kernels read.
-                        s += v[t] * X[(j * pc.cols + idx) >> 2u][idx & 3u];
+                        s += v[t] * X[((u0 + j) * pc.cols + idx) >> 2u][idx & 3u];
                     }
                 }
             }
@@ -107,7 +110,7 @@ void main() {
             facc += subgroupShuffleXor(facc, off);
         }
         if (lane == 0u) {
-            O[j * pc.rows + row] = facc;
+            O[(u0 + j) * pc.rows + row] = facc;
         }
     }
 }

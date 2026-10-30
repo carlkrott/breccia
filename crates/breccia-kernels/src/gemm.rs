@@ -121,13 +121,15 @@ impl<'g> GemmMany<'g> {
         users: usize,
         base_words: u32,
     ) -> Result<()> {
-        if users == 0 || users > USERS_MAX {
-            return Err(anyhow!("users must be 1..={USERS_MAX}, got {users}"));
+        if users == 0 {
+            return Err(anyhow!("users must be at least 1"));
         }
         let pc = Self::pc(rows, cols, self.blocks_per_row(cols), users, base_words);
         let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
         let gx = groups.min(WG_X_MAX);
         let gy = groups.div_ceil(WG_X_MAX);
+        // More than USERS_MAX users: one z slice of the dispatch per USERS_MAX.
+        let gz = users.div_ceil(USERS_MAX) as u32;
         // Inside a dispatch batch the dispatch is **recorded** (the same rule
         // `Pipe::run`, `Gemv::run` and `GemvBatch::run` follow): a chunked prefill
         // records ~200 expert groups per block, and one submit+wait each would be
@@ -138,7 +140,7 @@ impl<'g> GemmMany<'g> {
                 &self.kernel,
                 &[w, x, out, &self.tables],
                 &pc,
-                (gx, gy, 1),
+                (gx, gy, gz),
             );
         }
         self.gpu
@@ -157,7 +159,7 @@ impl<'g> GemmMany<'g> {
                     &[],
                 );
                 d.cmd_push_constants(cmd, kernel.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-                d.cmd_dispatch(cmd, gx, gy, 1);
+                d.cmd_dispatch(cmd, gx, gy, gz);
             })
             .map_err(|e| anyhow!("{e}"))?;
         Ok(())
