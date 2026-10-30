@@ -902,7 +902,8 @@ impl<'m> Session<'m> {
                     act: alloc(users * nfb, "prefill expert act")?,
                     down: alloc(users * nb, "prefill expert down")?,
                     out: alloc(chunk as u64 * nb, "prefill merged out")?,
-                    stream: Mailbox::new(gpu, STREAM_SLOTS as u64 * slot_stride)?,
+                    // Two halves, so the host fills one while the GPU copies the other.
+                    stream: Mailbox::new(gpu, 2 * STREAM_SLOTS as u64 * slot_stride)?,
                     sf_gate: alloc(gb.max(16), "streamed expert gate")?,
                     sf_up: alloc(ub.max(16), "streamed expert up")?,
                     sf_down: alloc(db.max(16), "streamed expert down")?,
@@ -1305,6 +1306,21 @@ impl<'m> Session<'m> {
         self.pending_batch = Some(dev);
         self.probe_stamp(dev, false)?;
         Ok(())
+    }
+
+    /// Submit the open batch on `dev` **without waiting** and open the next ring
+    /// slot, so the host records while the GPU runs (prefill, `BRECCIA_PF_OVERLAP=1`).
+    /// Returns the submitted segment for a caller that must later wait on it.
+    fn reopen_batch(&mut self, dev: usize) -> Result<Option<breccia_kernels::batch_cmd::Segment>> {
+        self.submit_batch()?;
+        let seg = self.pending_seg.take();
+        self.pending_dev = None;
+        batch_cmd::begin(self.model.devices[dev].gpu())
+            .map_err(|e| anyhow!("reopening a dispatch batch on device {dev}: {e}"))?;
+        self.timers.open_batch();
+        self.pending_batch = Some(dev);
+        self.probe_stamp(dev, false)?;
+        Ok(seg)
     }
 
     /// `BRECCIA_GPU_TIME=1`: bracket the first [`GPU_PROBE_BATCHES`] batches with
@@ -2828,6 +2844,8 @@ impl<'m> Session<'m> {
         );
         let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
         let disp_before = self.dispatches;
+        // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
+        let overlap = std::env::var_os("BRECCIA_PF_OVERLAP").is_some();
 
         // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
         self.ensure_batch(dev)?;
@@ -2863,8 +2881,12 @@ impl<'m> Session<'m> {
             }
             self.swap_r_in(dev, i);
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
-                self.flush()?;
-                self.ensure_batch(dev)?;
+                if overlap {
+                    self.reopen_batch(dev)?;
+                } else {
+                    self.flush()?;
+                    self.ensure_batch(dev)?;
+                }
             }
         }
         batch_cmd::record_barrier_to_host(gpu)?;
@@ -2941,6 +2963,7 @@ impl<'m> Session<'m> {
         // wait this pass reports).
         let mut expert_index = 0usize;
         let mut prev_expert: Option<usize> = None;
+        let mut stream_prev: Option<breccia_kernels::batch_cmd::Segment> = None;
         for (e, base, users) in groups.iter() {
             let mu = users.len();
             // First group of a new distinct expert: stream it (once per chunk).
@@ -2951,12 +2974,23 @@ impl<'m> Session<'m> {
                 // in-flight copies never see the next expert's bytes.
                 if expert_index > 0 && expert_index.is_multiple_of(STREAM_SLOTS) {
                     let t0 = std::time::Instant::now();
-                    self.submit_batch()?;
-                    self.flush()?;
+                    if overlap {
+                        // Double buffer: the half about to be refilled was read by the
+                        // batch before this one, so wait for that one only.
+                        let seg = self.reopen_batch(dev)?;
+                        if let Some(prev) = std::mem::replace(&mut stream_prev, seg) {
+                            let gpus = self.device_gpus();
+                            batch_cmd::wait(&gpus, prev)
+                                .map_err(|e| anyhow!("waiting for a streamed-expert half: {e}"))?;
+                        }
+                    } else {
+                        self.submit_batch()?;
+                        self.flush()?;
+                        self.ensure_batch(dev)?;
+                    }
                     self.pf_stream_wait_s += t0.elapsed().as_secs_f64();
-                    self.ensure_batch(dev)?;
                 }
-                self.fill_stream_slot(dev, b, *e, expert_index % STREAM_SLOTS)?;
+                self.fill_stream_slot(dev, b, *e, expert_index % (2 * STREAM_SLOTS))?;
                 expert_index += 1;
             } else if !streamed {
                 prev_expert = Some(*e);
@@ -2969,7 +3003,7 @@ impl<'m> Session<'m> {
                 let up = pipes.gemm(up_ty).expect("the up multi-user GEMM");
                 let down = pipes.gemm(down_ty).expect("the down multi-user GEMM");
                 if streamed && new_expert && expert_index > 0 {
-                    let slot = (expert_index - 1) % STREAM_SLOTS;
+                    let slot = (expert_index - 1) % (2 * STREAM_SLOTS);
                     // slot -> device, three region groups, one barrier.
                     let off = slot as u64 * pf.slot_stride;
                     batch_cmd::record_copies(

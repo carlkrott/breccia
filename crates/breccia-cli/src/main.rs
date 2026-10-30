@@ -2747,6 +2747,17 @@ fn prefill_only(
         }
         println!("  {:<14} {:>9.1}", "sum", sum);
     }
+    // Host recording vs ring waits (last run): which side bounds the dense chain.
+    let (rec, n) = (
+        breccia_kernels::batch_cmd::record_seconds(),
+        breccia_kernels::batch_cmd::recorded_dispatches().max(1),
+    );
+    println!(
+        "host record {:.2} s ({:.0} ns/dispatch, {n} dispatches) · ring wait {:.2} s",
+        rec,
+        rec * 1e9 / n as f64,
+        breccia_kernels::batch_cmd::wait_seconds()
+    );
     let s1 = breccia_engine::LogitSummary::of_top(&logits, 10);
     println!("top-1 {} ({:.4}) · top-10 {:?}", s1.top1, s1.top1_logit, s1.top10);
     if let Some(path) = &a.dump_logits {
