@@ -23,6 +23,10 @@
 #ifndef BRECCIA_GEMM_BODY_GLSL
 #define BRECCIA_GEMM_BODY_GLSL
 
+#ifdef BRECCIA_GEMM_RPL
+#include "gemm_rpl.glsl"
+#else
+
 // BRECCIA_GEMM_PAIR (§11l item 4): `W` holds `pc.rows` gate rows then `pc.rows` up
 // rows of one type (`w_concat`); each row decodes both, shares the X loads, keeps
 // both accumulator pairs in the single-kernel order and writes `silu(g) * u` (the
@@ -170,4 +174,5 @@ void main() {
     }
 }
 
+#endif // BRECCIA_GEMM_RPL
 #endif // BRECCIA_GEMM_BODY_GLSL

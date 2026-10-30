@@ -204,6 +204,19 @@ fn main() {
         // The fused HC `up` + gated-mean build (§8az): the GEMV with the
         // column-blocked row mapping and the gated-mean/inject epilogue. A
         // separate pipeline, so the default build keeps byte-identical SPIR-V.
+        // Register-blocked GEMM builds (§12 item 1): `RPL` rows per lane group,
+        // separate pipelines so the default SPIR-V stays byte-identical.
+        if name.starts_with("gemm_") && !name.ends_with("_q8") && !name.ends_with("_pair") {
+            for rpl in [2, 4] {
+                compile(
+                    &glslc,
+                    &out_dir,
+                    name,
+                    &format!("{name}_r{rpl}"),
+                    &[&format!("BRECCIA_GEMM_RPL={rpl}u")],
+                );
+            }
+        }
         if *name == "gemv_bf16" {
             compile(
                 &glslc,

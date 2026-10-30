@@ -29,6 +29,10 @@ pub struct GemmMany<'g> {
     q8: Option<breccia_vk::ctx::Kernel>,
     /// The fused gate + up + SwiGLU variant (§11l item 4), for the types that have one.
     pair: Option<breccia_vk::ctx::Kernel>,
+    /// The register-blocked builds (§12 item 1): `(rows per lane group, kernel)`.
+    blocked: Vec<(usize, breccia_vk::ctx::Kernel)>,
+    /// Wanted rows per lane group (1 = the plain build).
+    rpl: usize,
     /// Forced users per z slice (1..=USERS_MAX); `None` = [`upz_for`] per dispatch.
     upz: Option<usize>,
     tables: Buf,
@@ -42,6 +46,18 @@ fn default_upz() -> Option<usize> {
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .map(|n: usize| n.clamp(1, USERS_MAX))
+    })
+}
+
+/// `BRECCIA_GEMM_RPL` (1, 2 or 4): rows per lane group of the plain GEMM; 1 = off.
+fn default_rpl() -> usize {
+    static RPL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *RPL.get_or_init(|| {
+        std::env::var("BRECCIA_GEMM_RPL")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|n| [1, 2, 4].contains(n))
+            .unwrap_or(1)
     })
 }
 
@@ -62,6 +78,26 @@ fn upz_for(rows: usize, users: usize) -> usize {
         .find(|&z| groups * users.max(1).div_ceil(z) >= WG_TARGET)
         .unwrap_or(2)
 }
+
+macro_rules! blocked_spv {
+    ($($t:ident => $s:literal),* $(,)?) => {
+        /// The register-blocked builds of `ty`'s plain GEMM (`build.rs`, `_r2`/`_r4`).
+        fn blocked_spv(ty: QuantType) -> Vec<(usize, &'static [u8])> {
+            match ty {
+                $(QuantType::$t => vec![
+                    (2, include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r2.spv"))),
+                    (4, include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r4.spv"))),
+                ],)*
+                _ => Vec::new(),
+            }
+        }
+    };
+}
+blocked_spv!(
+    Iq4Nl => "iq4_nl", Q2_0 => "q2_0", Iq2Xxs => "iq2_xxs", Iq2Xs => "iq2_xs",
+    Iq2S => "iq2_s", Iq3Xxs => "iq3_xxs", Iq3S => "iq3_s", Iq4Xs => "iq4_xs",
+    Q4K => "q4_k", Q5K => "q5_k", Q6K => "q6_k", Bf16 => "bf16",
+);
 
 /// Whether [`GemmMany::run_pair`] has a shader for `ty` (gate and up both `ty`).
 pub fn has_pair_shader(ty: QuantType) -> bool {
@@ -122,11 +158,26 @@ impl<'g> GemmMany<'g> {
                 return Err(anyhow!("creating the {ty} gate+up GEMM pipeline: {e}"));
             }
         };
+        let mut blocked = Vec::new();
+        for (rpl, spv) in blocked_spv(ty) {
+            match gpu.kernel(spv, 4) {
+                Ok(k) => blocked.push((rpl, k)),
+                Err(e) => {
+                    for k in [&kernel].into_iter().chain(q8.iter()).chain(pair.iter()) {
+                        gpu.destroy_kernel(k);
+                    }
+                    for (_, k) in &blocked {
+                        gpu.destroy_kernel(k);
+                    }
+                    return Err(anyhow!("creating the {ty} r{rpl} GEMM pipeline: {e}"));
+                }
+            }
+        }
         let tables = match upload(gpu, &table_bytes()) {
             Ok(b) => b,
             Err(e) => {
                 gpu.destroy_kernel(&kernel);
-                for k in q8.iter().chain(pair.iter()) {
+                for k in q8.iter().chain(pair.iter()).chain(blocked.iter().map(|(_, k)| k)) {
                     gpu.destroy_kernel(k);
                 }
                 return Err(e.context("uploading the quant tables"));
@@ -138,6 +189,8 @@ impl<'g> GemmMany<'g> {
             kernel,
             q8,
             pair,
+            blocked,
+            rpl: default_rpl(),
             upz: default_upz(),
             tables,
         })
@@ -150,6 +203,11 @@ impl<'g> GemmMany<'g> {
     /// Force the users per z slice (clamped to 1..=USERS_MAX); `None` = adaptive.
     pub fn set_users_per_z(&mut self, n: Option<usize>) {
         self.upz = n.map(|n| n.clamp(1, USERS_MAX));
+    }
+
+    /// Force the rows per lane group (1, 2 or 4; A/B and tests).
+    pub fn set_rows_per_lane(&mut self, n: usize) {
+        self.rpl = n;
     }
 
     fn upz(&self, rows: usize, users: usize) -> usize {
@@ -173,6 +231,12 @@ impl<'g> GemmMany<'g> {
     }
 
     fn pc(&self, rows: usize, cols: usize, users: usize, base_words: u32) -> [u8; 24] {
+        self.pc_rpl(rows, cols, users, base_words, 1)
+    }
+
+    /// [`GemmMany::pc`] for a build with `rpl` rows per lane group: the z split
+    /// sees `rows / rpl` lane groups, the same count [`GemmMany::dispatch`] gets.
+    fn pc_rpl(&self, rows: usize, cols: usize, users: usize, base_words: u32, rpl: usize) -> [u8; 24] {
         let bpr = self.blocks_per_row(cols);
         let mut pc = [0u8; 24];
         pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
@@ -180,7 +244,7 @@ impl<'g> GemmMany<'g> {
         pc[8..12].copy_from_slice(&(bpr as u32).to_le_bytes());
         pc[12..16].copy_from_slice(&(users as u32).to_le_bytes());
         pc[16..20].copy_from_slice(&base_words.to_le_bytes());
-        pc[20..24].copy_from_slice(&(self.upz(rows, users) as u32).to_le_bytes());
+        pc[20..24].copy_from_slice(&(self.upz(rows / rpl, users) as u32).to_le_bytes());
         pc
     }
 
@@ -213,8 +277,29 @@ impl<'g> GemmMany<'g> {
         if users == 0 {
             return Err(anyhow!("users must be at least 1"));
         }
-        let pc = self.pc(rows, cols, users, base_words);
-        self.dispatch(&self.kernel, &[w, x, out, &self.tables], &pc, rows, users)
+        let (kernel, rpl) = self.plain(rows, users);
+        let pc = self.pc_rpl(rows, cols, users, base_words, rpl);
+        self.dispatch(kernel, &[w, x, out, &self.tables], &pc, rows / rpl, users)
+    }
+
+    /// The plain-GEMM pipeline for `rows x users` and its rows per lane group: a
+    /// register-blocked build when `BRECCIA_GEMM_RPL` asks for one, `rows` divides
+    /// and the fewer workgroups still fill the GPU at full users per slice.
+    /// Rows per lane group `run` would use for this shape (1 = plain build).
+    pub fn rows_per_lane_for(&self, rows: usize, users: usize) -> usize {
+        self.plain(rows, users).1
+    }
+
+    fn plain(&self, rows: usize, users: usize) -> (&breccia_vk::ctx::Kernel, usize) {
+        let want = self.rpl;
+        self.blocked
+            .iter()
+            .find(|(r, _)| {
+                *r == want
+                    && rows % r == 0
+                    && (rows / r).div_ceil(ROWS_PER_WG) * users.div_ceil(USERS_MAX) >= WG_TARGET
+            })
+            .map_or((&self.kernel, 1), |(r, k)| (k, *r))
     }
 
     /// Whether [`GemmMany::run_pair`] exists for this type.
@@ -341,8 +426,9 @@ impl<'g> GemmMany<'g> {
         users: usize,
         target_s: f64,
     ) -> Result<GemvTiming> {
-        let pc = self.pc(rows, cols, users, 0);
-        self.timed(&self.kernel, &[w, x, out, &self.tables], &pc, rows, users, target_s)
+        let (kernel, rpl) = self.plain(rows, users);
+        let pc = self.pc_rpl(rows, cols, users, 0, rpl);
+        self.timed(kernel, &[w, x, out, &self.tables], &pc, rows / rpl, users, target_s)
     }
 
     /// Timed variant of [`GemmMany::run_at_q8`] (base 0).
@@ -424,6 +510,9 @@ impl Drop for GemmMany<'_> {
     fn drop(&mut self) {
         self.gpu.destroy_kernel(&self.kernel);
         for k in self.q8.iter().chain(self.pair.iter()) {
+            self.gpu.destroy_kernel(k);
+        }
+        for (_, k) in &self.blocked {
             self.gpu.destroy_kernel(k);
         }
         self.gpu.destroy_buf(&self.tables);

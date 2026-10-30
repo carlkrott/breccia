@@ -643,3 +643,72 @@ fn paired_shared_gate_up_matches_gate_up_swiglu() {
         gpu.destroy_buf(&w);
     }
 }
+
+/// The register-blocked builds (`gemm_rpl.glsl`, §12 item 1) against the plain
+/// GEMM on a real dense projection: every output bit-identical at RPL 2 and 4,
+/// plus the time per dispatch of each. `BRECCIA_GEMM_TENSOR` picks the role
+/// (default `attn_gate`), `BRECCIA_GEMM_TYPE` the type (one per invocation); RX first.
+#[test]
+fn blocked_gemm_is_bit_identical_to_the_plain_gemm() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("rpl_gemm: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let Ok(want) = std::env::var("BRECCIA_GEMM_TYPE") else {
+        eprintln!("rpl_gemm: SKIPPED - set BRECCIA_GEMM_TYPE");
+        return;
+    };
+    let role = std::env::var("BRECCIA_GEMM_TENSOR").unwrap_or_else(|_| "attn_gate".into());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else {
+        eprintln!("rpl_gemm: no device for {selector}");
+        return;
+    };
+    let Ok(set) = ShardSet::open_glob(MODEL_GLOB) else {
+        eprintln!("rpl_gemm: no model");
+        return;
+    };
+    let Some((name, ty, rows, cols)) = (0..48).find_map(|b| {
+        let name = format!("blk.{b}.{role}.weight");
+        let t = set.tensor(&name)?;
+        let ty = QuantType::from_ggml(t.ty())?;
+        (ty.name() == want).then(|| (name, ty, t.ne1() as usize, t.ne0() as usize))
+    }) else {
+        eprintln!("rpl_gemm: no {want} {role} tensor");
+        return;
+    };
+    let gpu = &dev.gpu;
+    let w = breccia_kernels::gemv::upload(gpu, set.tensor(&name).unwrap().as_slice()).expect("upload");
+    for m in [16usize, 37] {
+        let flat: Vec<f32> = (0..m * cols)
+            .map(|i| (((i * 7 + (i / cols) * 13) % 29) as f32 - 14.0) * 0.011)
+            .collect();
+        let x = breccia_kernels::ops::upload_f32(gpu, &flat).expect("x");
+        let out = alloc(gpu, (m * rows * 4) as u64).expect("out");
+        let mut base: Option<Vec<f32>> = None;
+        for rpl in [1usize, 2, 4] {
+            let mut g = GemmMany::new(gpu, ty).expect("gemm pipeline");
+            g.set_rows_per_lane(rpl);
+            let used = g.rows_per_lane_for(rows, m);
+            g.run(&w, &x, &out, rows, cols, m).expect("gemm");
+            let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("down");
+            let t = g.run_timed(&w, &x, &out, rows, cols, m, 0.002).expect("timed");
+            println!(
+                "rpl_gemm: {name} [{rows} x {cols}] {} m = {m} rpl {rpl} (used {used}): {:.3} ms",
+                ty.name(),
+                t.per_iter_s * 1e3
+            );
+            match &base {
+                None => base = Some(got),
+                Some(b) => {
+                    assert_eq!(used, rpl, "rpl {rpl} not selected for m = {m}");
+                    let diff = b.iter().zip(&got).filter(|(a, c)| a.to_bits() != c.to_bits()).count();
+                    assert_eq!(diff, 0, "{}: rpl {rpl} m = {m}: {diff} outputs differ", ty.name());
+                }
+            }
+        }
+        gpu.destroy_buf(&out);
+        gpu.destroy_buf(&x);
+    }
+    gpu.destroy_buf(&w);
+}
