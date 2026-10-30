@@ -3073,9 +3073,48 @@ impl<'m> Session<'m> {
             .slots
             .write(&slot_bytes)?;
 
+        // §11f dual-card prototype: `BRECCIA_PF_EXPERT_DEVICE=<ordinal>` runs a
+        // streamed block's expert GEMMs and fan-in on that device instead (the RX
+        // streams experts over x16, the MI50 over x4). Host-staged both ways: the
+        // fan-in's inputs go out, `pf.out` comes back — no GPU-to-GPU copy.
+        let xdev = std::env::var("BRECCIA_PF_EXPERT_DEVICE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&x| {
+                streamed && x != dev && x < m.devices.len() && self.venues[x].pf.is_some()
+            });
+        let mut ship_s = 0.0f64;
+        if let Some(x) = xdev {
+            let t0 = std::time::Instant::now();
+            let nb = n_embd * 4;
+            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let items: [(&Buf, u64, usize); 4] = [
+                (&pf.mixed, 0, t * nb),
+                (&pf.w, 0, t * k * 4),
+                (&pf.shared, 0, t * nb),
+                (&pf.gate, 0, t * 4),
+            ];
+            let bytes = self.stagings[dev].read_batch(gpu, &items)?;
+            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            let regions: Vec<(&Buf, u64, &[u8])> = [&xpf.mixed, &xpf.w, &xpf.shared, &xpf.gate]
+                .into_iter()
+                .zip(bytes.iter())
+                .map(|(buf, d)| (buf, 0, d.as_slice()))
+                .collect();
+            self.stagings[x].write_regions(m.devices[x].gpu(), &regions)?;
+            xpf.slots.write(&slot_bytes)?;
+            ship_s += t0.elapsed().as_secs_f64();
+        }
+        // The device the expert GEMMs and the fan-in run on.
+        let (edev, egpu) = match xdev {
+            Some(x) => (x, m.devices[x].gpu()),
+            None => (dev, gpu),
+        };
+        let overlap = self.pf[edev][PF_OVERLAP];
+
         // ---- the expert GEMMs: three per (distinct expert, group of <= 8) -----
         self.timers.mark(EXPERTS);
-        self.ensure_batch(dev)?;
+        self.ensure_batch(edev)?;
         let t_gemm = std::time::Instant::now();
         // Streamed blocks walk the distinct experts in slot order; one submit per
         // STREAM_SLOTS experts bounds the host-visible staging (and is the ring
@@ -3096,7 +3135,7 @@ impl<'m> Session<'m> {
                     if overlap {
                         // Double buffer: the half about to be refilled was read by the
                         // batch before this one, so wait for that one only.
-                        let seg = self.reopen_batch(dev)?;
+                        let seg = self.reopen_batch(edev)?;
                         if let Some(prev) = std::mem::replace(&mut stream_prev, seg) {
                             let gpus = self.device_gpus();
                             batch_cmd::wait(&gpus, prev)
@@ -3105,17 +3144,17 @@ impl<'m> Session<'m> {
                     } else {
                         self.submit_batch()?;
                         self.flush()?;
-                        self.ensure_batch(dev)?;
+                        self.ensure_batch(edev)?;
                     }
                     self.pf_stream_wait_s += t0.elapsed().as_secs_f64();
                 }
-                self.fill_stream_slot(dev, b, *e, expert_index % (2 * STREAM_SLOTS))?;
+                self.fill_stream_slot(edev, b, *e, expert_index % (2 * STREAM_SLOTS))?;
                 expert_index += 1;
             } else if !streamed {
                 prev_expert = Some(*e);
             }
             {
-                let v = &self.venues[dev];
+                let v = &self.venues[edev];
                 let pf = v.pf.as_ref().expect("the merged prefill scratch");
                 let pipes = &v.pipes;
                 let gate = pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
@@ -3126,7 +3165,7 @@ impl<'m> Session<'m> {
                     // slot -> device, three region groups, one barrier.
                     let off = slot as u64 * pf.slot_stride;
                     batch_cmd::record_copies(
-                        gpu,
+                        egpu,
                         &[
                             (&pf.sf_gate, 0, &pf.stream.buf, off, pf.g_bytes),
                             (&pf.sf_up, 0, &pf.stream.buf, off + pf.g_bytes, pf.u_bytes),
@@ -3158,7 +3197,7 @@ impl<'m> Session<'m> {
                     ));
                     a = z;
                 }
-                batch_cmd::record_copies(gpu, &rows)?;
+                batch_cmd::record_copies(egpu, &rows)?;
                 // Resident: the arena holds all 512 experts, so the base is the
                 // expert's own offset. Streamed: the slot *is* expert `e`, base 0.
                 let (gbuf, ubuf, dbuf, gb, ub, db) = match pe {
@@ -3180,7 +3219,7 @@ impl<'m> Session<'m> {
                 v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
                 down.run_at(dbuf, &pf.act, &pf.down, n_embd, n_ff, mu, db)?;
                 batch_cmd::record_copy(
-                    gpu,
+                    egpu,
                     &pf.scratch,
                     (*base as u64) * (n_embd * 4) as u64,
                     &pf.down,
@@ -3190,7 +3229,7 @@ impl<'m> Session<'m> {
             }
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
                 self.flush()?;
-                self.ensure_batch(dev)?;
+                self.ensure_batch(edev)?;
             }
         }
         self.submit_batch()?;
@@ -3198,10 +3237,10 @@ impl<'m> Session<'m> {
         let gemm_s = t_gemm.elapsed().as_secs_f64();
 
         // ---- the fan-in: one dispatch, then the chunk's MoE result per token --
-        self.ensure_batch(dev)?;
+        self.ensure_batch(edev)?;
         let t_fan = std::time::Instant::now();
         {
-            let v = &self.venues[dev];
+            let v = &self.venues[edev];
             let pf = v.pf.as_ref().expect("the merged prefill scratch");
             v.moe_fanin.run(
                 &pf.scratch,
@@ -3214,6 +3253,22 @@ impl<'m> Session<'m> {
                 k,
                 n_embd,
             )?;
+        }
+        if let Some(x) = xdev {
+            // The MoE result back into the block device's `pf.out` (pass 2 reads it).
+            self.submit_batch()?;
+            self.flush()?;
+            let t0 = std::time::Instant::now();
+            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            let bytes = self.stagings[x].read_batch(egpu, &[(&xpf.out, 0, t * n_embd * 4)])?;
+            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
+            ship_s += t0.elapsed().as_secs_f64();
+            self.ensure_batch(dev)?;
+        }
+        {
+            let v = &self.venues[dev];
+            let pf = v.pf.as_ref().expect("the merged prefill scratch");
             let rows: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
                 .map(|i| {
                     (
@@ -3283,14 +3338,16 @@ impl<'m> Session<'m> {
                 self.pf_stream_wait_s,
             );
             eprintln!(
-                "merged blk {b:>2} t={t} {} distinct={distinct} groups={} slots={} \
-                 gemm={:.2} ms fanin={:.3} ms dispatches={dispatches} arena={:.1} MiB \
-                 streamed(cum)={:.1} MiB fill={:.1} ms wait={:.1} ms",
+                "merged blk {b:>2} t={t} {}{} distinct={distinct} groups={} slots={} \
+                 gemm={:.2} ms fanin={:.3} ms ship={:.2} ms dispatches={dispatches} \
+                 arena={:.1} MiB streamed(cum)={:.1} MiB fill={:.1} ms wait={:.1} ms",
                 if streamed { "streamed" } else { "resident" },
+                if xdev.is_some() { "@x" } else { "" },
                 groups.len(),
                 t * k,
                 gemm_s * 1e3,
                 fanin_s * 1e3,
+                ship_s * 1e3,
                 (distinct as u64 * expert_bytes) as f64 / (1u64 << 20) as f64,
                 sb as f64 / (1u64 << 20) as f64,
                 sf * 1e3,

@@ -79,14 +79,22 @@ impl Staging {
         let cap = cap.max(64);
         let region = block_region(tokens);
         let size = cap + region + breccia_kernels::gemv::TAIL_PAD;
+        let hv = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        // §11f: `BRECCIA_STAGING_CACHED=1` prefers a HOST_CACHED type, because the
+        // CPU reads uncached (write-combined) staging at ~0.3 GB/s in `read_batch`.
+        let pref = if std::env::var("BRECCIA_STAGING_CACHED").as_deref() == Ok("1") {
+            hv | vk::MemoryPropertyFlags::HOST_CACHED
+        } else {
+            hv
+        };
         let buf = gpu
             .buf(
                 size,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                hv,
+                pref,
             )
             .map_err(|e| anyhow!("allocating the {cap}-byte staging buffer: {e}"))?;
         // SAFETY: `buf` is a HOST_VISIBLE | HOST_COHERENT allocation owned by this
