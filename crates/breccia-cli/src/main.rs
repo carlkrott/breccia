@@ -741,6 +741,19 @@ fn profile(a: ProfileArgs) -> Result<()> {
     if a.prefill {
         return profile_prefill(&path, &a.model, &a.devices);
     }
+    // First calibration on a box (a GPU without a verdict): the one-time prefill
+    // check runs too, best-effort, so a missing model does not fail the install.
+    let unchecked = profile
+        .devices
+        .iter()
+        .any(|e| e.identity.device_type == "DISCRETE_GPU" && e.prefill.is_none());
+    if unchecked {
+        if let Err(e) = profile_prefill(&path, &a.model, &a.devices) {
+            eprintln!(
+                "breccia: prefill discovery skipped ({e:#}); run `breccia profile --prefill --model ...`"
+            );
+        }
+    }
     Ok(())
 }
 

@@ -4861,31 +4861,30 @@ const PF_HCCHUNK: usize = 4;
 
 /// Each device's merged-prefill flags, resolved once per session. The env wins
 /// (`=0` off, anything else on); else the card's `breccia profile --prefill`
-/// verdict when it was measured with this driver and these shaders; else on (all
-/// five pass the 1k/4k KL gate on RX and MI50, plan §11d). A stale verdict turns
-/// them off until the check re-runs: a new driver or shader is exactly what it is for.
+/// verdict; else on (all five pass the 1k/4k KL gate on RX and MI50, plan §11d).
+/// A stale verdict (new driver or shaders) still applies, with a hint to re-run
+/// the check: a card measured last week is better evidence than no measurement.
 fn pf_resolve(m: &Model) -> Vec<[bool; 5]> {
     m.devices
         .iter()
         .zip(&m.pf_verdicts)
         .map(|(d, v)| {
-            let current = v.as_ref().filter(|v| {
-                v.driver_version == d.info.driver && v.spirv_hash == breccia_kernels::SPIRV_HASH
+            let stale = v.as_ref().is_some_and(|v| {
+                v.driver_version != d.info.driver || v.spirv_hash != breccia_kernels::SPIRV_HASH
             });
-            if v.is_some() && current.is_none() {
+            if stale {
                 eprintln!(
                     "breccia: {} ({}): the prefill verdict is stale (driver or shaders \
-                     changed); merged-prefill flags off until `breccia profile --prefill \
+                     changed); using its flags until `breccia profile --prefill \
                      --model ...` re-runs",
                     d.info.name, d.info.pci_address
                 );
             }
             std::array::from_fn(|i| match std::env::var_os(PF_FLAGS[i]) {
                 Some(x) => x != "0",
-                None => v.is_none()
-                    || current
-                        .and_then(|c| c.flags.iter().find(|f| f.name == PF_FLAGS[i]))
-                        .is_some_and(|f| f.on),
+                None => v.as_ref().is_none_or(|v| {
+                    v.flags.iter().find(|f| f.name == PF_FLAGS[i]).is_some_and(|f| f.on)
+                }),
             })
         })
         .collect()
