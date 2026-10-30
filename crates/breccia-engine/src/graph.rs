@@ -507,6 +507,10 @@ pub struct Session<'m> {
     /// One staging buffer per device — kept out of [`Venue`] so a transfer can
     /// borrow it mutably while reading the device's own buffers.
     stagings: Vec<Staging>,
+    /// §11j item 5: the dual-card ship's shared host import (`BRECCIA_SHIP_IMPORT=1`),
+    /// made on the first ship; `ship_imp_off` once it is off or failed.
+    ship_imp: Option<crate::xfer::ShipImport>,
+    ship_imp_off: bool,
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
     /// One `QsaWorkspace` per QSA layer, allocated at `ctx_capacity` and reused
@@ -1068,6 +1072,8 @@ impl<'m> Session<'m> {
             model,
             venues,
             stagings,
+            ship_imp: None,
+            ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() != Ok("1"),
             gdn_state,
             qsa_state,
             qsa_ws,
@@ -1316,6 +1322,36 @@ impl<'m> Session<'m> {
     /// Everything recorded between here and the next [`Session::flush`] costs one
     /// submit and one fence wait, instead of one per kernel: the ~29 dispatches
     /// of a block collapse to a single round trip.
+    /// Whether the dual-card ship `dev` -> `x` goes through the shared host import.
+    /// Made on first use, sized for the largest merged-prefill scratch of either
+    /// card; any failure logs once and leaves the staged path on.
+    fn ship_ready(&mut self, dev: usize, x: usize) -> bool {
+        if self.ship_imp_off {
+            return false;
+        }
+        let m = self.model;
+        let r = (|| -> Result<()> {
+            if self.ship_imp.is_none() {
+                let cap = [dev, x]
+                    .iter()
+                    .filter_map(|&d| self.venues[d].pf.as_ref())
+                    .map(|pf| (pf.mixed.size + pf.w.size + pf.shared.size + pf.gate.size).max(pf.out.size))
+                    .max()
+                    .unwrap_or(0);
+                self.ship_imp = Some(crate::xfer::ShipImport::new(cap, m.devices.len())?);
+            }
+            let imp = self.ship_imp.as_mut().expect("just made");
+            imp.ensure(dev, m.devices[dev].gpu())?;
+            imp.ensure(x, m.devices[x].gpu())
+        })();
+        if let Err(e) = r {
+            eprintln!("breccia: ship import off, staged path kept: {e:#}");
+            self.ship_imp_off = true;
+            return false;
+        }
+        true
+    }
+
     fn ensure_batch(&mut self, dev: usize) -> Result<()> {
         if !self.batching {
             return Ok(());
@@ -3084,7 +3120,30 @@ impl<'m> Session<'m> {
             });
         let mut ship_s = 0.0f64;
         let mut ship_p = [0.0f64; 4];
-        if let Some(x) = xdev {
+        let ship_imp = xdev.is_some_and(|x| self.ship_ready(dev, x));
+        if let Some(x) = xdev.filter(|_| ship_imp) {
+            let t0 = std::time::Instant::now();
+            let nb = (n_embd * 4) as u64;
+            let lens = [t as u64 * nb, (t * k * 4) as u64, t as u64 * nb, (t * 4) as u64];
+            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            let imp = self.ship_imp.as_ref().expect("ship_ready");
+            let (hd, hx) = (imp.get(dev), imp.get(x));
+            let (mut down, mut up, mut at) = (Vec::new(), Vec::new(), 0u64);
+            for ((src, dst), n) in [&pf.mixed, &pf.w, &pf.shared, &pf.gate]
+                .into_iter()
+                .zip([&xpf.mixed, &xpf.w, &xpf.shared, &xpf.gate])
+                .zip(lens)
+            {
+                down.push((src, hd, 0, at, n));
+                up.push((hx, dst, at, 0, n));
+                at += n;
+            }
+            ship_p[0] = crate::xfer::copy_fenced(gpu, &down)?;
+            ship_p[1] = crate::xfer::copy_fenced(m.devices[x].gpu(), &up)?;
+            xpf.slots.write(&slot_bytes)?;
+            ship_s += t0.elapsed().as_secs_f64();
+        } else if let Some(x) = xdev {
             let t0 = std::time::Instant::now();
             let nb = n_embd * 4;
             let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
@@ -3261,10 +3320,17 @@ impl<'m> Session<'m> {
             self.flush()?;
             let t0 = std::time::Instant::now();
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
-            let bytes = self.stagings[x].read_batch(egpu, &[(&xpf.out, 0, t * n_embd * 4)])?;
-            ship_p[2] = t0.elapsed().as_secs_f64();
             let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
-            ship_p[3] = self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
+            if ship_imp {
+                let imp = self.ship_imp.as_ref().expect("ship_ready");
+                let n = (t * n_embd * 4) as u64;
+                ship_p[2] = crate::xfer::copy_fenced(egpu, &[(&xpf.out, imp.get(x), 0, 0, n)])?;
+                ship_p[3] = crate::xfer::copy_fenced(gpu, &[(imp.get(dev), &pf.out, 0, 0, n)])?;
+            } else {
+                let bytes = self.stagings[x].read_batch(egpu, &[(&xpf.out, 0, t * n_embd * 4)])?;
+                ship_p[2] = t0.elapsed().as_secs_f64();
+                ship_p[3] = self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
+            }
             ship_s += t0.elapsed().as_secs_f64();
             self.ensure_batch(dev)?;
         }
@@ -4634,6 +4700,9 @@ impl Drop for Session<'_> {
         // this thread — the last session to drop frees them.
         let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
         let _ = breccia_kernels::batch_cmd::wait_all(&gpus);
+        if let Some(mut imp) = self.ship_imp.take() {
+            imp.release(&gpus);
+        }
         if LIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
             let _ = breccia_kernels::batch_cmd::shutdown();
         }

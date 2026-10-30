@@ -567,3 +567,102 @@ mod tests {
         assert_eq!(at, 56);
     }
 }
+
+/// §11j item 5: one anonymous host allocation imported (`VK_EXT_external_memory_host`)
+/// on each card a dual-card ship touches, so the hand-off is two DMAs and no CPU
+/// copy (the staged path is DMA, memcpy out, memcpy in, DMA). Env-gated by
+/// `BRECCIA_SHIP_IMPORT=1`; never one card's exported allocation.
+pub struct ShipImport {
+    ptr: *mut u8,
+    layout: std::alloc::Layout,
+    pub cap: u64,
+    bufs: Vec<Option<Buf>>,
+}
+
+impl ShipImport {
+    /// `cap` is rounded up to 64 KiB so the buffer's `allocation_size` stays inside
+    /// the host range (both cards report a 4 KiB import alignment).
+    pub fn new(cap: u64, n_devices: usize) -> Result<Self> {
+        const GRAIN: u64 = 64 << 10;
+        let cap = cap.max(1).div_ceil(GRAIN) * GRAIN;
+        let layout = std::alloc::Layout::from_size_align(cap as usize, GRAIN as usize)?;
+        // SAFETY: non-zero size, valid power-of-two alignment.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        if ptr.is_null() {
+            return Err(anyhow!("ship import alloc of {cap} bytes failed"));
+        }
+        Ok(Self { ptr, layout, cap, bufs: (0..n_devices).map(|_| None).collect() })
+    }
+
+    /// Import the range on device `i` if it is not already.
+    pub fn ensure(&mut self, i: usize, gpu: &Gpu) -> Result<()> {
+        if self.bufs[i].is_some() {
+            return Ok(());
+        }
+        if !gpu.external_memory_host {
+            return Err(anyhow!("device {i} lacks VK_EXT_external_memory_host"));
+        }
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        let b = breccia_vk::transfer::import_from_host_ptr(gpu, self.ptr, self.cap, usage)
+            .map_err(|e| anyhow!("device {i}: {e}"))?;
+        self.bufs[i] = Some(b);
+        Ok(())
+    }
+
+    pub fn get(&self, i: usize) -> &Buf {
+        self.bufs[i].as_ref().expect("ShipImport::ensure ran for this device")
+    }
+
+    /// Destroy the imports; the host range is freed on drop, after this.
+    pub fn release(&mut self, gpus: &[&Gpu]) {
+        for (i, b) in self.bufs.iter_mut().enumerate() {
+            if let Some(b) = b.take() {
+                gpus[i].destroy_buf(&b);
+            }
+        }
+    }
+}
+
+impl Drop for ShipImport {
+    fn drop(&mut self) {
+        // A live import still points here: leak rather than free under a device.
+        if self.bufs.iter().any(Option::is_some) {
+            return;
+        }
+        // SAFETY: same ptr/layout this allocation was made with.
+        unsafe { std::alloc::dealloc(self.ptr, self.layout) };
+    }
+}
+
+/// Fenced `(src, dst, src offset, dst offset, bytes)` copies on `gpu`, for the
+/// [`ShipImport`] hand-off. The barriers add the HOST stage both ways: the other
+/// side of the memory is another card's DMA, reusing the same addresses every ship.
+pub fn copy_fenced(gpu: &Gpu, copies: &[(&Buf, &Buf, u64, u64, u64)]) -> Result<f64> {
+    for (s, d, so, dof, n) in copies {
+        if so.saturating_add(*n) > s.size || dof.saturating_add(*n) > d.size {
+            return Err(anyhow!(
+                "copy of {n} bytes ({so} of {}, {dof} of {}) is out of range",
+                s.size,
+                d.size
+            ));
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let rw = vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE;
+    let host = vk::AccessFlags::HOST_READ | vk::AccessFlags::HOST_WRITE;
+    let all = vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST;
+    gpu.record(Qc::C, |d, cmd| unsafe {
+        let pre = vk::MemoryBarrier::default().src_access_mask(rw | host).dst_access_mask(rw);
+        d.cmd_pipeline_barrier(cmd, all, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[pre], &[], &[]);
+        for (s, dst, so, dof, n) in copies {
+            let r = vk::BufferCopy::default().src_offset(*so).dst_offset(*dof).size(*n);
+            d.cmd_copy_buffer(cmd, s.buf, dst.buf, std::slice::from_ref(&r));
+        }
+        let post = vk::MemoryBarrier::default().src_access_mask(rw).dst_access_mask(rw | host);
+        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, all, vk::DependencyFlags::empty(), &[post], &[], &[]);
+    })
+    .map_err(|e| anyhow!("recording the ship copy: {e}"))?;
+    let fence = gpu.submit(Qc::C).map_err(|e| anyhow!("submitting the ship copy: {e}"))?;
+    gpu.wait_fence(fence).map_err(|e| anyhow!("waiting for the ship copy: {e}"))?;
+    Ok(t0.elapsed().as_secs_f64())
+}
