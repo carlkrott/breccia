@@ -1545,6 +1545,8 @@ pub struct HcWorkspace {
     /// `[hc_lr, splits]` partial products for the split-K `down` GEMV
     /// (`T = 1`, see [`HcMixer::down_splits`]).
     down_partials: Buf,
+    /// The `T` the row maps were built for; [`HcMixer::read`] refuses any other.
+    map_tokens: usize,
 }
 
 impl HcWorkspace {
@@ -1887,6 +1889,7 @@ impl<'g> HcMixer<'g> {
             map_down: take(),
             map_up: take(),
             down_partials: take(),
+            map_tokens: tokens,
         })
     }
 
@@ -1934,6 +1937,12 @@ impl<'g> HcMixer<'g> {
     /// again — the A/B arm, `ws.lo_raw` holds the raw projection.
     pub fn read(&self, ws: &HcWorkspace, r: &Buf, w: &HcWeights<'_>) -> Result<()> {
         let t = ws.tokens;
+        if t != ws.map_tokens {
+            return Err(anyhow!(
+                "hc workspace row maps are for T={}, not T={t}: make a workspace per T",
+                ws.map_tokens
+            ));
+        }
         // GPU-time probe marks (§8ay): the five stages of one HC_READ. `norm` and
         // `gated` are one-workgroup kernels at `t = 1`, so this is where the
         // dispatch floor of a 96-read token is visible.

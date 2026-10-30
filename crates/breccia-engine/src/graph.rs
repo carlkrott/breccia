@@ -592,7 +592,6 @@ pub struct Session<'m> {
     gdn_chunk_ws: Option<breccia_kernels::gdn::GdnWorkspace>,
     /// `BRECCIA_PF_HCCHUNK`: the T-token HC workspaces over `r_chunk`, one per chunk
     /// size (the batched GEMV row maps are built for an exact `T`).
-    // shortcut: one per distinct chunk size, freed at session end; cap it if long sessions vary T a lot.
     hc_chunk_ws: Vec<HcWorkspace>,
     mixer_from_chunk: Option<usize>,
     /// Host seconds spent faulting PLE table rows in for the whole chunk.
@@ -2897,11 +2896,11 @@ impl<'m> Session<'m> {
         let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
         let disp_before = self.dispatches;
         // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
-        let overlap = pf_on("BRECCIA_PF_OVERLAP");
+        let overlap = pf_on("BRECCIA_PF_OVERLAP", self.model.devices.len());
 
         // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
         // The chunk-level shared expert needs a multi-user GEMM for all three roles.
-        let shared_chunk = pf_on("BRECCIA_PF_SHCHUNK") && {
+        let shared_chunk = pf_on("BRECCIA_PF_SHCHUNK", self.model.devices.len()) && {
             let moe = &m.layers[b].moe;
             let pipes = &self.venues[dev].pipes;
             [&moe.gate, &moe.up, &moe.down]
@@ -2912,7 +2911,7 @@ impl<'m> Session<'m> {
         // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
         // The whole pass-1 dense chain as T-token dispatches (`record_hc_chunk`).
         let hc_chunk = shared_chunk
-            && pf_on("BRECCIA_PF_HCCHUNK")
+            && pf_on("BRECCIA_PF_HCCHUNK", self.model.devices.len())
             && self.venues[dev].r_chunk.is_some()
             && self.mixer_chunked(b, dev)
             && {
@@ -3827,13 +3826,13 @@ impl<'m> Session<'m> {
         // shortcut: env knobs, make them the default once the 1k/4k parity matrix passes.
         let lw = &self.model.layers[b];
         let ws: Vec<&crate::model::W> = match lw.kind {
-            LayerKind::Qsa if pf_on("BRECCIA_PF_QSACHUNK") => {
+            LayerKind::Qsa if pf_on("BRECCIA_PF_QSACHUNK", self.model.devices.len()) => {
                 match lw.qsa.as_ref() {
                     Some(q) => vec![&q.q, &q.k, &q.v, &q.idx_q, &q.idx_k, &q.out],
                     None => return false,
                 }
             }
-            LayerKind::Gdn if pf_on("BRECCIA_PF_GDNCHUNK") => {
+            LayerKind::Gdn if pf_on("BRECCIA_PF_GDNCHUNK", self.model.devices.len()) => {
                 match lw.gdn.as_ref() {
                     Some(g) => vec![&g.qkv, &g.z, &g.beta, &g.alpha, &g.beta_alpha, &g.out],
                     None => return false,
@@ -3858,6 +3857,16 @@ impl<'m> Session<'m> {
         let wi = match self.hc_chunk_ws.iter().position(|w| w.tokens == t) {
             Some(i) => i,
             None => {
+                // Keep at most two (a prompt's chunks have at most two sizes, ~47 MB each
+                // at T=512): drain the GPU, then drop the oldest.
+                if self.hc_chunk_ws.len() >= 2 {
+                    batch_cmd::record_barrier_to_host(gpu)?;
+                    self.submit_batch()?;
+                    self.flush()?;
+                    self.ensure_batch(dev)?;
+                    let old = self.hc_chunk_ws.remove(0);
+                    self.venues[dev].hc.release(gpu, old);
+                }
                 let ws = self.venues[dev].hc.workspace(gpu, t)?;
                 self.hc_chunk_ws.push(ws);
                 self.hc_chunk_ws.len() - 1
@@ -3922,7 +3931,7 @@ impl<'m> Session<'m> {
             self.swap_r_in(dev, i);
             res?;
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
-                if pf_on("BRECCIA_PF_OVERLAP") {
+                if pf_on("BRECCIA_PF_OVERLAP", self.model.devices.len()) {
                     self.reopen_batch(dev)?;
                 } else {
                     self.flush()?;
@@ -4826,9 +4835,13 @@ pub fn prefill_plan(len: usize, target: usize) -> Vec<usize> {
 }
 
 /// A merged-prefill optimisation flag (`BRECCIA_PF_*`): on unless set to `0`
-/// (all five pass the 1k/4k KL gate, plan §11d).
-fn pf_on(name: &str) -> bool {
-    std::env::var_os(name).is_none_or(|v| v != "0")
+/// (all five pass the 1k/4k KL gate, plan §11d). Single-device only by default:
+/// the chunk workspaces are made on one device and released on device 0.
+fn pf_on(name: &str, devices: usize) -> bool {
+    match std::env::var_os(name) {
+        Some(v) => v != "0",
+        None => devices == 1,
+    }
 }
 
 fn hc_read(v: &Venue<'_>, w: &HcW, r: &Buf) -> Result<()> {
