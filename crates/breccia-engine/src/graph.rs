@@ -909,7 +909,7 @@ impl<'m> Session<'m> {
                 let nb = mc.n_embd as u64 * 4;
                 let nfb = mc.n_ff as u64 * 4;
                 let nsb = mc.n_ff_shared as u64 * 4;
-                let users = breccia_kernels::gemm::USERS_MAX as u64;
+                let users = pf_group_users() as u64;
                 // Streamed experts: the largest role blob among the blocks that
                 // are **not** resident (the resident ones address the arena).
                 let (mut g_max, mut u_max, mut d_max) = (0usize, 0usize, 0usize);
@@ -3087,7 +3087,7 @@ impl<'m> Session<'m> {
             distinct += 1;
             let mut u = at;
             while u < end {
-                let g_end = (u + breccia_kernels::gemm::USERS_MAX).min(end);
+                let g_end = (u + pf_group_users()).min(end);
                 let base = slot;
                 let mut users = Vec::with_capacity(g_end - u);
                 for &(_, ti, j) in &pairs[u..g_end] {
@@ -4975,6 +4975,21 @@ pub fn prefill_plan(len: usize, target: usize) -> Vec<usize> {
     let n = len.div_ceil(cap);
     let (base, rem) = (len / n, len % n);
     (0..n).map(|i| base + usize::from(i < rem)).collect()
+}
+
+/// `BRECCIA_PF_GROUP_USERS`: users per merged-prefill expert group (default 1024,
+/// i.e. one group per distinct expert at chunk <= 1024; `USERS_MAX` = the old shape).
+/// Past 8 the GEMM rides z slices, replacing serialized gather/GEMM/scatter rounds;
+/// per-user arithmetic unchanged (1k logits byte-identical, prefill -7.6 %, §11l).
+fn pf_group_users() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BRECCIA_PF_GROUP_USERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(1024)
+    })
 }
 
 /// The merged-prefill optimisation flags, in [`Session::pf`] order.
