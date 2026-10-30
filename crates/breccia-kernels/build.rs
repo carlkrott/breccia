@@ -220,8 +220,10 @@ fn main() {
                 if *umax != 8 {
                     defs.push(format!("BRECCIA_GEMM_UMAX={umax}u"));
                 }
-                let defs: Vec<&str> = defs.iter().map(String::as_str).collect();
+                let mut defs: Vec<&str> = defs.iter().map(String::as_str).collect();
                 compile(&glslc, &out_dir, name, &format!("{name}_r{rpl}u{umax}"), &defs);
+                defs.push("BRECCIA_GEMM_LDSX");
+                compile(&glslc, &out_dir, name, &format!("{name}_r{rpl}u{umax}x"), &defs);
             }
         }
         if *name == "gemv_bf16" {

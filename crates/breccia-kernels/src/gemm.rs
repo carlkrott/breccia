@@ -30,10 +30,11 @@ pub struct GemmMany<'g> {
     /// The fused gate + up + SwiGLU variant (§11l item 4), for the types that have one.
     pair: Option<breccia_vk::ctx::Kernel>,
     /// The register-blocked builds (§12 item 1): `((rows per lane group, users
-    /// per decode), kernel)`.
-    blocked: Vec<(Variant, breccia_vk::ctx::Kernel)>,
-    /// Wanted variant (`(1, USERS_MAX)` = the plain build).
-    want: Variant,
+    /// per decode), LDS-staged X, kernel)`, LDS builds first.
+    blocked: Vec<(Variant, bool, breccia_vk::ctx::Kernel)>,
+    /// Wanted variant of the plain-X and the LDS-X builds (`(1, USERS_MAX)` =
+    /// the plain build).
+    want: [Variant; 2],
     /// Forced users per z slice (1..=USERS_MAX); `None` = [`upz_for`] per dispatch.
     upz: Option<usize>,
     tables: Buf,
@@ -78,15 +79,31 @@ fn env_rpl() -> Option<usize> {
 /// Measured best build per GPU family and type (plan §12 item 1, m = 1024,
 /// `tests/gemm_many.rs`): wave64 = Vega20 (MI50), wave32 = RDNA2 (RX). Types not
 /// measured keep the plain build.
-fn tuned(ty: QuantType, subgroup: u32) -> Variant {
+fn tuned(ty: QuantType, subgroup: u32, ldsx: bool) -> Variant {
     use QuantType::*;
-    match (subgroup, ty) {
-        (64, Iq3S | Iq4Xs | Q4K | Bf16) => (2, 8),
-        (64, Q5K | Q6K) => (1, 16),
-        (32, Iq3S | Iq4Xs | Bf16) => (2, 8),
+    match (subgroup, ldsx, ty) {
+        (64, true, Iq3S | Iq4Xs | Q4K | Q5K | Bf16) => (2, 8),
+        (64, true, Q6K) => (1, 16),
+        (64, false, Iq3S | Iq4Xs | Q4K | Bf16) => (2, 8),
+        (64, false, Q5K | Q6K) => (1, 16),
+        (32, _, Iq3S | Iq4Xs | Bf16) => (2, 8),
         _ => (1, USERS_MAX),
     }
 }
+
+/// Whether the blocked builds stage X in LDS (`gemm_rpl.glsl`): measured faster
+/// on wave64 (MI50) only; `BRECCIA_GEMM_LDSX=0|1` overrides.
+fn ldsx(gpu: &Gpu) -> bool {
+    match std::env::var("BRECCIA_GEMM_LDSX").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => subgroup_size(gpu) == 64,
+    }
+}
+
+/// Users per z slice a workgroup needs before the LDS-X build pays for its
+/// barriers: decode (2 streams) measured ~1 % slower with it on the MI50 (plan §12.1b).
+const LDSX_MIN_USERS: usize = 8;
 
 fn subgroup_size(gpu: &Gpu) -> u32 {
     let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
@@ -121,14 +138,21 @@ fn pushed_upz(pc: &[u8; 24]) -> usize {
 
 macro_rules! blocked_spv {
     ($($t:ident => $s:literal),* $(,)?) => {
-        /// The register-blocked builds of `ty`'s plain GEMM (`build.rs`, `_r2`/`_r4`).
-        fn blocked_spv(ty: QuantType) -> Vec<(Variant, &'static [u8])> {
-            match ty {
-                $(QuantType::$t => vec![
+        /// The register-blocked builds of `ty`'s plain GEMM (`build.rs`, `_r2`/`_r4`),
+        /// the LDS-staged-X ones (`..x.spv`) when `ldsx`.
+        fn blocked_spv(ty: QuantType, ldsx: bool) -> Vec<(Variant, &'static [u8])> {
+            match (ty, ldsx) {
+                $((QuantType::$t, false) => vec![
                     ((2, 8), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r2u8.spv"))),
                     ((4, 8), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r4u8.spv"))),
                     ((1, 16), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r1u16.spv"))),
                     ((2, 16), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r2u16.spv"))),
+                ],
+                (QuantType::$t, true) => vec![
+                    ((2, 8), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r2u8x.spv"))),
+                    ((4, 8), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r4u8x.spv"))),
+                    ((1, 16), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r1u16x.spv"))),
+                    ((2, 16), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_r2u16x.spv"))),
                 ],)*
                 _ => Vec::new(),
             }
@@ -201,14 +225,15 @@ impl<'g> GemmMany<'g> {
             }
         };
         let mut blocked = Vec::new();
-        for (rpl, spv) in blocked_spv(ty) {
+        let sets: &[bool] = if ldsx(gpu) { &[true, false] } else { &[false] };
+        for (x, (rpl, spv)) in sets.iter().flat_map(|&x| blocked_spv(ty, x).into_iter().map(move |b| (x, b))) {
             match gpu.kernel(spv, 4) {
-                Ok(k) => blocked.push((rpl, k)),
+                Ok(k) => blocked.push((rpl, x, k)),
                 Err(e) => {
                     for k in [&kernel].into_iter().chain(q8.iter()).chain(pair.iter()) {
                         gpu.destroy_kernel(k);
                     }
-                    for (_, k) in &blocked {
+                    for (_, _, k) in &blocked {
                         gpu.destroy_kernel(k);
                     }
                     return Err(anyhow!("creating the {ty} {rpl:?} GEMM pipeline: {e}"));
@@ -219,7 +244,7 @@ impl<'g> GemmMany<'g> {
             Ok(b) => b,
             Err(e) => {
                 gpu.destroy_kernel(&kernel);
-                for k in q8.iter().chain(pair.iter()).chain(blocked.iter().map(|(_, k)| k)) {
+                for k in q8.iter().chain(pair.iter()).chain(blocked.iter().map(|(_, _, k)| k)) {
                     gpu.destroy_kernel(k);
                 }
                 return Err(e.context("uploading the quant tables"));
@@ -232,10 +257,10 @@ impl<'g> GemmMany<'g> {
             q8,
             pair,
             blocked,
-            want: {
-                let t = tuned(ty, subgroup_size(gpu));
+            want: [false, true].map(|x| {
+                let t = tuned(ty, subgroup_size(gpu), x);
                 (env_rpl().unwrap_or(t.0), env_umax().unwrap_or(t.1))
-            },
+            }),
             upz: default_upz(),
             tables,
         })
@@ -253,7 +278,7 @@ impl<'g> GemmMany<'g> {
     /// Force the build: rows per lane group (1, 2 or 4) and users per decode
     /// (8 or 16); A/B and tests.
     pub fn set_variant(&mut self, rpl: usize, umax: usize) {
-        self.want = (rpl, umax);
+        self.want = [(rpl, umax); 2];
     }
 
     fn upz_max(&self, rows: usize, users: usize, umax: usize) -> usize {
@@ -339,12 +364,13 @@ impl<'g> GemmMany<'g> {
     fn plain(&self, rows: usize, users: usize) -> (&breccia_vk::ctx::Kernel, Variant) {
         self.blocked
             .iter()
-            .find(|((r, u), _)| {
-                (*r, *u) == self.want
+            .find(|((r, u), x, _)| {
+                (*r, *u) == self.want[*x as usize]
+                    && (!*x || self.upz_max(rows / r, users, *u).min(users) >= LDSX_MIN_USERS)
                     && rows % r == 0
                     && (rows / r).div_ceil(ROWS_PER_WG) * users.div_ceil(*u) >= WG_TARGET
             })
-            .map_or((&self.kernel, (1, USERS_MAX)), |(v, k)| {
+            .map_or((&self.kernel, (1, USERS_MAX)), |(v, _, k)| {
                 static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     eprintln!("gemm: blocked build {v:?} in use ({} {rows} x {users})", self.ty.name());
@@ -563,7 +589,7 @@ impl Drop for GemmMany<'_> {
         for k in self.q8.iter().chain(self.pair.iter()) {
             self.gpu.destroy_kernel(k);
         }
-        for (_, k) in &self.blocked {
+        for (_, _, k) in &self.blocked {
             self.gpu.destroy_kernel(k);
         }
         self.gpu.destroy_buf(&self.tables);

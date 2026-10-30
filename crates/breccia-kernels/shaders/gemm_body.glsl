@@ -23,7 +23,7 @@
 #ifndef BRECCIA_GEMM_BODY_GLSL
 #define BRECCIA_GEMM_BODY_GLSL
 
-#ifdef BRECCIA_GEMM_RPL
+#if defined(BRECCIA_GEMM_RPL) || defined(BRECCIA_GEMM_LDSX)
 #include "gemm_rpl.glsl"
 #else
 
