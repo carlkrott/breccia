@@ -3084,6 +3084,7 @@ impl<'m> Session<'m> {
                 streamed && x != dev && x < m.devices.len() && self.venues[x].pf.is_some()
             });
         let mut ship_s = 0.0f64;
+        let mut ship_p = [0.0f64; 4];
         if let Some(x) = xdev {
             let t0 = std::time::Instant::now();
             let nb = n_embd * 4;
@@ -3095,13 +3096,14 @@ impl<'m> Session<'m> {
                 (&pf.gate, 0, t * 4),
             ];
             let bytes = self.stagings[dev].read_batch(gpu, &items)?;
+            ship_p[0] = t0.elapsed().as_secs_f64();
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
             let regions: Vec<(&Buf, u64, &[u8])> = [&xpf.mixed, &xpf.w, &xpf.shared, &xpf.gate]
                 .into_iter()
                 .zip(bytes.iter())
                 .map(|(buf, d)| (buf, 0, d.as_slice()))
                 .collect();
-            self.stagings[x].write_regions(m.devices[x].gpu(), &regions)?;
+            ship_p[1] = self.stagings[x].write_regions(m.devices[x].gpu(), &regions)?;
             xpf.slots.write(&slot_bytes)?;
             ship_s += t0.elapsed().as_secs_f64();
         }
@@ -3261,8 +3263,9 @@ impl<'m> Session<'m> {
             let t0 = std::time::Instant::now();
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
             let bytes = self.stagings[x].read_batch(egpu, &[(&xpf.out, 0, t * n_embd * 4)])?;
+            ship_p[2] = t0.elapsed().as_secs_f64();
             let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
-            self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
+            ship_p[3] = self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
             ship_s += t0.elapsed().as_secs_f64();
             self.ensure_batch(dev)?;
         }
@@ -3339,7 +3342,7 @@ impl<'m> Session<'m> {
             );
             eprintln!(
                 "merged blk {b:>2} t={t} {}{} distinct={distinct} groups={} slots={} \
-                 gemm={:.2} ms fanin={:.3} ms ship={:.2} ms dispatches={dispatches} \
+                 gemm={:.2} ms fanin={:.3} ms ship={:.2} ms (rd {:.2} wr {:.2} | back rd {:.2} wr {:.2}) dispatches={dispatches} \
                  arena={:.1} MiB streamed(cum)={:.1} MiB fill={:.1} ms wait={:.1} ms",
                 if streamed { "streamed" } else { "resident" },
                 if xdev.is_some() { "@x" } else { "" },
@@ -3348,6 +3351,10 @@ impl<'m> Session<'m> {
                 gemm_s * 1e3,
                 fanin_s * 1e3,
                 ship_s * 1e3,
+                ship_p[0] * 1e3,
+                ship_p[1] * 1e3,
+                ship_p[2] * 1e3,
+                ship_p[3] * 1e3,
                 (distinct as u64 * expert_bytes) as f64 / (1u64 << 20) as f64,
                 sb as f64 / (1u64 << 20) as f64,
                 sf * 1e3,
