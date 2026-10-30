@@ -3038,12 +3038,21 @@ impl<'m> Session<'m> {
             let pf = v.pf.as_ref().expect("the merged prefill scratch");
             let n_sh = mc.n_ff_shared;
             let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked above");
-            batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_GATE);
-            g(&moe.gate).run(&moe.gate.buf, &pf.mixed, &pf.sh_g, n_sh, n_embd, t)?;
-            batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_UP);
-            g(&moe.up).run(&moe.up.buf, &pf.mixed, &pf.sh_u, n_sh, n_embd, t)?;
-            batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_SWIGLU);
-            v.swiglu.run(&pf.sh_g, &pf.sh_u, &pf.sh_a, t * n_sh)?;
+            match moe.gate_up.as_ref().filter(|w| g(w).has_pair()) {
+                // One dispatch for gate + up + SwiGLU (§11l item 4), bit-identical.
+                Some(gu) => {
+                    batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_GATE);
+                    g(gu).run_pair(&gu.buf, &pf.mixed, &pf.sh_a, n_sh, n_embd, t)?;
+                }
+                None => {
+                    batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_GATE);
+                    g(&moe.gate).run(&moe.gate.buf, &pf.mixed, &pf.sh_g, n_sh, n_embd, t)?;
+                    batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_UP);
+                    g(&moe.up).run(&moe.up.buf, &pf.mixed, &pf.sh_u, n_sh, n_embd, t)?;
+                    batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_SWIGLU);
+                    v.swiglu.run(&pf.sh_g, &pf.sh_u, &pf.sh_a, t * n_sh)?;
+                }
+            }
             batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_DOWN);
             g(&moe.down).run(&moe.down.buf, &pf.sh_a, &pf.shared, n_embd, n_sh, t)?;
         }

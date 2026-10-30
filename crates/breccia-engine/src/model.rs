@@ -143,6 +143,9 @@ pub struct MoeW {
     pub gate: W,
     pub up: W,
     pub down: W,
+    /// `gate` rows then `up` rows in one buffer, for the fused chunk-prefill
+    /// gate + up + SwiGLU (§11l item 4); only when both are one type with a pair shader.
+    pub gate_up: Option<W>,
 }
 
 /// Everything one block needs on its device.
@@ -176,6 +179,9 @@ impl LayerWeights {
             &self.moe.up,
             &self.moe.down,
         ] {
+            gpu.destroy_buf(&w.buf);
+        }
+        if let Some(w) = &self.moe.gate_up {
             gpu.destroy_buf(&w.buf);
         }
         for b in [&self.hc_attn.inject, &self.hc_ffn.inject]
@@ -498,7 +504,7 @@ impl Model {
             let kind = cfg.layer_kind(block);
             let hc_attn = hc_weights(gpu, &shards, block, "attn")?;
             let hc_ffn = hc_weights(gpu, &shards, block, "ffn")?;
-            let moe = MoeW {
+            let mut moe = MoeW {
                 router: w(gpu, &shards, &format!("blk.{block}.ffn_gate_inp.weight"))?,
                 shexp_gate: w(
                     gpu,
@@ -508,7 +514,20 @@ impl Model {
                 gate: w(gpu, &shards, &format!("blk.{block}.ffn_gate_shexp.weight"))?,
                 up: w(gpu, &shards, &format!("blk.{block}.ffn_up_shexp.weight"))?,
                 down: w(gpu, &shards, &format!("blk.{block}.ffn_down_shexp.weight"))?,
+                gate_up: None,
             };
+            if moe.gate.key == moe.up.key
+                && breccia_kernels::gemm::has_pair_shader(moe.gate.key.ty)
+            {
+                moe.gate_up = Some(w_concat(
+                    gpu,
+                    &shards,
+                    &[
+                        &format!("blk.{block}.ffn_gate_shexp.weight"),
+                        &format!("blk.{block}.ffn_up_shexp.weight"),
+                    ],
+                )?);
+            }
             let gdn = match kind {
                 LayerKind::Gdn => Some(GdnW {
                     qkv: w(gpu, &shards, &format!("blk.{block}.attn_qkv.weight"))?,
@@ -556,6 +575,7 @@ impl Model {
                     .iter()
                     .map(|w| w.buf.size)
                     .sum::<u64>()
+                + moe.gate_up.as_ref().map_or(0, |w| w.buf.size)
                 + gdn.as_ref().map_or(0, |g| {
                     [&g.qkv, &g.z, &g.beta, &g.alpha, &g.out]
                         .iter()

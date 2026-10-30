@@ -562,3 +562,84 @@ fn q8_gemm_tracks_the_fp32_gemm() {
     }
     drop(guard);
 }
+
+/// The fused shared-expert gate + up + SwiGLU (`run_pair`, §11l item 4) against
+/// gate GEMM + up GEMM + `SwiGlu` on a real same-type layer: per user and per row
+/// the same decodes, accumulation order and reduction, so **bit-identical**.
+/// `BRECCIA_GEMM_TYPE` picks the type (the ones with a pair shader: IQ3_S).
+#[test]
+fn paired_shared_gate_up_matches_gate_up_swiglu() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("pair_gemm: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let ty = match std::env::var("BRECCIA_GEMM_TYPE").as_deref() {
+        Ok("IQ3_S") => QuantType::Iq3S,
+        _ => {
+            eprintln!("pair_gemm: SKIPPED - set BRECCIA_GEMM_TYPE=IQ3_S");
+            return;
+        }
+    };
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else {
+        eprintln!("pair_gemm: no device for {selector}");
+        return;
+    };
+    let set = match ShardSet::open_glob(MODEL_GLOB) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("pair_gemm: no model: {e}");
+            return;
+        }
+    };
+    let block = (0..48).find(|b| {
+        ["ffn_gate_shexp", "ffn_up_shexp"].iter().all(|n| {
+            set.tensor(&format!("blk.{b}.{n}.weight"))
+                .is_some_and(|t| QuantType::from_ggml(t.ty()) == Some(ty))
+        })
+    });
+    let Some(b) = block else {
+        eprintln!("pair_gemm: no layer with both shared gate and up in {}", ty.name());
+        return;
+    };
+    let g = set.tensor(&format!("blk.{b}.ffn_gate_shexp.weight")).expect("gate");
+    let u = set.tensor(&format!("blk.{b}.ffn_up_shexp.weight")).expect("up");
+    let (rows, cols) = (g.ne1() as usize, g.ne0() as usize);
+    println!("pair_gemm: blk.{b} [{rows} x {cols}] {}", ty.name());
+    let gpu = &dev.gpu;
+    let wg = breccia_kernels::gemv::upload(gpu, g.as_slice()).expect("upload gate");
+    let wu = breccia_kernels::gemv::upload(gpu, u.as_slice()).expect("upload up");
+    let cat: Vec<u8> = [g.as_slice(), u.as_slice()].concat();
+    let wp = breccia_kernels::gemv::upload(gpu, &cat).expect("upload pair");
+    let many = GemmMany::new(gpu, ty).expect("gemm pipeline");
+    let swiglu = breccia_kernels::ops::SwiGlu::new(gpu).expect("swiglu");
+    // m = 1 (one z slice), USERS_MAX, and a chunk past USERS_MAX (several z slices).
+    for m in [1usize, USERS_MAX, 37] {
+        let flat: Vec<f32> = (0..m * cols)
+            .map(|i| (((i * 7 + (i / cols) * 13) % 29) as f32 - 14.0) * 0.011)
+            .collect();
+        let x = breccia_kernels::ops::upload_f32(gpu, &flat).expect("x");
+        let n = m * rows;
+        let [og, ou, oa, op] = [0; 4].map(|_| alloc(gpu, (n * 4) as u64).expect("out"));
+        many.run(&wg, &x, &og, rows, cols, m).expect("gate");
+        many.run(&wu, &x, &ou, rows, cols, m).expect("up");
+        swiglu.run(&og, &ou, &oa, n).expect("swiglu");
+        many.run_pair(&wp, &x, &op, rows, cols, m).expect("pair");
+        let want = breccia_kernels::ops::download_f32(gpu, &oa, n).expect("down ref");
+        let got = breccia_kernels::ops::download_f32(gpu, &op, n).expect("down pair");
+        let diff = want.iter().zip(&got).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let worst = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| ((a - b).abs() / a.abs().max(1e-6)) as f64)
+            .fold(0f64, f64::max);
+        println!("pair_gemm: m = {m}: {diff}/{n} differ, worst relative {worst:.3e}");
+        assert_eq!(diff, 0, "m = {m}: the fused gate+up+swiglu must be bit-identical");
+        for o in [og, ou, oa, op, x] {
+            gpu.destroy_buf(&o);
+        }
+    }
+    for w in [wg, wu, wp] {
+        gpu.destroy_buf(&w);
+    }
+}

@@ -23,6 +23,14 @@
 #ifndef BRECCIA_GEMM_BODY_GLSL
 #define BRECCIA_GEMM_BODY_GLSL
 
+// BRECCIA_GEMM_PAIR (§11l item 4): `W` holds `pc.rows` gate rows then `pc.rows` up
+// rows of one type (`w_concat`); each row decodes both, shares the X loads, keeps
+// both accumulator pairs in the single-kernel order and writes `silu(g) * u` (the
+// `ops_swiglu` expression), so one dispatch replaces gate + up + swiglu.
+#ifdef BRECCIA_GEMM_PAIR
+#include "ops_math.glsl"
+#endif
+
 layout(local_size_x = 256) in;
 
 // `W` (u16 words, binding 0), `X` (vec4, binding 1), `O` (binding 2), the quant
@@ -70,6 +78,16 @@ void main() {
         acc1[j] = 0.0;
     }
     float v[8];
+#ifdef BRECCIA_GEMM_PAIR
+    const uint up_base = ROW_BASE_WORDS + (pc.rows + row) * bpr * BLOCK_WORDS;
+    float accu0[USERS_MAX];
+    float accu1[USERS_MAX];
+    for (uint j = 0u; j < m; ++j) {
+        accu0[j] = 0.0;
+        accu1[j] = 0.0;
+    }
+    float w[8];
+#endif
 
     for (uint b0 = 0u; b0 < bpr; b0 += STEP) {
         uint b = b0 + b_off;
@@ -81,26 +99,52 @@ void main() {
         DEQUANT_UNIT(row_base + b * BLOCK_WORDS, u, v);
         vec4 v0 = vec4(v[0], v[1], v[2], v[3]);
         vec4 v1 = vec4(v[4], v[5], v[6], v[7]);
+#ifdef BRECCIA_GEMM_PAIR
+        DEQUANT_UNIT(up_base + b * BLOCK_WORDS, u, w);
+        vec4 w0 = vec4(w[0], w[1], w[2], w[3]);
+        vec4 w1 = vec4(w[4], w[5], w[6], w[7]);
+#endif
         for (uint j = 0u; j < m; ++j) {
             uint xb = ((u0 + j) * pc.cols + e) >> 2u;
             float s;
+#ifdef BRECCIA_GEMM_PAIR
+            float su;
+#endif
             if (b < full) {
-                s = dot(v0, X[xb]) + dot(v1, X[xb + 1u]);
+                vec4 xa = X[xb];
+                vec4 xc = X[xb + 1u];
+                s = dot(v0, xa) + dot(v1, xc);
+#ifdef BRECCIA_GEMM_PAIR
+                su = dot(w0, xa) + dot(w1, xc);
+#endif
             } else {
                 s = 0.0;
+#ifdef BRECCIA_GEMM_PAIR
+                su = 0.0;
+#endif
                 for (uint t = 0u; t < 8u; ++t) {
                     uint idx = e + t;
                     if (idx < pc.cols) {
                         // element `idx & 3` of the vec4 word; X is the same
                         // zero-padded buffer the single-user kernels read.
-                        s += v[t] * X[((u0 + j) * pc.cols + idx) >> 2u][idx & 3u];
+                        float x = X[((u0 + j) * pc.cols + idx) >> 2u][idx & 3u];
+                        s += v[t] * x;
+#ifdef BRECCIA_GEMM_PAIR
+                        su += w[t] * x;
+#endif
                     }
                 }
             }
             if ((b0 & 1u) == 0u) {
                 acc0[j] += s;
+#ifdef BRECCIA_GEMM_PAIR
+                accu0[j] += su;
+#endif
             } else {
                 acc1[j] += s;
+#ifdef BRECCIA_GEMM_PAIR
+                accu1[j] += su;
+#endif
             }
         }
     }
@@ -110,9 +154,19 @@ void main() {
         [[unroll]] for (uint off = 16u; off > 0u; off >>= 1u) {
             facc += subgroupShuffleXor(facc, off);
         }
+#ifdef BRECCIA_GEMM_PAIR
+        float fu = accu0[j] + accu1[j];
+        [[unroll]] for (uint off = 16u; off > 0u; off >>= 1u) {
+            fu += subgroupShuffleXor(fu, off);
+        }
+        if (lane == 0u) {
+            O[(u0 + j) * pc.rows + row] = breccia_silu(facc) * fu;
+        }
+#else
         if (lane == 0u) {
             O[(u0 + j) * pc.rows + row] = facc;
         }
+#endif
     }
 }
 

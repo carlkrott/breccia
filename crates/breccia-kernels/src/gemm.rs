@@ -27,6 +27,8 @@ pub struct GemmMany<'g> {
     kernel: breccia_vk::ctx::Kernel,
     /// The int8-dot variant (q8_1 activations, §11j), for the types that have one.
     q8: Option<breccia_vk::ctx::Kernel>,
+    /// The fused gate + up + SwiGLU variant (§11l item 4), for the types that have one.
+    pair: Option<breccia_vk::ctx::Kernel>,
     /// Forced users per z slice (1..=USERS_MAX); `None` = [`upz_for`] per dispatch.
     upz: Option<usize>,
     tables: Buf,
@@ -59,6 +61,11 @@ fn upz_for(rows: usize, users: usize) -> usize {
         .into_iter()
         .find(|&z| groups * users.max(1).div_ceil(z) >= WG_TARGET)
         .unwrap_or(2)
+}
+
+/// Whether [`GemmMany::run_pair`] has a shader for `ty` (gate and up both `ty`).
+pub fn has_pair_shader(ty: QuantType) -> bool {
+    ty == QuantType::Iq3S
 }
 
 impl<'g> GemmMany<'g> {
@@ -100,11 +107,26 @@ impl<'g> GemmMany<'g> {
                 return Err(anyhow!("creating the {ty} int8 GEMM pipeline: {e}"));
             }
         };
+        let pair_spv: Option<&[u8]> = match ty {
+            QuantType::Iq3S => Some(include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq3_s_pair.spv"))),
+            _ => None,
+        };
+        debug_assert_eq!(pair_spv.is_some(), has_pair_shader(ty));
+        let pair = match pair_spv.map(|spv| gpu.kernel(spv, 4)).transpose() {
+            Ok(k) => k,
+            Err(e) => {
+                gpu.destroy_kernel(&kernel);
+                if let Some(k) = &q8 {
+                    gpu.destroy_kernel(k);
+                }
+                return Err(anyhow!("creating the {ty} gate+up GEMM pipeline: {e}"));
+            }
+        };
         let tables = match upload(gpu, &table_bytes()) {
             Ok(b) => b,
             Err(e) => {
                 gpu.destroy_kernel(&kernel);
-                if let Some(k) = &q8 {
+                for k in q8.iter().chain(pair.iter()) {
                     gpu.destroy_kernel(k);
                 }
                 return Err(e.context("uploading the quant tables"));
@@ -115,6 +137,7 @@ impl<'g> GemmMany<'g> {
             gpu,
             kernel,
             q8,
+            pair,
             upz: default_upz(),
             tables,
         })
@@ -192,6 +215,33 @@ impl<'g> GemmMany<'g> {
         }
         let pc = self.pc(rows, cols, users, base_words);
         self.dispatch(&self.kernel, &[w, x, out, &self.tables], &pc, rows, users)
+    }
+
+    /// Whether [`GemmMany::run_pair`] exists for this type.
+    pub fn has_pair(&self) -> bool {
+        self.pair.is_some()
+    }
+
+    /// Fused gate + up + SwiGLU: `w` holds `rows` gate rows then `rows` up rows,
+    /// `out[u*rows + r] = silu(gate_r · x_u) * (up_r · x_u)`.
+    pub fn run_pair(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+    ) -> Result<()> {
+        if users == 0 {
+            return Err(anyhow!("users must be at least 1"));
+        }
+        let kernel = self
+            .pair
+            .as_ref()
+            .ok_or_else(|| anyhow!("no gate+up GEMM shader for {}", self.ty))?;
+        let pc = self.pc(rows, cols, users, 0);
+        self.dispatch(kernel, &[w, x, out, &self.tables], &pc, rows, users)
     }
 
     /// [`GemmMany::run_at`] on int8 dot products: `xq` holds `users * cols` int8
@@ -373,7 +423,7 @@ impl<'g> GemmMany<'g> {
 impl Drop for GemmMany<'_> {
     fn drop(&mut self) {
         self.gpu.destroy_kernel(&self.kernel);
-        if let Some(k) = &self.q8 {
+        for k in self.q8.iter().chain(self.pair.iter()) {
             self.gpu.destroy_kernel(k);
         }
         self.gpu.destroy_buf(&self.tables);
