@@ -26,6 +26,13 @@ pub enum Proj<'a, 'g> {
         pipe: &'a GemvBatch<'g>,
         map: &'a Buf,
     },
+    /// Multi-user GEMM: `out[t*rows + r] = W_r · x[t]`, one dispatch, each row in
+    /// the GEMV's accumulation order (bit-identical to `Single`, §8aa).
+    Many {
+        pipe: &'a crate::gemm::GemmMany<'g>,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 impl Proj<'_, '_> {
@@ -40,6 +47,7 @@ impl Proj<'_, '_> {
                 g.run(w, x, out)
             }
             Proj::Batch { pipe, map } => pipe.run(w, x, out, map, tokens),
+            Proj::Many { pipe, rows, cols } => pipe.run(w, x, out, *rows, *cols, tokens),
         }
     }
 
@@ -61,6 +69,7 @@ impl Proj<'_, '_> {
                 g.run_timed(w, x, out, target_s)
             }
             Proj::Batch { pipe, map } => pipe.run_timed(w, x, out, map, tokens, target_s),
+            Proj::Many { .. } => Err(anyhow!("Proj::Many has no timed form")),
         }
     }
 
@@ -69,6 +78,7 @@ impl Proj<'_, '_> {
         match self {
             Proj::Single(g) => g.rows(),
             Proj::Batch { pipe, .. } => pipe.rows_per_expert(),
+            Proj::Many { rows, .. } => *rows,
         }
     }
 }

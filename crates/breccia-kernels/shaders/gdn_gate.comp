@@ -60,6 +60,8 @@ void main() {
         return;
     }
     uint h = i % pc.h_v;
-    BETA[i] = breccia_sigmoid(BETA_IN[i]);
-    GATE[i] = breccia_softplus(ALPHA[i + pc.alpha_base] + DT[h]) * A[h];
+    // Merged `beta|alpha` rows are `h_v + alpha_base` wide per token (T > 1 too).
+    uint src = (i / pc.h_v) * (pc.h_v + pc.alpha_base) + h;
+    BETA[i] = breccia_sigmoid(BETA_IN[src]);
+    GATE[i] = breccia_softplus(ALPHA[src + pc.alpha_base] + DT[h]) * A[h];
 }

@@ -578,6 +578,12 @@ pub struct Session<'m> {
     /// Merged pass 1 only: the prelude leaves the shared expert's gate/up/SwiGLU/
     /// down out, and the pass runs them once over the chunk (`BRECCIA_PF_SHCHUNK`).
     shared_deferred: bool,
+    /// Merged pass 1 with `BRECCIA_PF_QSACHUNK` / `BRECCIA_PF_GDNCHUNK`: T-token
+    /// mixer workspaces (made on first use) and, while set, the chunk's `pos0`:
+    /// the prelude's mixer then copies its row of `pf.out` instead of running.
+    qsa_chunk_ws: Option<QsaWorkspace>,
+    gdn_chunk_ws: Option<breccia_kernels::gdn::GdnWorkspace>,
+    mixer_from_chunk: Option<usize>,
     /// Host seconds spent faulting PLE table rows in for the whole chunk.
     pf_ple_prefetch_s: f64,
     /// Fine-grained `shared-exp` attribution (§8ad): gate, up, swiglu, down, scalar
@@ -1096,6 +1102,9 @@ impl<'m> Session<'m> {
             pf_stream_fill_s: 0.0,
             pf_stream_wait_s: 0.0,
             shared_deferred: false,
+            qsa_chunk_ws: None,
+            gdn_chunk_ws: None,
+            mixer_from_chunk: None,
             pf_ple_prefetch_s: 0.0,
             sh_sub: [0.0; 6],
             pf_wall_s: 0.0,
@@ -2159,9 +2168,19 @@ impl<'m> Session<'m> {
 
         // ---- (C) the token mixer --------------------------------------------
         self.timers.mark(MIXER);
-        match m.layers[b].kind {
-            LayerKind::Gdn => self.run_gdn(b, dev)?,
-            LayerKind::Qsa => self.run_qsa(b, dev, pos)?,
+        match (self.mixer_from_chunk, m.layers[b].kind) {
+            (Some(pos0), _) => {
+                let v = &self.venues[dev];
+                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let nb = (mc.n_embd * 4) as u64;
+                let src = (pos - pos0) as u64 * nb;
+                batch_cmd::record_copies(
+                    m.devices[dev].gpu(),
+                    &[(&v.block_out.buf, 0, &pf.out, src, nb)],
+                )?;
+            }
+            (None, LayerKind::Gdn) => self.run_gdn(b, dev)?,
+            (None, LayerKind::Qsa) => self.run_qsa(b, dev, pos)?,
         }
         let mixer_out = self.maybe_checksum(trace.is_some(), dev, BufKind::BlockOut, mc.n_embd)?;
 
@@ -2879,12 +2898,21 @@ impl<'m> Session<'m> {
 
         // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
         self.ensure_batch(dev)?;
+        // The block's mixer for the whole chunk at once: every token's attn-mixed
+        // row into `pf.mixed`, one T-token forward into `pf.out`; the per-token
+        // prelude below recomputes HC_READ(attn) (its inject partials feed
+        // HC_WRITE) and copies its `pf.out` row in place of the mixer.
+        if self.mixer_chunked(b, dev) {
+            self.record_mixer_chunk(b, dev, t, pos0)?;
+            self.mixer_from_chunk = Some(pos0);
+        }
         self.shared_deferred = shared_chunk;
         for i in 0..t {
             self.swap_r_in(dev, i);
             let prelude = self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace);
             if let Err(e) = prelude {
                 self.shared_deferred = false;
+                self.mixer_from_chunk = None;
                 return Err(e);
             }
             {
@@ -2926,6 +2954,7 @@ impl<'m> Session<'m> {
             }
         }
         self.shared_deferred = false;
+        self.mixer_from_chunk = None;
         // The shared expert for the whole chunk: one dispatch per role, `t` users
         // over `pf.mixed`; the down GEMM writes `pf.shared` in the fan-in's layout.
         if shared_chunk {
@@ -3744,6 +3773,196 @@ impl<'m> Session<'m> {
         gdn.forward(state, ws, &weights, &proj, mixed, &v.block_out.buf)
     }
 
+    /// `BRECCIA_PF_QSACHUNK` (QSA) / `BRECCIA_PF_GDNCHUNK` (GDN) and every
+    /// projection the block's mixer runs has a multi-user GEMM.
+    fn mixer_chunked(&self, b: usize, dev: usize) -> bool {
+        // shortcut: env knobs, make them the default once the 1k/4k parity matrix passes.
+        let lw = &self.model.layers[b];
+        let ws: Vec<&crate::model::W> = match lw.kind {
+            LayerKind::Qsa if std::env::var_os("BRECCIA_PF_QSACHUNK").is_some() => {
+                match lw.qsa.as_ref() {
+                    Some(q) => vec![&q.q, &q.k, &q.v, &q.idx_q, &q.idx_k, &q.out],
+                    None => return false,
+                }
+            }
+            LayerKind::Gdn if std::env::var_os("BRECCIA_PF_GDNCHUNK").is_some() => {
+                match lw.gdn.as_ref() {
+                    Some(g) => vec![&g.qkv, &g.z, &g.beta, &g.alpha, &g.beta_alpha, &g.out],
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+        let pipes = &self.venues[dev].pipes;
+        ws.iter().all(|w| pipes.gemm(w.key.ty).is_some())
+    }
+
+    /// Merged pass 1: HC_READ(attn) per token into `pf.mixed`, then one
+    /// `t`-token mixer forward (multi-user GEMM projections) into `pf.out`.
+    fn record_mixer_chunk(&mut self, b: usize, dev: usize, t: usize, pos0: usize) -> Result<()> {
+        let m = self.model;
+        let gpu = m.devices[dev].gpu();
+        let nb = (m.cfg.n_embd * 4) as u64;
+        let chunk = self.venues[dev]
+            .pf
+            .as_ref()
+            .map_or(t, |pf| (pf.out.size / nb) as usize);
+        self.timers.mark(HC_READ_A);
+        for i in 0..t {
+            self.swap_r_in(dev, i);
+            let v = &self.venues[dev];
+            let res = hc_read(v, &m.layers[b].hc_attn, &v.r).and_then(|_| {
+                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                batch_cmd::record_copies(gpu, &[(&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb)])
+            });
+            self.swap_r_in(dev, i);
+            res?;
+            if batch_cmd::recorded() >= MERGED_BATCH_CAP {
+                if std::env::var_os("BRECCIA_PF_OVERLAP").is_some() {
+                    self.reopen_batch(dev)?;
+                } else {
+                    self.flush()?;
+                    self.ensure_batch(dev)?;
+                }
+            }
+        }
+        self.timers.mark(MIXER);
+        if m.layers[b].kind == LayerKind::Gdn {
+            return self.record_gdn_chunk(b, dev, t, chunk);
+        }
+        let cap = self.qsa_state[b]
+            .as_ref()
+            .ok_or_else(|| anyhow!("block {b} has no QSA state"))?
+            .capacity_cells;
+        if pos0 + t > cap {
+            bail!("block {b}: a chunk ending at {} needs more than the cache's {cap} KV cells", pos0 + t);
+        }
+        if self.qsa_chunk_ws.is_none() {
+            let qsa = self.venues[dev]
+                .qsa
+                .as_ref()
+                .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
+            self.qsa_chunk_ws = Some(qsa.workspace(gpu, chunk, cap)?);
+        }
+        {
+            let ws = self.qsa_chunk_ws.as_mut().expect("made above");
+            let n_blocks = (pos0 + t) / 4;
+            ws.tokens = t;
+            ws.n_blocks = n_blocks;
+            ws.max_ids = n_blocks.min(2048 / 4) + 1;
+            ws.slots = 4 * ws.max_ids;
+        }
+        let qw = m.layers[b]
+            .qsa
+            .as_ref()
+            .ok_or_else(|| anyhow!("block {b} is QSA but has no weights"))?;
+        let v = &self.venues[dev];
+        let qsa = v
+            .qsa
+            .as_ref()
+            .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
+        let state = self.qsa_state[b]
+            .as_ref()
+            .ok_or_else(|| anyhow!("block {b} has no QSA state"))?;
+        let many = |w: &crate::model::W| -> Result<Proj<'_, '_>> {
+            Ok(Proj::Many {
+                pipe: v
+                    .pipes
+                    .gemm(w.key.ty)
+                    .ok_or_else(|| anyhow!("no multi-user GEMM for {:?}", w.key.ty))?,
+                rows: w.key.rows,
+                cols: w.key.cols,
+            })
+        };
+        let weights = QsaWeights {
+            q_norm: &qw.q_norm,
+            k_norm: &qw.k_norm,
+            idx_q_norm: &qw.idx_q_norm,
+            idx_k_norm: &qw.idx_k_norm,
+        };
+        let proj = QsaProjections {
+            q: many(&qw.q)?,
+            w_q: &qw.q.buf,
+            k: many(&qw.k)?,
+            w_k: &qw.k.buf,
+            v: many(&qw.v)?,
+            w_v: &qw.v.buf,
+            idx_q: many(&qw.idx_q)?,
+            w_idx_q: &qw.idx_q.buf,
+            idx_k: many(&qw.idx_k)?,
+            w_idx_k: &qw.idx_k.buf,
+            out: many(&qw.out)?,
+            w_out: &qw.out.buf,
+        };
+        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let ws = self.qsa_chunk_ws.as_ref().expect("made above");
+        qsa.forward(state, ws, &weights, &proj, &pf.mixed, &pf.out, pos0)
+    }
+
+    /// The GDN half of [`Session::record_mixer_chunk`]: one `t`-token forward.
+    fn record_gdn_chunk(&mut self, b: usize, dev: usize, t: usize, chunk: usize) -> Result<()> {
+        let m = self.model;
+        let gpu = m.devices[dev].gpu();
+        if self.gdn_chunk_ws.is_none() {
+            let gdn = self.venues[dev]
+                .gdn
+                .as_ref()
+                .ok_or_else(|| anyhow!("device {dev} has no GDN pipelines"))?;
+            self.gdn_chunk_ws = Some(gdn.workspace(gpu, chunk)?);
+        }
+        self.gdn_chunk_ws.as_mut().expect("made above").tokens = t;
+        let gw = m.layers[b]
+            .gdn
+            .as_ref()
+            .ok_or_else(|| anyhow!("block {b} is GDN but has no weights"))?;
+        let v = &self.venues[dev];
+        let many = |w: &crate::model::W| -> Result<Proj<'_, '_>> {
+            Ok(Proj::Many {
+                pipe: v
+                    .pipes
+                    .gemm(w.key.ty)
+                    .ok_or_else(|| anyhow!("no multi-user GEMM for {:?}", w.key.ty))?,
+                rows: w.key.rows,
+                cols: w.key.cols,
+            })
+        };
+        let proj = GdnProjections {
+            qkv: many(&gw.qkv)?,
+            w_qkv: &gw.qkv.buf,
+            z: many(&gw.z)?,
+            w_z: &gw.z.buf,
+            beta: many(&gw.beta)?,
+            w_beta: &gw.beta.buf,
+            alpha: many(&gw.alpha)?,
+            w_alpha: &gw.alpha.buf,
+            beta_alpha: if breccia_kernels::gdn::beta_alpha_merged() {
+                Some(many(&gw.beta_alpha)?)
+            } else {
+                None
+            },
+            w_beta_alpha: Some(&gw.beta_alpha.buf),
+            out: many(&gw.out)?,
+            w_out: &gw.out.buf,
+        };
+        let weights = GdnWeights {
+            conv: &gw.conv,
+            dt: &gw.dt,
+            a: &gw.a,
+            ssm_norm: &gw.ssm_norm,
+        };
+        let gdn = v
+            .gdn
+            .as_ref()
+            .ok_or_else(|| anyhow!("device {dev} has no GDN pipelines"))?;
+        let state = self.gdn_state[b]
+            .as_ref()
+            .ok_or_else(|| anyhow!("block {b} has no GDN state"))?;
+        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let ws = self.gdn_chunk_ws.as_ref().expect("made above");
+        gdn.forward(state, ws, &weights, &proj, &pf.mixed, &pf.out)
+    }
+
     fn run_qsa(&mut self, b: usize, dev: usize, pos: usize) -> Result<()> {
         let m = self.model;
         let n_kv_after = pos + 1;
@@ -4322,6 +4541,16 @@ impl Drop for Session<'_> {
                 ] {
                     gpu.destroy_buf(buf);
                 }
+            }
+        }
+        if let Some(ws) = self.qsa_chunk_ws.take() {
+            if let Some(qsa) = self.venues[0].qsa.as_ref() {
+                qsa.release(m.devices[0].gpu(), ws);
+            }
+        }
+        if let Some(ws) = self.gdn_chunk_ws.take() {
+            if let Some(gdn) = self.venues[0].gdn.as_ref() {
+                gdn.release(m.devices[0].gpu(), ws);
             }
         }
         for (b, ws) in self.qsa_ws.iter_mut().enumerate() {

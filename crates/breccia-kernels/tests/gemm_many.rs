@@ -325,7 +325,7 @@ fn dense_shared_expert_gemm_matches_the_gemv() {
         return;
     };
     let Ok(want) = std::env::var("BRECCIA_GEMM_TYPE") else {
-        eprintln!("dense_gemm: SKIPPED - set BRECCIA_GEMM_TYPE=IQ4_XS|Q4_K|Q5_K|Q6_K");
+        eprintln!("dense_gemm: SKIPPED - set BRECCIA_GEMM_TYPE=IQ4_XS|Q4_K|Q5_K|Q6_K|BF16");
         return;
     };
     let ty = match want.trim().to_ascii_uppercase().as_str() {
@@ -333,8 +333,9 @@ fn dense_shared_expert_gemm_matches_the_gemv() {
         "Q4_K" => QuantType::Q4K,
         "Q5_K" => QuantType::Q5K,
         "Q6_K" => QuantType::Q6K,
+        "BF16" => QuantType::Bf16,
         other => {
-            eprintln!("dense_gemm: {other} is not one of the four");
+            eprintln!("dense_gemm: {other} is not a dense GEMM type");
             return;
         }
     };
@@ -353,8 +354,9 @@ fn dense_shared_expert_gemm_matches_the_gemv() {
     // Find the first shared-expert tensor of the requested type.
     let mut found: Option<(String, usize, usize)> = None;
     'outer: for b in 0..48 {
-        for role in ["gate", "up", "down"] {
-            let name = format!("blk.{b}.ffn_{role}_shexp.weight");
+        // BF16 lives in the QSA indexer projections, not the shared expert.
+        for name in ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "indexer.q_proj"] {
+            let name = format!("blk.{b}.{name}.weight");
             let Some(t) = set.tensor(&name) else { continue };
             if QuantType::from_ggml(t.ty()) != Some(ty) {
                 continue;

@@ -1159,20 +1159,22 @@ impl<'g> PipelineSet<'g> {
                 })?,
             );
         }
-        // The multi-user GEMM is only needed for the resident blocks' expert roles
-        // (the merged prefill pass, §8v). A type with no shader is left out and
-        // the caller falls back to the per-token path for those blocks.
+        // The multi-user GEMM serves the merged prefill pass: the expert roles
+        // (§8v) and the chunk-batched dense projections (QSA, shared expert). A type
+        // with no shader is left out and the caller falls back to the per-token
+        // path; only a missing expert-role type is worth a warning.
         let mut gemm = std::collections::BTreeMap::new();
         for k in keys {
             let is_expert_role =
                 (k.rows == 640 && k.cols == 2560) || (k.rows == 2560 && k.cols == 640);
-            if !is_expert_role || gemm.contains_key(&k.ty) {
+            if gemm.contains_key(&k.ty) {
                 continue;
             }
             match breccia_kernels::gemm::GemmMany::new(gpu, k.ty) {
                 Ok(g) => {
                     gemm.insert(k.ty, g);
                 }
+                Err(_) if !is_expert_role => {}
                 Err(e) => {
                     eprintln!(
                         "merged prefill: no multi-user GEMM for {} ({e}); those blocks keep \

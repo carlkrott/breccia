@@ -42,6 +42,7 @@ const SHADERS: &[&str] = &[
     "gemm_iq4_xs",
     "gemm_q4_k",
     "gemm_q5_k",
+    "gemm_bf16",
     "gemm_q6_k",
     "moe_fanin",
     // batched multi-expert variants (one dispatch over N experts' blobs)
