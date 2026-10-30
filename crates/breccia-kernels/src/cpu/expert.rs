@@ -20,6 +20,7 @@
 //! finishes first.
 
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -314,7 +315,16 @@ pub struct ExpertPool {
 /// One worker's work for one phase.
 enum Msg {
     Batch(Batch),
+    /// `BRECCIA_POOL_DYNAMIC=1`: claim shards from one shared list until it runs dry.
+    Claim(Arc<Claim>),
     Exit,
+}
+
+/// One phase's shards, claimed by index so an idle worker takes the next one
+/// instead of waiting on a static bucket.
+struct Claim {
+    tasks: Vec<Shard>,
+    next: AtomicUsize,
 }
 
 /// A worker's whole share of a phase, in one message.
@@ -364,6 +374,23 @@ struct Done {
     busy_ns: u64,
 }
 
+/// `BRECCIA_POOL_DYNAMIC=1`: workers claim shards from a shared cursor (coord §10 test 1).
+fn pool_dynamic() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_POOL_DYNAMIC").is_ok_and(|v| v == "1"))
+}
+
+/// `BRECCIA_POOL_SHARDS=n`: force the row split per role (still ≥ [`MIN_SHARD_ROWS`] rows).
+fn pool_shards() -> Option<usize> {
+    static N: OnceLock<Option<usize>> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BRECCIA_POOL_SHARDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
 /// `BRECCIA_LANE_STATS=1`: time every pool phase (coord plan Phase 0).
 pub fn lane_stats_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -401,6 +428,9 @@ const PACK_TOLERANCE: f64 = 1.15;
 /// Smallest row split (1..=[`MAX_SHARDS`]) that packs `tasks` jobs onto
 /// `threads` workers within [`PACK_TOLERANCE`] of perfect.
 fn choose_shards(tasks: usize, threads: usize, rows: usize) -> usize {
+    if let Some(n) = pool_shards() {
+        return n.min((rows / MIN_SHARD_ROWS).max(1));
+    }
     let ideal = tasks as f64 / threads as f64;
     let mut best = 1usize;
     for s in 1..=MAX_SHARDS {
@@ -465,6 +495,9 @@ impl ExpertPool {
     fn run_phase(&mut self, tasks: Vec<Shard>) -> Result<Vec<Option<Vec<f32>>>> {
         let n = tasks.len();
         let mut slots: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
+        if pool_dynamic() {
+            return self.run_claimed(tasks, slots);
+        }
         let mut buckets: Vec<Vec<Shard>> = (0..self.threads).map(|_| Vec::new()).collect();
         for (i, task) in tasks.into_iter().enumerate() {
             buckets[i % self.threads].push(task);
@@ -500,6 +533,49 @@ impl ExpertPool {
             st.wall_s += t0.elapsed().as_secs_f64();
             st.max_busy_s += max_ns as f64 / 1e9;
             st.mean_busy_s += sum_ns as f64 / 1e9 / busy as f64;
+        }
+        Ok(slots)
+    }
+
+    /// [`Self::run_phase`] with dynamic claiming: one shared list, one wake per
+    /// worker, each worker replies once with whatever it claimed. Results are
+    /// scattered by `seq`, so the output is the same as the static path.
+    fn run_claimed(
+        &mut self,
+        tasks: Vec<Shard>,
+        mut slots: Vec<Option<Vec<f32>>>,
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let wake = self.threads.min(tasks.len());
+        let claim = Arc::new(Claim {
+            tasks,
+            next: AtomicUsize::new(0),
+        });
+        let t0 = lane_stats_on().then(Instant::now);
+        for w in 0..wake {
+            self.tx[w]
+                .send(Msg::Claim(Arc::clone(&claim)))
+                .map_err(|_| anyhow::anyhow!("expert worker {w} is gone"))?;
+        }
+        let (mut max_ns, mut sum_ns) = (0u64, 0u64);
+        for _ in 0..wake {
+            let done = self
+                .rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("expert pool result channel closed"))?;
+            max_ns = max_ns.max(done.busy_ns);
+            sum_ns += done.busy_ns;
+            for (seq, values) in done.results {
+                if let Some(slot) = slots.get_mut(seq) {
+                    *slot = Some(values);
+                }
+            }
+        }
+        if let (Some(t0), true) = (t0, wake > 0) {
+            let st = &mut self.lane_stats;
+            st.phases += 1;
+            st.wall_s += t0.elapsed().as_secs_f64();
+            st.max_busy_s += max_ns as f64 / 1e9;
+            st.mean_busy_s += sum_ns as f64 / 1e9 / wake as f64;
         }
         Ok(slots)
     }
@@ -920,6 +996,24 @@ fn worker_loop(set: &ShardSet, path: Path, rx: &Receiver<Msg>, done: &Sender<Don
                     };
                     results.push((shard.seq, values));
                 }
+                let busy_ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
+                if done.send(Done { results, busy_ns }).is_err() {
+                    break;
+                }
+            }
+            Msg::Claim(claim) => {
+                let t0 = lane_stats_on().then(Instant::now);
+                let mut results = Vec::new();
+                loop {
+                    let i = claim.next.fetch_add(1, Ordering::Relaxed);
+                    let Some(shard) = claim.tasks.get(i) else {
+                        break;
+                    };
+                    if let Some(values) = run_shard(set, path, shard) {
+                        results.push((shard.seq, values));
+                    }
+                }
+                drop(claim);
                 let busy_ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
                 if done.send(Done { results, busy_ns }).is_err() {
                     break;
