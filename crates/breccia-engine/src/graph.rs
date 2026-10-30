@@ -2694,7 +2694,6 @@ impl<'m> Session<'m> {
             }
         }
         self.lane_s += t_lane.elapsed().as_secs_f64();
-        self.lane_covered_s += self.lane_s.min(0.0); // set by the driver when relevant
         for i in 0..t {
             let gate = 1.0 / (1.0 + (-gates[i]).exp());
             let row = &mut out[i * n_embd..(i + 1) * n_embd];
