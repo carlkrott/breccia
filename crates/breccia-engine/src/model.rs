@@ -588,6 +588,15 @@ impl Model {
                     keys.insert(w.key);
                 }
             }
+            // Streamed blocks' expert types too: the merged prefill GEMM is keyed by
+            // type, and a type only seen on streamed blocks would else fall back to
+            // the per-token CPU lane (25 of 48 blocks on IQ3_XXS, 2026-10-30).
+            for role in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"] {
+                let name = format!("blk.{block}.{role}.weight");
+                if let Some(t) = shards.tensor(&name) {
+                    keys.insert(PipeKey::of(&t)?);
+                }
+            }
             per_device_upload[dev] += t0.elapsed().as_secs_f64();
             layers.push(LayerWeights {
                 block,

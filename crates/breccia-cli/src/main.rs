@@ -2709,6 +2709,65 @@ fn reference_parity(ours: &[u32]) -> String {
     format!("{ok}/{n}")
 }
 
+/// `BRECCIA_PREFILL_ONLY=1`: one warm prompt pass, then `--runs` measured passes;
+/// prints prefill seconds, the GPU stage table per prompt token (with
+/// `BRECCIA_GPU_TIME=1`) and, with `--dump-logits PATH`, writes the last pass's
+/// full last-token logits as raw little-endian f32 (the parity input).
+fn prefill_only(
+    a: &TokenArgs,
+    sess: &mut breccia_engine::Session<'_>,
+    prompt: &[u32],
+) -> Result<()> {
+    feed_prompt(sess, prompt, a.prefill_chunk).context("the warm prompt pass")?;
+    let mut secs = Vec::new();
+    let mut logits = Vec::new();
+    for run in 0..a.runs.max(1) {
+        sess.reset_counters()?;
+        let t0 = std::time::Instant::now();
+        logits = feed_prompt(sess, prompt, a.prefill_chunk)
+            .with_context(|| format!("prefill run {run}"))?;
+        let s = t0.elapsed().as_secs_f64();
+        println!(
+            "prefill run {run}: {:.3} s · {:.2} ms/token · {:.1} tok/s ({} tokens)",
+            s,
+            s * 1e3 / prompt.len() as f64,
+            prompt.len() as f64 / s,
+            prompt.len()
+        );
+        secs.push(s);
+    }
+    // The stage table divides by `forwards`; a prefill counts its prompt tokens.
+    sess.forwards = prompt.len();
+    if let Some(rows) = sess.gpu_time_table() {
+        println!("\ngpu time (us/prompt-token, last run):");
+        let mut sum = 0.0;
+        for row in &rows {
+            println!("  {:<14} {:>9.1}", row.stage, row.total_us);
+            sum += row.total_us;
+        }
+        println!("  {:<14} {:>9.1}", "sum", sum);
+    }
+    let s1 = breccia_engine::LogitSummary::of_top(&logits, 10);
+    println!("top-1 {} ({:.4}) · top-10 {:?}", s1.top1, s1.top1_logit, s1.top10);
+    if let Some(path) = &a.dump_logits {
+        let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+    }
+    if let Some(path) = &a.json {
+        let best = secs.iter().copied().fold(f64::MAX, f64::min);
+        let j = serde_json::json!({
+            "prompt_tokens": prompt.len(),
+            "prefill_chunk": a.prefill_chunk,
+            "prefill_s": secs,
+            "best_ms_per_token": best * 1e3 / prompt.len() as f64,
+            "top1": s1.top1,
+        });
+        std::fs::write(path, serde_json::to_string_pretty(&j)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn bench_token(a: TokenArgs) -> Result<()> {
     let prompt = parse_prompt_ids(&a)?;
     let glob = a
@@ -2784,6 +2843,9 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         top_k: 0,
         seed: 0x9e37_79b9_7f4a_7c15,
     };
+    if std::env::var_os("BRECCIA_PREFILL_ONLY").is_some() {
+        return prefill_only(&a, &mut sess, &prompt);
+    }
     println!(
         "session  {} expert threads ({}) · {} MiB state + scratch · {} compiled pipelines",
         sess.threads(),
