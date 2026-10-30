@@ -958,7 +958,23 @@ impl<'g> Qsa<'g> {
             .u(ws.n_blocks as u32)
             .u(IDX_TOPK_BLOCKS as u32)
             .u(ws.max_ids as u32)
-            .i(pos0 as i32);
+            .i(pos0 as i32)
+            .u(0); // dense off: a word Pc does not push is undefined in the shader
+        let (gx, gy) = grid_for(ws.tokens, 1);
+        self.topk
+            .run(&[&ws.idx_scores, &ws.ids, &ws.counts], &pc, (gx, gy, 1))
+    }
+
+    /// [`Self::topk`] when every visible block is selected anyway (`n_blocks <=
+    /// IDX_TOPK_BLOCKS`): no scores read, ids in ascending block order.
+    pub fn topk_dense(&self, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        let pc = Pc::new()
+            .u(ws.tokens as u32)
+            .u(ws.n_blocks as u32)
+            .u(IDX_TOPK_BLOCKS as u32)
+            .u(ws.max_ids as u32)
+            .i(pos0 as i32)
+            .u(1);
         let (gx, gy) = grid_for(ws.tokens, 1);
         self.topk
             .run(&[&ws.idx_scores, &ws.ids, &ws.counts], &pc, (gx, gy, 1))
@@ -1059,8 +1075,12 @@ impl<'g> Qsa<'g> {
         self.idx_pool(state, ws, w.idx_k_norm, pos0)?;
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::QSA_AUX);
         self.idx_tail(state, ws, pos0)?;
-        self.idx_score(state, ws, pos0)?;
-        self.topk(ws, pos0)?;
+        if ws.n_blocks <= IDX_TOPK_BLOCKS && idx_skip() {
+            self.topk_dense(ws, pos0)?;
+        } else {
+            self.idx_score(state, ws, pos0)?;
+            self.topk(ws, pos0)?;
+        }
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::ATTN);
         self.attend(state, ws, pos0)?;
         self.apply(state, ws, pos0)?;
@@ -1077,6 +1097,12 @@ impl Drop for Qsa<'_> {
         let gpu = self.q_norm.gpu();
         gpu.destroy_buf(&self.table_buf);
     }
+}
+
+/// Indexer skip at <= 2k context (§11l item 2); `BRECCIA_IDX_SKIP=0` opts out.
+fn idx_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_IDX_SKIP").map_or(true, |v| v != "0"))
 }
 
 /// `(first block completed by this call, how many complete)`.

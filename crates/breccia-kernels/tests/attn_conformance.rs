@@ -705,15 +705,20 @@ fn qsa_sequence(chunk: usize, label: &str) {
             }
             next_input[start * N_EMBD..(start + n) * N_EMBD].copy_from_slice(&got);
 
-            // Selection id sets: exact (order too — both are descending score,
-            // ties to the lower block, tail last).
+            // Selection id sets: exact as sets. Order is not compared: forward()
+            // takes the dense path (ascending) at n_blocks <= 512, and the scored
+            // order is pinned by the 2062-cell test.
             let got_ids =
                 breccia_kernels::ops::download_u32(gpu, &ws.ids, n * ws.max_ids).expect("ids");
             let got_counts = breccia_kernels::ops::download_u32(gpu, &ws.counts, n).expect("cnt");
             for t in 0..n {
                 let count = got_counts[t] as usize;
-                let got_row: Vec<u32> = got_ids[t * ws.max_ids..t * ws.max_ids + count].to_vec();
-                if got_row != want.ids[t] {
+                let mut got_row: Vec<u32> =
+                    got_ids[t * ws.max_ids..t * ws.max_ids + count].to_vec();
+                let mut want_row = want.ids[t].clone();
+                got_row.sort_unstable();
+                want_row.sort_unstable();
+                if got_row != want_row {
                     eprintln!(
                         "layer {layer} token {}: got {got_row:?} want {:?}",
                         start + t,
@@ -827,6 +832,54 @@ fn qsa_indexer_pooling_matches_the_cpu_reference() {
     qsa.release(gpu, ws);
     state.release(gpu);
     gpu.destroy_buf(&b_gamma);
+}
+
+/// The dense skip (`n_blocks <= 512`) selects the same blocks as the scored
+/// top-k at production shapes: 1k prefill, decode with and without a tail
+/// block, and the 512-block edge. Sets only — the dense path is ascending.
+#[test]
+fn qsa_dense_skip_selects_the_scored_set() {
+    let fx = need_gpu!("qsa");
+    let gpu = fx.dev.gpu();
+    let max_pos = 4096usize;
+    let qsa = Qsa::new(gpu, max_pos).expect("qsa");
+    let state = QsaState::new(gpu, 2048, max_pos).expect("state");
+    let pooled = normalish(0xF2, (2048 / qsa::IDX_BLOCK + 1) * qsa::IDX_DIM);
+    breccia_kernels::gemv::upload_into(gpu, &state.idx_pooled, &breccia_kernels::ops::f32_to_bytes(&pooled))
+        .expect("pooled");
+    // (tokens, pos0): 1k prefill chunk, decode at a block edge, decode with 3 tail
+    // cells (own block not yet pooled), 2nd 1k chunk reaching exactly 512 blocks.
+    for (tokens, pos0) in [(1024usize, 0usize), (1, 1055), (1, 1058), (1024, 1024)] {
+        let ws = qsa.workspace(gpu, tokens, pos0 + tokens).expect("ws");
+        assert!(ws.n_blocks <= qsa::IDX_TOPK_BLOCKS);
+        let q = normalish(0xF1 ^ pos0 as u64, tokens * qsa::IDX_N_HEAD * qsa::IDX_DIM);
+        breccia_kernels::gemv::upload_into(gpu, &ws.idx_q, &breccia_kernels::ops::f32_to_bytes(&q))
+            .expect("idx q");
+        let read = |ws: &qsa::QsaWorkspace| {
+            let ids = breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).expect("ids");
+            let cnt = breccia_kernels::ops::download_u32(gpu, &ws.counts, tokens).expect("counts");
+            (0..tokens)
+                .map(|t| {
+                    let mut r = ids[t * ws.max_ids..][..cnt[t] as usize].to_vec();
+                    r.sort_unstable();
+                    r
+                })
+                .collect::<Vec<_>>()
+        };
+        qsa.idx_score(&state, &ws, pos0).expect("score");
+        qsa.topk(&ws, pos0).expect("topk");
+        let scored = read(&ws);
+        qsa.topk_dense(&ws, pos0).expect("dense");
+        let dense = read(&ws);
+        let bad = (0..tokens).filter(|&t| scored[t] != dense[t]).count();
+        println!(
+            "qsa dense skip  tokens={tokens} pos0={pos0} blocks={} last row {} ids",
+            ws.n_blocks,
+            dense[tokens - 1].len()
+        );
+        assert_eq!(bad, 0, "tokens={tokens} pos0={pos0}: dense set differs at {bad} rows");
+        qsa.release(gpu, ws);
+    }
 }
 
 /// The sparse path: 2062 cached cells (> 2051) so the selection drops blocks,

@@ -53,7 +53,7 @@ layout(push_constant) uniform Params {
     uint topk_blocks; // 512
     uint max_ids;     // per-token id row length (>= topk_blocks + 1)
     int pos0;         // sequence position of token 0 of this call
-    uint pad0;
+    uint dense;       // 1: n_blocks <= topk_blocks, emit every visible block unscored
     uint pad1;
     uint pad2;
 } pc;
@@ -74,6 +74,25 @@ void main() {
     uint base = t * pc.n_blocks;
     uint want = min(pc.n_blocks, pc.topk_blocks);
     uint count = 0u;
+
+    if (pc.dense != 0u) {
+        // Every visible block (b*4 <= pos, i.e. b <= own) would be selected, so
+        // skip the argmax passes: same set, ascending order (softmax sum order
+        // differs from the scored path, fp rounding only).
+        uint own = uint(pc.pos0 + int(t)) / 4u;
+        uint n = min(min(pc.n_blocks, own + 1u), pc.max_ids);
+        for (uint i = tid; i < n; i += 256u) {
+            IDS[t * pc.max_ids + i] = i;
+        }
+        if (tid == 0u) {
+            if (own >= pc.n_blocks && n < pc.max_ids) {
+                IDS[t * pc.max_ids + n] = own;
+                n += 1u;
+            }
+            CNT[t] = n;
+        }
+        return;
+    }
 
     for (uint r = 0u; r < want; ++r) {
         float bs = MASK_DEAD;
