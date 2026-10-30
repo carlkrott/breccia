@@ -8,7 +8,7 @@
 //! | class | DRAM copy | PCIe H2D | overlap | role |
 //! |---|---|---|---|---|
 //! | RX 6950 XT (`1002:73a5`, gfx1030) | 462 GB/s (+3.9× cache lever) | ~28 GB/s | ~100 % | [`DeviceRole::StreamingCompute`] |
-//! | Radeon VII / MI50 (`1002:66af`, gfx906) | 826 GB/s HBM | ~2.9 GB/s (gen3×4) | ~0 % | [`DeviceRole::StaticResident`] |
+//! | Radeon VII / MI50 (`1002:66af`, gfx906) | 826 GB/s HBM | 5.4–6.6 GB/s (PCIe 4.0 ×4; gen3×4 2.9 at Gate A) | partial (3.3 GB/s under churn) | [`DeviceRole::StaticResident`] |
 //! | Raphael iGPU (`1002:164e`) | — (not benchmarked) | — | — | [`DeviceRole::DisplayOnly`] |
 //!
 //! Binding decisions this encodes: the MI50 is excluded from PCIe streaming

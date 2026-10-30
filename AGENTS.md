@@ -56,7 +56,7 @@ The project goal is **proper dual-GPU usage** (RX 6950 XT + Radeon VII/MI50), no
   say so and return to dual immediately.
 - Placement must give **both cards real work**, matched to their measured strengths: RX = compute,
   prefill, hot-expert batches and the streaming lane (28.7 GB/s PCIe, 100% overlap, Infinity Cache);
-  MI50 = resident expert/weight blocks and bandwidth-bound GEMV (826 GB/s HBM, but PCIe gen3x4 and
+  MI50 = resident expert/weight blocks and bandwidth-bound GEMV (826 GB/s HBM, but PCIe 4.0 x4 ~5.4–6.6 GB/s and
   per-block round trips matter).
 - A single-card number is a diagnostic, never a target or a gate.
 - **Default run shape (binding, 2026-10-27)**: every bench, sweep, A/B, parity run, `serve` and live

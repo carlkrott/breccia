@@ -17,7 +17,7 @@ Baseline this document is scored against (all from `docs/phase-4/01-forward-pass
 | host lane rate | 33 GB/s at 32 threads (24.5 ms/token) | §8p, §8s |
 | host single-core DRAM stream | **53.9 GB/s** — the lane is at 61 % of one core | `docs/phase-3/08` §4 |
 | RX PCIe | **28.7 GB/s, 100 % overlap** | AGENTS.md (Gate A) |
-| MI50 PCIe | ~2.9 GB/s (gen3×4) — no streaming lane | Gate A |
+| MI50 PCIe | ~2.9 GB/s (gen3×4) at Gate A; now PCIe 4.0 ×4, 5.4–6.6 GB/s (2026-10-29) | Gate A, plan §2c |
 
 Two things follow from that table before any technique is discussed, and they set the rank order:
 

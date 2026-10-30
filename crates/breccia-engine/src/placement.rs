@@ -151,7 +151,7 @@ impl Placement {
     /// Contiguity is a graph requirement, not an aesthetic one: moving the
     /// residual stack between GPUs is a PCIe round trip, so the forward pass
     /// wants exactly one hand-off per token per boundary. The MI50's PCIe link
-    /// is gen3 ×4 (2.9 GB/s measured), so a hand-off must stay a handful of
+    /// is PCIe 4.0 ×4 (5.4–6.6 GB/s measured), so a hand-off must stay a handful of
     /// kilobytes — one `[hc, n_embd]` stack is 40 KiB.
     pub fn balanced(devices: Vec<DeviceSpec>, layer_bytes: &[u64], tail_bytes: u64) -> Self {
         let n = layer_bytes.len();

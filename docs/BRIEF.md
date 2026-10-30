@@ -123,8 +123,8 @@ sum 30,319 µs   vs   wait-gpu 30,691 µs   (residual ~1 %, so the table explain
 5. **BF16/f16 GEMV reaches 98 % of DRAM** (810 GB/s); quantised types do not, which is where
    the remaining headroom is.
 6. **PCIe: one stream saturates the link** (25–26.5 GB/s on the RX); only duplex helps
-   (17.9 up + 17.9 down). The MI50 is gen3×4 (~2.9 GB/s, ~0 % overlap) and is therefore
-   **never** used for streaming.
+   (17.9 up + 17.9 down). The MI50 link is PCIe 4.0 ×4, 5.4–6.6 GB/s (3.3 under compute churn; plan §2c, 2026-10-29); it is
+   still not a streaming home (the RX link is ~5× wider).
 7. **The GPU can execute host-resident experts directly** via `VK_EXT_external_memory_host`:
    22–26 GB/s dequant GEMV straight out of host RAM (86–92 % of copy-engine rate), no
    staging, no CPU compute. Not yet used by the engine — see §12.
@@ -189,7 +189,7 @@ or the matching research doc.
 | **Pre-dequantised f16 weight cache** | DRAM-bound at 405–413 M el/ms (slower than the int8 path) and needs 17 GiB against 16 GiB/card |
 | **Expecting a speedup from KV quantisation** | attention is **latency-bound at ~13 GB/s** at T=1, so cutting V bytes to 0.56× cannot be spent: 32.5 → 32.3 ms (−1.0 %). q8_0 KV is a *capacity* feature only |
 | **Push descriptors** | 150 ns vs 39 ns for a bind — worse here |
-| **Layer-pipeline split across the cards** | MI50 is gen3×4 (~2.9 GB/s): activation shipping dominates |
+| **Layer-pipeline split across the cards** | measured when the MI50 link was gen3×4 (~2.9 GB/s); now PCIe 4.0 ×4, 5.4–6.6 GB/s — re-test under §10 (#10 host-staged pipeline) |
 | **Pipeline-"storm" theory** for the crash | pipeline creation is host-side ACO compilation with zero GPU submissions |
 
 ---

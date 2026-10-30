@@ -49,7 +49,7 @@ Breccia/
 | 3 — kernels (M2) | **complete** — all 14 quant types, 3.4× expert batching, 10 ops + attention/GDN/paged-KV conformant, CPU expert lane 117–174% of the parity bar (`docs/phase-3/01–08`) |
 | 4 — forward pass (M2) | **parity + two-stream dual decode** — 32/32 greedy tokens identical to the production server (64/64 across two streams); **aggregate 15.8–16.5 tok/s with both GPUs busy** (7.9–8.3 tok/s per stream, 100% host/GPU overlap); single-stream ~8–10 tok/s. Host expert lane is the critical path; GPU-expert placement + stream scaling in progress (`docs/phase-4/01`) |
 
-Backend decision (2026-10-26): **Vulkan primary**, HIP-style launch flags preserved, HIP secondary. Architecture rules from Gate A: RX 6950 XT = streaming/compute home; MI50 = static-resident only (PCIe ≈2.9 GB/s, no DMA overlap); expert-parallel placement by default.
+Backend decision (2026-10-26): **Vulkan primary**, HIP-style launch flags preserved, HIP secondary. Architecture rules from Gate A: RX 6950 XT = streaming/compute home; MI50 = static-resident by default (Gate A measured gen3 ×4 ≈2.9 GB/s; the link is now PCIe 4.0 ×4, 5.4–6.6 GB/s, 3.3 under compute churn); expert-parallel placement by default.
 
 Reproduction commands for every published number: [`docs/REPRODUCE.md`](docs/REPRODUCE.md).
 

@@ -68,7 +68,7 @@ cargo run -p breccia-cli -- profile --dry-run-plan --json /tmp/hw.json
 harnesses/vk-probe/target/release/vk-probe --json /tmp/raw.json      # bandwidth/PCIe/overlap
 ```
 
-Expected (`docs/phase-0/02`): RX 462 GB/s DRAM (1811 GB/s in-cache), 26.7 TF FP32, 28.7 GB/s PCIe, ~100% overlap; MI50 826 GB/s HBM, **~2.9 GB/s PCIe (gen3×4)**, ~0% overlap.
+Expected (`docs/phase-0/02`): RX 462 GB/s DRAM (1811 GB/s in-cache), 26.7 TF FP32, 28.7 GB/s PCIe, ~100% overlap; MI50 826 GB/s HBM, **~2.9 GB/s PCIe (gen3×4)**, ~0% overlap (historical: the link is now PCIe 4.0 ×4, expect 5.4–6.6 GB/s).
 
 **Environment trap**: `MESA_VK_DEVICE_SELECT=1002:164e!` (set by some desktop sessions) hides both discrete GPUs from every Vulkan process. `breccia` unsets it with a warning; manual runs need `env -u MESA_VK_DEVICE_SELECT`.
 

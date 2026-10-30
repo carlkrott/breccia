@@ -8,7 +8,7 @@
 //! exactly one read and one write.
 //!
 //! The measured rates this is built against: RX 6950 XT PCIe H2D 28.25–28.71
-//! GB/s, Radeon VII gen3 ×4 ≈ 2.9 GB/s (`docs/phase-2/01`). At these sizes
+//! GB/s (`docs/phase-2/01`), Radeon VII PCIe 4.0 ×4 5.4–6.6 GB/s (2026-10-29). At these sizes
 //! (10 KiB) latency dominates bandwidth, which is why the count of round trips
 //! — not their size — is what this module minimises.
 
