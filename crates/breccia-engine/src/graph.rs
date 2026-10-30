@@ -3038,9 +3038,13 @@ impl<'m> Session<'m> {
             let pf = v.pf.as_ref().expect("the merged prefill scratch");
             let n_sh = mc.n_ff_shared;
             let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked above");
+            batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_GATE);
             g(&moe.gate).run(&moe.gate.buf, &pf.mixed, &pf.sh_g, n_sh, n_embd, t)?;
+            batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_UP);
             g(&moe.up).run(&moe.up.buf, &pf.mixed, &pf.sh_u, n_sh, n_embd, t)?;
+            batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_SWIGLU);
             v.swiglu.run(&pf.sh_g, &pf.sh_u, &pf.sh_a, t * n_sh)?;
+            batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_DOWN);
             g(&moe.down).run(&moe.down.buf, &pf.sh_a, &pf.shared, n_embd, n_sh, t)?;
         }
         batch_cmd::record_barrier_to_host(gpu)?;
@@ -4029,11 +4033,13 @@ impl<'m> Session<'m> {
         let rc = v.r_chunk.as_ref().expect("checked by the caller");
         let ws = &self.hc_chunk_ws[dev][wi];
         let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::HC_WRITE);
         v.hc.write(ws, rc, &pf.out, rc)?;
         hc_read_ws(v, ws, &m.layers[b].hc_ffn, rc)?;
         batch_cmd::record_copies(gpu, &[(&pf.mixed, 0, &ws.mixed, 0, tb)])?;
         let moe = &m.layers[b].moe;
         let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked by the caller");
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::ROUTER);
         g(&moe.router).run(&moe.router.buf, &pf.mixed, &pf.logits, mc.n_expert, mc.n_embd, t)?;
         v.router.run(&pf.logits, &pf.ids.buf, &pf.w, t)?;
         g(&moe.shexp_gate).run(&moe.shexp_gate.buf, &pf.mixed, &pf.gate, 1, mc.n_embd, t)
