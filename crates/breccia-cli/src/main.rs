@@ -574,7 +574,7 @@ fn run(cli: Cli) -> Result<()> {
                 .filter(|s| !s.is_empty())
                 .collect();
             let (prefill_chunk, prefill_chunks) =
-                resolve_prefill_chunks(prefill_chunk, prefill_merged, &devs);
+                resolve_prefill_chunks(prefill_chunk, prefill_merged, &devs, 0);
             bench_agents(AgentArgs {
             streams,
             gen,
@@ -627,7 +627,7 @@ fn run(cli: Cli) -> Result<()> {
                 }),
         } => {
             let (prefill_chunk, prefill_chunks) =
-                resolve_prefill_chunks(prefill_chunk, prefill_merged, &devices);
+                resolve_prefill_chunks(prefill_chunk, prefill_merged, &devices, ctx);
             bench_token(TokenArgs {
             gen,
             prompt_ids,
@@ -783,11 +783,15 @@ fn same_pci(a: &str, b: &str) -> bool {
 
 /// `--prefill-chunk` per `devs` entry: an explicit value wins (0 included);
 /// absent, `--prefill-merged` uses every card's discovered `best_chunk`, all or
-/// nothing (a card without one sends every card back to token by token).
+/// nothing (a card without one sends every card back to token by token). A
+/// discovered chunk is capped at the largest power of two <= `ctx`: a bigger one
+/// only grows the chunk scratch and shrinks the arena (MI50 2048 vs 1024 at ctx
+/// 1100: byte-identical logits, prefill 15.0 vs 12.2 s, §11l item 5).
 fn prefill_chunks_for(
     flag: Option<usize>,
     merged: bool,
     devs: &[String],
+    ctx: usize,
     best_chunk: impl Fn(&str) -> Option<usize>,
 ) -> (Vec<usize>, &'static str) {
     let n = devs.len().max(1);
@@ -799,7 +803,11 @@ fn prefill_chunks_for(
     }
     let found: Option<Vec<usize>> = devs
         .iter()
-        .map(|d| best_chunk(d).filter(|&c| c > 0))
+        .map(|d| {
+            best_chunk(d)
+                .filter(|&c| c > 0)
+                .map(|c| if ctx > 0 { c.min(1 << ctx.ilog2()) } else { c })
+        })
         .collect();
     match found {
         Some(v) if !v.is_empty() => (v, "discovered per card"),
@@ -813,11 +821,16 @@ fn prefill_chunks_for(
 
 /// [`prefill_chunks_for`] against the saved hardware profile; returns the smallest
 /// chunk (a multi-device model's) and the per-card list, and says where they came from.
-fn resolve_prefill_chunks(flag: Option<usize>, merged: bool, devs: &[String]) -> (usize, Vec<usize>) {
+fn resolve_prefill_chunks(
+    flag: Option<usize>,
+    merged: bool,
+    devs: &[String],
+    ctx: usize,
+) -> (usize, Vec<usize>) {
     let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
         .ok()
         .flatten();
-    let (chunks, src) = prefill_chunks_for(flag, merged, devs, |d| {
+    let (chunks, src) = prefill_chunks_for(flag, merged, devs, ctx, |d| {
         let e = prof.as_ref()?.devices.iter().find(|e| same_pci(&e.identity.pci_address, d))?;
         Some(e.prefill.as_ref()?.best_chunk)
     });
@@ -1547,13 +1560,18 @@ mod tests {
         let devs = vec!["0000:03:00.0".to_string(), "0000:0e:00.0".to_string()];
         let both = |d: &str| Some(if d.ends_with("03:00.0") { 2048 } else { 1024 });
         let one = |d: &str| d.ends_with("03:00.0").then_some(2048);
-        assert_eq!(prefill_chunks_for(Some(0), true, &devs, both).0, vec![0, 0]);
-        assert_eq!(prefill_chunks_for(Some(512), false, &devs, both).0, vec![512, 512]);
-        assert_eq!(prefill_chunks_for(None, false, &devs, both).0, vec![0, 0]);
-        assert_eq!(prefill_chunks_for(None, true, &devs, both).0, vec![2048, 1024]);
-        assert_eq!(prefill_chunks_for(None, true, &devs, one).0, vec![0, 0]);
-        assert_eq!(prefill_chunks_for(None, true, &devs, |_| Some(0)).0, vec![0, 0]);
-        assert_eq!(prefill_chunks_for(None, true, &[], both).0, vec![0]);
+        assert_eq!(prefill_chunks_for(Some(0), true, &devs, 0, both).0, vec![0, 0]);
+        assert_eq!(prefill_chunks_for(Some(512), false, &devs, 0, both).0, vec![512, 512]);
+        assert_eq!(prefill_chunks_for(None, false, &devs, 0, both).0, vec![0, 0]);
+        assert_eq!(prefill_chunks_for(None, true, &devs, 0, both).0, vec![2048, 1024]);
+        assert_eq!(prefill_chunks_for(None, true, &devs, 0, one).0, vec![0, 0]);
+        assert_eq!(prefill_chunks_for(None, true, &devs, 0, |_| Some(0)).0, vec![0, 0]);
+        assert_eq!(prefill_chunks_for(None, true, &[], 0, both).0, vec![0]);
+        // ctx caps a discovered chunk (largest power of two <= ctx), never the flag.
+        assert_eq!(prefill_chunks_for(None, true, &devs, 1100, both).0, vec![1024, 1024]);
+        assert_eq!(prefill_chunks_for(None, true, &devs, 600, both).0, vec![512, 512]);
+        assert_eq!(prefill_chunks_for(None, true, &devs, 4200, both).0, vec![2048, 1024]);
+        assert_eq!(prefill_chunks_for(Some(2048), true, &devs, 1100, both).0, vec![2048, 2048]);
     }
 
     #[test]
