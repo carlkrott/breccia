@@ -256,9 +256,10 @@ enum BenchKind {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         inbatch_read: bool,
         /// Prefill chunk: feed the prompt `N` tokens at a time with the grouped
-        /// expert lane. `0` = token by token
-        #[arg(long, default_value_t = 0)]
-        prefill_chunk: usize,
+        /// expert lane. `0` = token by token. Absent: with `--prefill-merged`, each
+        /// card's discovered chunk (`breccia profile --prefill`), else 0
+        #[arg(long)]
+        prefill_chunk: Option<usize>,
         /// Merged prefill (§8v): route a chunk once and run **one multi-user GEMM
         /// per distinct expert** over the resident (`--gpu-experts`) arena instead
         /// of one GEMV per token
@@ -379,9 +380,10 @@ enum BenchKind {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         inbatch_read: bool,
         /// Prefill chunk: feed the prompt `N` tokens at a time with the grouped
-        /// expert lane (§8s). `0` = token by token
-        #[arg(long, default_value_t = 0)]
-        prefill_chunk: usize,
+        /// expert lane (§8s). `0` = token by token. Absent: with `--prefill-merged`,
+        /// each card's discovered chunk (`breccia profile --prefill`), else 0
+        #[arg(long)]
+        prefill_chunk: Option<usize>,
         /// Merged prefill (§8v): one multi-user GEMM per distinct resident expert
         #[arg(long, default_value_t = false)]
         prefill_merged: bool,
@@ -565,7 +567,15 @@ fn run(cli: Cli) -> Result<()> {
                     arena_display_reserve_mib,
                     arena_headroom_mib,
                 }),
-        } => bench_agents(AgentArgs {
+        } => {
+            let devs: Vec<String> = devices
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let (prefill_chunk, prefill_chunks) =
+                resolve_prefill_chunks(prefill_chunk, prefill_merged, &devs);
+            bench_agents(AgentArgs {
             streams,
             gen,
             prefix,
@@ -576,11 +586,13 @@ fn run(cli: Cli) -> Result<()> {
             gpu_experts,
             same_prompt,
             prefill_chunk,
+            prefill_chunks,
             prefill_merged,
             warm,
             arena_display_reserve_mib,
             arena_headroom_mib,
-        }),
+        })
+        }
         Command::Bench {
             kind:
                 Some(BenchKind::Token {
@@ -613,7 +625,10 @@ fn run(cli: Cli) -> Result<()> {
                     host_expert_import,
                     page_hint_trim,
                 }),
-        } => bench_token(TokenArgs {
+        } => {
+            let (prefill_chunk, prefill_chunks) =
+                resolve_prefill_chunks(prefill_chunk, prefill_merged, &devices);
+            bench_token(TokenArgs {
             gen,
             prompt_ids,
             prompt_ids_file,
@@ -637,12 +652,14 @@ fn run(cli: Cli) -> Result<()> {
             streams,
             inbatch_read,
             prefill_chunk,
+            prefill_chunks,
             prefill_merged,
             warm,
             then_prompt_ids,
             host_expert_import,
             page_hint_trim,
-        }),
+        })
+        }
     }
 }
 
@@ -656,7 +673,10 @@ struct AgentArgs {
     inbatch_read: bool,
     gpu_experts: Option<String>,
     same_prompt: bool,
+    /// The smallest of `prefill_chunks` (what a multi-device model runs at).
     prefill_chunk: usize,
+    /// Per `devices` entry.
+    prefill_chunks: Vec<usize>,
     prefill_merged: bool,
     warm: usize,
     arena_display_reserve_mib: u64,
@@ -759,6 +779,72 @@ fn profile(a: ProfileArgs) -> Result<()> {
 
 fn same_pci(a: &str, b: &str) -> bool {
     !a.is_empty() && breccia_vk::pci::normalize_address(a) == breccia_vk::pci::normalize_address(b)
+}
+
+/// `--prefill-chunk` per `devs` entry: an explicit value wins (0 included);
+/// absent, `--prefill-merged` uses every card's discovered `best_chunk`, all or
+/// nothing (a card without one sends every card back to token by token).
+fn prefill_chunks_for(
+    flag: Option<usize>,
+    merged: bool,
+    devs: &[String],
+    best_chunk: impl Fn(&str) -> Option<usize>,
+) -> (Vec<usize>, &'static str) {
+    let n = devs.len().max(1);
+    if let Some(c) = flag {
+        return (vec![c; n], "--prefill-chunk");
+    }
+    if !merged {
+        return (vec![0; n], "default");
+    }
+    let found: Option<Vec<usize>> = devs
+        .iter()
+        .map(|d| best_chunk(d).filter(|&c| c > 0))
+        .collect();
+    match found {
+        Some(v) if !v.is_empty() => (v, "discovered per card"),
+        _ => (
+            vec![0; n],
+            "no discovered chunk for every card: token by token \
+             (run `breccia profile --prefill` or pass --prefill-chunk)",
+        ),
+    }
+}
+
+/// [`prefill_chunks_for`] against the saved hardware profile; returns the smallest
+/// chunk (a multi-device model's) and the per-card list, and says where they came from.
+fn resolve_prefill_chunks(flag: Option<usize>, merged: bool, devs: &[String]) -> (usize, Vec<usize>) {
+    let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+        .ok()
+        .flatten();
+    let (chunks, src) = prefill_chunks_for(flag, merged, devs, |d| {
+        let e = prof.as_ref()?.devices.iter().find(|e| same_pci(&e.identity.pci_address, d))?;
+        Some(e.prefill.as_ref()?.best_chunk)
+    });
+    if flag.is_none() && merged {
+        println!("prefill chunk {chunks:?} ({src})");
+    }
+    (chunks.iter().copied().min().unwrap_or(0), chunks)
+}
+
+/// Stream `s`'s chunk, from its card (`s % devs`), and its `auto` arena grown by
+/// the scratch every stream on that card allocates after the arenas are chosen.
+fn stream_chunk_arena(
+    spec: breccia_engine::ArenaSpec,
+    chunks: &[usize],
+    s: usize,
+    per_card: usize,
+    ctx: usize,
+) -> (usize, breccia_engine::ArenaSpec) {
+    let chunk = chunks[s % chunks.len()];
+    let spec = match spec {
+        breccia_engine::ArenaSpec::Auto(o) => {
+            // Every stream on the card allocates its own scratch.
+            breccia_engine::ArenaSpec::Auto((0..per_card).fold(o, |o, _| o.with_prefill_chunk(chunk, ctx)))
+        }
+        other => other,
+    };
+    (chunk, spec)
 }
 
 /// KL(p || q) over two logit vectors (softmax each), in nats.
@@ -900,6 +986,7 @@ fn profile_prefill(path: &std::path::Path, model_glob: &str, devices: &[String])
             off_ms: off_ms / prompt.len() as f64,
             on_ms: on_ms / prompt.len() as f64,
             flags,
+            best_chunk: 0,
         };
         drop(sess);
         drop(model);
@@ -912,8 +999,100 @@ fn profile_prefill(path: &std::path::Path, model_glob: &str, devices: &[String])
         // Saved per device, so a crash on the second GPU keeps the first verdict.
         breccia_profile::save_profile(&prof, path)?;
         println!("  verdict stored in {}", path.display());
+        // The sweep loads the model with the flags just stored.
+        let best = profile_prefill_chunk(path, model_glob, &addr)?;
+        if let Some(v) = prof
+            .devices
+            .iter_mut()
+            .find(|e| same_pci(&e.identity.pci_address, &addr))
+            .and_then(|e| e.prefill.as_mut())
+        {
+            v.best_chunk = best;
+        }
+        breccia_profile::save_profile(&prof, path)?;
+        println!("  best chunk {best} stored");
     }
     Ok(())
+}
+
+/// The prefill chunk one card runs fastest at. Each candidate gets a fresh model
+/// and session (workspaces are sized at `Session::new`) under the `auto` arena
+/// with that chunk's scratch reserve, so a bigger chunk also pays for the expert
+/// blocks it pushes out of VRAM. A candidate must match the 512 arm (KL <= 1e-3,
+/// same top-1) and beat the smaller winner by more than 2 % to replace it.
+fn profile_prefill_chunk(path: &std::path::Path, model_glob: &str, addr: &str) -> Result<usize> {
+    const CANDIDATES: [usize; 3] = [512, 1024, 2048];
+    // Planner splits evenly up to 1.5x the target: 3x700 / 2x1050 / 1x2100.
+    const TOKENS: usize = 2100;
+    let mut base: Option<Vec<f32>> = None;
+    let mut best = (0usize, f64::MAX);
+    for chunk in CANDIDATES {
+        let model = breccia_engine::Model::load(
+            model_glob,
+            &breccia_engine::LoadOptions {
+                devices: vec![addr.to_string()],
+                ctx_capacity: TOKENS + 64,
+                profile: Some(path.to_path_buf()),
+                // A display card keeps 2.5 GiB free (desktop + other tenants).
+                arena: breccia_engine::ArenaSpec::Auto(
+                    breccia_engine::ArenaOpts {
+                        display_reserve: 2560 << 20,
+                        ..Default::default()
+                    }
+                    .with_prefill_chunk(chunk, TOKENS + 64),
+                ),
+                verbose: false,
+                ..Default::default()
+            },
+        )
+        .with_context(|| format!("loading the model on {addr} for chunk {chunk}"))?;
+        let prompt = synthetic_prefix(
+            &[760, 13017, 1433, 364, 279, 5447],
+            TOKENS,
+            0x5eed,
+            model.cfg.vocab as u32,
+        );
+        let mut sess = breccia_engine::Session::new(
+            &model,
+            &breccia_engine::SessionCfg {
+                ctx_capacity: TOKENS + 64,
+                threads: 0,
+                timers: false,
+                batching: true,
+                inbatch_read: true,
+                prefill_chunk: chunk,
+                prefill_merged: true,
+                probe: false,
+                pool: None,
+            },
+        )?;
+        feed_prompt(&mut sess, &prompt, chunk)?; // warm-up: pipelines, workspaces
+        let mut ms = f64::MAX;
+        let mut logits = Vec::new();
+        for _ in 0..2 {
+            let t = std::time::Instant::now();
+            logits = feed_prompt(&mut sess, &prompt, chunk)?;
+            ms = ms.min(t.elapsed().as_secs_f64() * 1e3 / prompt.len() as f64);
+        }
+        let (kl, same) = match &base {
+            Some(b) => (logits_kl(b, &logits), argmax(b) == argmax(&logits)),
+            None => (0.0, true),
+        };
+        let ok = kl <= 1e-3 && same;
+        let wins = ok && ms < best.1 * 0.98;
+        println!(
+            "  chunk {chunk:>4}: {ms:.2} ms/token, KL vs 512 {kl:.2e}, top-1 {}{}",
+            if same { "same" } else { "DIFFERENT" },
+            if wins { " <- best so far" } else { "" }
+        );
+        if base.is_none() {
+            base = Some(logits);
+        }
+        if wins {
+            best = (chunk, ms);
+        }
+    }
+    Ok(best.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,6 +1541,20 @@ fn busy_per_step(measured: bool, busy_s: f64, steps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefill_chunk_flag_wins_then_discovered_all_or_nothing() {
+        let devs = vec!["0000:03:00.0".to_string(), "0000:0e:00.0".to_string()];
+        let both = |d: &str| Some(if d.ends_with("03:00.0") { 2048 } else { 1024 });
+        let one = |d: &str| d.ends_with("03:00.0").then_some(2048);
+        assert_eq!(prefill_chunks_for(Some(0), true, &devs, both).0, vec![0, 0]);
+        assert_eq!(prefill_chunks_for(Some(512), false, &devs, both).0, vec![512, 512]);
+        assert_eq!(prefill_chunks_for(None, false, &devs, both).0, vec![0, 0]);
+        assert_eq!(prefill_chunks_for(None, true, &devs, both).0, vec![2048, 1024]);
+        assert_eq!(prefill_chunks_for(None, true, &devs, one).0, vec![0, 0]);
+        assert_eq!(prefill_chunks_for(None, true, &devs, |_| Some(0)).0, vec![0, 0]);
+        assert_eq!(prefill_chunks_for(None, true, &[], both).0, vec![0]);
+    }
 
     #[test]
     fn unmeasured_busy_never_prints_a_percentage() {
@@ -1940,7 +2133,10 @@ struct TokenArgs {
     arena_headroom_mib: u64,
     streams: usize,
     inbatch_read: bool,
+    /// The smallest of `prefill_chunks` (what a multi-device model runs at).
     prefill_chunk: usize,
+    /// Per `devices` entry.
+    prefill_chunks: Vec<usize>,
     prefill_merged: bool,
     warm: usize,
     then_prompt_ids: Option<String>,
@@ -2069,9 +2265,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             let opts = breccia_engine::ArenaOpts {
                 display_reserve: a.arena_display_reserve_mib << 20,
                 headroom: a.arena_headroom_mib << 20,
-            }
-            // Each stream on a card allocates its own chunk scratch after every arena is chosen.
-            .with_prefill_chunk(a.prefill_chunk * n_streams.div_ceil(devs.len()));
+            };
             multi_arena_specs(spec, n_streams, opts)?
         }
         // Measured default for a two-stream pair (§8p): the production mapping's
@@ -2082,15 +2276,13 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         ])],
         None => vec![breccia_engine::ArenaSpec::Off],
     };
-    let stream_specs: Vec<breccia_engine::ArenaSpec> = (0..n_streams)
+    let (stream_chunks, stream_specs): (Vec<usize>, Vec<breccia_engine::ArenaSpec>) = (0
+        ..n_streams)
         .map(|s| {
-            groups
-                .get(s)
-                .or_else(|| groups.last())
-                .cloned()
-                .unwrap_or_default()
+            let g = groups.get(s).or_else(|| groups.last()).cloned().unwrap_or_default();
+            stream_chunk_arena(g, &a.prefill_chunks, s, n_streams.div_ceil(devs.len()), a.ctx)
         })
-        .collect();
+        .unzip();
     println!(
         "breccia bench token --streams {n_streams}: {} prompt ids, {} to generate each, \
          one device per stream",
@@ -2170,7 +2362,8 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         probe: std::env::var_os("BRECCIA_GPU_TIME").is_some(),
         pool: None,
     };
-    let mut multi = breccia_engine::Multi::new(&refs, &cfg).context("building the streams")?;
+    let mut multi = breccia_engine::Multi::with_chunks(&refs, &cfg, &stream_chunks)
+        .context("building the streams")?;
     // `BRECCIA_BENCH_MIXED_PROMPTS=1`: stream 0 keeps the reference prompt, the others
     // get `synthetic_prefix` of the same length (seeded by stream index), so routing
     // differs per stream the way real agents' does; identical prompts route
@@ -2466,8 +2659,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
     let opts = breccia_engine::ArenaOpts {
         display_reserve: a.arena_display_reserve_mib << 20,
         headroom: a.arena_headroom_mib << 20,
-    }
-    .with_prefill_chunk(a.prefill_chunk * n.div_ceil(devs.len()));
+    };
     let groups: Vec<breccia_engine::ArenaSpec> = match a.gpu_experts.as_deref() {
         Some(spec) => multi_arena_specs(spec, n, opts)?,
         None if n == 2 && devs.len() >= 2 => vec![breccia_engine::ArenaSpec::List(vec![
@@ -2476,8 +2668,17 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         None => vec![breccia_engine::ArenaSpec::Off],
     };
     let mut models = Vec::with_capacity(n);
+    let mut stream_chunks = Vec::with_capacity(n);
     for s in 0..n {
         let dev = devs[s % devs.len()].clone();
+        let (chunk, arena) = stream_chunk_arena(
+            groups.get(s).or_else(|| groups.last()).cloned().unwrap_or(breccia_engine::ArenaSpec::Off),
+            &a.prefill_chunks,
+            s,
+            n.div_ceil(devs.len()),
+            512,
+        );
+        stream_chunks.push(chunk);
         let model = breccia_engine::Model::load(
             &glob,
             &breccia_engine::LoadOptions {
@@ -2486,11 +2687,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
                 blocks: None,
                 head_device: breccia_engine::HeadSpec::Auto,
                 profile: None,
-                arena: groups
-                    .get(s)
-                    .or_else(|| groups.last())
-                    .cloned()
-                    .unwrap_or(breccia_engine::ArenaSpec::Off),
+                arena,
                 host_expert_import: false,
                 page_hint_trim: false,
                 verbose: s == 0,
@@ -2516,8 +2713,8 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         probe: true,
         pool: None,
     };
-    let mut multi =
-        breccia_engine::Multi::new(&refs, &cfg).context("building the agent streams")?;
+    let mut multi = breccia_engine::Multi::with_chunks(&refs, &cfg, &stream_chunks)
+        .context("building the agent streams")?;
     for s in multi.streams.iter_mut() {
         s.sampling = breccia_engine::Sampling {
             temperature: 0.0,
@@ -2605,7 +2802,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
         logits = vec![Vec::new(); n];
         for (s, sess) in multi.streams.iter_mut().enumerate() {
             let mut pos = 0usize;
-            for len in breccia_engine::prefill_plan(padded[s].len(), a.prefill_chunk) {
+            for len in breccia_engine::prefill_plan(padded[s].len(), stream_chunks[s]) {
                 logits[s] = sess.prefill(&padded[s][pos..pos + len], pos)?;
                 pos += len;
             }
@@ -2752,9 +2949,9 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
     }
     println!(
         "\nprefill  {prompt_tokens} prompt tokens ({common} x {n}) in {prompt_seconds:.2} s = \
-         {:.2} tok/s per agent (chunk {} = {}, grouped lane {})",
+         {:.2} tok/s per agent (chunk {:?} = {}, grouped lane {})",
         prompt_tokens as f64 / prompt_seconds.max(1e-9) / n as f64,
-        a.prefill_chunk,
+        stream_chunks,
         if a.prefill_chunk > 0 {
             "chunked"
         } else {
@@ -3020,7 +3217,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                     display_reserve: a.arena_display_reserve_mib << 20,
                     headroom: a.arena_headroom_mib << 20,
                 }
-                .with_prefill_chunk(a.prefill_chunk));
+                .with_prefill_chunk(a.prefill_chunk, a.ctx));
             }
             arena
         }

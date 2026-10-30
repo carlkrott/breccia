@@ -191,6 +191,20 @@ impl<'m> Multi<'m> {
     /// is what makes the streams' GPU work concurrent); the expert lane is built
     /// once and shared.
     pub fn new(models: &[&'m Model], cfg: &SessionCfg) -> Result<Self> {
+        Self::with_chunks(models, cfg, &vec![cfg.prefill_chunk; models.len()])
+    }
+
+    /// [`Multi::new`] with a prefill chunk per stream (`chunks[i]` replaces
+    /// `cfg.prefill_chunk` for stream `i`), e.g. each card's discovered chunk.
+    /// Workspaces are sized at `Session::new`, so the chunk is fixed here.
+    pub fn with_chunks(models: &[&'m Model], cfg: &SessionCfg, chunks: &[usize]) -> Result<Self> {
+        if chunks.len() != models.len() {
+            bail!("{} prefill chunks for {} streams", chunks.len(), models.len());
+        }
+        // The token-by-token pass interleaves every stream, so it is all or none.
+        if chunks.iter().any(|&c| c == 0) && chunks.iter().any(|&c| c > 0) {
+            bail!("prefill chunks {chunks:?} mix chunked and token-by-token streams");
+        }
         if models.is_empty() {
             bail!("a multi-stream session needs at least one model");
         }
@@ -208,6 +222,7 @@ impl<'m> Multi<'m> {
         for (i, m) in models.iter().enumerate() {
             // The first session builds the lane; every later one shares it, so
             // N streams use `threads` workers, not N*threads.
+            cfg.prefill_chunk = chunks[i];
             let s = Session::new(m, &cfg)
                 .map_err(|e| anyhow::anyhow!("building stream {i}'s session: {e:#}"))?;
             if cfg.pool.is_none() {
@@ -337,7 +352,8 @@ impl<'m> Multi<'m> {
         let prefill_t = std::time::Instant::now();
         // Plan from the --prefill-chunk target: prefill_plan applies prefill_cap itself,
         // so passing the cap would plan chunks 2.25x the target and Session::prefill bails.
-        let target = self.streams[0].prefill_target;
+        let targets: Vec<usize> = self.streams.iter().map(|s| s.prefill_target).collect();
+        let target = targets[0];
         let mut stream_prefill = vec![0.0f64; ns];
         let concurrent = prefill_concurrent_on(
             std::env::var("BRECCIA_MULTI_PREFILL_CONCURRENT")
@@ -347,15 +363,15 @@ impl<'m> Multi<'m> {
         if target > 0 && concurrent {
             // One scoped thread per stream: the streams' chunks overlap instead of
             // stream 1 waiting for stream 0's whole prompt.
-            let plan = crate::graph::prefill_plan(plen, target);
             let done: Vec<Result<(Vec<f32>, f64)>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = self
                     .streams
                     .iter_mut()
                     .zip(prompts)
-                    .map(|(sess, prompt)| {
-                        let plan = &plan;
+                    .zip(&targets)
+                    .map(|((sess, prompt), &target)| {
                         scope.spawn(move || -> Result<(Vec<f32>, f64)> {
+                            let plan = crate::graph::prefill_plan(plen, target);
                             let t_stream = std::time::Instant::now();
                             let mut pos = 0usize;
                             let mut lg = Vec::new();
@@ -383,7 +399,7 @@ impl<'m> Multi<'m> {
             for (s, sess) in self.streams.iter_mut().enumerate() {
                 let t_stream = std::time::Instant::now();
                 let mut pos = 0usize;
-                for len in crate::graph::prefill_plan(plen, target) {
+                for len in crate::graph::prefill_plan(plen, targets[s]) {
                     logits[s] = sess.prefill(&prompts[s][pos..pos + len], pos)?;
                     pos += len;
                 }

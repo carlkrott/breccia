@@ -88,19 +88,22 @@ pub struct ArenaOpts {
     pub headroom: u64,
 }
 
-/// VRAM the chunked prefill scratch costs per chunk token (merged-pass buffers plus
-/// the QSA/GDN/HC chunk workspaces), measured on the MI50 at chunk 512 vs 1024:
-/// +584 MiB per 512 tokens = 1.14 MiB, rounded up for allocator slack.
+/// VRAM the chunked prefill scratch costs per token of the largest chunk the
+/// planner runs (merged-pass buffers plus the QSA/GDN/HC chunk workspaces). RX,
+/// measured after the arena: one 2100-token chunk at ctx 2164 = 2836 MiB (1.35),
+/// 1366-token chunks at ctx 4200 = 1881 MiB (1.38); flat in ctx, so 1.5 for slack.
 /// shortcut: measured on this model only; derive it from the session's real
 /// allocations once a second model ships.
-pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 5 << 18;
+pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 3 << 19;
 
 impl ArenaOpts {
     /// Both reserves grown by the scratch a `chunk`-token prefill allocates after
     /// the arena is chosen. Without it `auto` fills VRAM and the scratch spills to
     /// GTT (MI50 chunk 1024: 22.85 -> 27.61 ms/token).
-    pub fn with_prefill_chunk(self, chunk: usize) -> Self {
-        let extra = chunk as u64 * PREFILL_SCRATCH_PER_TOKEN;
+    /// Sized for the largest chunk `prefill_plan` can run (1.5x the target), but
+    /// never more tokens than the session's `ctx`.
+    pub fn with_prefill_chunk(self, chunk: usize, ctx: usize) -> Self {
+        let extra = crate::graph::prefill_cap(chunk).min(ctx) as u64 * PREFILL_SCRATCH_PER_TOKEN;
         ArenaOpts {
             display_reserve: self.display_reserve + extra,
             headroom: self.headroom + extra,
@@ -345,10 +348,12 @@ mod tests {
     #[test]
     fn prefill_chunk_grows_both_reserves() {
         let o = ArenaOpts::default();
-        assert_eq!(o.with_prefill_chunk(0), o);
-        let c = o.with_prefill_chunk(1024);
-        assert_eq!(c.headroom - o.headroom, 1280 << 20);
-        assert_eq!(c.display_reserve - o.display_reserve, 1280 << 20);
+        assert_eq!(o.with_prefill_chunk(0, 4096), o);
+        let c = o.with_prefill_chunk(1024, 4096); // chunks up to 1536 tokens
+        assert_eq!(c.headroom - o.headroom, 2304 << 20);
+        assert_eq!(c.display_reserve - o.display_reserve, 2304 << 20);
+        let c = o.with_prefill_chunk(2048, 1100); // the ctx caps the chunk
+        assert_eq!(c.headroom - o.headroom, 1650 << 20);
     }
 
     use super::*;

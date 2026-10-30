@@ -64,6 +64,10 @@ pub struct PrefillVerdict {
     pub off_ms: f64,
     pub on_ms: f64,
     pub flags: Vec<PrefillFlag>,
+    /// The prefill chunk this card runs fastest at (parity-checked against 512);
+    /// `0` = not measured. Bench and agents use it when `--prefill-chunk` is absent.
+    #[serde(default)]
+    pub best_chunk: usize,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

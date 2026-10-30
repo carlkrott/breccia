@@ -299,6 +299,9 @@ pub fn shutdown() -> Result<()> {
         unsafe { dev.destroy_descriptor_pool(pool, None) };
     }
     SETS.with(|c| c.borrow_mut().clear());
+    // A slot's owner handle outlives its device otherwise, and a model loaded
+    // after this one (a new logical device) would find every slot "taken".
+    DEVICES.with(|d| d.borrow_mut().iter_mut().for_each(|h| *h = vk::Device::null()));
     if std::env::var_os("BRECCIA_TRACE_BATCH").is_some() {
         eprintln!("batch ring: freed {freed} descriptor pool(s) at shutdown");
     }
