@@ -415,7 +415,14 @@ impl Model {
                         specs.len()
                     );
                 }
-                Placement::explicit(specs, &layer_bytes, tail_bytes, counts)?
+                // One `usize::MAX` takes the blocks the others leave (the streams'
+                // expert helper loads as `[rest, 0]` without knowing the block count).
+                let named: usize = counts.iter().filter(|&&c| c != usize::MAX).sum();
+                let counts: Vec<usize> = counts
+                    .iter()
+                    .map(|&c| if c == usize::MAX { layer_bytes.len().saturating_sub(named) } else { c })
+                    .collect();
+                Placement::explicit(specs, &layer_bytes, tail_bytes, &counts)?
             }
             None => Placement::balanced(specs, &layer_bytes, tail_bytes),
         };

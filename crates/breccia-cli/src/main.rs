@@ -2276,13 +2276,28 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         ])],
         None => vec![breccia_engine::ArenaSpec::Off],
     };
-    let (stream_chunks, stream_specs): (Vec<usize>, Vec<breccia_engine::ArenaSpec>) = (0
+    let (stream_chunks, mut stream_specs): (Vec<usize>, Vec<breccia_engine::ArenaSpec>) = (0
         ..n_streams)
         .map(|s| {
             let g = groups.get(s).or_else(|| groups.last()).cloned().unwrap_or_default();
             stream_chunk_arena(g, &a.prefill_chunks, s, n_streams.div_ceil(devs.len()), a.ctx)
         })
         .unzip();
+    // Item 2 (§11j): `BRECCIA_PF_EXPERT_DEVICE=1` also opens the first `--devices`
+    // card in every other stream's model as device 1 with no blocks, so that
+    // stream's streamed-expert GEMMs run there (the §11f host-staged path). Its
+    // chunk scratch there is allocated with its session, after every arena is
+    // chosen, so the helper card's own streams reserve room for it up front.
+    let helper = std::env::var("BRECCIA_PF_EXPERT_DEVICE").as_deref() == Ok("1");
+    let helped = |s: usize| helper && devs[s % devs.len()] != devs[0];
+    for s in (0..n_streams).filter(|&s| devs[s % devs.len()] == devs[0]) {
+        if let breccia_engine::ArenaSpec::Auto(o) = &stream_specs[s] {
+            let o = (0..n_streams)
+                .filter(|&h| helped(h))
+                .fold(*o, |o, h| o.with_prefill_chunk(stream_chunks[h], a.ctx));
+            stream_specs[s] = breccia_engine::ArenaSpec::Auto(o);
+        }
+    }
     println!(
         "breccia bench token --streams {n_streams}: {} prompt ids, {} to generate each, \
          one device per stream",
@@ -2319,20 +2334,30 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             );
         }
     }
-    let mut models = Vec::with_capacity(n_streams);
-    #[allow(clippy::needless_range_loop)]
-    for s in 0..n_streams {
+    // Helped streams load first so their helper-side load allocations land before
+    // the helper card's own arena measures free VRAM.
+    let mut loaded: Vec<Option<breccia_engine::Model>> = (0..n_streams).map(|_| None).collect();
+    let order: Vec<usize> = (0..n_streams)
+        .filter(|&s| helped(s))
+        .chain((0..n_streams).filter(|&s| !helped(s)))
+        .collect();
+    for s in order {
         if owner[s] != s {
             continue;
         }
         let dev = devs[s % devs.len()].clone();
         let arena = stream_specs[s].clone();
+        let (devices, blocks) = if helped(s) {
+            (vec![dev.clone(), devs[0].clone()], Some(vec![usize::MAX, 0]))
+        } else {
+            (vec![dev.clone()], None)
+        };
         let model = breccia_engine::Model::load(
             glob,
             &breccia_engine::LoadOptions {
-                devices: vec![dev.clone()],
+                devices,
                 ctx_capacity: a.ctx,
-                blocks: None,
+                blocks,
                 head_device: breccia_engine::HeadSpec::Auto,
                 profile: None,
                 arena,
@@ -2346,8 +2371,9 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             print!("{}", model.stats.banner(&model.cfg));
         }
         breccia_engine::graph::assert_head(&model)?;
-        models.push(model);
+        loaded[s] = Some(model);
     }
+    let models: Vec<breccia_engine::Model> = loaded.into_iter().flatten().collect();
     // `models` holds the owners in stream order, so owner `o` sits at its rank.
     let rank = |o: usize| (0..o).filter(|&i| owner[i] == i).count();
     let refs: Vec<&breccia_engine::Model> = owner.iter().map(|&o| &models[rank(o)]).collect();

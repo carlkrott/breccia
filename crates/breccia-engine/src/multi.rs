@@ -209,10 +209,12 @@ impl<'m> Multi<'m> {
             bail!("a multi-stream session needs at least one model");
         }
         for (i, m) in models.iter().enumerate() {
-            if m.devices.len() != 1 {
+            // Extra devices may only be blockless expert helpers (§11j item 2).
+            if m.placement.layer_device.iter().any(|&d| d != 0) {
                 bail!(
-                    "stream {i} has {} devices: a stream must own exactly one, so that the \
-                     streams' GPU phases are concurrent rather than queued behind each other",
+                    "stream {i} spreads its blocks over {} devices: a stream must own exactly \
+                     one, so that the streams' GPU phases are concurrent rather than queued \
+                     behind each other",
                     m.devices.len()
                 );
             }
