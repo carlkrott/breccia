@@ -2069,7 +2069,8 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             let opts = breccia_engine::ArenaOpts {
                 display_reserve: a.arena_display_reserve_mib << 20,
                 headroom: a.arena_headroom_mib << 20,
-            };
+            }
+            .with_prefill_chunk(a.prefill_chunk);
             multi_arena_specs(spec, n_streams, opts)?
         }
         // Measured default for a two-stream pair (§8p): the production mapping's
@@ -2464,7 +2465,8 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
     let opts = breccia_engine::ArenaOpts {
         display_reserve: a.arena_display_reserve_mib << 20,
         headroom: a.arena_headroom_mib << 20,
-    };
+    }
+    .with_prefill_chunk(a.prefill_chunk);
     let groups: Vec<breccia_engine::ArenaSpec> = match a.gpu_experts.as_deref() {
         Some(spec) => multi_arena_specs(spec, n, opts)?,
         None if n == 2 && devs.len() >= 2 => vec![breccia_engine::ArenaSpec::List(vec![
@@ -3016,7 +3018,8 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                 arena = breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
                     display_reserve: a.arena_display_reserve_mib << 20,
                     headroom: a.arena_headroom_mib << 20,
-                });
+                }
+                .with_prefill_chunk(a.prefill_chunk));
             }
             arena
         }

@@ -88,6 +88,26 @@ pub struct ArenaOpts {
     pub headroom: u64,
 }
 
+/// VRAM the chunked prefill scratch costs per chunk token (merged-pass buffers plus
+/// the QSA/GDN/HC chunk workspaces), measured on the MI50 at chunk 512 vs 1024:
+/// +584 MiB per 512 tokens = 1.14 MiB, rounded up for allocator slack.
+/// shortcut: measured on this model only; derive it from the session's real
+/// allocations once a second model ships.
+pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 5 << 18;
+
+impl ArenaOpts {
+    /// Both reserves grown by the scratch a `chunk`-token prefill allocates after
+    /// the arena is chosen. Without it `auto` fills VRAM and the scratch spills to
+    /// GTT (MI50 chunk 1024: 22.85 -> 27.61 ms/token).
+    pub fn with_prefill_chunk(self, chunk: usize) -> Self {
+        let extra = chunk as u64 * PREFILL_SCRATCH_PER_TOKEN;
+        ArenaOpts {
+            display_reserve: self.display_reserve + extra,
+            headroom: self.headroom + extra,
+        }
+    }
+}
+
 impl Default for ArenaOpts {
     fn default() -> Self {
         ArenaOpts {
@@ -322,6 +342,15 @@ pub struct DeviceArenaRow {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefill_chunk_grows_both_reserves() {
+        let o = ArenaOpts::default();
+        assert_eq!(o.with_prefill_chunk(0), o);
+        let c = o.with_prefill_chunk(1024);
+        assert_eq!(c.headroom - o.headroom, 1280 << 20);
+        assert_eq!(c.display_reserve - o.display_reserve, 1280 << 20);
+    }
+
     use super::*;
 
     const MIB: u64 = 1 << 20;
