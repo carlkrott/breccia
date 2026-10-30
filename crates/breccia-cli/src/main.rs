@@ -796,6 +796,9 @@ fn profile_prefill(path: &std::path::Path, model_glob: &str, devices: &[String])
                 devices: vec![addr.clone()],
                 ctx_capacity: 1024,
                 profile: Some(path.to_path_buf()),
+                // Without an arena the experts run on the CPU lane at per-token
+                // speed and no flag shows an effect; block 0 matches `--gpu-experts 0`.
+                arena: breccia_engine::ArenaSpec::parse("0").map_err(anyhow::Error::msg)?,
                 verbose: false,
                 ..Default::default()
             },
