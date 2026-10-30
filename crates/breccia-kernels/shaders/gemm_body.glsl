@@ -25,6 +25,8 @@
 
 #if defined(BRECCIA_GEMM_RPL) || defined(BRECCIA_GEMM_LDSX)
 #include "gemm_rpl.glsl"
+#elif defined(BRECCIA_GEMM_TILE)
+#include "gemm_tile.glsl"
 #else
 
 // BRECCIA_GEMM_PAIR (§11l item 4): `W` holds `pc.rows` gate rows then `pc.rows` up
@@ -178,5 +180,5 @@ void main() {
     }
 }
 
-#endif // BRECCIA_GEMM_RPL
+#endif // BRECCIA_GEMM_RPL / TILE
 #endif // BRECCIA_GEMM_BODY_GLSL

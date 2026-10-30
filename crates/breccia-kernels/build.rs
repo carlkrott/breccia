@@ -160,6 +160,10 @@ const WIDE_SHADERS: &[&str] = &[
 /// step with `blocked_spv!` in `src/gemm.rs`.
 const GEMM_VARIANTS: &[(u32, u32)] = &[(2, 8), (4, 8), (1, 16), (2, 16)];
 
+/// `(RM, RN)` register tiles of the tiled GEMM (`shaders/gemm_tile.glsl`: a
+/// 16*RM x 16*RN output tile per workgroup); keep in step with `TILES` in `src/gemm.rs`.
+const GEMM_TILES: &[(u32, u32)] = &[(4, 4), (8, 4), (8, 8)];
+
 fn main() {
     // **Every** shader and include, file by file. `rerun-if-changed=shaders` (the
     // directory) only fires when a file is *added or removed*, so editing a
@@ -226,6 +230,15 @@ fn main() {
                 compile(&glslc, &out_dir, name, &format!("{name}_r{rpl}u{umax}"), &defs);
                 defs.push("BRECCIA_GEMM_LDSX");
                 compile(&glslc, &out_dir, name, &format!("{name}_r{rpl}u{umax}x"), &defs);
+            }
+            for (rm, rn) in GEMM_TILES {
+                let defs = [
+                    "BRECCIA_GEMM_TILE=1".to_string(),
+                    format!("TILE_RM={rm}u"),
+                    format!("TILE_RN={rn}u"),
+                ];
+                let defs: Vec<&str> = defs.iter().map(String::as_str).collect();
+                compile(&glslc, &out_dir, name, &format!("{name}_t{rm}x{rn}"), &defs);
             }
         }
         if *name == "gemv_bf16" {

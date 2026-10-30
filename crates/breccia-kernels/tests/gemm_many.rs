@@ -713,3 +713,103 @@ fn blocked_gemm_is_bit_identical_to_the_plain_gemm() {
     }
     gpu.destroy_buf(&w);
 }
+
+/// The tiled GEMM (`gemm_tile.glsl`) against the plain GEMV-shaped kernel on a real
+/// dense projection. It sums in a different order, so the bound is fp32-reorder
+/// (max abs error / max |reference| < 1e-4; the max abs and max rel diff are printed),
+/// plus a ragged-column check (`cols % 4 != 0`, `cols % QK != 0`) and the time per
+/// dispatch of the incumbent (`tuned` build) and of every tile. Same env as
+/// `blocked_gemm_is_bit_identical_to_the_plain_gemm`; RX first.
+#[test]
+fn tiled_gemm_matches_plain() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("tile_gemm: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let Ok(want) = std::env::var("BRECCIA_GEMM_TYPE") else {
+        eprintln!("tile_gemm: SKIPPED - set BRECCIA_GEMM_TYPE");
+        return;
+    };
+    let role = std::env::var("BRECCIA_GEMM_TENSOR").unwrap_or_else(|_| "attn_gate".into());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else {
+        eprintln!("tile_gemm: no device for {selector}");
+        return;
+    };
+    let Ok(set) = ShardSet::open_glob(MODEL_GLOB) else {
+        eprintln!("tile_gemm: no model");
+        return;
+    };
+    let Some((name, ty, rows, cols)) = (0..48).find_map(|b| {
+        let name = format!("blk.{b}.{role}.weight");
+        let t = set.tensor(&name)?;
+        let ty = QuantType::from_ggml(t.ty())?;
+        (ty.name() == want).then(|| (name, ty, t.ne1() as usize, t.ne0() as usize))
+    }) else {
+        eprintln!("tile_gemm: no {want} {role} tensor");
+        return;
+    };
+    let gpu = &dev.gpu;
+    let w = breccia_kernels::gemv::upload(gpu, set.tensor(&name).unwrap().as_slice()).expect("upload");
+    let mut plain = GemmMany::new(gpu, ty).expect("gemm pipeline");
+    plain.set_tile(None);
+    let mut base = GemmMany::new(gpu, ty).expect("gemm pipeline");
+    base.set_tile(None);
+    base.set_variant(1, 8);
+    let tiles = [(4usize, 4usize), (8, 4), (8, 8)];
+    // (users, cols): the two timed shapes, then ragged columns.
+    for (m, c) in [(37usize, cols), (1024, cols), (37, cols - 103), (70, cols - 100)] {
+        let flat: Vec<f32> = (0..m * c)
+            .map(|i| (((i * 7 + (i / c) * 13) % 29) as f32 - 14.0) * 0.011)
+            .collect();
+        let x = breccia_kernels::ops::upload_f32(gpu, &flat).expect("x");
+        let out = alloc(gpu, (m * rows * 4) as u64).expect("out");
+        base.run(&w, &x, &out, rows, c, m).expect("plain");
+        let refv = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("down");
+        let scale = refv.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let timed = c == cols;
+        if timed {
+            let t = plain.run_timed(&w, &x, &out, rows, c, m, 0.002).expect("timed");
+            println!(
+                "tile_gemm: {name} [{rows} x {c}] {} m = {m} incumbent {:?}: {:.3} ms",
+                ty.name(),
+                plain.variant_for(rows, m),
+                t.per_iter_s * 1e3
+            );
+        }
+        for t in tiles {
+            let mut g = GemmMany::new(gpu, ty).expect("gemm pipeline");
+            g.set_tile(Some(t));
+            out_fill(gpu, &out, m * rows);
+            g.run_tiled(t, &w, &x, &out, rows, c, m).expect("tiled");
+            let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("down");
+            let (mut max_abs, mut max_rel) = (0f32, 0f32);
+            for (a, b) in got.iter().zip(&refv) {
+                let d = (a - b).abs();
+                max_abs = max_abs.max(d);
+                max_rel = max_rel.max(d / b.abs().max(1e-3 * scale));
+            }
+            print!(
+                "tile_gemm: {} m = {m} cols = {c} tile {t:?}: max abs {max_abs:.3e} (scale {scale:.3e}) max rel {max_rel:.3e}",
+                ty.name()
+            );
+            if timed {
+                let tm = g.run_timed_tiled(t, &w, &x, &out, rows, c, m, 0.002).expect("timed");
+                print!("  {:.3} ms", tm.per_iter_s * 1e3);
+            }
+            println!();
+            assert!(max_abs <= 1e-4 * scale, "{}: {t:?} m = {m} cols = {c}: max abs {max_abs} vs scale {scale}", ty.name());
+        }
+        gpu.destroy_buf(&out);
+        gpu.destroy_buf(&x);
+    }
+    gpu.destroy_buf(&w);
+}
+
+/// Fill the output with NaN so an unwritten element fails the comparison.
+fn out_fill(gpu: &Gpu, out: &breccia_vk::ctx::Buf, n: usize) {
+    let nan = vec![f32::NAN; n];
+    let b = breccia_kernels::ops::upload_f32(gpu, &nan).expect("nan");
+    gpu.copy_once(&b, out, (n * 4) as u64).expect("copy");
+    gpu.destroy_buf(&b);
+}
