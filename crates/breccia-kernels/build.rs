@@ -154,6 +154,10 @@ const WIDE_SHADERS: &[&str] = &[
     "gemv_iq4_xs",
 ];
 
+/// `(rows per lane group, users per decode)` builds of every plain GEMM; keep in
+/// step with `blocked_spv!` in `src/gemm.rs`.
+const GEMM_VARIANTS: &[(u32, u32)] = &[(2, 8), (4, 8), (1, 16), (2, 16)];
+
 fn main() {
     // **Every** shader and include, file by file. `rerun-if-changed=shaders` (the
     // directory) only fires when a file is *added or removed*, so editing a
@@ -204,17 +208,20 @@ fn main() {
         // The fused HC `up` + gated-mean build (§8az): the GEMV with the
         // column-blocked row mapping and the gated-mean/inject epilogue. A
         // separate pipeline, so the default build keeps byte-identical SPIR-V.
-        // Register-blocked GEMM builds (§12 item 1): `RPL` rows per lane group,
-        // separate pipelines so the default SPIR-V stays byte-identical.
+        // Register-blocked GEMM builds (§12 item 1): `RPL` rows per lane group
+        // and/or `UMAX` users per decode, separate pipelines so the default
+        // SPIR-V stays byte-identical.
         if name.starts_with("gemm_") && !name.ends_with("_q8") && !name.ends_with("_pair") {
-            for rpl in [2, 4] {
-                compile(
-                    &glslc,
-                    &out_dir,
-                    name,
-                    &format!("{name}_r{rpl}"),
-                    &[&format!("BRECCIA_GEMM_RPL={rpl}u")],
-                );
+            for (rpl, umax) in GEMM_VARIANTS {
+                let mut defs = Vec::new();
+                if *rpl > 1 {
+                    defs.push(format!("BRECCIA_GEMM_RPL={rpl}u"));
+                }
+                if *umax != 8 {
+                    defs.push(format!("BRECCIA_GEMM_UMAX={umax}u"));
+                }
+                let defs: Vec<&str> = defs.iter().map(String::as_str).collect();
+                compile(&glslc, &out_dir, name, &format!("{name}_r{rpl}u{umax}"), &defs);
             }
         }
         if *name == "gemv_bf16" {

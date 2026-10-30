@@ -54,7 +54,11 @@ layout(local_size_x = 256) in;
 #define UNITS (QK / 8u)
 #define STEP (UNITS >= LANES ? 1u : (LANES / UNITS))
 /// Users one invocation can hold in registers (two accumulators each).
+#ifdef BRECCIA_GEMM_UMAX
+#define USERS_MAX BRECCIA_GEMM_UMAX
+#else
 #define USERS_MAX 8u
+#endif
 
 void main() {
     uint lane = gl_LocalInvocationID.x % LANES;

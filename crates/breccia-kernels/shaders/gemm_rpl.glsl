@@ -22,7 +22,11 @@ layout(local_size_x = 256) in;
 #define WG_X_MAX 65535u
 #define UNITS (QK / 8u)
 #define STEP (UNITS >= LANES ? 1u : (LANES / UNITS))
+#ifdef BRECCIA_GEMM_UMAX
+#define USERS_MAX BRECCIA_GEMM_UMAX
+#else
 #define USERS_MAX 8u
+#endif
 #define RPL BRECCIA_GEMM_RPL
 
 void main() {

@@ -679,31 +679,32 @@ fn blocked_gemm_is_bit_identical_to_the_plain_gemm() {
     };
     let gpu = &dev.gpu;
     let w = breccia_kernels::gemv::upload(gpu, set.tensor(&name).unwrap().as_slice()).expect("upload");
-    for m in [16usize, 37] {
+    for m in [37usize, 1024] {
         let flat: Vec<f32> = (0..m * cols)
             .map(|i| (((i * 7 + (i / cols) * 13) % 29) as f32 - 14.0) * 0.011)
             .collect();
         let x = breccia_kernels::ops::upload_f32(gpu, &flat).expect("x");
         let out = alloc(gpu, (m * rows * 4) as u64).expect("out");
         let mut base: Option<Vec<f32>> = None;
-        for rpl in [1usize, 2, 4] {
+        for v in [(1usize, 8usize), (2, 8), (4, 8), (1, 16), (2, 16)] {
             let mut g = GemmMany::new(gpu, ty).expect("gemm pipeline");
-            g.set_rows_per_lane(rpl);
-            let used = g.rows_per_lane_for(rows, m);
+            g.set_variant(v.0, v.1);
+            let used = g.variant_for(rows, m);
             g.run(&w, &x, &out, rows, cols, m).expect("gemm");
             let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("down");
             let t = g.run_timed(&w, &x, &out, rows, cols, m, 0.002).expect("timed");
             println!(
-                "rpl_gemm: {name} [{rows} x {cols}] {} m = {m} rpl {rpl} (used {used}): {:.3} ms",
+                "rpl_gemm: {name} [{rows} x {cols}] {} m = {m} {v:?} (used {used:?}): {:.3} ms",
                 ty.name(),
                 t.per_iter_s * 1e3
             );
             match &base {
                 None => base = Some(got),
                 Some(b) => {
-                    assert_eq!(used, rpl, "rpl {rpl} not selected for m = {m}");
+                    // A shape too small for the blocked grid falls back to plain, by design.
+                    assert!(used == v || used == (1, 8), "{v:?} -> {used:?} for m = {m}");
                     let diff = b.iter().zip(&got).filter(|(a, c)| a.to_bits() != c.to_bits()).count();
-                    assert_eq!(diff, 0, "{}: rpl {rpl} m = {m}: {diff} outputs differ", ty.name());
+                    assert_eq!(diff, 0, "{}: {v:?} m = {m}: {diff} outputs differ", ty.name());
                 }
             }
         }
