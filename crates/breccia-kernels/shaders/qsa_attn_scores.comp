@@ -81,7 +81,13 @@ void main() {
 
     // The query slice, `head_dim / sg_size` values per lane.
     uint n_local = pc.head_dim / sg_size;
-    for (uint slot = 0u; slot < pc.slots; ++slot) {
+    // Slots past the selection list are dead whatever the cell: write them in
+    // parallel instead of walking them (same values, plan §12 item 3).
+    uint live = min(pc.slots, count * 4u);
+    for (uint slot = live + lane; slot < pc.slots; slot += sg_size) {
+        SC[unit * pc.slots + slot] = MASK_DEAD;
+    }
+    for (uint slot = 0u; slot < live; ++slot) {
         uint r = slot / 4u;
         uint k = slot % 4u;
         float acc = 0.0;

@@ -1,0 +1,133 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+//
+// Prefill build of `qsa_attn_apply.comp` (plan §12 item 3): one workgroup per
+// (token, kv head) instead of one invocation per (token, head, d).
+//
+// The selection is per token, not per head, and the 12 query heads of a kv head
+// read the same V cells. The per-head kernel walks the IDS -> page table -> V
+// load chain once per head, three dependent loads per slot, so it is latency-bound.
+// Here the cell addresses and the 12 heads' probabilities of a chunk of slots are
+// staged in LDS in parallel, then every V element is loaded once and accumulated
+// into 12 heads. Per (head, d) the sum runs over the same slots in the same order
+// with the same `p == 0` skip, so the output is bit-identical to the per-head kernel.
+//
+// Host contract: `head_dim == 256` (one invocation per `d`) and
+// `n_head == GROUP * n_kv_head` (`Qsa::apply`). Decode (few tokens) keeps the
+// per-head kernel: two workgroups per token would underfill the device.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Probs { float P[]; }; // [n_head*T, slots]
+layout(std430, binding = 1) readonly buffer VPool { uint VP[]; }; // paged f16 pairs
+layout(std430, binding = 2) readonly buffer PageTable { uint PT[]; };
+layout(std430, binding = 3) readonly buffer Ids { uint IDS[]; }; // [T, max_blocks]
+layout(std430, binding = 4) readonly buffer Counts { uint CNT[]; }; // [T]
+layout(std430, binding = 5) readonly buffer QFull { float QF[]; }; // [T, n_head*512]
+layout(std430, binding = 6) writeonly buffer Out { float O[]; }; // [T, n_head, head_dim]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_head;
+    uint head_dim;
+    uint slots;
+    uint id_stride;
+    int pos0;
+    uint page_cells;
+    uint n_kv_head;
+} pc;
+
+#define WG_X_MAX 65535u
+#define GROUP 12u
+#define CHUNK 256u
+#define DEAD 0xffffffffu
+
+#include "f16_storage.glsl"
+#include "ops_math.glsl"
+
+shared uint CB[CHUNK];          // V row/element base of each staged slot, or DEAD
+shared float PS[CHUNK * GROUP]; // [slot][head] probabilities
+
+#ifdef BRECCIA_KV_Q8V
+// Same q8_0 V layout and decode as `qsa_attn_apply.comp`.
+#define Q8_BLOCK_ELEMS 32u
+#define Q8_BLOCK_WORDS 9u
+
+float load_v(uint row, uint elem) {
+    uint at = (row * (pc.head_dim / Q8_BLOCK_ELEMS) + (elem / Q8_BLOCK_ELEMS)) * Q8_BLOCK_WORDS;
+    float scale = uintBitsToFloat(VP[at]);
+    int q = bitfieldExtract(int(VP[at + 1u + ((elem % Q8_BLOCK_ELEMS) >> 2u)]),
+                            int((elem % 4u) * 8u), 8);
+    return float(q) * scale;
+}
+#else
+float load_v(uint base, uint elem) {
+    return breccia_load_f16(VP[(base + elem) >> 1], base + elem);
+}
+#endif
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint t = wg / pc.n_kv_head;
+    if (t >= pc.tokens) {
+        return; // whole workgroup: no barrier is skipped by part of it
+    }
+    uint kvh = wg - t * pc.n_kv_head;
+    uint h0 = kvh * GROUP;
+    uint d = gl_LocalInvocationID.x;
+
+    uint count = CNT[t];
+    int pos = pc.pos0 + int(t);
+    uint nslots = min(count * 4u, pc.slots);
+
+    float acc[GROUP];
+    [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+        acc[h] = 0.0;
+    }
+
+    for (uint c0 = 0u; c0 < nslots; c0 += CHUNK) {
+        barrier();
+        uint s = c0 + d;
+        uint base = DEAD;
+        if (s < nslots) {
+            int cell = int(IDS[t * pc.id_stride + s / 4u]) * 4 + int(s % 4u);
+            if (cell <= pos) {
+                uint page = PT[uint(cell) / pc.page_cells];
+                uint in_page = uint(cell) % pc.page_cells;
+#ifdef BRECCIA_KV_Q8V
+                base = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
+#else
+                base = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
+                       in_page * pc.head_dim;
+#endif
+            }
+        }
+        CB[d] = base;
+        [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+            PS[d * GROUP + h] = s < nslots ? P[(t * pc.n_head + h0 + h) * pc.slots + s] : 0.0;
+        }
+        barrier();
+
+        uint n = min(CHUNK, nslots - c0);
+        for (uint j = 0u; j < n; ++j) {
+            uint b = CB[j];
+            if (b == DEAD) {
+                continue;
+            }
+            float v = load_v(b, d);
+            [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+                float p = PS[j * GROUP + h];
+                if (p != 0.0) {
+                    acc[h] += p * v;
+                }
+            }
+        }
+    }
+
+    [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+        uint hh = h0 + h;
+        uint gate_at = t * (pc.n_head * 2u * pc.head_dim) + hh * (2u * pc.head_dim) +
+                       pc.head_dim + d;
+        O[(t * pc.n_head + hh) * pc.head_dim + d] = acc[h] * breccia_sigmoid(QF[gate_at]);
+    }
+}

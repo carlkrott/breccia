@@ -771,6 +771,8 @@ fn qsa_two_layers_match_the_cpu_reference() {
     need_gpu!("qsa");
     qsa_sequence(1, "decode T=1");
     qsa_sequence(8, "prefill T=8");
+    // >= GQA_MIN_TOKENS: the kv-head-group apply (plan §12 item 3).
+    qsa_sequence(32, "prefill T=32");
 }
 
 /// Pooling across chunk boundaries (the tail-source path) vs the f64 reference.

@@ -118,7 +118,9 @@ const SHADERS: &[&str] = &[
     "qsa_idx_score",
     "qsa_topk",
     "qsa_attn_scores",
+    "qsa_attn_scores_gqa",
     "qsa_attn_apply",
+    "qsa_attn_apply_gqa",
     // int8-dot decode path (§8bb): the q8_1 quantiser and the IQ3_S dp4a GEMV.
     "ops_q8_quantize",
     "gemv_iq3s_q8",
@@ -311,7 +313,7 @@ fn spirv_hash(out_dir: &Path) {
 /// QSA stems that get the q8_0 **V**-cache build (`BRECCIA_KV_Q8V`, §8bg): the
 /// append (quantise on write) and the apply (dequantise in registers inside the
 /// accumulate loop). The scores kernel never reads V, so it has no variant.
-const KV_Q8V_SHADERS: &[&str] = &["qsa_kv_append", "qsa_attn_apply"];
+const KV_Q8V_SHADERS: &[&str] = &["qsa_kv_append", "qsa_attn_apply", "qsa_attn_apply_gqa"];
 
 /// Assemble a hand-written `.spvasm` module with `spirv-as` and validate it, the
 /// same two-step the compiled shaders go through (`AGENTS.md`: malformed SPIR-V must

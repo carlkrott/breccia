@@ -95,6 +95,28 @@ pub const ATTN_OUT_DIM: usize = MODEL_N_HEAD * MODEL_HEAD_DIM;
 const _: () = assert!(SELECT_WIDTH == 2051);
 const _: () = assert!(QGATE_DIM == 12288);
 const _: () = assert!(ATTN_OUT_DIM == 6144);
+// `qsa_attn_apply_gqa.comp`: one invocation per `d`, GROUP = 12 heads per kv head.
+const _: () = assert!(MODEL_HEAD_DIM == 256 && MODEL_N_HEAD == 12 * MODEL_N_KV_HEAD);
+
+/// Calls of at least this many tokens use the kv-head-group apply. Below it the
+/// per-head kernel stays: the group kernel runs `2 * T` workgroups, which a
+/// decode step cannot spread over the device.
+const GQA_MIN_TOKENS: usize = 16;
+
+/// `BRECCIA_QSA_GQA=0` keeps the per-head apply at every `T` (A/B and revert).
+fn gqa_apply(tokens: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    tokens >= GQA_MIN_TOKENS
+        && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_GQA").map_or(true, |v| v != "0"))
+}
+
+/// Same gate for the scores (`qsa_attn_scores_gqa.comp`); `BRECCIA_QSA_GQA_SCORES=0`
+/// keeps the per-head scores alone.
+fn gqa_scores(tokens: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    gqa_apply(tokens)
+        && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_GQA_SCORES").map_or(true, |v| v != "0"))
+}
 
 /// Bytes of one 16-cell page of one layer, K and V together (32 KiB).
 pub fn page_bytes() -> u64 {
@@ -538,9 +560,14 @@ pub struct Qsa<'g> {
     idx_score: Pipe<'g>,
     topk: Pipe<'g>,
     attn_scores: Pipe<'g>,
+    attn_scores_gqa: Pipe<'g>,
     attn_apply: Pipe<'g>,
     /// `BRECCIA_KV_Q8V`: read V as q8_0, dequantise in registers in the dot.
     attn_apply_q8: Pipe<'g>,
+    /// Prefill apply: one workgroup per (token, kv head), V loaded once for the
+    /// 12 heads that share it (`qsa_attn_apply_gqa.comp`, plan §12 item 3).
+    attn_apply_gqa: Pipe<'g>,
+    attn_apply_gqa_q8: Pipe<'g>,
     softmax: Softmax<'g>,
     rope_hd: Rope<'g>,
     rope_idx: Rope<'g>,
@@ -603,6 +630,12 @@ impl<'g> Qsa<'g> {
             6,
             "qsa attention scores",
         )?;
+        let attn_scores_gqa = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_scores_gqa.spv")),
+            6,
+            "qsa attention scores (kv-head groups)",
+        )?;
         let attn_apply = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply.spv")),
@@ -614,6 +647,18 @@ impl<'g> Qsa<'g> {
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_q8v.spv")),
             7,
             "qsa attention apply (q8_0 V)",
+        )?;
+        let attn_apply_gqa = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_gqa.spv")),
+            7,
+            "qsa attention apply (kv-head groups)",
+        )?;
+        let attn_apply_gqa_q8 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_gqa_q8v.spv")),
+            7,
+            "qsa attention apply (kv-head groups, q8_0 V)",
         )?;
         let softmax = Softmax::new(gpu)?;
         let rope_hd = Rope::new(gpu, MODEL_HEAD_DIM, MODEL_N_ROT, max_pos)?;
@@ -631,8 +676,11 @@ impl<'g> Qsa<'g> {
             idx_score,
             topk,
             attn_scores,
+            attn_scores_gqa,
             attn_apply,
             attn_apply_q8,
+            attn_apply_gqa,
+            attn_apply_gqa_q8,
             softmax,
             rope_hd,
             rope_idx,
@@ -991,9 +1039,13 @@ impl<'g> Qsa<'g> {
             .i(pos0 as i32)
             .u(PAGE_CELLS as u32)
             .u(MODEL_N_KV_HEAD as u32);
-        let units = ws.tokens * MODEL_N_HEAD;
+        let (pipe, units) = if gqa_scores(ws.tokens) {
+            (&self.attn_scores_gqa, ws.tokens * MODEL_N_KV_HEAD)
+        } else {
+            (&self.attn_scores, ws.tokens * MODEL_N_HEAD)
+        };
         let (gx, gy) = grid_for(units, 1);
-        self.attn_scores.run(
+        pipe.run(
             &[
                 &ws.q,
                 &state.k_pool,
@@ -1020,8 +1072,18 @@ impl<'g> Qsa<'g> {
             .i(pos0 as i32)
             .u(PAGE_CELLS as u32)
             .u(MODEL_N_KV_HEAD as u32);
-        let (gx, gy) = grid_for(ws.tokens * ATTN_OUT_DIM, 256);
-        self.attn_apply_target(state).run(
+        let gqa = gqa_apply(ws.tokens);
+        let (gx, gy) = if gqa {
+            grid_for(ws.tokens * MODEL_N_KV_HEAD, 1)
+        } else {
+            grid_for(ws.tokens * ATTN_OUT_DIM, 256)
+        };
+        let pipe = match (gqa, state.v_layout) {
+            (true, VLayout::F16) => &self.attn_apply_gqa,
+            (true, VLayout::Q8_0) => &self.attn_apply_gqa_q8,
+            (false, _) => self.attn_apply_target(state),
+        };
+        pipe.run(
             &[
                 &ws.attn,
                 &state.v_pool,

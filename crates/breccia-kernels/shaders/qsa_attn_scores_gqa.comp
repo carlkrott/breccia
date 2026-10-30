@@ -1,0 +1,130 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_control_flow_attributes : require
+//
+// Prefill build of `qsa_attn_scores.comp` (plan §12 item 3): one workgroup per
+// (token, kv head) instead of one subgroup per (token, head).
+//
+// The 12 query heads of a kv head score the same selected cells, but the
+// per-head kernel walks the IDS -> page table -> K chain once per head. Here a
+// chunk of cell addresses is staged in LDS, each subgroup takes every `sgs`-th
+// slot, loads its K row once and dots it with all 12 queries held in registers.
+// Per (head, slot) the lane split, the accumulation order and the shuffle
+// reduction are the per-head kernel's, so every score is bit-identical.
+//
+// Host contract as `qsa_attn_apply_gqa.comp`: `n_head == GROUP * n_kv_head`,
+// `head_dim <= 8 * subgroup size`; decode keeps the per-head kernel.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QVec { float Q[]; }; // [T, n_head, head_dim]
+layout(std430, binding = 1) readonly buffer KPool { uint KP[]; }; // paged f16 pairs
+layout(std430, binding = 2) readonly buffer PageTable { uint PT[]; };
+layout(std430, binding = 3) readonly buffer Ids { uint IDS[]; }; // [T, max_blocks]
+layout(std430, binding = 4) readonly buffer Counts { uint CNT[]; }; // [T]
+layout(std430, binding = 5) writeonly buffer Scores { float SC[]; }; // [n_head*T, slots]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_head;
+    uint head_dim;
+    uint slots;
+    uint id_stride;
+    int pos0;
+    uint page_cells;
+    uint n_kv_head;
+} pc;
+
+#define WG_X_MAX 65535u
+#define MASK_DEAD (-1.0e30)
+#define KQ_SCALE 0.0625
+#define GROUP 12u
+#define CHUNK 256u
+#define LOCAL_MAX 8u
+#define DEAD 0xffffffffu
+
+#include "f16_storage.glsl"
+
+shared uint CB[CHUNK]; // K row base of each staged slot, or DEAD
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint t = wg / pc.n_kv_head;
+    if (t >= pc.tokens) {
+        return; // whole workgroup
+    }
+    uint kvh = wg - t * pc.n_kv_head;
+    uint h0 = kvh * GROUP;
+    uint sg_size = gl_SubgroupSize;
+    uint sgs = 256u / sg_size;
+    uint sg_id = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint n_local = pc.head_dim / sg_size;
+    uint row0 = t * pc.n_head + h0;
+
+    float q[GROUP][LOCAL_MAX];
+    [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+        [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+            q[h][m] = m < n_local ? Q[(row0 + h) * pc.head_dim + lane + m * sg_size] : 0.0;
+        }
+    }
+
+    uint count = CNT[t];
+    int pos = pc.pos0 + int(t);
+    uint live = min(pc.slots, count * 4u);
+    uint dead = pc.slots - live;
+    for (uint i = gl_LocalInvocationID.x; i < GROUP * dead; i += 256u) {
+        uint h = i / dead;
+        SC[(row0 + h) * pc.slots + live + (i - h * dead)] = MASK_DEAD;
+    }
+
+    for (uint c0 = 0u; c0 < live; c0 += CHUNK) {
+        barrier();
+        uint s = c0 + gl_LocalInvocationID.x;
+        uint base = DEAD;
+        if (s < live) {
+            int cell = int(IDS[t * pc.id_stride + s / 4u]) * 4 + int(s % 4u);
+            if (cell <= pos) {
+                uint page = PT[uint(cell) / pc.page_cells];
+                uint in_page = uint(cell) % pc.page_cells;
+                base = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
+                       in_page * pc.head_dim;
+            }
+        }
+        CB[gl_LocalInvocationID.x] = base;
+        barrier();
+
+        uint n = min(CHUNK, live - c0);
+        for (uint j = sg_id; j < n; j += sgs) {
+            uint b = CB[j];
+            uint at = c0 + j;
+            if (b == DEAD) {
+                if (lane < GROUP) {
+                    SC[(row0 + lane) * pc.slots + at] = MASK_DEAD;
+                }
+                continue;
+            }
+            float k[LOCAL_MAX];
+            [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+                uint d = lane + m * sg_size;
+                k[m] = m < n_local ? breccia_load_f16(KP[(b + d) >> 1], b + d) : 0.0;
+            }
+            [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+                float acc = 0.0;
+                // Register arrays need constant indices; the guard keeps the
+                // per-head kernel's n_local terms (no + 0.0 tail).
+                [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+                    if (m < n_local) {
+                        acc += q[h][m] * k[m];
+                    }
+                }
+                for (uint off = sg_size >> 1; off > 0u; off >>= 1u) {
+                    acc += subgroupShuffleXor(acc, off);
+                }
+                if (lane == 0u) {
+                    SC[(row0 + h) * pc.slots + at] = acc * KQ_SCALE;
+                }
+            }
+        }
+    }
+}
