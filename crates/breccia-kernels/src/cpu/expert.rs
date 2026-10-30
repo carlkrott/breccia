@@ -315,7 +315,7 @@ pub struct ExpertPool {
 /// One worker's work for one phase.
 enum Msg {
     Batch(Batch),
-    /// `BRECCIA_POOL_DYNAMIC=1`: claim shards from one shared list until it runs dry.
+    /// Dynamic mode (default; `BRECCIA_POOL_DYNAMIC=0` opts out): claim shards from one shared list until it runs dry.
     Claim(Arc<Claim>),
     Exit,
 }
@@ -374,10 +374,11 @@ struct Done {
     busy_ns: u64,
 }
 
-/// `BRECCIA_POOL_DYNAMIC=1`: workers claim shards from a shared cursor (coord §10 test 1).
+/// Workers claim shards from a shared cursor (coord §10 test 1: decode +2.5 %, less
+/// jitter). On by default since §11i; `BRECCIA_POOL_DYNAMIC=0` restores static buckets.
 fn pool_dynamic() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BRECCIA_POOL_DYNAMIC").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("BRECCIA_POOL_DYNAMIC").map_or(true, |v| v != "0"))
 }
 
 /// `BRECCIA_POOL_SHARDS=n`: force the row split per role (still ≥ [`MIN_SHARD_ROWS`] rows).
