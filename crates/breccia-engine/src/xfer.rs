@@ -570,8 +570,8 @@ mod tests {
 
 /// §11j item 5: one anonymous host allocation imported (`VK_EXT_external_memory_host`)
 /// on each card a dual-card ship touches, so the hand-off is two DMAs and no CPU
-/// copy (the staged path is DMA, memcpy out, memcpy in, DMA). Env-gated by
-/// `BRECCIA_SHIP_IMPORT=1`; never one card's exported allocation.
+/// copy (the staged path is DMA, memcpy out, memcpy in, DMA). On by default (Carl 10-30);
+/// `BRECCIA_SHIP_IMPORT=0` opts out; never one card's exported allocation.
 pub struct ShipImport {
     ptr: *mut u8,
     layout: std::alloc::Layout,

@@ -2294,7 +2294,22 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
         if let breccia_engine::ArenaSpec::Auto(o) = &stream_specs[s] {
             let o = (0..n_streams)
                 .filter(|&h| helped(h))
-                .fold(*o, |o, h| o.with_prefill_chunk(stream_chunks[h], a.ctx));
+                .fold(*o, |o, h| {
+                    // shortcut: a helper venue spills to GTT (RX helper GEMMs 75 -> 275 ms)
+                    // unless its fold gets a margin; fixed 800 MiB measured at 1k only
+                    // (reserve 2560 ok, 1536 still spills), kernel mechanism open.
+                    // Re-measure before longer prompts.
+                    let f = o.with_prefill_chunk(stream_chunks[h], a.ctx);
+                    let extra = std::env::var("BRECCIA_HELPER_MARGIN_MIB")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(800)
+                        << 20;
+                    breccia_engine::ArenaOpts {
+                        display_reserve: f.display_reserve + extra,
+                        headroom: f.headroom + extra,
+                    }
+                });
             stream_specs[s] = breccia_engine::ArenaSpec::Auto(o);
         }
     }

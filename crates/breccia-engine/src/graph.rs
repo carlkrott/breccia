@@ -507,7 +507,7 @@ pub struct Session<'m> {
     /// One staging buffer per device — kept out of [`Venue`] so a transfer can
     /// borrow it mutably while reading the device's own buffers.
     stagings: Vec<Staging>,
-    /// §11j item 5: the dual-card ship's shared host import (`BRECCIA_SHIP_IMPORT=1`),
+    /// §11j item 5: the dual-card ship's shared host import (default on, `BRECCIA_SHIP_IMPORT=0` opts out),
     /// made on the first ship; `ship_imp_off` once it is off or failed.
     ship_imp: Option<crate::xfer::ShipImport>,
     ship_imp_off: bool,
@@ -1073,7 +1073,7 @@ impl<'m> Session<'m> {
             venues,
             stagings,
             ship_imp: None,
-            ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() != Ok("1"),
+            ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() == Ok("0"),
             gdn_state,
             qsa_state,
             qsa_ws,
