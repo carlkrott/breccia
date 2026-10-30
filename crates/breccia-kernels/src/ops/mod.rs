@@ -1617,6 +1617,8 @@ pub struct HcMixer<'g> {
     /// dispatch (`docs/phase-4/01-forward-pass.md` §8l). Used for `T = 1`.
     down_split: crate::Gemv<'g>,
     up: crate::GemvBatch<'g>,
+    /// Multi-user GEMM for `down`/`up` at T > 1 (`None`: the type has none).
+    gemm: Option<crate::gemm::GemmMany<'g>>,
     /// `true` when the `inject` projection is folded into the gated-mean pass.
     fused_inject: bool,
     /// `true` when `Act` rides in the `down` GEMV's epilogue — one dispatch
@@ -1731,6 +1733,17 @@ impl<'g> HcMixer<'g> {
             )
         };
         let up = crate::GemvBatch::new(gpu, ty, hc * n_embd, hc_lr)?;
+        // T > 1: the batched GEMV re-reads a weight row per (row, token), which
+        // a small L2 (MI50: 4 MB vs 6.5 MB of BF16 weights) pays from HBM every
+        // token. The multi-user GEMM reads each row once per 8 tokens.
+        // `BRECCIA_NO_HC_GEMM=1` keeps the GEMV.
+        let gemm = if std::env::var_os("BRECCIA_NO_HC_GEMM").is_none() {
+            crate::gemm::GemmMany::new(gpu, ty).ok().filter(|g| {
+                g.padded_cols(hc * n_embd) == hc * n_embd && g.padded_cols(hc_lr) == hc_lr
+            })
+        } else {
+            None
+        };
         let no_weight = empty_buf(gpu, "hc inject weight")?;
         Ok(HcMixer {
             n_embd,
@@ -1743,6 +1756,7 @@ impl<'g> HcMixer<'g> {
             down,
             down_split,
             up,
+            gemm,
             fused_inject: with_inject,
             fused_act,
             up_gated,
@@ -1996,7 +2010,12 @@ impl<'g> HcMixer<'g> {
                 )?;
             }
             _ => {
-                self.up.run(w.up, &ws.lo, &ws.gate, &ws.map_up, t)?;
+                match &self.gemm {
+                    Some(g) if t > 1 => {
+                        g.run(w.up, &ws.lo, &ws.gate, self.hc * self.n_embd, self.hc_lr, t)?
+                    }
+                    _ => self.up.run(w.up, &ws.lo, &ws.gate, &ws.map_up, t)?,
+                }
                 crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_GATED);
                 self.gated
                     .run(&ws.xn, &ws.gate, &ws.mixed, winj, &ws.inject, t)?;
@@ -2062,6 +2081,16 @@ impl<'g> HcMixer<'g> {
     /// result is the *activated* value and lands in `ws.lo`; without it the raw
     /// projection lands in `ws.lo_raw` for [`Act`] to read.
     fn run_down(&self, ws: &HcWorkspace, w: &HcWeights<'_>) -> Result<()> {
+        if let (Some(g), true) = (&self.gemm, ws.tokens > 1) {
+            let rows = self.hc_lr;
+            g.run(w.down, &ws.xn, &ws.lo_raw, rows, self.hc * self.n_embd, ws.tokens)?;
+            // The GEMM has no epilogue; without the fused one `read` runs `Act`.
+            if self.fused_act {
+                self.act
+                    .run(&ws.lo_raw, &ws.lo, rows * ws.tokens, self.hc as f32)?;
+            }
+            return Ok(());
+        }
         let out = if self.fused_act { &ws.lo } else { &ws.lo_raw };
         let splits = self.down_splits();
         if ws.tokens == 1 && splits > 1 {
