@@ -398,8 +398,8 @@ pub struct Venue<'m> {
     pub moe_combine: breccia_kernels::MoeCombine<'m>,
     /// The chunk's weighted expert fan-in (§8v), used by the merged prefill pass.
     pub moe_fanin: breccia_kernels::MoeFanIn<'m>,
-    /// The merged prefill pass's chunk scratch (`Some` only when
-    /// `--prefill-merged` is on and the placement is single-device).
+    /// The merged prefill pass's chunk scratch on this device (`Some` only when
+    /// `--prefill-merged` is on).
     pub pf: Option<PfChunk>,
     /// Chunked-prefill scratch: the chunk's gathered residual, one residual slice
     /// per token (the dense chain runs per token, unchanged) and one host-visible
@@ -436,8 +436,8 @@ pub struct SessionCfg {
     pub inbatch_read: bool,
     /// Prefill chunk size: the prompt is fed `t` tokens at a time with one
     /// submission per stage per chunk and the expert lane **grouped by expert**
-    /// over the chunk (§8s). `0` = token by token. Requires a single-device
-    /// placement (which is what a multi-stream session is).
+    /// over the chunk (§8s). `0` = token by token. A layer-split placement runs
+    /// each chunk on every device in block order (host-staged handoff).
     pub prefill_chunk: usize,
     /// **Merged** prefill (§8v): for a chunk of `t` tokens, route the whole chunk
     /// once, bucket the `(token, expert)` pairs by distinct expert, and run one
@@ -588,11 +588,16 @@ pub struct Session<'m> {
     /// Merged pass 1 with `BRECCIA_PF_QSACHUNK` / `BRECCIA_PF_GDNCHUNK`: T-token
     /// mixer workspaces (made on first use) and, while set, the chunk's `pos0`:
     /// the prelude's mixer then copies its row of `pf.out` instead of running.
-    qsa_chunk_ws: Option<QsaWorkspace>,
-    gdn_chunk_ws: Option<breccia_kernels::gdn::GdnWorkspace>,
+    /// The chunk workspaces below are per device (indexed by `device_of(b)`):
+    /// a layer-split session runs its chunk on every card that owns blocks.
+    qsa_chunk_ws: Vec<Option<QsaWorkspace>>,
+    gdn_chunk_ws: Vec<Option<breccia_kernels::gdn::GdnWorkspace>>,
     /// `BRECCIA_PF_HCCHUNK`: the T-token HC workspaces over `r_chunk`, one per chunk
     /// size (the batched GEMV row maps are built for an exact `T`).
-    hc_chunk_ws: Vec<HcWorkspace>,
+    hc_chunk_ws: Vec<Vec<HcWorkspace>>,
+    /// Per device, the [`PF_FLAGS`] this session runs ([`pf_resolve`]); public so
+    /// `breccia profile --prefill` can A/B them in one process.
+    pub pf: Vec<[bool; 5]>,
     mixer_from_chunk: Option<usize>,
     /// Host seconds spent faulting PLE table rows in for the whole chunk.
     pf_ple_prefetch_s: f64,
@@ -731,7 +736,7 @@ impl<'m> Session<'m> {
             } else {
                 192 << 10
             };
-            let chunk_slots = if i == 0 && cfg.prefill_chunk > 0 && model.devices.len() == 1 {
+            let chunk_slots = if cfg.prefill_chunk > 0 {
                 prefill_cap(cfg.prefill_chunk)
             } else {
                 1
@@ -823,7 +828,7 @@ impl<'m> Session<'m> {
             let moe_map_gate = alloc((2 * k * ff) as u64 * 4, "moe map gate")?;
             let moe_map_up = alloc((2 * k * ff) as u64 * 4, "moe map up")?;
             let moe_map_down = alloc((2 * k * mc.n_embd) as u64 * 4, "moe map down")?;
-            let chunk = if i == 0 && cfg.prefill_chunk > 0 && model.devices.len() == 1 {
+            let chunk = if cfg.prefill_chunk > 0 {
                 prefill_cap(cfg.prefill_chunk)
             } else {
                 0
@@ -1088,21 +1093,9 @@ impl<'m> Session<'m> {
             dispatches: 0,
             batching: cfg.batching,
             inbatch_read: cfg.inbatch_read,
-            prefill_chunk: if model.devices.len() == 1 {
-                prefill_cap(cfg.prefill_chunk)
-            } else {
-                0
-            },
-            prefill_target: if model.devices.len() == 1 {
-                cfg.prefill_chunk
-            } else {
-                0
-            },
-            prefill_merged: if model.devices.len() == 1 {
-                cfg.prefill_merged
-            } else {
-                false
-            },
+            prefill_chunk: prefill_cap(cfg.prefill_chunk),
+            prefill_target: cfg.prefill_chunk,
+            prefill_merged: cfg.prefill_merged,
             pf_ids: Vec::new(),
             pf_weights: Vec::new(),
             pf_mixed: Vec::new(),
@@ -1113,9 +1106,10 @@ impl<'m> Session<'m> {
             pf_stream_fill_s: 0.0,
             pf_stream_wait_s: 0.0,
             shared_deferred: false,
-            qsa_chunk_ws: None,
-            gdn_chunk_ws: None,
-            hc_chunk_ws: Vec::new(),
+            qsa_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
+            gdn_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
+            hc_chunk_ws: (0..model.devices.len()).map(|_| Vec::new()).collect(),
+            pf: pf_resolve(model),
             mixer_from_chunk: None,
             pf_ple_prefetch_s: 0.0,
             sh_sub: [0.0; 6],
@@ -2304,8 +2298,8 @@ impl<'m> Session<'m> {
     /// per expert** across the chunk instead of once per token
     /// (`moe_topk_chunk`, §8s).
     ///
-    /// Requires a single-device placement (what a multi-stream session is) and a
-    /// configured [`SessionCfg::prefill_chunk`].
+    /// Requires a configured [`SessionCfg::prefill_chunk`]; a layer-split
+    /// placement hands the chunk's residuals across devices ([`Self::handoff_slots`]).
     pub fn prefill(&mut self, toks: &[u32], pos0: usize) -> Result<Vec<f32>> {
         let t = toks.len();
         if t == 0 {
@@ -2313,12 +2307,6 @@ impl<'m> Session<'m> {
         }
         let m = self.model;
         let mc = &m.cfg;
-        if m.devices.len() != 1 {
-            bail!(
-                "chunked prefill needs a single-device placement (this model spans {} devices)",
-                m.devices.len()
-            );
-        }
         if t > self.prefill_chunk {
             bail!(
                 "prefill chunk of {t} tokens exceeds the session's chunk cap of {} \
@@ -2335,7 +2323,7 @@ impl<'m> Session<'m> {
         if !self.batching {
             bail!("chunked prefill records into a dispatch batch: it needs --batching");
         }
-        let dev = 0;
+        let dev = m.device_of(0);
         let gpu = m.devices[dev].gpu();
         let hc_dim = mc.hc_dim();
         let wall0 = std::time::Instant::now();
@@ -2386,6 +2374,9 @@ impl<'m> Session<'m> {
         self.timers.mark(PLE);
 
         for b in 0..mc.n_layers {
+            if b > 0 && m.device_of(b - 1) != m.device_of(b) {
+                self.handoff_slots(m.device_of(b - 1), m.device_of(b), t)?;
+            }
             self.prefill_block(b, t, pos0)?;
         }
         // `BRECCIA_TRACE_PREFILL=1`: the chunk's own stage split, ms per prompt
@@ -2450,13 +2441,35 @@ impl<'m> Session<'m> {
 
         // ---- the head sees the chunk's last token only -----------------------
         self.timers.mark(FINAL_HC);
-        self.swap_r_in(dev, t - 1);
+        let last = m.device_of(mc.n_layers - 1);
+        self.swap_r_in(last, t - 1);
         self.submit_head()?;
         let logits = self.finish_head()?;
-        self.swap_r_in(dev, t - 1);
+        self.swap_r_in(last, t - 1);
         self.timers.stop();
         self.pf_wall_s += wall0.elapsed().as_secs_f64();
         Ok(logits)
+    }
+
+    /// Layer-split chunked prefill: carry the chunk's `t` residual slots from the
+    /// card that ran the previous block to the one that runs the next, as one fenced
+    /// readback and one upload for the whole chunk (host-staged, like the decode
+    /// hand-off in [`Session::submit_block`]; no GPU-to-GPU copy).
+    fn handoff_slots(&mut self, from: usize, to: usize, t: usize) -> Result<()> {
+        let m = self.model;
+        let hb = m.cfg.hc_dim() * 4;
+        self.flush()?;
+        self.timers.mark(HANDOFF);
+        let items: Vec<(&Buf, u64, usize)> =
+            self.venues[from].r_slots[..t].iter().map(|s| (s, 0, hb)).collect();
+        let bytes = self.stagings[from].read_batch(m.devices[from].gpu(), &items)?;
+        let regions: Vec<(&Buf, u64, &[u8])> = self.venues[to].r_slots[..t]
+            .iter()
+            .zip(bytes.iter())
+            .map(|(s, d)| (s, 0, d.as_slice()))
+            .collect();
+        self.stagings[to].write_regions(m.devices[to].gpu(), &regions)?;
+        Ok(())
     }
 
     /// One block of a chunked prefill: the dense chain for every token of the
@@ -2465,7 +2478,7 @@ impl<'m> Session<'m> {
     fn prefill_block(&mut self, b: usize, t: usize, pos0: usize) -> Result<()> {
         let m = self.model;
         let mc = &m.cfg;
-        let dev = 0;
+        let dev = m.device_of(b);
         let n_embd = mc.n_embd;
         let k = mc.n_expert_used;
         let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
@@ -2864,7 +2877,7 @@ impl<'m> Session<'m> {
     ) -> Result<()> {
         let m = self.model;
         let mc = &m.cfg;
-        let dev = 0usize;
+        let dev = m.device_of(b);
         let n_embd = mc.n_embd;
         let n_ff = mc.n_ff;
         let k = mc.n_expert_used;
@@ -2895,12 +2908,10 @@ impl<'m> Session<'m> {
         );
         let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
         let disp_before = self.dispatches;
-        // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
-        let overlap = pf_on("BRECCIA_PF_OVERLAP", self.model.devices.len());
+        let overlap = self.pf[dev][PF_OVERLAP];
 
-        // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
         // The chunk-level shared expert needs a multi-user GEMM for all three roles.
-        let shared_chunk = pf_on("BRECCIA_PF_SHCHUNK", self.model.devices.len()) && {
+        let shared_chunk = self.pf[dev][PF_SHCHUNK] && {
             let moe = &m.layers[b].moe;
             let pipes = &self.venues[dev].pipes;
             [&moe.gate, &moe.up, &moe.down]
@@ -2908,10 +2919,9 @@ impl<'m> Session<'m> {
                 .all(|w| pipes.gemm(w.key.ty).is_some())
         };
 
-        // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
         // The whole pass-1 dense chain as T-token dispatches (`record_hc_chunk`).
         let hc_chunk = shared_chunk
-            && pf_on("BRECCIA_PF_HCCHUNK", self.model.devices.len())
+            && self.pf[dev][PF_HCCHUNK]
             && self.venues[dev].r_chunk.is_some()
             && self.mixer_chunked(b, dev)
             && {
@@ -3231,7 +3241,7 @@ impl<'m> Session<'m> {
             let v = &self.venues[dev];
             let rc = v.r_chunk.as_ref().expect("checked above");
             let ws = self
-                .hc_chunk_ws
+                .hc_chunk_ws[dev]
                 .iter()
                 .find(|w| w.tokens == t)
                 .expect("made in pass 1");
@@ -3823,16 +3833,15 @@ impl<'m> Session<'m> {
     /// `BRECCIA_PF_QSACHUNK` (QSA) / `BRECCIA_PF_GDNCHUNK` (GDN) and every
     /// projection the block's mixer runs has a multi-user GEMM.
     fn mixer_chunked(&self, b: usize, dev: usize) -> bool {
-        // shortcut: env knobs, make them the default once the 1k/4k parity matrix passes.
         let lw = &self.model.layers[b];
         let ws: Vec<&crate::model::W> = match lw.kind {
-            LayerKind::Qsa if pf_on("BRECCIA_PF_QSACHUNK", self.model.devices.len()) => {
+            LayerKind::Qsa if self.pf[dev][PF_QSACHUNK] => {
                 match lw.qsa.as_ref() {
                     Some(q) => vec![&q.q, &q.k, &q.v, &q.idx_q, &q.idx_k, &q.out],
                     None => return false,
                 }
             }
-            LayerKind::Gdn if pf_on("BRECCIA_PF_GDNCHUNK", self.model.devices.len()) => {
+            LayerKind::Gdn if self.pf[dev][PF_GDNCHUNK] => {
                 match lw.gdn.as_ref() {
                     Some(g) => vec![&g.qkv, &g.z, &g.beta, &g.alpha, &g.beta_alpha, &g.out],
                     None => return false,
@@ -3854,29 +3863,29 @@ impl<'m> Session<'m> {
         let gpu = m.devices[dev].gpu();
         let hb = (mc.hc_dim() * 4) as u64;
         let tb = t as u64 * (mc.n_embd * 4) as u64;
-        let wi = match self.hc_chunk_ws.iter().position(|w| w.tokens == t) {
+        let wi = match self.hc_chunk_ws[dev].iter().position(|w| w.tokens == t) {
             Some(i) => i,
             None => {
                 // Keep at most two (a prompt's chunks have at most two sizes, ~47 MB each
                 // at T=512): drain the GPU, then drop the oldest.
-                if self.hc_chunk_ws.len() >= 2 {
+                if self.hc_chunk_ws[dev].len() >= 2 {
                     batch_cmd::record_barrier_to_host(gpu)?;
                     self.submit_batch()?;
                     self.flush()?;
                     self.ensure_batch(dev)?;
-                    let old = self.hc_chunk_ws.remove(0);
+                    let old = self.hc_chunk_ws[dev].remove(0);
                     self.venues[dev].hc.release(gpu, old);
                 }
                 let ws = self.venues[dev].hc.workspace(gpu, t)?;
-                self.hc_chunk_ws.push(ws);
-                self.hc_chunk_ws.len() - 1
+                self.hc_chunk_ws[dev].push(ws);
+                self.hc_chunk_ws[dev].len() - 1
             }
         };
         self.timers.mark(HC_READ_A);
         {
             let v = &self.venues[dev];
             let rc = v.r_chunk.as_ref().expect("checked by the caller");
-            let ws = &self.hc_chunk_ws[wi];
+            let ws = &self.hc_chunk_ws[dev][wi];
             let pf = v.pf.as_ref().expect("the merged prefill scratch");
             let gather: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
                 .map(|i| (rc, i as u64 * hb, &v.r_slots[i], 0, hb))
@@ -3889,7 +3898,7 @@ impl<'m> Session<'m> {
         self.timers.mark(HC_WRITE_A);
         let v = &self.venues[dev];
         let rc = v.r_chunk.as_ref().expect("checked by the caller");
-        let ws = &self.hc_chunk_ws[wi];
+        let ws = &self.hc_chunk_ws[dev][wi];
         let pf = v.pf.as_ref().expect("the merged prefill scratch");
         v.hc.write(ws, rc, &pf.out, rc)?;
         hc_read_ws(v, ws, &m.layers[b].hc_ffn, rc)?;
@@ -3931,7 +3940,7 @@ impl<'m> Session<'m> {
             self.swap_r_in(dev, i);
             res?;
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
-                if pf_on("BRECCIA_PF_OVERLAP", self.model.devices.len()) {
+                if self.pf[dev][PF_OVERLAP] {
                     self.reopen_batch(dev)?;
                 } else {
                     self.flush()?;
@@ -3950,15 +3959,15 @@ impl<'m> Session<'m> {
         if pos0 + t > cap {
             bail!("block {b}: a chunk ending at {} needs more than the cache's {cap} KV cells", pos0 + t);
         }
-        if self.qsa_chunk_ws.is_none() {
+        if self.qsa_chunk_ws[dev].is_none() {
             let qsa = self.venues[dev]
                 .qsa
                 .as_ref()
                 .ok_or_else(|| anyhow!("device {dev} has no QSA pipelines"))?;
-            self.qsa_chunk_ws = Some(qsa.workspace(gpu, chunk, cap)?);
+            self.qsa_chunk_ws[dev] = Some(qsa.workspace(gpu, chunk, cap)?);
         }
         {
-            let ws = self.qsa_chunk_ws.as_mut().expect("made above");
+            let ws = self.qsa_chunk_ws[dev].as_mut().expect("made above");
             let n_blocks = (pos0 + t) / 4;
             ws.tokens = t;
             ws.n_blocks = n_blocks;
@@ -4008,7 +4017,7 @@ impl<'m> Session<'m> {
             w_out: &qw.out.buf,
         };
         let pf = v.pf.as_ref().expect("the merged prefill scratch");
-        let ws = self.qsa_chunk_ws.as_ref().expect("made above");
+        let ws = self.qsa_chunk_ws[dev].as_ref().expect("made above");
         qsa.forward(state, ws, &weights, &proj, &pf.mixed, &pf.out, pos0)
     }
 
@@ -4016,14 +4025,14 @@ impl<'m> Session<'m> {
     fn record_gdn_chunk(&mut self, b: usize, dev: usize, t: usize, chunk: usize) -> Result<()> {
         let m = self.model;
         let gpu = m.devices[dev].gpu();
-        if self.gdn_chunk_ws.is_none() {
+        if self.gdn_chunk_ws[dev].is_none() {
             let gdn = self.venues[dev]
                 .gdn
                 .as_ref()
                 .ok_or_else(|| anyhow!("device {dev} has no GDN pipelines"))?;
-            self.gdn_chunk_ws = Some(gdn.workspace(gpu, chunk)?);
+            self.gdn_chunk_ws[dev] = Some(gdn.workspace(gpu, chunk)?);
         }
-        self.gdn_chunk_ws.as_mut().expect("made above").tokens = t;
+        self.gdn_chunk_ws[dev].as_mut().expect("made above").tokens = t;
         let gw = m.layers[b]
             .gdn
             .as_ref()
@@ -4071,7 +4080,7 @@ impl<'m> Session<'m> {
             .as_ref()
             .ok_or_else(|| anyhow!("block {b} has no GDN state"))?;
         let pf = v.pf.as_ref().expect("the merged prefill scratch");
-        let ws = self.gdn_chunk_ws.as_ref().expect("made above");
+        let ws = self.gdn_chunk_ws[dev].as_ref().expect("made above");
         gdn.forward(state, ws, &weights, &proj, &pf.mixed, &pf.out)
     }
 
@@ -4655,18 +4664,20 @@ impl Drop for Session<'_> {
                 }
             }
         }
-        if let Some(ws) = self.qsa_chunk_ws.take() {
-            if let Some(qsa) = self.venues[0].qsa.as_ref() {
-                qsa.release(m.devices[0].gpu(), ws);
+        for (dev, ws) in self.qsa_chunk_ws.iter_mut().enumerate() {
+            if let (Some(ws), Some(qsa)) = (ws.take(), self.venues[dev].qsa.as_ref()) {
+                qsa.release(m.devices[dev].gpu(), ws);
             }
         }
-        if let Some(ws) = self.gdn_chunk_ws.take() {
-            if let Some(gdn) = self.venues[0].gdn.as_ref() {
-                gdn.release(m.devices[0].gpu(), ws);
+        for (dev, ws) in self.gdn_chunk_ws.iter_mut().enumerate() {
+            if let (Some(ws), Some(gdn)) = (ws.take(), self.venues[dev].gdn.as_ref()) {
+                gdn.release(m.devices[dev].gpu(), ws);
             }
         }
-        for ws in self.hc_chunk_ws.drain(..) {
-            self.venues[0].hc.release(m.devices[0].gpu(), ws);
+        for (dev, list) in self.hc_chunk_ws.iter_mut().enumerate() {
+            for ws in list.drain(..) {
+                self.venues[dev].hc.release(m.devices[dev].gpu(), ws);
+            }
         }
         for (b, ws) in self.qsa_ws.iter_mut().enumerate() {
             if let Some(ws) = ws.take() {
@@ -4834,14 +4845,50 @@ pub fn prefill_plan(len: usize, target: usize) -> Vec<usize> {
     (0..n).map(|i| base + usize::from(i < rem)).collect()
 }
 
-/// A merged-prefill optimisation flag (`BRECCIA_PF_*`): on unless set to `0`
-/// (all five pass the 1k/4k KL gate, plan §11d). Single-device only by default:
-/// the chunk workspaces are made on one device and released on device 0.
-fn pf_on(name: &str, devices: usize) -> bool {
-    match std::env::var_os(name) {
-        Some(v) => v != "0",
-        None => devices == 1,
-    }
+/// The merged-prefill optimisation flags, in [`Session::pf`] order.
+pub const PF_FLAGS: [&str; 5] = [
+    "BRECCIA_PF_OVERLAP",
+    "BRECCIA_PF_SHCHUNK",
+    "BRECCIA_PF_QSACHUNK",
+    "BRECCIA_PF_GDNCHUNK",
+    "BRECCIA_PF_HCCHUNK",
+];
+const PF_OVERLAP: usize = 0;
+const PF_SHCHUNK: usize = 1;
+const PF_QSACHUNK: usize = 2;
+const PF_GDNCHUNK: usize = 3;
+const PF_HCCHUNK: usize = 4;
+
+/// Each device's merged-prefill flags, resolved once per session. The env wins
+/// (`=0` off, anything else on); else the card's `breccia profile --prefill`
+/// verdict when it was measured with this driver and these shaders; else on (all
+/// five pass the 1k/4k KL gate on RX and MI50, plan §11d). A stale verdict turns
+/// them off until the check re-runs: a new driver or shader is exactly what it is for.
+fn pf_resolve(m: &Model) -> Vec<[bool; 5]> {
+    m.devices
+        .iter()
+        .zip(&m.pf_verdicts)
+        .map(|(d, v)| {
+            let current = v.as_ref().filter(|v| {
+                v.driver_version == d.info.driver && v.spirv_hash == breccia_kernels::SPIRV_HASH
+            });
+            if v.is_some() && current.is_none() {
+                eprintln!(
+                    "breccia: {} ({}): the prefill verdict is stale (driver or shaders \
+                     changed); merged-prefill flags off until `breccia profile --prefill \
+                     --model ...` re-runs",
+                    d.info.name, d.info.pci_address
+                );
+            }
+            std::array::from_fn(|i| match std::env::var_os(PF_FLAGS[i]) {
+                Some(x) => x != "0",
+                None => v.is_none()
+                    || current
+                        .and_then(|c| c.flags.iter().find(|f| f.name == PF_FLAGS[i]))
+                        .is_some_and(|f| f.on),
+            })
+        })
+        .collect()
 }
 
 fn hc_read(v: &Venue<'_>, w: &HcW, r: &Buf) -> Result<()> {

@@ -151,6 +151,7 @@ pub fn build_profile(
                 role: decision.role,
                 role_reason: decision.reason,
                 role_notes: decision.notes,
+                prefill: None,
             }
         })
         .collect();

@@ -260,6 +260,28 @@ fn main() {
             );
         }
     }
+
+    spirv_hash(&out_dir);
+}
+
+/// FNV-1a 64 over every module in `OUT_DIR`, in file-name order, exported as
+/// `BRECCIA_SPIRV_HASH`: the shader half of a `breccia profile --prefill` verdict's
+/// staleness key (a shader edit re-asks the per-GPU question; a Rust-only rebuild
+/// does not).
+fn spirv_hash(out_dir: &Path) {
+    let mut names: Vec<PathBuf> = std::fs::read_dir(out_dir)
+        .expect("OUT_DIR readable")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "spv"))
+        .collect();
+    names.sort();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for p in &names {
+        for b in p.file_name().unwrap().as_encoded_bytes().iter().chain(&std::fs::read(p).expect("a compiled module")) {
+            h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    println!("cargo:rustc-env=BRECCIA_SPIRV_HASH={h:016x}");
 }
 
 /// QSA stems that get the q8_0 **V**-cache build (`BRECCIA_KV_Q8V`, §8bg): the

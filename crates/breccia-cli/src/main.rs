@@ -62,6 +62,17 @@ enum Command {
         /// Print the hardware fingerprint (BLAKE3) and exit
         #[arg(long)]
         print_fingerprint: bool,
+        /// One-time per-GPU prefill discovery: A/B the merged-prefill flags
+        /// (`BRECCIA_PF_*`) on each discrete GPU and store the verdict the engine
+        /// uses as their default. Re-run after a driver or shader change.
+        #[arg(long)]
+        prefill: bool,
+        /// Model for `--prefill` (shard glob or path)
+        #[arg(long, value_name = "GLOB", default_value = DEFAULT_MODEL_GLOB)]
+        model: String,
+        /// PCI address(es) for `--prefill` (default: every discrete GPU in the profile)
+        #[arg(long, value_name = "PCI")]
+        devices: Vec<String>,
     },
     /// Phase 2: OpenAI-compatible agent server (parsing surface present now)
     Serve {
@@ -412,12 +423,18 @@ fn run(cli: Cli) -> Result<()> {
             json,
             dry_run_plan,
             print_fingerprint,
+            prefill,
+            model,
+            devices,
         } => profile(ProfileArgs {
             reprofile,
             quick,
             json,
             dry_run_plan,
             print_fingerprint,
+            prefill,
+            model,
+            devices,
         }),
         Command::Serve { dry_run_plan, args } => serve(dry_run_plan, args),
         Command::Bench { kind: None } => {
@@ -652,6 +669,9 @@ struct ProfileArgs {
     json: Option<PathBuf>,
     dry_run_plan: bool,
     print_fingerprint: bool,
+    prefill: bool,
+    model: String,
+    devices: Vec<String>,
 }
 
 fn profile(a: ProfileArgs) -> Result<()> {
@@ -682,6 +702,9 @@ fn profile(a: ProfileArgs) -> Result<()> {
                     "cached profile reused (fingerprint match): {}",
                     path.display()
                 );
+                if a.prefill && !a.dry_run_plan {
+                    return profile_prefill(&path, &a.model, &a.devices);
+                }
                 return Ok(());
             }
         }
@@ -692,8 +715,19 @@ fn profile(a: ProfileArgs) -> Result<()> {
         "calibrating hardware profile ({} mode)…",
         if a.quick { "quick" } else { "full" }
     );
-    let profile =
+    let mut profile =
         breccia_profile::calibrate(a.quick).context("calibration failed (Vulkan benchmarks)")?;
+    // A recalibration keeps each GPU's prefill verdict; its own staleness check
+    // (driver + shader hash) decides whether it still applies.
+    if let Ok(Some(old)) = breccia_profile::load_profile(&path) {
+        for e in &mut profile.devices {
+            e.prefill = old
+                .devices
+                .iter()
+                .find(|o| same_pci(&o.identity.pci_address, &e.identity.pci_address))
+                .and_then(|o| o.prefill.clone());
+        }
+    }
 
     if a.dry_run_plan {
         print!("{}", breccia_profile::plan::plan_text(&profile, None));
@@ -704,6 +738,165 @@ fn profile(a: ProfileArgs) -> Result<()> {
     breccia_profile::save_profile(&profile, &path)?;
     print!("{}", breccia_profile::summary_text(&profile));
     println!("wrote {}", path.display());
+    if a.prefill {
+        return profile_prefill(&path, &a.model, &a.devices);
+    }
+    Ok(())
+}
+
+fn same_pci(a: &str, b: &str) -> bool {
+    !a.is_empty() && breccia_vk::pci::normalize_address(a) == breccia_vk::pci::normalize_address(b)
+}
+
+/// KL(p || q) over two logit vectors (softmax each), in nats.
+fn logits_kl(p: &[f32], q: &[f32]) -> f64 {
+    let lsm = |x: &[f32]| {
+        let m = x.iter().fold(f32::MIN, |a, &b| a.max(b)) as f64;
+        let z = x.iter().map(|&v| (v as f64 - m).exp()).sum::<f64>().ln() + m;
+        x.iter().map(move |&v| v as f64 - z).collect::<Vec<f64>>()
+    };
+    let (lp, lq) = (lsm(p), lsm(q));
+    lp.iter().zip(&lq).map(|(a, b)| a.exp() * (a - b)).sum()
+}
+
+fn argmax(x: &[f32]) -> usize {
+    (0..x.len()).fold(0, |b, i| if x[i] > x[b] { i } else { b })
+}
+
+/// `breccia profile --prefill`: per discrete GPU, A/B the merged-prefill flags
+/// in-process and store a verdict in the profile (`DeviceEntry.prefill`).
+///
+/// Arms on a 701-token synthetic prompt (one 512 chunk + a ragged 189, so both
+/// the full and a ragged T run through every chunked kernel): per-token reference,
+/// all flags off, all on, and all on minus each flag. A flag stays on when the
+/// all-on arm matches the per-token reference (KL <= 1e-3, or no worse than
+/// all-off, and the same top-1) and dropping it does not make prefill faster.
+fn profile_prefill(path: &std::path::Path, model_glob: &str, devices: &[String]) -> Result<()> {
+    use breccia_engine::graph::PF_FLAGS;
+    const CHUNK: usize = 512;
+    let mut prof = breccia_profile::load_profile(path)?
+        .with_context(|| format!("no hardware profile at {}", path.display()))?;
+    let targets: Vec<String> = if devices.is_empty() {
+        prof.devices
+            .iter()
+            .filter(|e| e.identity.device_type == "DISCRETE_GPU" && !e.identity.pci_address.is_empty())
+            .map(|e| e.identity.pci_address.clone())
+            .collect()
+    } else {
+        devices.to_vec()
+    };
+    if targets.is_empty() {
+        anyhow::bail!("no discrete GPU in {} (pass --devices PCI)", path.display());
+    }
+    for addr in targets {
+        println!("prefill discovery on {addr} ({model_glob})");
+        let model = breccia_engine::Model::load(
+            model_glob,
+            &breccia_engine::LoadOptions {
+                devices: vec![addr.clone()],
+                ctx_capacity: 1024,
+                profile: Some(path.to_path_buf()),
+                verbose: false,
+                ..Default::default()
+            },
+        )
+        .with_context(|| format!("loading the model on {addr}"))?;
+        breccia_engine::graph::assert_head(&model)?;
+        let prompt = synthetic_prefix(
+            &[760, 13017, 1433, 364, 279, 5447],
+            701,
+            0x5eed,
+            model.cfg.vocab as u32,
+        );
+        let mut sess = breccia_engine::Session::new(
+            &model,
+            &breccia_engine::SessionCfg {
+                ctx_capacity: 1024,
+                threads: 0,
+                timers: false,
+                batching: true,
+                inbatch_read: true,
+                prefill_chunk: CHUNK,
+                prefill_merged: true,
+                probe: false,
+                pool: None,
+            },
+        )?;
+        // One arm: (best of two wall times in ms, last-token logits).
+        let arm = |sess: &mut breccia_engine::Session<'_>, pf: [bool; 5], chunk: usize, reps: usize| {
+            sess.pf[0] = pf;
+            let mut best = f64::MAX;
+            let mut logits = Vec::new();
+            for _ in 0..reps {
+                let t = std::time::Instant::now();
+                logits = feed_prompt(sess, &prompt, chunk)?;
+                best = best.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            anyhow::Ok((best, logits))
+        };
+        let (_, reference) = arm(&mut sess, [false; 5], 0, 1)?;
+        arm(&mut sess, [true; 5], CHUNK, 1)?; // warm-up: pipelines, workspaces
+        let (off_ms, off) = arm(&mut sess, [false; 5], CHUNK, 2)?;
+        let (on_ms, on) = arm(&mut sess, [true; 5], CHUNK, 2)?;
+        let top = argmax(&reference);
+        let kl_off = logits_kl(&reference, &off);
+        let kl_on = logits_kl(&reference, &on);
+        let on_ok = argmax(&on) == top && (kl_on <= 1e-3 || kl_on <= kl_off * 1.1);
+        println!(
+            "  per-token ref top-1 {top}; all-off {off_ms:.0} ms KL {kl_off:.2e}; \
+             all-on {on_ms:.0} ms KL {kl_on:.2e} top-1 {}",
+            if argmax(&on) == top { "same" } else { "DIFFERENT" }
+        );
+        let mut flags = Vec::new();
+        for (i, name) in PF_FLAGS.iter().enumerate() {
+            let mut pf = [true; 5];
+            pf[i] = false;
+            let (ms, lg) = arm(&mut sess, pf, CHUNK, 2)?;
+            let kl = logits_kl(&reference, &lg);
+            let (on, reason) = if !on_ok {
+                (false, "all-on arm failed parity".to_string())
+            } else if on_ms > ms * 1.02 {
+                (false, format!("slower: {on_ms:.0} ms with vs {ms:.0} ms without"))
+            } else {
+                (true, format!("{on_ms:.0} ms with vs {ms:.0} ms without"))
+            };
+            println!("  {name:<20} {} ({reason}; KL without {kl:.2e})", if on { "on " } else { "OFF" });
+            flags.push(breccia_profile::schema::PrefillFlag {
+                name: name.to_string(),
+                on,
+                kl,
+                top1_same: argmax(&lg) == top,
+                ms_without: ms / prompt.len() as f64,
+                reason,
+            });
+        }
+        let verdict = breccia_profile::schema::PrefillVerdict {
+            driver_version: model.devices[0].info.driver.clone(),
+            spirv_hash: breccia_kernels::SPIRV_HASH.to_string(),
+            timestamp: breccia_profile::schema::iso8601(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
+            model: model_glob.to_string(),
+            tokens: prompt.len(),
+            chunk: CHUNK,
+            off_ms: off_ms / prompt.len() as f64,
+            on_ms: on_ms / prompt.len() as f64,
+            flags,
+        };
+        drop(sess);
+        drop(model);
+        let entry = prof
+            .devices
+            .iter_mut()
+            .find(|e| same_pci(&e.identity.pci_address, &addr))
+            .with_context(|| format!("{addr} is not in {}", path.display()))?;
+        entry.prefill = Some(verdict);
+        // Saved per device, so a crash on the second GPU keeps the first verdict.
+        breccia_profile::save_profile(&prof, path)?;
+        println!("  verdict stored in {}", path.display());
+    }
     Ok(())
 }
 

@@ -41,6 +41,43 @@ pub struct DeviceEntry {
     pub role: DeviceRole,
     pub role_reason: String,
     pub role_notes: Vec<String>,
+    /// `breccia profile --prefill`: which merged-prefill flags this card runs
+    /// correctly *and* faster. Optional and additive (older readers ignore it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefill: Option<PrefillVerdict>,
+}
+
+/// One card's merged-prefill discovery result. Stale (and so not trusted) when
+/// the driver or the compiled shaders differ from the ones it was measured with.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PrefillVerdict {
+    pub driver_version: String,
+    /// `breccia_kernels::SPIRV_HASH` of the build that measured it.
+    pub spirv_hash: String,
+    pub timestamp: String,
+    /// The model the check ran (the flags are model-shape specific).
+    pub model: String,
+    /// Prompt length and chunk of the check (one full chunk + a ragged one).
+    pub tokens: usize,
+    pub chunk: usize,
+    /// ms per prompt token, every flag off / every flag on.
+    pub off_ms: f64,
+    pub on_ms: f64,
+    pub flags: Vec<PrefillFlag>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PrefillFlag {
+    /// `BRECCIA_PF_*` name.
+    pub name: String,
+    /// The engine's default for this card: correct and not slower.
+    pub on: bool,
+    /// KL(per-token reference || all-on-but-this) and top-1 agreement, ms/token
+    /// with this flag left out.
+    pub kl: f64,
+    pub top1_same: bool,
+    pub ms_without: f64,
+    pub reason: String,
 }
 
 /// Backend-neutral device identity (the seam a HIP backend fills from
@@ -229,6 +266,7 @@ mod tests {
                 role: crate::role::DeviceRole::StreamingCompute,
                 role_reason: "test".into(),
                 role_notes: vec!["note".into()],
+                prefill: None,
             }],
             host: HostInfo {
                 hostname: "host".into(),

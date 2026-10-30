@@ -60,6 +60,9 @@ pub mod reference;
 pub(crate) mod tables;
 
 pub use batch::{GemvBatch, XLayout};
+
+/// Hash of every compiled SPIR-V module in this build (see `build.rs`).
+pub const SPIRV_HASH: &str = env!("BRECCIA_SPIRV_HASH");
 pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
 pub use dispatch_batch as batch_cmd;

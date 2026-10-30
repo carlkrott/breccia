@@ -369,6 +369,7 @@ mod tests {
             role: d.role,
             role_reason: d.reason,
             role_notes: d.notes,
+            prefill: None,
         }
     }
 

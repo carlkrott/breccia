@@ -298,6 +298,8 @@ pub struct Model {
     /// The arena decision (rule, budget source, chosen set) for the report.
     pub arena: Option<ArenaReport>,
     pub stats: LoadStats,
+    /// Per device, its `breccia profile --prefill` verdict (matched by PCI address).
+    pub pf_verdicts: Vec<Option<breccia_profile::schema::PrefillVerdict>>,
     /// Distinct pipelines the graph will need, discovered at load.
     pub keys: BTreeSet<PipeKey>,
 }
@@ -433,7 +435,9 @@ impl Model {
         // last block's. `Auto` reads the profile's compute role (see `crate::head`),
         // an ordinal indexes `--devices`, and a PCI address indexes identity.
         let last_dev = placement.device_of(cfg.n_layers - 1);
-        let candidates = head_candidates(&devices, opts.profile.as_deref(), opts.verbose);
+        let entries = profile_entries(&devices, opts.profile.as_deref(), opts.verbose);
+        let candidates = head_candidates(&devices, &entries);
+        let pf_verdicts = entries.iter().map(|e| e.as_ref().and_then(|e| e.prefill.clone())).collect();
         let mut head_choice = head::resolve(&opts.head_device, &candidates, last_dev)?;
         // **The device-crossing hand-off is removed, not disabled.** It produced a
         // wrong greedy sequence in 2 of 16 exclusive processes (`scripts/
@@ -1037,6 +1041,7 @@ impl Model {
             imported_experts,
             arena: arena_report,
             stats,
+            pf_verdicts,
             keys,
         })
     }
@@ -1544,18 +1549,17 @@ fn hc_weights(gpu: &Gpu, shards: &ShardSet, block: usize, half: &str) -> Result<
     })
 }
 
-/// The devices of this placement, annotated with whatever the hardware profile
-/// measured about them.
+/// Each device's hardware-profile entry, if the profile covers it.
 ///
 /// Matching is by **PCI address**, never by enumeration ordinal: the profile's
 /// index is its own backend's, and this engine's device order is whatever
-/// `--devices` said. A card the profile does not cover keeps `role: None`, which
-/// makes the `auto` rule fall back to the historical answer instead of guessing.
-fn head_candidates(
+/// `--devices` said. A card the profile does not cover gets `None`, which makes
+/// the `auto` head rule fall back to the historical answer instead of guessing.
+fn profile_entries(
     devices: &[Device],
     profile: Option<&std::path::Path>,
     verbose: bool,
-) -> Vec<HeadCandidate> {
+) -> Vec<Option<breccia_profile::schema::DeviceEntry>> {
     let path = match profile {
         Some(p) => Some(p.to_path_buf()),
         None => Some(breccia_profile::default_profile_path()),
@@ -1584,14 +1588,27 @@ fn head_candidates(
                     d.info.name, d.info.pci_address
                 );
             }
-            HeadCandidate {
-                pci: d.info.pci_address.clone(),
-                name: d.info.name.clone(),
-                role: entry.map(|e| e.role),
-                fp32_gflops: entry
-                    .and_then(|e| e.measurements.compute.as_ref())
-                    .map(|c| c.fp32_gflops),
-            }
+            entry.cloned()
+        })
+        .collect()
+}
+
+/// The devices of this placement, annotated with what the profile measured.
+fn head_candidates(
+    devices: &[Device],
+    entries: &[Option<breccia_profile::schema::DeviceEntry>],
+) -> Vec<HeadCandidate> {
+    devices
+        .iter()
+        .zip(entries)
+        .map(|(d, entry)| HeadCandidate {
+            pci: d.info.pci_address.clone(),
+            name: d.info.name.clone(),
+            role: entry.as_ref().map(|e| e.role),
+            fp32_gflops: entry
+                .as_ref()
+                .and_then(|e| e.measurements.compute.as_ref())
+                .map(|c| c.fp32_gflops),
         })
         .collect()
 }
