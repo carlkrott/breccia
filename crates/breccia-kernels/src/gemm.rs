@@ -27,20 +27,38 @@ pub struct GemmMany<'g> {
     kernel: breccia_vk::ctx::Kernel,
     /// The int8-dot variant (q8_1 activations, §11j), for the types that have one.
     q8: Option<breccia_vk::ctx::Kernel>,
-    /// Users per z slice (1..=USERS_MAX): fewer = more workgroups per dispatch.
-    upz: usize,
+    /// Forced users per z slice (1..=USERS_MAX); `None` = [`upz_for`] per dispatch.
+    upz: Option<usize>,
     tables: Buf,
 }
 
-/// `BRECCIA_GEMM_UPZ` (1..=8), the default users per z slice.
-fn default_upz() -> usize {
-    static UPZ: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// `BRECCIA_GEMM_UPZ` (1..=8) forces the users per z slice (A/B only).
+fn default_upz() -> Option<usize> {
+    static UPZ: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *UPZ.get_or_init(|| {
         std::env::var("BRECCIA_GEMM_UPZ")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .map_or(USERS_MAX, |n: usize| n.clamp(1, USERS_MAX))
+            .map(|n: usize| n.clamp(1, USERS_MAX))
     })
+}
+
+/// Workgroups a dispatch should reach before users share a z slice.
+// shortcut: 320 = 4 WGs per CU on the RX's 80 CUs (MI50 has 60); per-device
+// target if MI50 numbers disagree.
+const WG_TARGET: usize = 320;
+
+/// Users per z slice: `USERS_MAX` when rows x slices already fill the GPU, else
+/// the largest split that reaches [`WG_TARGET`], floor 2. A 640-row expert
+/// GEMM at 8 users gets 2 (1.9x, per-user bits unchanged); down (2560 rows)
+/// and wide dense GEMMs keep 8.
+fn upz_for(rows: usize, users: usize) -> usize {
+    let groups = rows.div_ceil(ROWS_PER_WG).max(1);
+    // Powers of two only: 16 users at 5 per slice would leave a 1-user slice.
+    [USERS_MAX, 4, 2]
+        .into_iter()
+        .find(|&z| groups * users.max(1).div_ceil(z) >= WG_TARGET)
+        .unwrap_or(2)
 }
 
 impl<'g> GemmMany<'g> {
@@ -106,9 +124,13 @@ impl<'g> GemmMany<'g> {
         self.ty
     }
 
-    /// Users per z slice (clamped to 1..=USERS_MAX); see [`default_upz`].
-    pub fn set_users_per_z(&mut self, n: usize) {
-        self.upz = n.clamp(1, USERS_MAX);
+    /// Force the users per z slice (clamped to 1..=USERS_MAX); `None` = adaptive.
+    pub fn set_users_per_z(&mut self, n: Option<usize>) {
+        self.upz = n.map(|n| n.clamp(1, USERS_MAX));
+    }
+
+    fn upz(&self, rows: usize, users: usize) -> usize {
+        self.upz.unwrap_or_else(|| upz_for(rows, users))
     }
 
     /// Whether [`GemmMany::run_at_q8`] exists for this type.
@@ -135,7 +157,7 @@ impl<'g> GemmMany<'g> {
         pc[8..12].copy_from_slice(&(bpr as u32).to_le_bytes());
         pc[12..16].copy_from_slice(&(users as u32).to_le_bytes());
         pc[16..20].copy_from_slice(&base_words.to_le_bytes());
-        pc[20..24].copy_from_slice(&(self.upz as u32).to_le_bytes());
+        pc[20..24].copy_from_slice(&(self.upz(rows, users) as u32).to_le_bytes());
         pc
     }
 
@@ -227,7 +249,7 @@ impl<'g> GemmMany<'g> {
         let gx = groups.min(WG_X_MAX);
         let gy = groups.div_ceil(WG_X_MAX);
         // One z slice of the dispatch per `upz` users.
-        let gz = users.div_ceil(self.upz) as u32;
+        let gz = users.div_ceil(self.upz(rows, users)) as u32;
         // Inside a dispatch batch the dispatch is **recorded** (the same rule
         // `Pipe::run`, `Gemv::run` and `GemvBatch::run` follow): a chunked prefill
         // records ~200 expert groups per block, and one submit+wait each would be
@@ -306,7 +328,7 @@ impl<'g> GemmMany<'g> {
         let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
         let gx = groups.min(WG_X_MAX);
         let gy = groups.div_ceil(WG_X_MAX);
-        let gz = users.div_ceil(self.upz) as u32;
+        let gz = users.div_ceil(self.upz(rows, users)) as u32;
         let t = self
             .gpu
             .run_timed(Qc::C, target_s, |d, cmd, n| {
@@ -355,5 +377,20 @@ impl Drop for GemmMany<'_> {
             self.gpu.destroy_kernel(k);
         }
         self.gpu.destroy_buf(&self.tables);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn upz_splits_only_narrow_dispatches() {
+        use super::upz_for;
+        // 640-row expert gate/up: 80 WGs per slice.
+        assert_eq!(upz_for(640, 8), 2);
+        assert_eq!(upz_for(640, 16), 4);
+        assert_eq!(upz_for(640, 1), 2);
+        // down (2560 rows) and a 1024-token dense chunk keep USERS_MAX.
+        assert_eq!(upz_for(2560, 8), 8);
+        assert_eq!(upz_for(640, 1024), 8);
     }
 }

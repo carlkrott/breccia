@@ -480,7 +480,7 @@ fn q8_gemm_tracks_the_fp32_gemm() {
     let gpu = &dev.gpu;
     let (rows, cols) = (plan.n_ff, plan.n_embd);
     let mut gemm = GemmMany::new(gpu, want_ty).expect("gemm pipeline");
-    gemm.set_users_per_z(USERS_MAX);
+    gemm.set_users_per_z(Some(USERS_MAX));
     assert!(gemm.has_q8());
     let quant = breccia_kernels::Q8Quantize::new(gpu).expect("quantiser");
     let slices = plan.slices(&set, 7).expect("slices");
@@ -511,7 +511,7 @@ fn q8_gemm_tracks_the_fp32_gemm() {
     }
     let rel = (num / den).sqrt();
     let mut same_bits = true;
-    for m in [1usize, 2, 4, 8, 12, 16] {
+    for m in [1usize, 2, 4, 6, 8, 12, 16] {
         gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, m, 0).expect("q8 gemm");
         let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("download");
         same_bits &= got.iter().zip(&full).all(|(a, b)| a.to_bits() == b.to_bits());
@@ -529,9 +529,10 @@ fn q8_gemm_tracks_the_fp32_gemm() {
     }
     // Users per z slice: more, smaller slices = more workgroups. Results must
     // not change (each user's accumulation is independent of the slicing).
-    for upz in [1usize, 2, 4, 8] {
+    // `None` = the adaptive per-dispatch choice.
+    for upz in [Some(1usize), Some(2), Some(4), Some(8), None] {
         gemm.set_users_per_z(upz);
-        for m in [8usize, 16] {
+        for m in [2usize, 4, 6, 8, 16] {
             gemm.run(&w, &x, &out, rows, cols, m).expect("fp32 gemm");
             let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("download");
             same_bits &= got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits());
@@ -543,7 +544,7 @@ fn q8_gemm_tracks_the_fp32_gemm() {
                 .run_timed_q8(&w, &xq, &xd, &out, rows, cols, m, 0.2)
                 .expect("timed q8");
             println!(
-                "{} gate upz = {upz} m = {m}: fp32 {:.1} us, q8 {:.1} us",
+                "{} gate upz = {upz:?} m = {m}: fp32 {:.1} us, q8 {:.1} us",
                 want_ty.name(),
                 tf.per_iter_s * 1e6,
                 tq.per_iter_s * 1e6
