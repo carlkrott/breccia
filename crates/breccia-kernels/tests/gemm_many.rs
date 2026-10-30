@@ -757,8 +757,15 @@ fn tiled_gemm_matches_plain() {
     base.set_tile(None);
     base.set_variant(1, 8);
     let tiles = [(4usize, 4usize), (8, 4), (8, 8)];
-    // (users, cols): the two timed shapes, then ragged columns.
-    for (m, c) in [(37usize, cols), (1024, cols), (37, cols - 103), (70, cols - 100)] {
+    // (users, cols, rows): the two timed shapes, then a ragged K tail (`cols % QK != 0`,
+    // still `% 4 == 0`: the plain kernel's vec4 X loads need that) and partial row / user tiles.
+    let full_rows = rows;
+    for (m, c, rows) in [
+        (37usize, cols, full_rows),
+        (1024, cols, full_rows),
+        (37, cols - 100, full_rows),
+        (70, cols - 100, full_rows - 5),
+    ] {
         let flat: Vec<f32> = (0..m * c)
             .map(|i| (((i * 7 + (i / c) * 13) % 29) as f32 - 14.0) * 0.011)
             .collect();
