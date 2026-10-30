@@ -601,6 +601,83 @@ fn hc_gated_fusion_matches_the_separate_path() {
     );
 }
 
+/// A fused BF16 mixer at `T > 1` runs the separate gated-mean layout (the fusion
+/// is `T = 1` only), so `write` must sum that layout's partial count: a T-token
+/// read + write must match T single-token runs (the batched prefill HC chain).
+#[test]
+fn hc_fused_mixer_batched_matches_single_tokens() {
+    let fx = need_gpu!("hc");
+    let gpu = fx.dev.gpu();
+    // `BRECCIA_HC_T` overrides the token count (the engine's chunk is 512).
+    let tokens = std::env::var("BRECCIA_HC_T").ok().and_then(|v| v.parse().ok()).unwrap_or(3usize);
+    let (n_embd, hc, hc_lr) = (2560usize, 4usize, 320usize);
+    let hc_dim = hc * n_embd;
+    let bf16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    };
+    let gamma = normalish(0x1111, hc_dim)
+        .into_iter()
+        .map(|v| v.abs() + 0.5)
+        .collect::<Vec<f32>>();
+    let gbuf = ops::upload_f32(gpu, &gamma).expect("gamma");
+    let dbuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x2222, hc_lr * hc_dim)))
+        .expect("down");
+    let ubuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x3333, hc_dim * hc_lr)))
+        .expect("up");
+    let ibuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x4444, hc * hc_dim)))
+        .expect("inject");
+    let w = HcWeights {
+        norm: &gbuf,
+        down: &dbuf,
+        up: &ubuf,
+        inject: Some(&ibuf),
+    };
+    let r = normalish(0x5555, hc_dim * tokens);
+    let block = normalish(0x6666, n_embd * tokens);
+    let mixer = HcMixer::with_fusion(gpu, QuantType::Bf16, n_embd, hc, hc_lr, true, true)
+        .expect("mixer");
+    assert!(mixer.fused_gated(), "fusion must be on for this test");
+
+    // Batched.
+    let rbuf = ops::upload_f32(gpu, &r).expect("r");
+    let bbuf = ops::upload_f32(gpu, &block).expect("block");
+    let obuf = breccia_kernels::gemv::alloc(gpu, (hc_dim * tokens * 4) as u64).expect("out");
+    let ws = mixer.workspace(gpu, tokens).expect("workspace");
+    mixer.read(&ws, &rbuf, &w).expect("read");
+    let got_mixed = ops::download_f32(gpu, &ws.mixed, n_embd * tokens).expect("mixed");
+    mixer.write(&ws, &rbuf, &bbuf, &obuf).expect("write");
+    let got_out = ops::download_f32(gpu, &obuf, hc_dim * tokens).expect("out");
+    mixer.release(gpu, ws);
+
+    // One token at a time (the fused path).
+    let mut want_mixed = Vec::new();
+    let mut want_out = Vec::new();
+    for t in 0..tokens {
+        let rb = ops::upload_f32(gpu, &r[t * hc_dim..(t + 1) * hc_dim]).expect("r1");
+        let bb = ops::upload_f32(gpu, &block[t * n_embd..(t + 1) * n_embd]).expect("b1");
+        let ob = breccia_kernels::gemv::alloc(gpu, (hc_dim * 4) as u64).expect("o1");
+        let ws = mixer.workspace(gpu, 1).expect("ws1");
+        mixer.read(&ws, &rb, &w).expect("read1");
+        want_mixed.extend(ops::download_f32(gpu, &ws.mixed, n_embd).expect("m1"));
+        mixer.write(&ws, &rb, &bb, &ob).expect("write1");
+        want_out.extend(ops::download_f32(gpu, &ob, hc_dim).expect("o1"));
+        mixer.release(gpu, ws);
+        for b in [&rb, &bb, &ob] {
+            gpu.destroy_buf(b);
+        }
+    }
+    let mixed_rel = max_rel(&got_mixed, &as_f64(&want_mixed));
+    let out_rel = max_rel(&got_out, &as_f64(&want_out));
+    println!("hc fused batched T={tokens}: mixed {mixed_rel:.2e} write {out_rel:.2e}");
+    assert!(mixed_rel <= 1e-5, "mixed max rel {mixed_rel:e}");
+    assert!(out_rel <= 1e-5, "write max rel {out_rel:e}");
+    for b in [&gbuf, &dbuf, &ubuf, &ibuf, &rbuf, &bbuf, &obuf] {
+        gpu.destroy_buf(b);
+    }
+}
+
 #[test]
 fn hc_mixer_matches_the_cpu_reference() {
     let fx = need_gpu!("hc");

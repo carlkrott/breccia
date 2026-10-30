@@ -1524,6 +1524,7 @@ pub struct HcWeights<'a> {
 
 /// Per-batch HC scratch, allocated once per `T`.
 pub struct HcWorkspace {
+    /// Fixed at creation: `map_down`/`map_up` are laid out for exactly this `T`.
     pub tokens: usize,
     /// `[n_embd, hc, T]` the grouped RMSNorm output.
     pub xn: Buf,
@@ -1911,7 +1912,7 @@ impl<'g> HcMixer<'g> {
     /// [`HcWrite`]; this is the same arithmetic on the host, for tests and for a
     /// debug dump.
     pub fn inject_values(&self, gpu: &Gpu, ws: &HcWorkspace) -> Result<Vec<f32>> {
-        let chunks = self.gated_chunks().max(1);
+        let chunks = self.read_chunks(ws.tokens).max(1);
         let raw = download_f32(gpu, &ws.inject, ws.tokens * self.hc * chunks)?;
         let mut out = vec![0.0f32; ws.tokens * self.hc];
         for t in 0..ws.tokens {
@@ -2066,7 +2067,18 @@ impl<'g> HcMixer<'g> {
     /// `ws.tokens` tokens. Reads `ws.inject` from the last [`HcMixer::read`].
     pub fn write(&self, ws: &HcWorkspace, r: &Buf, block: &Buf, out: &Buf) -> Result<()> {
         self.write
-            .run(r, block, &ws.inject, out, ws.tokens, self.inject_chunks())
+            .run(r, block, &ws.inject, out, ws.tokens, self.read_chunks(ws.tokens))
+    }
+
+    /// The inject partial count [`HcMixer::read`] wrote for `tokens` tokens: the
+    /// fused `up`+gated kernel only runs at `t = 1`, so `t > 1` has the separate
+    /// gated-mean layout even when fusion is compiled.
+    pub fn read_chunks(&self, tokens: usize) -> usize {
+        if tokens == 1 {
+            self.inject_chunks()
+        } else {
+            self.gated_chunks()
+        }
     }
 
     /// Time a whole HC_READ (`ws.tokens` tokens) as one back-to-back sequence:

@@ -256,6 +256,8 @@ pub struct PfChunk {
     sh_g: Buf,
     sh_u: Buf,
     sh_a: Buf,
+    /// `[T, n_expert]` router logits of the batched pass-1 chain (`BRECCIA_PF_HCCHUNK`).
+    logits: Buf,
     /// **Streamed** (non-resident) experts: `STREAM_SLOTS` host-visible slots, each
     /// laid out `[gate | up | down]`, so one host memcpy per distinct expert
     /// replaces the lane's per-token dequantisation (§8x). The slot is copied to
@@ -299,6 +301,7 @@ impl PfChunk {
                 &self.sh_g,
                 &self.sh_u,
                 &self.sh_a,
+                &self.logits,
                 &self.stream.buf,
                 &self.sf_gate,
                 &self.sf_up,
@@ -325,6 +328,10 @@ impl PfChunk {
             &self.act,
             &self.down,
             &self.out,
+            &self.sh_g,
+            &self.sh_u,
+            &self.sh_a,
+            &self.logits,
             &self.sf_gate,
             &self.sf_up,
             &self.sf_down,
@@ -583,6 +590,10 @@ pub struct Session<'m> {
     /// the prelude's mixer then copies its row of `pf.out` instead of running.
     qsa_chunk_ws: Option<QsaWorkspace>,
     gdn_chunk_ws: Option<breccia_kernels::gdn::GdnWorkspace>,
+    /// `BRECCIA_PF_HCCHUNK`: the T-token HC workspaces over `r_chunk`, one per chunk
+    /// size (the batched GEMV row maps are built for an exact `T`).
+    // shortcut: one per distinct chunk size, freed at session end; cap it if long sessions vary T a lot.
+    hc_chunk_ws: Vec<HcWorkspace>,
     mixer_from_chunk: Option<usize>,
     /// Host seconds spent faulting PLE table rows in for the whole chunk.
     pf_ple_prefetch_s: f64,
@@ -923,6 +934,7 @@ impl<'m> Session<'m> {
                     sh_g: alloc(chunk as u64 * nsb, "prefill chunk shared gate")?,
                     sh_u: alloc(chunk as u64 * nsb, "prefill chunk shared up")?,
                     sh_a: alloc(chunk as u64 * nsb, "prefill chunk shared act")?,
+                    logits: alloc(chunk as u64 * mc.n_expert as u64 * 4, "prefill chunk router logits")?,
                     // Two halves, so the host fills one while the GPU copies the other.
                     stream: Mailbox::new(gpu, 2 * STREAM_SLOTS as u64 * slot_stride)?,
                     sf_gate: alloc(gb.max(16), "streamed expert gate")?,
@@ -1104,6 +1116,7 @@ impl<'m> Session<'m> {
             shared_deferred: false,
             qsa_chunk_ws: None,
             gdn_chunk_ws: None,
+            hc_chunk_ws: Vec::new(),
             mixer_from_chunk: None,
             pf_ple_prefetch_s: 0.0,
             sh_sub: [0.0; 6],
@@ -2884,11 +2897,11 @@ impl<'m> Session<'m> {
         let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
         let disp_before = self.dispatches;
         // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
-        let overlap = std::env::var_os("BRECCIA_PF_OVERLAP").is_some();
+        let overlap = pf_on("BRECCIA_PF_OVERLAP");
 
         // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
         // The chunk-level shared expert needs a multi-user GEMM for all three roles.
-        let shared_chunk = std::env::var_os("BRECCIA_PF_SHCHUNK").is_some() && {
+        let shared_chunk = pf_on("BRECCIA_PF_SHCHUNK") && {
             let moe = &m.layers[b].moe;
             let pipes = &self.venues[dev].pipes;
             [&moe.gate, &moe.up, &moe.down]
@@ -2896,65 +2909,82 @@ impl<'m> Session<'m> {
                 .all(|w| pipes.gemm(w.key.ty).is_some())
         };
 
+        // shortcut: env knob, make it the default once the 1k/4k parity matrix passes.
+        // The whole pass-1 dense chain as T-token dispatches (`record_hc_chunk`).
+        let hc_chunk = shared_chunk
+            && pf_on("BRECCIA_PF_HCCHUNK")
+            && self.venues[dev].r_chunk.is_some()
+            && self.mixer_chunked(b, dev)
+            && {
+                let moe = &m.layers[b].moe;
+                let pipes = &self.venues[dev].pipes;
+                pipes.gemm(moe.router.key.ty).is_some()
+                    && pipes.gemm(moe.shexp_gate.key.ty).is_some()
+            };
+
         // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
         self.ensure_batch(dev)?;
         // The block's mixer for the whole chunk at once: every token's attn-mixed
         // row into `pf.mixed`, one T-token forward into `pf.out`; the per-token
         // prelude below recomputes HC_READ(attn) (its inject partials feed
         // HC_WRITE) and copies its `pf.out` row in place of the mixer.
-        if self.mixer_chunked(b, dev) {
-            self.record_mixer_chunk(b, dev, t, pos0)?;
-            self.mixer_from_chunk = Some(pos0);
-        }
-        self.shared_deferred = shared_chunk;
-        for i in 0..t {
-            self.swap_r_in(dev, i);
-            let prelude = self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace);
-            if let Err(e) = prelude {
-                self.shared_deferred = false;
-                self.mixer_from_chunk = None;
-                return Err(e);
+        if hc_chunk {
+            self.record_hc_chunk(b, dev, t, pos0)?;
+        } else {
+            if self.mixer_chunked(b, dev) {
+                self.record_mixer_chunk(b, dev, t, pos0, false)?;
+                self.mixer_from_chunk = Some(pos0);
             }
-            {
-                let v = &self.venues[dev];
-                let pf = v.pf.as_ref().expect("the merged prefill scratch");
-                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-                let kb = (k * 4) as u64;
-                let nb = (n_embd * 4) as u64;
-                let inject = (
-                    &v.inject_slots[i],
-                    0,
-                    &ws.inject,
-                    0,
-                    ((mc.hc * v.hc.inject_chunks() * 4) as u64).min(ws.inject.size),
-                );
-                // Six copies, one region array (and one barrier) per token. The
-                // ffn `HC_WRITE` moves to pass 2, so this token's inject partials
-                // (the last region) have to survive the rest of the chunk.
-                let mut regions = vec![
-                    (&pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb),
-                    (&pf.w, i as u64 * kb, &v.router_w, 0, kb),
-                    (&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb),
-                    (&pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4),
-                    inject,
-                ];
-                if !shared_chunk {
-                    regions.push((&pf.shared, i as u64 * nb, &v.sh, 0, nb));
+            self.shared_deferred = shared_chunk;
+            for i in 0..t {
+                self.swap_r_in(dev, i);
+                let prelude = self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace);
+                if let Err(e) = prelude {
+                    self.shared_deferred = false;
+                    self.mixer_from_chunk = None;
+                    return Err(e);
                 }
-                batch_cmd::record_copies(gpu, &regions)?;
-            }
-            self.swap_r_in(dev, i);
-            if batch_cmd::recorded() >= MERGED_BATCH_CAP {
-                if overlap {
-                    self.reopen_batch(dev)?;
-                } else {
-                    self.flush()?;
-                    self.ensure_batch(dev)?;
+                {
+                    let v = &self.venues[dev];
+                    let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                    let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                    let kb = (k * 4) as u64;
+                    let nb = (n_embd * 4) as u64;
+                    let inject = (
+                        &v.inject_slots[i],
+                        0,
+                        &ws.inject,
+                        0,
+                        ((mc.hc * v.hc.inject_chunks() * 4) as u64).min(ws.inject.size),
+                    );
+                    // Six copies, one region array (and one barrier) per token. The
+                    // ffn `HC_WRITE` moves to pass 2, so this token's inject partials
+                    // (the last region) have to survive the rest of the chunk.
+                    let mut regions = vec![
+                        (&pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb),
+                        (&pf.w, i as u64 * kb, &v.router_w, 0, kb),
+                        (&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb),
+                        (&pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4),
+                        inject,
+                    ];
+                    if !shared_chunk {
+                        regions.push((&pf.shared, i as u64 * nb, &v.sh, 0, nb));
+                    }
+                    batch_cmd::record_copies(gpu, &regions)?;
+                }
+                self.swap_r_in(dev, i);
+                if batch_cmd::recorded() >= MERGED_BATCH_CAP {
+                    if overlap {
+                        self.reopen_batch(dev)?;
+                    } else {
+                        self.flush()?;
+                        self.ensure_batch(dev)?;
+                    }
                 }
             }
+            self.shared_deferred = false;
+            self.mixer_from_chunk = None;
         }
-        self.shared_deferred = false;
-        self.mixer_from_chunk = None;
         // The shared expert for the whole chunk: one dispatch per role, `t` users
         // over `pf.mixed`; the down GEMM writes `pf.shared` in the fan-in's layout.
         if shared_chunk {
@@ -3196,7 +3226,25 @@ impl<'m> Session<'m> {
         // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
         self.timers.mark(HC_WRITE_F);
         self.ensure_batch(dev)?;
-        for i in 0..t {
+        if hc_chunk {
+            // One T-token HC_WRITE (the ffn inject partials are still in the chunk
+            // workspace), then the residual back into the per-token slots.
+            let v = &self.venues[dev];
+            let rc = v.r_chunk.as_ref().expect("checked above");
+            let ws = self
+                .hc_chunk_ws
+                .iter()
+                .find(|w| w.tokens == t)
+                .expect("made in pass 1");
+            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            v.hc.write(ws, rc, &pf.out, rc)?;
+            let hb = (mc.hc_dim() * 4) as u64;
+            let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
+                .map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb))
+                .collect();
+            batch_cmd::record_copies(gpu, &scatter)?;
+        }
+        for i in (0..t).filter(|_| !hc_chunk) {
             self.swap_r_in(dev, i);
             self.swap_inject_in(dev, i);
             let v = &self.venues[dev];
@@ -3779,13 +3827,13 @@ impl<'m> Session<'m> {
         // shortcut: env knobs, make them the default once the 1k/4k parity matrix passes.
         let lw = &self.model.layers[b];
         let ws: Vec<&crate::model::W> = match lw.kind {
-            LayerKind::Qsa if std::env::var_os("BRECCIA_PF_QSACHUNK").is_some() => {
+            LayerKind::Qsa if pf_on("BRECCIA_PF_QSACHUNK") => {
                 match lw.qsa.as_ref() {
                     Some(q) => vec![&q.q, &q.k, &q.v, &q.idx_q, &q.idx_k, &q.out],
                     None => return false,
                 }
             }
-            LayerKind::Gdn if std::env::var_os("BRECCIA_PF_GDNCHUNK").is_some() => {
+            LayerKind::Gdn if pf_on("BRECCIA_PF_GDNCHUNK") => {
                 match lw.gdn.as_ref() {
                     Some(g) => vec![&g.qkv, &g.z, &g.beta, &g.alpha, &g.beta_alpha, &g.out],
                     None => return false,
@@ -3797,9 +3845,64 @@ impl<'m> Session<'m> {
         ws.iter().all(|w| pipes.gemm(w.key.ty).is_some())
     }
 
+    /// Merged pass 1 with `BRECCIA_PF_HCCHUNK`: the dense chain as T-token
+    /// dispatches over `r_chunk` (HC_READ(attn), the chunked mixer, HC_WRITE(attn),
+    /// HC_READ(ffn), router, scalar shared gate) instead of ~20 dispatches per
+    /// token. The ffn inject partials stay in the chunk workspace for pass 2.
+    fn record_hc_chunk(&mut self, b: usize, dev: usize, t: usize, pos0: usize) -> Result<()> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let gpu = m.devices[dev].gpu();
+        let hb = (mc.hc_dim() * 4) as u64;
+        let tb = t as u64 * (mc.n_embd * 4) as u64;
+        let wi = match self.hc_chunk_ws.iter().position(|w| w.tokens == t) {
+            Some(i) => i,
+            None => {
+                let ws = self.venues[dev].hc.workspace(gpu, t)?;
+                self.hc_chunk_ws.push(ws);
+                self.hc_chunk_ws.len() - 1
+            }
+        };
+        self.timers.mark(HC_READ_A);
+        {
+            let v = &self.venues[dev];
+            let rc = v.r_chunk.as_ref().expect("checked by the caller");
+            let ws = &self.hc_chunk_ws[wi];
+            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            let gather: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
+                .map(|i| (rc, i as u64 * hb, &v.r_slots[i], 0, hb))
+                .collect();
+            batch_cmd::record_copies(gpu, &gather)?;
+            hc_read_ws(v, ws, &m.layers[b].hc_attn, rc)?;
+            batch_cmd::record_copies(gpu, &[(&pf.mixed, 0, &ws.mixed, 0, tb)])?;
+        }
+        self.record_mixer_chunk(b, dev, t, pos0, true)?;
+        self.timers.mark(HC_WRITE_A);
+        let v = &self.venues[dev];
+        let rc = v.r_chunk.as_ref().expect("checked by the caller");
+        let ws = &self.hc_chunk_ws[wi];
+        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        v.hc.write(ws, rc, &pf.out, rc)?;
+        hc_read_ws(v, ws, &m.layers[b].hc_ffn, rc)?;
+        batch_cmd::record_copies(gpu, &[(&pf.mixed, 0, &ws.mixed, 0, tb)])?;
+        let moe = &m.layers[b].moe;
+        let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked by the caller");
+        g(&moe.router).run(&moe.router.buf, &pf.mixed, &pf.logits, mc.n_expert, mc.n_embd, t)?;
+        v.router.run(&pf.logits, &pf.ids.buf, &pf.w, t)?;
+        g(&moe.shexp_gate).run(&moe.shexp_gate.buf, &pf.mixed, &pf.gate, 1, mc.n_embd, t)
+    }
+
     /// Merged pass 1: HC_READ(attn) per token into `pf.mixed`, then one
     /// `t`-token mixer forward (multi-user GEMM projections) into `pf.out`.
-    fn record_mixer_chunk(&mut self, b: usize, dev: usize, t: usize, pos0: usize) -> Result<()> {
+    /// With `hc_done` the caller already put the attn-mixed rows in `pf.mixed`.
+    fn record_mixer_chunk(
+        &mut self,
+        b: usize,
+        dev: usize,
+        t: usize,
+        pos0: usize,
+        hc_done: bool,
+    ) -> Result<()> {
         let m = self.model;
         let gpu = m.devices[dev].gpu();
         let nb = (m.cfg.n_embd * 4) as u64;
@@ -3808,7 +3911,7 @@ impl<'m> Session<'m> {
             .as_ref()
             .map_or(t, |pf| (pf.out.size / nb) as usize);
         self.timers.mark(HC_READ_A);
-        for i in 0..t {
+        for i in (0..t).filter(|_| !hc_done) {
             self.swap_r_in(dev, i);
             let v = &self.venues[dev];
             let res = hc_read(v, &m.layers[b].hc_attn, &v.r).and_then(|_| {
@@ -3819,7 +3922,7 @@ impl<'m> Session<'m> {
             self.swap_r_in(dev, i);
             res?;
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
-                if std::env::var_os("BRECCIA_PF_OVERLAP").is_some() {
+                if pf_on("BRECCIA_PF_OVERLAP") {
                     self.reopen_batch(dev)?;
                 } else {
                     self.flush()?;
@@ -4553,6 +4656,9 @@ impl Drop for Session<'_> {
                 gdn.release(m.devices[0].gpu(), ws);
             }
         }
+        for ws in self.hc_chunk_ws.drain(..) {
+            self.venues[0].hc.release(m.devices[0].gpu(), ws);
+        }
         for (b, ws) in self.qsa_ws.iter_mut().enumerate() {
             if let Some(ws) = ws.take() {
                 let dev = m.device_of(b);
@@ -4719,14 +4825,24 @@ pub fn prefill_plan(len: usize, target: usize) -> Vec<usize> {
     (0..n).map(|i| base + usize::from(i < rem)).collect()
 }
 
+/// A merged-prefill optimisation flag (`BRECCIA_PF_*`): on unless set to `0`
+/// (all five pass the 1k/4k KL gate, plan §11d).
+fn pf_on(name: &str) -> bool {
+    std::env::var_os(name).is_none_or(|v| v != "0")
+}
+
 fn hc_read(v: &Venue<'_>, w: &HcW, r: &Buf) -> Result<()> {
+    hc_read_ws(v, v.hc_ws.as_ref().expect("the session's hc workspace"), w, r)
+}
+
+/// [`hc_read`] on an explicit workspace (the T-token chunk one).
+fn hc_read_ws(v: &Venue<'_>, ws: &HcWorkspace, w: &HcW, r: &Buf) -> Result<()> {
     let hw = HcWeights {
         norm: &w.norm,
         down: &w.down.buf,
         up: &w.up.buf,
         inject: w.inject.as_ref(),
     };
-    let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
     v.hc.read(ws, r, &hw)
 }
 

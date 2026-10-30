@@ -355,7 +355,14 @@ fn dense_shared_expert_gemm_matches_the_gemv() {
     let mut found: Option<(String, usize, usize)> = None;
     'outer: for b in 0..48 {
         // BF16 lives in the QSA indexer projections, not the shared expert.
-        for name in ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "indexer.q_proj"] {
+        // `BRECCIA_GEMM_TENSOR` picks one role instead (the router shapes).
+        let names = match std::env::var("BRECCIA_GEMM_TENSOR") {
+            Ok(n) => vec![n],
+            Err(_) => ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "indexer.q_proj"]
+                .map(String::from)
+                .to_vec(),
+        };
+        for name in &names {
             let name = format!("blk.{b}.{name}.weight");
             let Some(t) = set.tensor(&name) else { continue };
             if QuantType::from_ggml(t.ty()) != Some(ty) {
