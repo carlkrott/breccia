@@ -8,18 +8,18 @@ Measurement caveats:
 - Rep 0 of every MTP bench has a cold plain baseline and is excluded from ratios.
 - "Bytes ==" means the dumped logits are byte-identical to the reference run. "Tokens ==" means greedy output is identical.
 
-## Current numbers (RX 6950 XT unless stated, 1k prompt, greedy)
+## Current numbers (RX 6950 XT unless stated, greedy, defaults on unless stated)
 
 | Metric | Value | Notes |
 |---|---|---|
-| Plain decode, single stream | 21.5-22.4 tok/s (about 46-49 ms/token) | ctx 256 |
-| Decode at 4k context | 48.76 ms/token (was 63.83) | split-K QSA apply + rank top-k |
-| Prefill, 1k prompt (plx: merged prefill, chunk 1024, MI50 + RX) | 300-308 tok/s | logits bytes == reference |
-| Two streams (RX + MI50), gen 32 | 27-28 tok/s aggregate | tokens == reference |
-| MTP spec, fixed k=3, code prompt | 1.17x plain | lossless (greedy identical) |
-| MTP spec, gate gC (default), code / prose | 1.04x / 0.89-0.93x | see "MTP gate" |
+| Plain decode, single stream | 21.5-22.4 tok/s (about 46-49 ms/token) | ctx 256 code/prose prompts, top-8 default; exact-routing opt-out 21.3 tok/s (4dce67e build) |
+| Decode at 4k context | 48.76 ms/token (was 63.83) | 4k prompt; split-K QSA apply + rank top-k |
+| Prefill, 1k prompt (plx: merged prefill, chunk 1024, MI50 + RX) | 314 tok/s top-8 default; 300-308 tok/s exact routing | exact routing (7df7b6f..35300b3, opt-out 307 on 4dce67e): logits bytes == reference. Top-8 default: top-1 identical at all 9039 positions, KL 5.1e-3 vs exact, not byte-identical |
+| Two streams (RX + MI50), 1k prompt, gen 32 | 27-28 tok/s aggregate | exact routing, measured before the top-8 default (35300b3); tokens == reference; not re-run under top-8 |
+| MTP spec, fixed k=3, code prompt | 1.17x plain | ctx 256, 64 tokens; greedy identical to plain |
+| MTP spec, gate gC (default), code / prose | 1.04x / 0.89-0.93x | ctx 256, 64 tokens; see "MTP gate" |
 
-Phase 4 (README, 10-27) was 15.8-16.5 tok/s aggregate and 8-10 tok/s single stream.
+Phase 4 (README, 10-27, exact routing) was 15.8-16.5 tok/s aggregate and 8-10 tok/s single stream.
 
 Spec decoding runs only in the bench path (`BRECCIA_MTP_SPEC_BENCH`); serving does not use it yet.
 
@@ -88,7 +88,7 @@ The decision was to take the code gain at the cost of about -4 % on prose.
 
 ## Reproduce
 
-All runs use `breccia bench token` (release build) with `--arena-display-reserve-mib 2560`, `--threads 30` and `--gpu-experts auto`. Model files and prompt-id files are outside the repo (see `docs/REPRODUCE.md`). Per-arm settings are passed as env vars.
+All runs use `breccia bench token` (release build) with `--arena-display-reserve-mib 2560`, `--threads 30` and `--gpu-experts auto`. Model files and prompt-id files are outside the repo (see `docs/REPRODUCE.md`). Per-arm settings are passed as env vars. The model defaults to a path on the reference box; elsewhere add `--gguf '<model-dir>/*-0000?-of-00002.gguf'` to every command.
 
 ```bash
 B=target/release/breccia
