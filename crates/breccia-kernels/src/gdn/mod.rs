@@ -117,6 +117,46 @@ impl GdnState {
     }
 }
 
+/// What a speculative verify keeps of one GDN layer's chunk so the state after
+/// any prefix of it can be rebuilt: the pre-conv `qkv`, `gate` and `beta` rows
+/// (the whole input of `conv` + `delta_step`, which read no weights but the conv
+/// kernel).
+pub struct GdnTap {
+    /// `[max_t, 10240]`
+    pub qkv: Buf,
+    /// `[max_t, 48]`
+    pub gate: Buf,
+    /// `[max_t, 48]`
+    pub beta: Buf,
+}
+
+impl GdnTap {
+    pub fn new(gpu: &Gpu, max_t: usize) -> Result<Self> {
+        let qkv = alloc(gpu, (max_t * CONV_CHANNELS * 4) as u64)?;
+        let gate = match alloc(gpu, (max_t * MODEL_H_V * 4) as u64) {
+            Ok(b) => b,
+            Err(e) => {
+                gpu.destroy_buf(&qkv);
+                return Err(e);
+            }
+        };
+        match alloc(gpu, (max_t * MODEL_H_V * 4) as u64) {
+            Ok(beta) => Ok(GdnTap { qkv, gate, beta }),
+            Err(e) => {
+                gpu.destroy_buf(&qkv);
+                gpu.destroy_buf(&gate);
+                Err(e)
+            }
+        }
+    }
+
+    pub fn release(self, gpu: &Gpu) {
+        for b in [&self.qkv, &self.gate, &self.beta] {
+            gpu.destroy_buf(b);
+        }
+    }
+}
+
 /// The per-call scratch of one GDN layer at a given `T`.
 pub struct GdnWorkspace {
     pub tokens: usize,
@@ -465,6 +505,22 @@ impl<'g> Gdn<'g> {
         x: &Buf,
         out: &Buf,
     ) -> Result<()> {
+        self.forward_tapped(state, ws, w, proj, x, out, None)
+    }
+
+    /// [`Self::forward`], also copying `conv`'s input and the gate/beta rows into
+    /// `tap` so [`Self::replay`] can rebuild the state after a prefix.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_tapped(
+        &self,
+        state: &GdnState,
+        ws: &GdnWorkspace,
+        w: &GdnWeights<'_>,
+        proj: &GdnProjections<'_, '_, '_>,
+        x: &Buf,
+        out: &Buf,
+        tap: Option<&GdnTap>,
+    ) -> Result<()> {
         let t = ws.tokens;
         let gpu = self.conv.gpu();
         // GPU-time probe stage boundaries (`BRECCIA_GPU_TIME`, no-op when off).
@@ -496,14 +552,38 @@ impl<'g> Gdn<'g> {
         }
 
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_SCAN);
+        if let Some(tap) = tap {
+            crate::batch_cmd::record_copy(gpu, &tap.qkv, 0, &ws.qkv, 0, (t * CONV_CHANNELS * 4) as u64)?;
+        }
         self.conv(state, &ws.qkv, w.conv, t)?;
         self.qk_l2_norm(&ws.qkv, t)?;
         self.beta_gate(ws, w)?;
+        if let Some(tap) = tap {
+            let n = (t * MODEL_H_V * 4) as u64;
+            crate::batch_cmd::record_copy(gpu, &tap.gate, 0, &ws.gate, 0, n)?;
+            crate::batch_cmd::record_copy(gpu, &tap.beta, 0, &ws.beta, 0, n)?;
+        }
         self.delta_step(state, ws, &ws.step)?;
         self.norm_gate(&ws.step, w.ssm_norm, &ws.z, &ws.normed)?;
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_OUT);
         proj.out.run(proj.w_out, &ws.normed, out, t)?;
         Ok(())
+    }
+
+    /// Re-run `conv`, the q/k norm and the recurrence over the first `ws.tokens`
+    /// rows of `tap` against `state` (which the caller restored to the chunk's
+    /// start): the state a `forward` of just those rows would have left. `ws` is
+    /// scratch; its `qkv`/`gate`/`beta`/`step` are overwritten.
+    pub fn replay(&self, state: &GdnState, ws: &GdnWorkspace, w_conv: &Buf, tap: &GdnTap) -> Result<()> {
+        let t = ws.tokens;
+        let gpu = self.conv.gpu();
+        let n = (t * MODEL_H_V * 4) as u64;
+        crate::batch_cmd::record_copy(gpu, &ws.qkv, 0, &tap.qkv, 0, (t * CONV_CHANNELS * 4) as u64)?;
+        crate::batch_cmd::record_copy(gpu, &ws.gate, 0, &tap.gate, 0, n)?;
+        crate::batch_cmd::record_copy(gpu, &ws.beta, 0, &tap.beta, 0, n)?;
+        self.conv(state, &ws.qkv, w_conv, t)?;
+        self.qk_l2_norm(&ws.qkv, t)?;
+        self.delta_step(state, ws, &ws.step)
     }
 
     /// The `ssm_out` projection is `[6144 -> 2560]`; exposed so a caller that

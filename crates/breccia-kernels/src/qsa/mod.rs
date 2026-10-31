@@ -961,14 +961,20 @@ impl<'g> Qsa<'g> {
 
     /// Store this call's raw indexer keys into the rolling 3-slot tail.
     pub fn idx_tail(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        self.idx_tail_raw(state, &ws.idx_k, ws.tokens, pos0)
+    }
+
+    /// [`Self::idx_tail`] for `tokens` raw keys held in `idx_k` (`[tokens, 128]`):
+    /// a speculative rollback re-stores a saved prefix of a chunk's keys.
+    pub fn idx_tail_raw(&self, state: &QsaState, idx_k: &Buf, tokens: usize, pos0: usize) -> Result<()> {
         let pc = Pc::new()
-            .u(ws.tokens as u32)
+            .u(tokens as u32)
             .i(pos0 as i32)
             .u(IDX_DIM as u32)
             .u(IDX_BLOCK as u32);
-        let (gx, gy) = grid_for(ws.tokens * IDX_DIM, 128);
+        let (gx, gy) = grid_for(tokens * IDX_DIM, 128);
         self.idx_tail
-            .run(&[&ws.idx_k, &state.idx_tail], &pc, (gx, gy, 1))
+            .run(&[idx_k, &state.idx_tail], &pc, (gx, gy, 1))
     }
 
     /// Score every completed block against every token's indexer query.

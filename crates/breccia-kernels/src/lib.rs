@@ -66,7 +66,7 @@ pub const SPIRV_HASH: &str = env!("BRECCIA_SPIRV_HASH");
 pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
 pub use dispatch_batch as batch_cmd;
-pub use gdn::{Gdn, GdnProjections, GdnState, GdnWeights, GdnWorkspace};
+pub use gdn::{Gdn, GdnProjections, GdnState, GdnTap, GdnWeights, GdnWorkspace};
 pub use gemv::{dequant_to_f32, Accum, Gemv, GemvTiming};
 pub use moe::{MoeCombine, MoeFanIn, MoeMap};
 pub use ops::bench::{run_ops_bench, OpKind, OpsBenchOptions, OpsReport};
