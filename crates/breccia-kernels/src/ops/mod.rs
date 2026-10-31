@@ -746,7 +746,7 @@ impl<'g> Q8Quantize<'g> {
 
     /// Quantise `x[..k]` into `q8[..k]` (int8) and `d[..k/32]` (f16); `k % 32 == 0`.
     pub fn run(&self, x: &Buf, q8: &Buf, d: &Buf, k: usize) -> Result<()> {
-        if k == 0 || k % 32 != 0 {
+        if k == 0 || !k.is_multiple_of(32) {
             return Err(anyhow!(
                 "q8 quantise needs k a non-zero multiple of 32, got {k}"
             ));

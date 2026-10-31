@@ -185,7 +185,7 @@ fn load_frames(path: &Path) -> R<Frames> {
         let words = n / 4;
         let off_l = le(img, 4 * lanes as usize)? as usize;
         let plane = if mode == 1 { frame_raw / 2 } else { 0 };
-        if n % 4 != 0 || lanes as usize + 1 + off_l + plane.div_ceil(4) > words {
+        if !n.is_multiple_of(4) || lanes as usize + 1 + off_l + plane.div_ceil(4) > words {
             return Err(format!("frame {fi}: offsets/plane overrun the image"));
         }
         frames.push((img.to_vec(), raw.to_vec()));
@@ -698,8 +698,8 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 let res: Vec<Buf> = (0..slots)
                     .map(|_| dev_buf(gpu, max_img as u64 + 64))
                     .collect::<R<_>>()?;
-                for s in 0..slots as usize {
-                    upload(gpu, &bufs[0], &res[s], &f.frames[s % n].0)?;
+                for (s, r) in res.iter().enumerate() {
+                    upload(gpu, &bufs[0], r, &f.frames[s % n].0)?;
                 }
                 let rows: Vec<Vec<vk::Buffer>> = (0..slots as usize)
                     .map(|s| vec![bufs[1].buf, res[s].buf, outs[s].buf])
@@ -858,8 +858,8 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                     cg.push(run(&mut ring, &ds, 1, true, iters)?);
                 }
                 let mut exact = true;
-                for s in 0..slots as usize {
-                    exact &= download_eq(gpu, &bufs[0], &outs[s], &f.frames[s % n].1)?;
+                for (s, o) in outs.iter().enumerate().take(slots as usize) {
+                    exact &= download_eq(gpu, &bufs[0], o, &f.frames[s % n].1)?;
                 }
                 let (rm, rsd) = mean_spread(&rg);
                 let (cm, csd) = mean_spread(&cg);

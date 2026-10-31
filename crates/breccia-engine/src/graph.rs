@@ -2084,7 +2084,7 @@ impl<'m> Session<'m> {
             env("BRECCIA_DUMP_EVERY", 64).max(1),
             env("BRECCIA_DUMP_MAX", 8),
         );
-        if pos % every != 0 || self.dumps >= max {
+        if !pos.is_multiple_of(every) || self.dumps >= max {
             return Ok(());
         }
         self.dumps += 1;
@@ -4707,7 +4707,7 @@ impl<'m> Session<'m> {
             self.micro_record_b(dev, th)?;
         }
         if have_a {
-            let b_a = (n + 1) / 2;
+            let b_a = n.div_ceil(2);
             if m.cfg.is_ple_layer(b_a) {
                 // PLE is a host round trip over this half's residuals: drain the card
                 // (the helper has not started this tick's experts yet), run it, go on.
@@ -4731,7 +4731,7 @@ impl<'m> Session<'m> {
         if !self.prefill_merged {
             return Some("--prefill-merged is off".into());
         }
-        if t % 2 != 0 || (t / 2) % 4 != 0 || t < 8 || pos0 % 4 != 0 {
+        if !t.is_multiple_of(2) || !(t / 2).is_multiple_of(4) || t < 8 || !pos0.is_multiple_of(4) {
             return Some(format!(
                 "chunk t={t} pos0={pos0} does not split into two multiples of 4"
             ));
@@ -6745,6 +6745,21 @@ pub fn assert_head(m: &Model) -> Result<()> {
     Ok(())
 }
 
+/// `BRECCIA_DUMP_HC` + `BRECCIA_DUMP_HC_BLOCKS`, read once (see `capture_hc`).
+fn hc_capture() -> Option<&'static (String, Vec<usize>)> {
+    static C: std::sync::OnceLock<Option<(String, Vec<usize>)>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let dir = std::env::var("BRECCIA_DUMP_HC").ok()?;
+        let blocks = std::env::var("BRECCIA_DUMP_HC_BLOCKS")
+            .unwrap_or_else(|_| "0,5,11,15,22,25,33,35,44,45".into())
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        Some((dir, blocks))
+    })
+    .as_ref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6920,9 +6935,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got[0].to_vec(), want, "streamed blk1 gate reads blob 0");
-        for r in 0..3 {
+        for (r, g) in got.iter().enumerate().take(3) {
             let want = arena.blob(r).unwrap()[2 * 1024..3 * 1024].to_vec();
-            assert_eq!(got[r].to_vec(), want, "role {r}");
+            assert_eq!(g.to_vec(), want, "role {r}");
         }
 
         // Streamed block 2: blob base 3. Without the placed-skip it would read
@@ -6936,9 +6951,9 @@ mod tests {
             ROLE / EXPERTS,
         )
         .unwrap();
-        for r in 0..3 {
+        for (r, g) in got2.iter().enumerate().take(3) {
             let want = arena.blob(3 + r).unwrap()[0..1024].to_vec();
-            assert_eq!(got2[r].to_vec(), want, "blk2 role {r} reads blob {}", 3 + r);
+            assert_eq!(g.to_vec(), want, "blk2 role {r} reads blob {}", 3 + r);
         }
 
         // Distinct patterns prove cross-blob separation: blob r and 3+r differ to
@@ -6949,19 +6964,4 @@ mod tests {
             super::Session::imported_role_slices(&arena, 4, 0, EXPERTS, EXPERTS, EXPERTS).is_err()
         );
     }
-}
-
-/// `BRECCIA_DUMP_HC` + `BRECCIA_DUMP_HC_BLOCKS`, read once (see `capture_hc`).
-fn hc_capture() -> Option<&'static (String, Vec<usize>)> {
-    static C: std::sync::OnceLock<Option<(String, Vec<usize>)>> = std::sync::OnceLock::new();
-    C.get_or_init(|| {
-        let dir = std::env::var("BRECCIA_DUMP_HC").ok()?;
-        let blocks = std::env::var("BRECCIA_DUMP_HC_BLOCKS")
-            .unwrap_or_else(|_| "0,5,11,15,22,25,33,35,44,45".into())
-            .split(',')
-            .filter_map(|x| x.trim().parse().ok())
-            .collect();
-        Some((dir, blocks))
-    })
-    .as_ref()
 }

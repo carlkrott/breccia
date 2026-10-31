@@ -33,6 +33,9 @@ use breccia_kernels::reference::f16_to_f32;
 
 use crate::config::ModelConfig;
 
+/// `gated_cur` output per token: gated row, current row, last s and g taps.
+type GatedRow = (Vec<f32>, Vec<f32>, [f32; 8], [f32; 8]);
+
 /// The PLE host state of one sequence.
 pub struct PleHost {
     /// `ple_norm_key` `[hc*n_embd]` f32.
@@ -263,22 +266,21 @@ impl PleHost {
             .min(t);
         let per = t.div_ceil(workers);
         let this = &*self;
-        let prep: Vec<Result<Vec<(Vec<f32>, Vec<f32>, [f32; 8], [f32; 8])>>> =
-            std::thread::scope(|sc| {
-                let hs: Vec<_> = (0..t)
-                    .step_by(per)
-                    .map(|lo| {
-                        sc.spawn(move || {
-                            (lo..(lo + per).min(t))
-                                .map(|i| this.gated_cur(&r[i], &key_raw[i], &value[i]))
-                                .collect()
-                        })
+        let prep: Vec<Result<Vec<GatedRow>>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..t)
+                .step_by(per)
+                .map(|lo| {
+                    sc.spawn(move || {
+                        (lo..(lo + per).min(t))
+                            .map(|i| this.gated_cur(&r[i], &key_raw[i], &value[i]))
+                            .collect()
                     })
-                    .collect();
-                hs.into_iter()
-                    .map(|h| h.join().expect("PLE worker"))
-                    .collect()
-            });
+                })
+                .collect();
+            hs.into_iter()
+                .map(|h| h.join().expect("PLE worker"))
+                .collect()
+        });
         let mut gated = Vec::with_capacity(t);
         let mut cur = Vec::with_capacity(t);
         let (mut s_last, mut g_last) = ([0.0; 8], [0.0; 8]);
@@ -439,8 +441,8 @@ impl PleHost {
             .collect();
         for i in 0..self.hc_dim {
             let mut acc = 0f32;
-            for k in 0..kern {
-                let src = match rows[k] {
+            for (k, row_k) in rows.iter().enumerate() {
+                let src = match row_k {
                     None => cur[i],
                     Some(row) => row[i],
                 };

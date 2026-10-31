@@ -38,6 +38,9 @@ use crate::graph::{Session, SessionCfg};
 use crate::model::Model;
 use crate::stats::LayerTrace;
 
+/// One decode thread's result: sampled tokens, last logits, per-step seconds.
+type StreamRun = (Vec<u32>, Vec<f32>, Vec<f64>);
+
 /// Per-stream decode result.
 #[derive(Clone, Debug, Default)]
 pub struct StreamReport {
@@ -206,7 +209,7 @@ impl<'m> Multi<'m> {
             );
         }
         // The token-by-token pass interleaves every stream, so it is all or none.
-        if chunks.iter().any(|&c| c == 0) && chunks.iter().any(|&c| c > 0) {
+        if chunks.contains(&0) && chunks.iter().any(|&c| c > 0) {
             bail!("prefill chunks {chunks:?} mix chunked and token-by-token streams");
         }
         if models.is_empty() {
@@ -292,9 +295,9 @@ impl<'m> Multi<'m> {
             // there is nothing to group; upgrade if a stream's lanes still get
             // evicted by its own partial batch.
             if plan == Submit::AtBlockEnd {
-                for s in 0..n {
+                for (sess, d) in self.streams.iter_mut().zip(digests.iter_mut()).take(n) {
                     let t1 = std::time::Instant::now();
-                    digests[s] = self.streams[s].submit_block(b + 1, &mut no_trace)?;
+                    *d = sess.submit_block(b + 1, &mut no_trace)?;
                     self.t_submit += t1.elapsed().as_secs_f64();
                 }
             }
@@ -444,20 +447,19 @@ impl<'m> Multi<'m> {
             // runs one lane at a time, but each stream's fence waits, readbacks and
             // submits now overlap the other stream's lane instead of queueing behind it.
             let firsts = std::mem::take(&mut logits);
-            let done: Vec<Result<(Vec<u32>, Vec<f32>, Vec<f64>)>> = std::thread::scope(|scope| {
+            let done: Vec<Result<StreamRun>> = std::thread::scope(|scope| {
                 let handles: Vec<_> = self
                     .streams
                     .iter_mut()
                     .zip(firsts)
                     .map(|(sess, mut lg)| {
-                        scope.spawn(move || -> Result<(Vec<u32>, Vec<f32>, Vec<f64>)> {
+                        scope.spawn(move || -> Result<StreamRun> {
                             let mut toks = Vec::with_capacity(n);
                             let mut times = Vec::with_capacity(n);
-                            let mut pos = plen;
                             // The GPU-time probe accumulates per thread: base and
                             // capture on this one, or the report reads 0.
                             sess.snapshot_probe();
-                            for i in 0..n {
+                            for (i, pos) in (plen..).enumerate().take(n) {
                                 let t = sess.sample(&lg).unwrap_or(0);
                                 toks.push(t);
                                 if i + 1 == n {
@@ -466,7 +468,6 @@ impl<'m> Multi<'m> {
                                 let t_step = std::time::Instant::now();
                                 lg = sess.token(t, pos, None)?;
                                 times.push(t_step.elapsed().as_secs_f64());
-                                pos += 1;
                             }
                             sess.capture_probe();
                             Ok((toks, lg, times))

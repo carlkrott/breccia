@@ -121,7 +121,7 @@ impl Gate {
         let best = argmax(0..=MAX_K);
         // probe 4x as often from plain: acceptance is bursty and plain rounds teach nothing
         let period = if best == 0 { 4 } else { 16 };
-        if self.picks % period != 0 || best == MAX_K {
+        if !self.picks.is_multiple_of(period) || best == MAX_K {
             best
         } else if best == 0 {
             // from plain, probe the best spec depth: a k=1 probe never beats plain and never

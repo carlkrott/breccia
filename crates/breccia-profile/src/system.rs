@@ -547,7 +547,9 @@ Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n\
         assert!(h.mem_total_bytes > 0);
         assert_eq!(h.numa_nodes, 1, "this host is single-NUMA (phase-0/04)");
         assert!(
-            h.mlock_limit_bytes > 0 && h.mlock_limit_bytes <= (1 << 40),
+            // u64::MAX is RLIM_INFINITY (LimitMEMLOCK=infinity), a real setting
+            h.mlock_limit_bytes > 0
+                && (h.mlock_limit_bytes <= (1 << 40) || h.mlock_limit_bytes == u64::MAX),
             "effective mlock limit must be a real number, got {}",
             h.mlock_limit_bytes
         );

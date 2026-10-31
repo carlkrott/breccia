@@ -64,6 +64,7 @@ impl HostPages {
         assert!(!ptr.is_null(), "host alloc of {bytes} bytes");
         HostPages { ptr, layout }
     }
+    #[allow(clippy::mut_from_ref)] // raw host pages: the probe owns them and never aliases a borrow
     fn words(&self) -> &mut [u32] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr as *mut u32, self.layout.size() / 4) }
     }
@@ -368,10 +369,14 @@ fn run(pci: &str) -> R<()> {
         indirect_memory_copy: 0,
         indirect_memory_to_image_copy: 0,
     };
-    let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
-    v12.p_next = &mut ifeat as *mut _ as *mut c_void;
-    let mut f2 = vk::PhysicalDeviceFeatures2::default();
-    f2.p_next = &mut v12 as *mut _ as *mut c_void;
+    let mut v12 = vk::PhysicalDeviceVulkan12Features {
+        p_next: &mut ifeat as *mut _ as *mut c_void,
+        ..Default::default()
+    };
+    let mut f2 = vk::PhysicalDeviceFeatures2 {
+        p_next: &mut v12 as *mut _ as *mut c_void,
+        ..Default::default()
+    };
     unsafe { host.instance.get_physical_device_features2(d.pdev, &mut f2) };
     let has_indirect = d.has_ext("VK_KHR_copy_memory_indirect") && ifeat.indirect_memory_copy != 0;
 
@@ -380,10 +385,14 @@ fn run(pci: &str) -> R<()> {
         p_next: std::ptr::null_mut(),
         supported_queues: vk::QueueFlags::empty(),
     };
-    let mut minmax = vk::PhysicalDeviceSamplerFilterMinmaxProperties::default();
-    minmax.p_next = &mut iprops as *mut _ as *mut c_void;
-    let mut p2 = vk::PhysicalDeviceProperties2::default();
-    p2.p_next = &mut minmax as *mut _ as *mut c_void;
+    let mut minmax = vk::PhysicalDeviceSamplerFilterMinmaxProperties {
+        p_next: &mut iprops as *mut _ as *mut c_void,
+        ..Default::default()
+    };
+    let mut p2 = vk::PhysicalDeviceProperties2 {
+        p_next: &mut minmax as *mut _ as *mut c_void,
+        ..Default::default()
+    };
     unsafe {
         host.instance
             .get_physical_device_properties2(d.pdev, &mut p2)
@@ -1227,12 +1236,12 @@ fn tmu(c: &Ctx) -> R<()> {
     run(2, 1)?;
     let bl = out_f32(c)?;
     let mut worst = 0f64;
-    for i in 0..OUT {
+    for (i, &b) in bl.iter().enumerate().take(OUT) {
         let (x, y) = ((i % h) * 2, (i / h) * 2);
         let (fx, fy) = (0.3f64, 0.6f64);
         let top = at(x, y) as f64 * (1.0 - fx) + at(x + 1, y) as f64 * fx;
         let bot = at(x, y + 1) as f64 * (1.0 - fx) + at(x + 1, y + 1) as f64 * fx;
-        worst = worst.max((bl[i] as f64 - (top * (1.0 - fy) + bot * fy)).abs());
+        worst = worst.max((b as f64 - (top * (1.0 - fy) + bot * fy)).abs());
     }
     println!("bilinear weights: worst abs error {worst:.2e} on [0,1) data (2^-8 = {:.2e}, 2^-24 = {:.2e})", 1.0 / 256.0, 1.0 / (1u64 << 24) as f64);
     // Throughput: 64 passes over the cache-resident image per dispatch.

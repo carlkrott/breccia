@@ -78,7 +78,10 @@ fn f16_to_f32(h: u16) -> f32 {
 /// shortcut: the engine has no Q8_0 GEMV, so the dense weights are widened to
 /// fp16 on the host (2x VRAM, ~134 MB); upgrade if the draft's VRAM matters.
 fn q8_0_to_f16(src: &[u8]) -> Vec<u8> {
-    assert!(src.len() % 34 == 0, "q8_0 data is whole 34-byte blocks");
+    assert!(
+        src.len().is_multiple_of(34),
+        "q8_0 data is whole 34-byte blocks"
+    );
     let mut out = Vec::with_capacity(src.len() / 34 * 64);
     for blk in src.chunks_exact(34) {
         let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
@@ -642,12 +645,9 @@ impl<'g> MtpDraft<'g> {
 
     fn gather(&self, tok: u32) -> Result<()> {
         // The gather uploads and waits by itself, so it goes before the batch opens.
-        let staged = self.emb.gather_staged(
-            self.gpu,
-            self.model.token_embd()?,
-            &vec![tok; HC],
-            &self.emb4,
-        )?;
+        let staged =
+            self.emb
+                .gather_staged(self.gpu, self.model.token_embd()?, &[tok; HC], &self.emb4)?;
         self.emb.release(self.gpu, &staged);
         Ok(())
     }

@@ -276,7 +276,7 @@ fn align_up(x: u64, a: u64) -> u64 {
     if a == 0 {
         return x;
     }
-    (x + a - 1) / a * a
+    x.div_ceil(a) * a
 }
 
 /// Plan and indices for an expert-span sidecar.
@@ -742,7 +742,7 @@ mod tests {
             assert_eq!(e.offset % SPAN_ALIGN, 0);
         }
         let dir = std::env::temp_dir().join(format!("breccia-span-{}", std::process::id()));
-        write_spans(&dir, &l, |_, e| Ok(vec![e as u8; (1000 + e) as usize])).unwrap();
+        write_spans(&dir, &l, |_, e| Ok(vec![e as u8; 1000 + e])).unwrap();
         let (r, mut file) = open_spans(&dir).unwrap();
         assert_eq!(r.rows, l.rows);
         use std::io::Read;

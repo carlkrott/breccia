@@ -946,6 +946,7 @@ mod import_type_tests {
     use super::*;
 
     /// Memory types: 0 = DEVICE_LOCAL only, 1 = HOST_VISIBLE, 2 = HOST_VISIBLE|COHERENT.
+    #[allow(clippy::field_reassign_with_default)] // fixed-size vk arrays read clearer by index
     fn mem_props() -> vk::PhysicalDeviceMemoryProperties {
         let mut mem = vk::PhysicalDeviceMemoryProperties::default();
         mem.memory_type_count = 3;

@@ -632,7 +632,7 @@ impl<'g> GemmMany<'g> {
             .find(|((r, u), x, _)| {
                 (*r, *u) == self.want[*x as usize]
                     && (!*x || self.upz_max(rows / r, users, *u).min(users) >= LDSX_MIN_USERS)
-                    && rows % r == 0
+                    && rows.is_multiple_of(*r)
                     && (rows / r).div_ceil(ROWS_PER_WG) * users.div_ceil(*u) >= WG_TARGET
             })
             .map_or((&self.kernel, (1, USERS_MAX)), |(v, _, k)| {
@@ -731,7 +731,7 @@ impl<'g> GemmMany<'g> {
         if users == 0 {
             return Err(anyhow!("users must be at least 1"));
         }
-        if cols % self.ty.block_elems() != 0 {
+        if !cols.is_multiple_of(self.ty.block_elems()) {
             return Err(anyhow!(
                 "int8 GEMM needs cols ({cols}) a multiple of {}",
                 self.ty.block_elems()

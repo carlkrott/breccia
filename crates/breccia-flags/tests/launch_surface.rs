@@ -10,12 +10,9 @@ use breccia_flags::{
     LaunchPlan, ReasoningMode, Switch, WarningCode,
 };
 use std::path::PathBuf;
-use std::sync::OnceLock;
-
-static CELL: OnceLock<String> = OnceLock::new();
 
 /// Verbatim argument list from the production `qwen-dual-serve.sh`
-/// (paths supplied via BRECCIA_MODEL_ROOT / BRECCIA_SLOT_ROOT).
+/// (paths from BRECCIA_MODEL_ROOT / BRECCIA_SLOT_ROOT, placeholders when unset).
 ///
 /// Only the shell's line continuations are omitted; every flag and value is
 /// character-for-character what the service passes to `llama-server`.
@@ -32,18 +29,18 @@ const SERVICE_ARGS_TEMPLATE: &str = r#"
 -t 16 -tb 16 --host 127.0.0.1 --port 8160 --jinja --metrics --fit off --no-op-offload -ub 256
 "#;
 
-fn path_var(name: &'static str) -> &'static str {
-    CELL.get_or_init(|| match std::env::var(name) {
+/// Paths are only parsed, never opened, so a placeholder stands in when unset.
+fn path_var(name: &str) -> String {
+    match std::env::var(name) {
         Ok(v) if !v.trim().is_empty() => v.trim_end_matches('/').to_string(),
-        _ => panic!("{name} must be set for launch_surface tests"),
-    })
-    .as_str()
+        _ => format!("/opt/{}", name.to_lowercase()),
+    }
 }
 
 fn service_args() -> String {
     SERVICE_ARGS_TEMPLATE
-        .replace("<MODEL_ROOT>", path_var("BRECCIA_MODEL_ROOT"))
-        .replace("<SLOT_ROOT>", path_var("BRECCIA_SLOT_ROOT"))
+        .replace("<MODEL_ROOT>", &path_var("BRECCIA_MODEL_ROOT"))
+        .replace("<SLOT_ROOT>", &path_var("BRECCIA_SLOT_ROOT"))
 }
 
 fn service_plan() -> LaunchPlan {

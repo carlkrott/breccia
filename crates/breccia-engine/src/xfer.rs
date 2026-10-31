@@ -539,44 +539,6 @@ impl Mailbox {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    /// The staging math is pure: `read_batch` lays items out back to back and the
-    /// offsets must tile `total` exactly (a mismatch would silently hand a caller
-    /// another buffer's bytes).
-    /// The PLE phase's batched readback needs `t * (2*hc_dim + n_embd) * 4` bytes and
-    /// `read_batch` refuses a total above `cap`, so the chunked session must size its
-    /// staging buffer from this, not from the single-readback default (§8ai).
-    #[test]
-    fn ple_stage_bytes_covers_a_whole_chunk() {
-        let (hc_dim, n_embd) = (10240usize, 2560usize);
-        for t in [1usize, 8, 64, 128] {
-            let want = t as u64 * (2 * hc_dim + n_embd) as u64 * 4;
-            let got = super::ple_stage_bytes(t, hc_dim, n_embd);
-            assert!(
-                got >= want,
-                "t = {t}: {got} B does not cover a {want} B readback"
-            );
-            // and it must not be wildly oversized either
-            assert!(got <= want + 65536, "t = {t}: {got} B is oversized");
-        }
-        assert!(super::ple_stage_bytes(128, hc_dim, n_embd) > 10 << 20);
-    }
-
-    #[test]
-    fn read_offsets_tile_the_staging_buffer() {
-        let items = [(0u64, 4usize), (4, 12), (16, 40)];
-        let mut at = 0u64;
-        let mut offs = Vec::new();
-        for (_, n) in items {
-            offs.push(at);
-            at += n as u64;
-        }
-        assert_eq!(offs, vec![0, 4, 16]);
-        assert_eq!(at, 56);
-    }
-}
-
 /// §11j item 5: one anonymous host allocation imported (`VK_EXT_external_memory_host`)
 /// on each card a dual-card ship touches, so the hand-off is two DMAs and no CPU
 /// copy (the staged path is DMA, memcpy out, memcpy in, DMA). On by default (Carl 10-30);
@@ -725,4 +687,42 @@ pub fn copy_submit(gpu: &Gpu, copies: &[(&Buf, &Buf, u64, u64, u64)]) -> Result<
         .submit(Qc::C)
         .map_err(|e| anyhow!("submitting the ship copy: {e}"))?;
     Ok(PendingCopy { fence, t0 })
+}
+
+#[cfg(test)]
+mod tests {
+    /// The staging math is pure: `read_batch` lays items out back to back and the
+    /// offsets must tile `total` exactly (a mismatch would silently hand a caller
+    /// another buffer's bytes).
+    /// The PLE phase's batched readback needs `t * (2*hc_dim + n_embd) * 4` bytes and
+    /// `read_batch` refuses a total above `cap`, so the chunked session must size its
+    /// staging buffer from this, not from the single-readback default (§8ai).
+    #[test]
+    fn ple_stage_bytes_covers_a_whole_chunk() {
+        let (hc_dim, n_embd) = (10240usize, 2560usize);
+        for t in [1usize, 8, 64, 128] {
+            let want = t as u64 * (2 * hc_dim + n_embd) as u64 * 4;
+            let got = super::ple_stage_bytes(t, hc_dim, n_embd);
+            assert!(
+                got >= want,
+                "t = {t}: {got} B does not cover a {want} B readback"
+            );
+            // and it must not be wildly oversized either
+            assert!(got <= want + 65536, "t = {t}: {got} B is oversized");
+        }
+        assert!(super::ple_stage_bytes(128, hc_dim, n_embd) > 10 << 20);
+    }
+
+    #[test]
+    fn read_offsets_tile_the_staging_buffer() {
+        let items = [(0u64, 4usize), (4, 12), (16, 40)];
+        let mut at = 0u64;
+        let mut offs = Vec::new();
+        for (_, n) in items {
+            offs.push(at);
+            at += n as u64;
+        }
+        assert_eq!(offs, vec![0, 4, 16]);
+        assert_eq!(at, 56);
+    }
 }
