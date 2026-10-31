@@ -84,8 +84,8 @@ impl Gate {
         Gate {
             // p=0.8 = measured first-position acceptance (code 81 %, prose 82 %); at p=0.6
             // k=1 never beats plain and the gate never leaves k=0 (10-31 gt-job)
-            num: [1.6; MAX_K],
-            den: [2.0; MAX_K],
+            num: [6.4; MAX_K],
+            den: [8.0; MAX_K],
             round_ms: [47.0, 92.0, 112.0, 130.0, 158.0, 179.0],
             seen: [false; MAX_K + 1],
             picks: 0,
@@ -103,15 +103,21 @@ impl Gate {
 
     fn pick(&mut self) -> usize {
         self.picks += 1;
-        let best = (0..=MAX_K)
-            .max_by(|&a, &b| {
-                (self.tokens(a) / self.round_ms[a]).total_cmp(&(self.tokens(b) / self.round_ms[b]))
-            })
-            .unwrap_or(0);
-        if self.picks % 16 == 0 && best < MAX_K {
-            best + 1
-        } else {
+        let rate = |k: usize| self.tokens(k) / self.round_ms[k];
+        let argmax = |r: std::ops::RangeInclusive<usize>| {
+            r.max_by(|&a, &b| rate(a).total_cmp(&rate(b))).unwrap_or(0)
+        };
+        let best = argmax(0..=MAX_K);
+        // probe 4x as often from plain: acceptance is bursty and plain rounds teach nothing
+        let period = if best == 0 { 4 } else { 16 };
+        if self.picks % period != 0 || best == MAX_K {
             best
+        } else if best == 0 {
+            // from plain, probe the best spec depth: a k=1 probe never beats plain and never
+            // re-learns positions 2+, so one early miss used to pin the gate at k=0 (10-31 rk-mc)
+            argmax(1..=MAX_K)
+        } else {
+            best + 1
         }
     }
 
@@ -374,8 +380,8 @@ mod tests {
             g.observe(1, 0, 118.0);
         }
         let picks: Vec<usize> = (0..32).map(|_| g.pick()).collect();
-        assert_eq!(picks.iter().filter(|&&k| k == 0).count(), 30);
-        assert_eq!(picks[15], 1); // the 16th pick probes one deeper
+        assert_eq!(picks.iter().filter(|&&k| k == 0).count(), 24);
+        assert_ne!(picks[3], 0); // from plain, every 4th pick probes a spec depth
         // always-accepting draft with cheap verify: deepest wins
         let mut g = Gate::new();
         for _ in 0..200 {
