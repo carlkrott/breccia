@@ -12,16 +12,19 @@
 //! - `Q2_0`: 64 values permuted so slot `p * 16 + b` holds `x[4b + p]`, the order
 //!   a shift-and-mask of the 16 code bytes yields; the block's sum of the q8
 //!   values is kept for the `q - 1` offset, applied in integers.
+//! - `IQ3_S`: 32 values in natural order, one scale per 32-value sub-block. The
+//!   grid magnitudes are unsigned bytes and the sign bits are applied to the
+//!   activation (`vpsignb`), so the dot is still unsigned x signed.
 
 use std::arch::x86_64::*;
 use std::cell::RefCell;
 
 use crate::quant::QuantType;
-use crate::tables::KVALUES_IQ4NL;
+use crate::tables::{IQ3S_GRID, KVALUES_IQ4NL};
 
 /// Types with an int8 kernel; everything else stays on the f32 AVX2 kernels.
 pub(super) fn supported(ty: QuantType) -> bool {
-    matches!(ty, QuantType::Iq4Nl | QuantType::Q2_0)
+    matches!(ty, QuantType::Iq4Nl | QuantType::Q2_0 | QuantType::Iq3S)
 }
 
 /// Activation values per q8 scale for `ty` (also a multiple of its weight block).
@@ -108,10 +111,7 @@ pub(super) unsafe fn gemv(
 /// # Safety
 /// As [`gemv`]; `row` is whole weight blocks matching `q`'s length.
 pub(super) unsafe fn dot(vnni: bool, ty: QuantType, row: &[u8], q: &Q8) -> f32 {
-    debug_assert_eq!(
-        row.len() / 18 * if ty == QuantType::Q2_0 { 64 } else { 32 },
-        q.qs.len()
-    );
+    debug_assert_eq!(row.len() / ty.block_bytes() * ty.block_elems(), q.qs.len());
     // SAFETY: the caller checked the features of whichever kernel runs.
     unsafe {
         match (ty, vnni) {
@@ -119,6 +119,8 @@ pub(super) unsafe fn dot(vnni: bool, ty: QuantType, row: &[u8], q: &Q8) -> f32 {
             (QuantType::Iq4Nl, true) => iq4_nl_vnni(row, q),
             (QuantType::Q2_0, false) => q2_0_avx2(row, q),
             (QuantType::Q2_0, true) => q2_0_vnni(row, q),
+            (QuantType::Iq3S, false) => iq3_s_avx2(row, q),
+            (QuantType::Iq3S, true) => iq3_s_vnni(row, q),
             _ => unreachable!("no int8 kernel for {ty}"),
         }
     }
@@ -255,6 +257,91 @@ unsafe fn q2_0_vnni(row: &[u8], q: &Q8) -> f32 {
     }
 }
 
+/// One 32-value IQ3_S sub-block as `(|w|, x * sign(w))`: 8 grid entries (4
+/// unsigned magnitudes each) and the sub-block's 32 sign bits applied to `x`.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn iq3_unit(blk: &[u8], ib: usize, xp: *const i8) -> (__m256i, __m256i) {
+    // SAFETY: `blk` is one 110-byte block (qs 2..66, qh 66..74, signs 74..106),
+    // `ib < 8`; grid indices are <= 511 into the 512-entry table; `xp` points at
+    // 32 activation bytes.
+    unsafe {
+        // 9-bit grid index k = qs[k] | qh bit k << 8, then one 8-lane gather.
+        let qs = _mm256_cvtepu8_epi32(_mm_loadl_epi64(blk[2 + 8 * ib..].as_ptr().cast()));
+        let qh = _mm256_sllv_epi32(
+            _mm256_set1_epi32(i32::from(blk[66 + ib])),
+            _mm256_setr_epi32(8, 7, 6, 5, 4, 3, 2, 1),
+        );
+        let idx = _mm256_or_si256(qs, _mm256_and_si256(qh, _mm256_set1_epi32(256)));
+        let w = _mm256_i32gather_epi32::<4>(IQ3S_GRID.as_ptr().cast(), idx);
+        // Sign byte l covers values 8l..8l+8, bit j value 8l+j.
+        let sb = u32::from_le_bytes([
+            blk[74 + 4 * ib],
+            blk[75 + 4 * ib],
+            blk[76 + 4 * ib],
+            blk[77 + 4 * ib],
+        ]);
+        let spread = _mm256_set_epi64x(
+            0x0303_0303_0303_0303,
+            0x0202_0202_0202_0202,
+            0x0101_0101_0101_0101,
+            0,
+        );
+        let bits = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
+        let s = _mm256_shuffle_epi8(_mm256_set1_epi32(sb as i32), spread);
+        let neg = _mm256_cmpeq_epi8(_mm256_and_si256(s, bits), bits);
+        let sgn = _mm256_or_si256(neg, _mm256_set1_epi8(1));
+        let x = _mm256_loadu_si256(xp.cast());
+        (w, _mm256_sign_epi8(x, sgn))
+    }
+}
+
+/// The sub-block multiplier `1 + 2 * scale_nibble` of IQ3_S unit `ib`.
+#[inline]
+fn iq3_sub(blk: &[u8], ib: usize) -> f32 {
+    let sc = blk[106 + ib / 2];
+    let sc = if ib & 1 == 0 { sc & 0xf } else { sc >> 4 };
+    f32::from(1 + 2 * sc)
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn iq3_s_avx2(row: &[u8], q: &Q8) -> f32 {
+    // SAFETY: whole 110-byte blocks, 256 activation bytes per block (see `dot`).
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut acc = [_mm256_setzero_ps(); 2];
+        for (b, blk) in row.chunks_exact(110).enumerate() {
+            let d = wscale(blk);
+            for ib in 0..8 {
+                let (w, x) = iq3_unit(blk, ib, q.qs.as_ptr().add(b * 256 + ib * 32));
+                // |w| <= 15, |x| <= 127: a pair sum (<= 3810) never saturates i16.
+                let p = _mm256_madd_epi16(_mm256_maddubs_epi16(w, x), ones);
+                let s = _mm256_set1_ps(d * iq3_sub(blk, ib) * q.d[b * 8 + ib]);
+                acc[ib & 1] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), s, acc[ib & 1]);
+            }
+        }
+        hsum(acc[0], acc[1])
+    }
+}
+
+#[target_feature(enable = "avx2,fma,f16c,avx512vnni,avx512vl")]
+unsafe fn iq3_s_vnni(row: &[u8], q: &Q8) -> f32 {
+    // SAFETY: as `iq3_s_avx2`.
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); 2];
+        for (b, blk) in row.chunks_exact(110).enumerate() {
+            let d = wscale(blk);
+            for ib in 0..8 {
+                let (w, x) = iq3_unit(blk, ib, q.qs.as_ptr().add(b * 256 + ib * 32));
+                let p = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w, x);
+                let s = _mm256_set1_ps(d * iq3_sub(blk, ib) * q.d[b * 8 + ib]);
+                acc[ib & 1] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(p), s, acc[ib & 1]);
+            }
+        }
+        hsum(acc[0], acc[1])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,9 +356,9 @@ mod tests {
     }
 
     /// Random whole-block row with a sane fp16 scale per block.
-    fn row(blocks: usize, seed: &mut u64) -> Vec<u8> {
-        let mut r = vec![0u8; blocks * 18];
-        for blk in r.chunks_exact_mut(18) {
+    fn row(ty: QuantType, blocks: usize, seed: &mut u64) -> Vec<u8> {
+        let mut r = vec![0u8; blocks * ty.block_bytes()];
+        for blk in r.chunks_exact_mut(ty.block_bytes()) {
             for b in blk.iter_mut() {
                 *b = lcg(seed) as u8;
             }
@@ -290,11 +377,11 @@ mod tests {
 
     /// Independent reference: natural-order quantisation, integer weights from
     /// the reference dequantiser at unit scale, exact i64 block sums.
-    fn reference(ty: QuantType, r: &[u8], x: &[f32]) -> f64 {
+    /// Returns `(dot, sum of |terms|)`; the second sizes the f32 rounding tolerance.
+    fn reference(ty: QuantType, r: &[u8], x: &[f32]) -> (f64, f64) {
         let n = act_block(ty);
-        let wpb = if ty == QuantType::Q2_0 { 64 } else { 32 };
         let mut w = Vec::new();
-        for blk in r.chunks_exact(18) {
+        for blk in r.chunks_exact(ty.block_bytes()) {
             let mut unit = blk.to_vec();
             unit[..2].copy_from_slice(&0x3c00u16.to_le_bytes()); // 1.0
             let mut vals = Vec::new();
@@ -303,19 +390,23 @@ mod tests {
             w.extend(vals.iter().map(|v| (*v as i64, d)));
         }
         let mut acc = 0f64;
+        let mut mag = 0f64;
         for (bi, xb) in x.chunks_exact(n).enumerate() {
             let amax = xb.iter().fold(0f32, |m, v| m.max(v.abs()));
             let dx = amax / 127.0;
             let id = if dx > 0.0 { 1.0 / dx } else { 0.0 };
-            // n is a multiple of the weight block, so one weight scale per act block.
+            // An act block never straddles a weight block, so one weight scale.
             let mut isum = 0i64;
+            let mut iabs = 0i64;
             for (i, v) in xb.iter().enumerate() {
-                isum += w[bi * n + i].0 * i64::from((v * id).round_ties_even() as i8);
+                let t = w[bi * n + i].0 * i64::from((v * id).round_ties_even() as i8);
+                isum += t;
+                iabs += t.abs();
             }
             acc += w[bi * n].1 * f64::from(dx) * isum as f64;
-            debug_assert_eq!(n % wpb, 0);
+            mag += w[bi * n].1 * f64::from(dx) * iabs as f64;
         }
-        acc
+        (acc, mag)
     }
 
     #[test]
@@ -324,19 +415,16 @@ mod tests {
             return;
         }
         let mut seed = 0x1234_5678;
-        for ty in [QuantType::Iq4Nl, QuantType::Q2_0] {
-            let wpb = if ty == QuantType::Q2_0 { 64 } else { 32 };
-            for blocks in [2usize, 3, 20, 40, 80] {
-                if (blocks * wpb) % act_block(ty) != 0 {
-                    continue;
-                }
-                let r = row(blocks, &mut seed);
+        for ty in [QuantType::Iq4Nl, QuantType::Q2_0, QuantType::Iq3S] {
+            let wpb = ty.block_elems();
+            for blocks in [2usize, 3, 10, 20, 40, 80] {
+                let r = row(ty, blocks, &mut seed);
                 let x = act(blocks * wpb, &mut seed);
                 let mut q = Q8::default();
                 quantize(ty, &x, &mut q);
                 let a = unsafe { dot(false, ty, &r, &q) };
-                let want = reference(ty, &r, &x);
-                let tol = 1e-5 * want.abs().max(1e-3);
+                let (want, mag) = reference(ty, &r, &x);
+                let tol = 1e-6 * mag + 1e-9;
                 assert!(
                     (f64::from(a) - want).abs() <= tol,
                     "{ty} {blocks}: {a} vs {want}"
@@ -349,7 +437,7 @@ mod tests {
                 let f = dot_row_with(Path::Avx2, ty, &r, x.len(), &x);
                 let mut bound = 0f64;
                 let mut vals = Vec::new();
-                for (bi, blk) in r.chunks_exact(18).enumerate() {
+                for (bi, blk) in r.chunks_exact(ty.block_bytes()).enumerate() {
                     vals.clear();
                     dequant_block(ty, blk, &mut vals);
                     for (j, wv) in vals.iter().enumerate() {
@@ -371,9 +459,9 @@ mod tests {
             return;
         }
         let mut seed = 7;
-        for ty in [QuantType::Iq4Nl, QuantType::Q2_0] {
-            let r = row(2, &mut seed);
-            let mut x = act(if ty == QuantType::Q2_0 { 128 } else { 64 }, &mut seed);
+        for ty in [QuantType::Iq4Nl, QuantType::Q2_0, QuantType::Iq3S] {
+            let r = row(ty, 2, &mut seed);
+            let mut x = act(2 * ty.block_elems(), &mut seed);
             x[5] = f32::NAN;
             let mut q = Q8::default();
             quantize(ty, &x, &mut q);
