@@ -242,6 +242,18 @@ fn main() {
                 compile(&glslc, &out_dir, name, &format!("{name}_t{rm}x{rn}"), &defs);
             }
         }
+        // The HC `up` GEMM with the gated mean + inject partials as its epilogue
+        // (opt-in, `BRECCIA_FUSE_HC=1`): a separate pipeline, so every other build
+        // keeps byte-identical SPIR-V.
+        if *name == "gemm_bf16" {
+            compile(
+                &glslc,
+                &out_dir,
+                name,
+                "gemm_bf16_t4x4_hcgate",
+                &["BRECCIA_GEMM_TILE=1", "TILE_RM=4u", "TILE_RN=4u", "BRECCIA_HC_TILE_GATED"],
+            );
+        }
         if *name == "gemv_bf16" {
             compile(
                 &glslc,

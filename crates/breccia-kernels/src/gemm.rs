@@ -41,6 +41,10 @@ pub struct GemmMany<'g> {
     /// Tiled build [`GemmMany::run_at`] / [`GemmMany::run_timed`] use for wide-enough
     /// shapes; `None` = the GEMV-shaped builds.
     want_tile: Option<Tile>,
+    /// The 4x4 tiled BF16 build with the HC gated-mean + inject epilogue
+    /// (`gemm_tile.glsl`, `BRECCIA_HC_TILE_GATED`); built on demand by
+    /// [`GemmMany::enable_hc_tile_gated`].
+    hcgate: Option<breccia_vk::ctx::Kernel>,
     /// Forced users per z slice (1..=USERS_MAX); `None` = [`upz_for`] per dispatch.
     upz: Option<usize>,
     tables: Buf,
@@ -343,6 +347,7 @@ impl<'g> GemmMany<'g> {
             blocked,
             tiles,
             want_tile: env_tile(subgroup_size(gpu), ty),
+            hcgate: None,
             want: [false, true].map(|x| {
                 let t = tuned(ty, subgroup_size(gpu), x);
                 (env_rpl().unwrap_or(t.0), env_umax().unwrap_or(t.1))
@@ -364,6 +369,62 @@ impl<'g> GemmMany<'g> {
     /// Force the tiled build (`None` = the GEMV-shaped builds); A/B and tests.
     pub fn set_tile(&mut self, t: Option<Tile>) {
         self.want_tile = t;
+    }
+
+    /// Build the HC `up` + gated-mean pipeline (BF16 only; `BRECCIA_FUSE_HC=1`).
+    /// A no-op for other types. See [`GemmMany::run_up_gated`].
+    pub fn enable_hc_tile_gated(&mut self) -> Result<()> {
+        if self.ty != QuantType::Bf16 || self.hcgate.is_some() {
+            return Ok(());
+        }
+        let spv: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_bf16_t4x4_hcgate.spv"));
+        let k = self
+            .gpu
+            .kernel(spv, 8)
+            .map_err(|e| anyhow!("creating the BF16 HC up + gated-mean GEMM pipeline: {e}"))?;
+        self.hcgate = Some(k);
+        Ok(())
+    }
+
+    /// `true` when [`GemmMany::run_up_gated`] would replace the plain `run` for
+    /// `users`: the pipeline is built, and the plain `run` would itself take the
+    /// default 4x4 tile (so the fused arithmetic is the unfused arithmetic).
+    pub fn hc_tile_gated_for(&self, users: usize) -> bool {
+        self.hcgate.is_some() && self.want_tile == Some((4, 4)) && users >= TILE_MIN_USERS
+    }
+
+    /// The HC `up` GEMM (`rows = 4 * n_embd`, hc = 4) with the gated mean and the
+    /// inject partials as its epilogue. Writes `mixed` `[users, n_embd]` and
+    /// `part` `[users, 4, n_embd / 16]`; `gate` is NOT written (`gate_dummy` only
+    /// satisfies binding 2). Needs `n_embd % 16 == 0` and [`GemmMany::hc_tile_gated_for`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_up_gated(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        gate_dummy: &Buf,
+        xn: &Buf,
+        winj: &Buf,
+        part: &Buf,
+        mixed: &Buf,
+        n_embd: usize,
+        cols: usize,
+        users: usize,
+    ) -> Result<()> {
+        let kernel = self
+            .hcgate
+            .as_ref()
+            .filter(|_| self.hc_tile_gated_for(users) && n_embd.is_multiple_of(16))
+            .ok_or_else(|| anyhow!("HC up + gated-mean GEMM not available for {users} users"))?;
+        let mut pc = [0u8; 28];
+        pc[..24].copy_from_slice(&self.pc(4 * n_embd, cols, users, 0));
+        pc[24..28].copy_from_slice(&(n_embd as u32).to_le_bytes());
+        self.dispatch_grid(
+            kernel,
+            &[w, x, gate_dummy, &self.tables, xn, winj, part, mixed],
+            &pc,
+            ((n_embd / 16) as u32, users.div_ceil(64) as u32, 1),
+        )
     }
 
     /// The tiled pipeline `run_at` would use for `rows x users`, if any.
@@ -636,7 +697,7 @@ impl<'g> GemmMany<'g> {
         &self,
         kernel: &breccia_vk::ctx::Kernel,
         bufs: &[&Buf],
-        pc: &[u8; 24],
+        pc: &[u8],
         (gx, gy, gz): (u32, u32, u32),
     ) -> Result<()> {
         // Inside a dispatch batch the dispatch is **recorded** (the same rule
@@ -780,6 +841,9 @@ impl Drop for GemmMany<'_> {
             self.gpu.destroy_kernel(k);
         }
         for (_, k) in &self.tiles {
+            self.gpu.destroy_kernel(k);
+        }
+        if let Some(k) = &self.hcgate {
             self.gpu.destroy_kernel(k);
         }
         self.gpu.destroy_buf(&self.tables);

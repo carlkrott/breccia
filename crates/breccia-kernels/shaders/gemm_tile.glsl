@@ -12,8 +12,25 @@
 // kernels (users in `pc.splits`, `pc.upz` ignored). NOT bit-identical (summation order
 // differs): `tests/gemm_many.rs::tiled_gemm_matches_plain` bounds the error.
 // Host contract: dispatch (ceil(rows / TM), ceil(users / TN), 1); any rows / users / cols.
+//
+// `-DBRECCIA_HC_TILE_GATED` (4x4 only, hc = 4): the HC `up` GEMM with the gated mean and
+// the inject partials as its epilogue, so `gate` is never written or re-read. The weight
+// rows are remapped so one workgroup owns 16 consecutive `d` of ALL four streams
+// (tile row r -> stream r >> 4, d = 16 * WG.x + (r & 15)); thread tx then holds the four
+// streams of one `d` in acc[0..3][j], and `mixed` is thread-local. Host contract: dispatch
+// (n_embd / 16, ceil(users / TN), 1), `rows = 4 * n_embd`. See `HcMixer::read`.
 
 layout(local_size_x = 256) in;
+
+#ifdef BRECCIA_HC_TILE_GATED
+// Requires the 4x4 tile: build.rs defines TILE_RM = TILE_RN = 4u for this variant.
+#include "ops_math.glsl"
+// Same arrays and layouts as the `gemv_bf16_hcgate` build's bindings 4..7.
+layout(std430, binding = 4) readonly buffer XnVec { float XN[]; };
+layout(std430, binding = 5) readonly buffer WinjVec { uint16_t WINJ[]; };  // BF16 [4][4 * n_embd]
+layout(std430, binding = 6) writeonly buffer PartVec { float P[]; };        // [T][4][n_embd / 16]
+layout(std430, binding = 7) writeonly buffer MixVec { float MIX[]; };       // [T][n_embd]
+#endif
 
 #define pc_users pc.splits
 #define ROW_BASE_WORDS pc.base
@@ -62,7 +79,11 @@ void main() {
             vec4 a = vec4(0.0);
             vec4 b = vec4(0.0);
             if (g < nunits) {
+#ifdef BRECCIA_HC_TILE_GATED
+                uint row = (r >> 4u) * pc.n_embd + gl_WorkGroupID.x * 16u + (r & 15u);
+#else
                 uint row = min(row0 + r, pc.rows - 1u);
+#endif
                 float v[8];
                 DEQUANT_UNIT(ROW_BASE_WORDS + row * row_words + (g / UNITS) * BLOCK_WORDS, g % UNITS, v);
                 a = vec4(v[0], v[1], v[2], v[3]);
@@ -116,6 +137,51 @@ void main() {
         barrier();
     }
 
+#ifdef BRECCIA_HC_TILE_GATED
+    const uint n_embd = pc.n_embd;
+    const uint d = gl_WorkGroupID.x * 16u + tx;
+    const uint chunks = n_embd / 16u;
+    // inject weight for this d: wi[c_out][c_src] = W_inject[c_out * 4 * n_embd + c_src * n_embd + d].
+    float wi[4][4];
+    [[unroll]] for (uint co = 0u; co < 4u; ++co) {
+        [[unroll]] for (uint cs = 0u; cs < 4u; ++cs) {
+            wi[co][cs] = uintBitsToFloat(uint(WINJ[co * 4u * n_embd + cs * n_embd + d]) << 16);
+        }
+    }
+    [[unroll]] for (uint j = 0u; j < RN; ++j) {
+        const uint u = user0 + ty + 16u * j;
+        const bool live = u < users;
+        float xn[4] = float[4](0.0, 0.0, 0.0, 0.0);
+        if (live) {
+            [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+                xn[c] = XN[(c + 4u * u) * n_embd + d];
+            }
+        }
+        // Same expression and stream order as `ops_hc_gated_mean.comp`.
+        float m = 0.0;
+        [[unroll]] for (uint c = 0u; c < 4u; ++c) {
+            m += xn[c] * breccia_sigmoid(acc[c][j]);
+        }
+        if (live) {
+            MIX[u * n_embd + d] = m / 4.0;
+        }
+        // The shuffles below must be reached by every lane (a dead user's lanes
+        // carry zeros), so nothing above may return early.
+        [[unroll]] for (uint co = 0u; co < 4u; ++co) {
+            float sum = 0.0;
+            [[unroll]] for (uint cs = 0u; cs < 4u; ++cs) {
+                sum += xn[cs] * wi[co][cs];
+            }
+            sum += subgroupShuffleXor(sum, 8u);
+            sum += subgroupShuffleXor(sum, 4u);
+            sum += subgroupShuffleXor(sum, 2u);
+            sum += subgroupShuffleXor(sum, 1u);
+            if (tx == 0u && live) {
+                P[(u * 4u + co) * chunks + gl_WorkGroupID.x] = sum;
+            }
+        }
+    }
+#else
     [[unroll]] for (uint j = 0u; j < RN; ++j) {
         uint u = user0 + ty + 16u * j;
         if (u < users) {
@@ -127,4 +193,5 @@ void main() {
             }
         }
     }
+#endif
 }

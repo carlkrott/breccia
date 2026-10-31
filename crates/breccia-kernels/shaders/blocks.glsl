@@ -98,6 +98,12 @@ layout(push_constant) uniform Params {
     // rows/8 workgroups (80 for a 640-row expert) and is occupancy-bound.
     uint upz;
 #endif
+#ifdef BRECCIA_HC_TILE_GATED
+    // 7th word, the `gemm_tile.glsl` HC up + gated-mean build only (28 bytes): the
+    // elements per hyper-connection stream (hc = 4 and the chunk count n_embd / 16
+    // are fixed in that shader).
+    uint n_embd;
+#endif
 #ifdef BRECCIA_HC_GATED_EPILOGUE
     // The fused HC `up` + gated-mean variant (§8az) needs the column geometry:
     // `n_embd` elements per hyper-connection stream, `hc` streams, and the number
