@@ -3101,6 +3101,7 @@ impl<'m> Session<'m> {
         self.flush()?;
 
         // ---- the bucket list: per distinct expert, its users -----------------
+        let bucket_t0 = std::time::Instant::now();
         let mut raw = vec![0u8; t * k * 4];
         self.venues[dev]
             .pf
@@ -3160,6 +3161,7 @@ impl<'m> Session<'m> {
             .expect("the merged prefill scratch")
             .slots
             .write(&slot_bytes)?;
+        let bucket_s = bucket_t0.elapsed().as_secs_f64();
 
         let mut ship_s = 0.0f64;
         let mut ship_p = [0.0f64; 4];
@@ -3487,7 +3489,7 @@ impl<'m> Session<'m> {
             eprintln!(
                 "merged blk {b:>2} t={t} {}{} distinct={distinct} groups={} slots={} \
                  gemm={:.2} ms fanin={:.3} ms ship={:.2} ms (rd {:.2} wr {:.2} | back rd {:.2} wr {:.2}) dispatches={dispatches} \
-                 arena={:.1} MiB streamed(cum)={:.1} MiB fill={:.1} ms wait={:.1} ms",
+                 arena={:.1} MiB streamed(cum)={:.1} MiB fill={:.1} ms wait={:.1} ms bucket={:.3} ms",
                 if streamed { "streamed" } else { "resident" },
                 if xdev.is_some() { "@x" } else { "" },
                 groups.len(),
@@ -3502,7 +3504,8 @@ impl<'m> Session<'m> {
                 (distinct as u64 * expert_bytes) as f64 / (1u64 << 20) as f64,
                 sb as f64 / (1u64 << 20) as f64,
                 sf * 1e3,
-                sw * 1e3
+                sw * 1e3,
+                bucket_s * 1e3
             );
         }
         Ok(())
