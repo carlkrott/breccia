@@ -1,6 +1,6 @@
 # Phase 5 results: coord-lanes (2026-10-29 to 10-31)
 
-Status: all of this is on branch `claude/coord-lanes`, not on `main`. It is not merged because `scripts/verify.sh` fails on the branch (see "Merge state" below). Numbers are single runs or short A/B/A/B series on the reference box (`docs/REPRODUCE.md`); 0 GPU hangs in every arm listed.
+Status: merged to `main` on 2026-10-31 (fast-forward from `claude/coord-lanes`; `scripts/verify.sh` passes). Numbers are single runs or short A/B/A/B series on the reference box (`docs/REPRODUCE.md`); 0 GPU hangs in every arm listed.
 
 Measurement caveats:
 
@@ -112,12 +112,10 @@ $B bench token --streams 2 --devices 0000:03:00.0,0000:0e:00.0 --gpu-experts aut
 
 The fault/load gate, the systemd memory limits (MemoryMax 30G, no swap, LimitMEMLOCK=infinity) and the logit-parity script were run out of tree. They are not in this repo.
 
-## Merge state (why this is not on `main` yet)
+## Merge state
 
-`scripts/verify.sh` on 702d591:
+Merged to `main` 2026-10-31 after `scripts/verify.sh` passed. To get there:
 
-- `cargo fmt --check`: about 295 diffs across 31 files on the branch; `main` is clean. Formatting graph.rs is a deliberate decision that has not been taken yet.
-- `cargo clippy -D warnings`: 2 lints in `breccia-cache/src/lib.rs` (manual `div_ceil`, a same-type cast), from code added on the branch.
-- `breccia-flags` launch_surface tests: they need `BRECCIA_MODEL_ROOT` and `BRECCIA_SLOT_ROOT` set. With them set, 10/10 pass.
-- `host_arena::oversize_and_overfill_are_clean_errors` assumes a low `RLIMIT_MEMLOCK`. It passes under `ulimit -l 8192` and fails when the limit is unlimited.
-- Build, all other tests, reference clones and the no-weights check pass.
+- `cargo fmt --all` over the branch (one style-only commit, graph.rs included).
+- Clippy `-D warnings` fixes across breccia-cache, -engine, -kernels and -vk (div_ceil, is_multiple_of, iterator loops, type aliases, test module order); no behaviour change intended.
+- Env-dependent tests: `breccia-flags` launch_surface now uses placeholder roots when `BRECCIA_MODEL_ROOT` / `BRECCIA_SLOT_ROOT` are unset (paths are parsed, never opened); `host_arena::oversize_and_overfill_are_clean_errors` skips the mlock-failure check when `RLIMIT_MEMLOCK` is high; `breccia-profile` `live_host_probe_reads_real_values` accepts an unlimited memlock limit.
