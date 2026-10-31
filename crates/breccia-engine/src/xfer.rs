@@ -448,6 +448,16 @@ pub struct Mailbox {
 
 impl Mailbox {
     pub fn new(gpu: &Gpu, size: u64) -> Result<Self> {
+        Self::with_preferred(gpu, size, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+    }
+
+    /// A mailbox the host **reads** in bulk: system memory, cached when the heap has
+    /// it (a read out of a BAR-mapped VRAM mailbox is an uncached MMIO read).
+    pub fn new_cached(gpu: &Gpu, size: u64) -> Result<Self> {
+        Self::with_preferred(gpu, size, vk::MemoryPropertyFlags::HOST_CACHED)
+    }
+
+    fn with_preferred(gpu: &Gpu, size: u64, pref: vk::MemoryPropertyFlags) -> Result<Self> {
         let size = size.max(16);
         let buf = gpu
             .buf(
@@ -456,8 +466,7 @@ impl Mailbox {
                     | vk::BufferUsageFlags::TRANSFER_SRC
                     | vk::BufferUsageFlags::TRANSFER_DST,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL
-                    | vk::MemoryPropertyFlags::HOST_VISIBLE
+                pref | vk::MemoryPropertyFlags::HOST_VISIBLE
                     | vk::MemoryPropertyFlags::HOST_COHERENT,
             )
             .map_err(|e| anyhow!("allocating the {size}-byte mailbox: {e}"))?;
