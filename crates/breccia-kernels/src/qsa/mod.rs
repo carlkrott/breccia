@@ -118,11 +118,10 @@ fn gqa_scores(tokens: usize) -> bool {
         && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_GQA_SCORES").map_or(true, |v| v != "0"))
 }
 
-/// Calls of `SMALL_MIN_TOKENS..GQA_MIN_TOKENS` rows (speculative verify) score with
-/// `qsa_attn_scores_small.comp`: a thread per slot, K read once per kv head. `T = 1`
-/// (decode) keeps the per-head kernel, so decode scores stay bit-identical;
-/// `BRECCIA_QSA_SMALL_MIN=1` includes it (~2x faster attention at ctx 1k) and
-/// `BRECCIA_QSA_SMALL_MIN=99` turns the kernel off.
+/// Calls of `1..GQA_MIN_TOKENS` rows (decode, speculative verify) score with
+/// `qsa_attn_scores_small.comp`: a thread per slot, K read once per kv head. Decode at
+/// ctx 1k: 70 -> 52-60 ms/token, same 32 tokens as the per-head kernel (not bit-equal).
+/// `BRECCIA_QSA_SMALL_MIN=2` keeps decode on the per-head kernel, `=99` turns it off.
 fn small_scores(tokens: usize) -> bool {
     static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     tokens < GQA_MIN_TOKENS
@@ -131,7 +130,7 @@ fn small_scores(tokens: usize) -> bool {
                 std::env::var("BRECCIA_QSA_SMALL_MIN")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(2)
+                    .unwrap_or(1)
             })
 }
 
