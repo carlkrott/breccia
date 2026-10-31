@@ -402,6 +402,9 @@ pub struct Venue<'m> {
     /// result is written straight into the mapping instead of being uploaded
     /// through a submit + fence.
     pub block_out: Mailbox,
+    /// `BRECCIA_EXPERT_CACHE`: slot ids, routing weights and the GPU partial MoE sum
+    /// (routed hits + shared) of the resident-expert split.
+    pub ec: Option<(Mailbox, Mailbox, Mailbox)>,
     pub sh: Buf,
     pub sh_gate_logit: Buf,
     pub shexp_gate: Buf,
@@ -619,6 +622,9 @@ pub struct Session<'m> {
     /// Forward passes run since the last reset (the decode denominator).
     pub forwards: usize,
     pub expert_bytes: u64,
+    /// `BRECCIA_EXPERT_CACHE` decode counters since the last reset: resident draws,
+    /// all draws on cached blocks, split blocks, GPU-partial wait s, host lane s.
+    ec_stats: [f64; 5],
     /// `BRECCIA_DUMP_STATE` snapshots written so far (`dump_state`).
     dumps: usize,
     /// Device whose dispatch batch is currently open (`None` = none). At most
@@ -874,6 +880,12 @@ impl<'m> Session<'m> {
             let n = mc.n_embd as u64;
             let r = alloc(mc.hc_dim() as u64 * 4, "the residual stack")?;
             let block_out = Mailbox::new(gpu, n * 4)?;
+            let ec = if model.cache.is_empty() {
+                None
+            } else {
+                let kb = mc.n_expert_used as u64 * 4;
+                Some((Mailbox::new(gpu, kb)?, Mailbox::new(gpu, kb)?, Mailbox::new(gpu, n * 4)?))
+            };
             let sh = alloc(n * 4, "shared-expert out")?;
             let sh_gate_logit = alloc(4, "shared-expert gate")?;
             let shexp_gate = alloc(mc.n_ff as u64 * 4, "shexp gate")?;
@@ -1022,7 +1034,7 @@ impl<'m> Session<'m> {
             let moe_fanin = breccia_kernels::MoeFanIn::new(gpu)?;
             // The merged prefill pass's chunk scratch (§8v): only when the flag is
             // on, so a session that does not use it pays nothing.
-            let pf = if chunk > 0 && cfg.prefill_merged && !model.placed.is_empty() {
+            let pf = if chunk > 0 && cfg.prefill_merged && (!model.placed.is_empty() || !model.cache.is_empty()) {
                 let k = mc.n_expert_used;
                 let nb = mc.n_embd as u64 * 4;
                 let nfb = mc.n_ff as u64 * 4;
@@ -1089,6 +1101,7 @@ impl<'m> Session<'m> {
                 emb_ple,
                 r,
                 block_out,
+                ec,
                 sh,
                 sh_gate_logit,
                 shexp_gate,
@@ -1209,6 +1222,7 @@ impl<'m> Session<'m> {
             forwards: 0,
             dumps: 0,
             expert_bytes: 0,
+            ec_stats: [0.0; 5],
             pending_batch: None,
             pending_seg: None,
             pending_dev: None,
@@ -1666,6 +1680,7 @@ impl<'m> Session<'m> {
         self.pf_merged_chunks = 0;
         self.forwards = 0;
         self.expert_bytes = 0;
+        self.ec_stats = [0.0; 5];
         self.lane_s = 0.0;
         self.lane_covered_s = 0.0;
         self.reset_lane_stats();
@@ -4757,6 +4772,55 @@ impl<'m> Session<'m> {
 
         // ---- host expert lane -------------------------------------------------
         self.timers.mark(EXPERTS);
+        // `BRECCIA_EXPERT_CACHE`: the resident experts' partial sum (plus shared·σ(gate))
+        // runs on the GPU while the host lane does the rest; the two partials are
+        // added in a fixed order (host, then GPU), so a run is deterministic.
+        let mut gpu_seg = None;
+        let (mut host_ids, mut host_w) = (ids.clone(), weights.clone());
+        let ec_pool = m.cache.get(&b);
+        if let Some(ec) = ec_pool {
+            let (mut sid, mut sw) = (Vec::new(), Vec::new());
+            host_ids.clear();
+            host_w.clear();
+            for (j, &e) in ids.iter().enumerate() {
+                let s = ec.slot_of[e];
+                if s >= 0 {
+                    sid.extend_from_slice(&(s as u32).to_le_bytes());
+                    sw.extend_from_slice(&weights[j].to_le_bytes());
+                } else {
+                    host_ids.push(e);
+                    host_w.push(weights[j]);
+                }
+            }
+            let k_res = sid.len() / 4;
+            self.ec_stats[0] += k_res as f64;
+            self.ec_stats[1] += ids.len() as f64;
+            if k_res > 0 {
+                if !self.batching {
+                    bail!("BRECCIA_EXPERT_CACHE needs dispatch batching");
+                }
+                self.ec_stats[2] += 1.0;
+                let (e_ids, e_w, _) = self.venues[dev].ec.as_ref().expect("the expert cache scratch");
+                e_ids.write(&sid)?;
+                e_w.write(&sw)?;
+                self.ensure_batch(dev)?;
+                let v = &self.venues[dev];
+                let (e_ids, e_w, e_part) = v.ec.as_ref().expect("the expert cache scratch");
+                self.run_moe_chain(
+                    dev,
+                    [&ec.gate, &ec.up, &ec.down],
+                    &e_ids.buf,
+                    &e_w.buf,
+                    &e_part.buf,
+                    mc.n_embd,
+                    mc.n_ff,
+                    k_res,
+                )?;
+                batch_cmd::record_barrier_to_host(m.devices[dev].gpu())?;
+                self.submit_batch()?;
+                gpu_seg = self.pending_seg.take().map(|s| (s, self.pending_dev.take().unwrap_or(dev)));
+            }
+        }
         let mut out = vec![0f32; mc.n_embd];
         let t_lane = std::time::Instant::now();
         let mut pool = self.pool.lock().expect("the expert pool's lock");
@@ -4766,18 +4830,37 @@ impl<'m> Session<'m> {
             0.0
         };
         let bytes = pool
-            .moe_topk(&m.layers[b].experts, &ids, &weights, &mixed, &mut out)
+            .moe_topk(&m.layers[b].experts, &host_ids, &host_w, &mixed, &mut out)
             .with_context(|| format!("the expert lane on block {b}"))?;
         drop(pool);
         self.lock_wait_s += waited;
         let lane = t_lane.elapsed().as_secs_f64();
         self.lane_s += lane;
+        if ec_pool.is_some() {
+            self.ec_stats[4] += lane;
+        }
         if covered {
             self.lane_covered_s += lane;
         }
         self.expert_bytes += bytes as u64;
-        for i in 0..mc.n_embd {
-            out[i] += shared[i] * gate;
+        if let Some((seg, d)) = gpu_seg {
+            let wait = {
+                let gpus = self.device_gpus();
+                batch_cmd::wait(&gpus, seg)
+                    .map_err(|e| anyhow!("waiting for block {b}'s resident-expert partial: {e}"))?
+            };
+            self.dev_wait_s[d] += wait;
+            self.ec_stats[3] += wait;
+            let mut part = vec![0u8; mc.n_embd * 4];
+            self.venues[dev].ec.as_ref().expect("the expert cache scratch").2.read(&mut part)?;
+            let part = f32_from_bytes(&part);
+            for i in 0..mc.n_embd {
+                out[i] += part[i];
+            }
+        } else {
+            for i in 0..mc.n_embd {
+                out[i] += shared[i] * gate;
+            }
         }
         let moe_out = if trace.is_some() {
             Some(Checksum::of(&out, 0))
@@ -4964,7 +5047,35 @@ impl<'m> Session<'m> {
         n_ff: usize,
         k: usize,
     ) -> Result<()> {
-        let _ = n_ff;
+        let _ = b;
+        let v = &self.venues[dev];
+        self.run_moe_chain(
+            dev,
+            [&pe.gate, &pe.up, &pe.down],
+            &v.router_ids,
+            &v.router_w,
+            &v.block_out.buf,
+            n_embd,
+            n_ff,
+            k,
+        )
+    }
+
+    /// The resident-expert MoE chain over `ws = [gate, up, down]` pools: `ids` index
+    /// the pool (expert ids for a placed block, slot ids for a cache pool). Writes
+    /// `Σ w·down + shared·σ(gate)` of `k` experts into `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn run_moe_chain(
+        &self,
+        dev: usize,
+        ws: [&crate::model::W; 3],
+        ids: &Buf,
+        wts: &Buf,
+        out: &Buf,
+        n_embd: usize,
+        n_ff: usize,
+        k: usize,
+    ) -> Result<()> {
         let v = &self.venues[dev];
         let pipes = &v.pipes;
         let mixed = &v.hc_ws.as_ref().expect("hc ws").mixed;
@@ -4972,37 +5083,26 @@ impl<'m> Session<'m> {
         // tensors need not share a type, and the row map's units depend on it.
         let gpu = self.model.devices[dev].gpu();
         batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_MAP);
-        let gate = pipes.batch(&pe.gate.key)?;
-        v.moe_map
-            .run(&v.router_ids, &v.moe_map_gate, gate, k, 0, false)?;
+        let gate = pipes.batch(&ws[0].key)?;
+        v.moe_map.run(ids, &v.moe_map_gate, gate, k, 0, false)?;
         batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_GATE);
-        gate.run(&pe.gate.buf, mixed, &v.moe_gate, &v.moe_map_gate, k)?;
+        gate.run(&ws[0].buf, mixed, &v.moe_gate, &v.moe_map_gate, k)?;
         batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_MAP);
-        let up = pipes.batch(&pe.up.key)?;
-        v.moe_map
-            .run(&v.router_ids, &v.moe_map_up, up, k, 0, false)?;
+        let up = pipes.batch(&ws[1].key)?;
+        v.moe_map.run(ids, &v.moe_map_up, up, k, 0, false)?;
         batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_UP);
-        up.run(&pe.up.buf, mixed, &v.moe_up, &v.moe_map_up, k)?;
+        up.run(&ws[1].buf, mixed, &v.moe_up, &v.moe_map_up, k)?;
         batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_SWIGLU);
         v.swiglu.run(&v.moe_gate, &v.moe_up, &v.moe_act, k * n_ff)?;
         // down: one activation row per expert, so the map carries the stride
         batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_MAP);
-        let down = pipes.batch(&pe.down.key)?;
-        v.moe_map
-            .run(&v.router_ids, &v.moe_map_down, down, k, 0, true)?;
+        let down = pipes.batch(&ws[2].key)?;
+        v.moe_map.run(ids, &v.moe_map_down, down, k, 0, true)?;
         batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_DOWN);
-        down.run(&pe.down.buf, &v.moe_act, &v.moe_down, &v.moe_map_down, k)?;
+        down.run(&ws[2].buf, &v.moe_act, &v.moe_down, &v.moe_map_down, k)?;
         batch_cmd::probe::enter(gpu, batch_cmd::probe::MOE_COMBINE);
-        v.moe_combine.run(
-            &v.moe_down,
-            &v.router_w,
-            &v.sh,
-            &v.sh_gate_logit,
-            &v.block_out.buf,
-            k,
-            n_embd,
-        )?;
-        let _ = b;
+        v.moe_combine
+            .run(&v.moe_down, wts, &v.sh, &v.sh_gate_logit, out, k, n_embd)?;
         Ok(())
     }
 
@@ -5866,6 +5966,20 @@ impl Drop for Session<'_> {
     /// `VUID-vkDestroyDevice-device-05137` at teardown.
     fn drop(&mut self) {
         let m = self.model;
+        if self.ec_stats[1] > 0.0 {
+            let f = self.forwards.max(1) as f64;
+            eprintln!(
+                "breccia: expert-cache decode: hit {:.1} % ({:.0}/{:.0} draws), {:.2} split blocks/token, \
+                 {:.2} ms/token waiting on the GPU partial after the host lane, {:.2} ms/token host lane, {} forwards",
+                100.0 * self.ec_stats[0] / self.ec_stats[1],
+                self.ec_stats[0],
+                self.ec_stats[1],
+                self.ec_stats[2] / f,
+                self.ec_stats[3] * 1e3 / f,
+                self.ec_stats[4] * 1e3 / f,
+                self.forwards
+            );
+        }
         // Every submission must be finished before anything it references is
         // freed, and the ring's descriptor pools are shared by every session on
         // this thread — the last session to drop frees them.
@@ -5880,6 +5994,11 @@ impl Drop for Session<'_> {
         for (i, v) in self.venues.iter_mut().enumerate() {
             let gpu = m.devices[i].gpu();
             v.block_out.release(gpu);
+            if let Some((a, b, c)) = &v.ec {
+                a.release(gpu);
+                b.release(gpu);
+                c.release(gpu);
+            }
             for b in [
                 &v.r,
                 &v.sh,

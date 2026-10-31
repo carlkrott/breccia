@@ -79,6 +79,18 @@ impl PlacedExperts {
     }
 }
 
+/// `BRECCIA_EXPERT_CACHE=<profile>`: one block's hottest routed experts packed into
+/// a VRAM pool (slot `i` holds expert `experts[i]`), instead of a whole-block arena.
+pub struct ExpertCache {
+    pub device: usize,
+    pub gate: W,
+    pub up: W,
+    pub down: W,
+    /// expert id -> slot in the pool, -1 = not resident (host lane).
+    pub slot_of: Vec<i32>,
+    pub slots: usize,
+}
+
 /// A projection weight plus the pipeline shape it needs.
 pub struct W {
     pub buf: Buf,
@@ -296,6 +308,9 @@ pub struct Model {
     pub ple: Option<PleRaw>,
     /// Blocks whose routed experts live in VRAM, keyed by block.
     pub placed: std::collections::BTreeMap<usize, PlacedExperts>,
+    /// `BRECCIA_EXPERT_CACHE`: per-block resident-expert pools (empty = off). Mutually
+    /// exclusive with `placed`.
+    pub cache: std::collections::BTreeMap<usize, ExpertCache>,
     /// D4c: when `--host-expert-import` is ON, the locked host arena holding the
     /// host-lane routed-expert blobs, built once at load. The blobs are laid out
     /// in block order (block b starts at 3×b expert slots); a later stage binds
@@ -732,6 +747,19 @@ impl Model {
                 (choice, Some(report))
             }
         };
+        let cache_profile = std::env::var_os("BRECCIA_EXPERT_CACHE").map(std::path::PathBuf::from);
+        let mut cache_bytes = vec![0u64; devices.len()];
+        let (arena_choice, arena_report) = if cache_profile.is_some() {
+            if !matches!(opts.arena, ArenaSpec::Auto(_)) {
+                bail!("BRECCIA_EXPERT_CACHE needs --gpu-experts auto (it takes the arena's byte budget)");
+            }
+            for ab in &arena_choice.blocks {
+                cache_bytes[ab.device] += ab.bytes;
+            }
+            (arena::ArenaChoice::default(), None)
+        } else {
+            (arena_choice, arena_report)
+        };
         let mut placed = std::collections::BTreeMap::new();
         // A block whose allocation fails is *dropped* (it stays on the host lane,
         // which is the default path) instead of aborting the load — the rule's
@@ -772,6 +800,19 @@ impl Model {
                 }
             }
         }
+        let cache = match &cache_profile {
+            Some(path) => build_expert_cache(
+                &devices,
+                &shards,
+                &layers,
+                &placement,
+                &cache_bytes,
+                path,
+                &mut keys,
+                &mut per_device_upload,
+            )?,
+            None => Default::default(),
+        };
         let mut arena_report = arena_report;
         if let Some(r) = arena_report.as_mut() {
             for b in &dropped {
@@ -1065,6 +1106,7 @@ impl Model {
             out_hc_up,
             ple,
             placed,
+            cache,
             imported_experts,
             arena: arena_report,
             stats,
@@ -1131,6 +1173,12 @@ impl Drop for Model {
         for pe in self.placed.values() {
             let gpu = self.devices[pe.device].gpu();
             for w in [&pe.gate, &pe.up, &pe.down] {
+                gpu.destroy_buf(&w.buf);
+            }
+        }
+        for ec in self.cache.values() {
+            let gpu = self.devices[ec.device].gpu();
+            for w in [&ec.gate, &ec.up, &ec.down] {
                 gpu.destroy_buf(&w.buf);
             }
         }
@@ -1291,6 +1339,116 @@ fn page_hint_experts(
             };
         }
     }
+}
+
+/// Parse a routing profile (`layer expert count` per line, `#` comments) and pack
+/// the globally hottest experts of each device's blocks into per-block VRAM pools,
+/// up to `bytes[dev]`. A missing or malformed profile is a hard error: a silent
+/// fallback to the arena would make a flag-on run look like the baseline.
+#[allow(clippy::too_many_arguments)]
+fn build_expert_cache(
+    devices: &[Device],
+    shards: &ShardSet,
+    layers: &[LayerWeights],
+    placement: &Placement,
+    bytes: &[u64],
+    path: &std::path::Path,
+    keys: &mut BTreeSet<PipeKey>,
+    per_device_upload: &mut [f64],
+) -> Result<std::collections::BTreeMap<usize, ExpertCache>> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("BRECCIA_EXPERT_CACHE profile {}", path.display()))?;
+    let mut counts: Vec<(u64, usize, usize)> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<u64> = line
+            .split_whitespace()
+            .map(|x| x.parse::<u64>())
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| anyhow!("{}:{}: {e}", path.display(), i + 1))?;
+        if f.len() != 3 || f[0] as usize >= layers.len() || f[1] as usize >= layers[f[0] as usize].experts.n_experts {
+            bail!("{}:{}: expected `layer expert count` in range", path.display(), i + 1);
+        }
+        counts.push((f[2], f[0] as usize, f[1] as usize));
+    }
+    if counts.is_empty() {
+        bail!("BRECCIA_EXPERT_CACHE profile {} has no rows", path.display());
+    }
+    // `BRECCIA_EXPERT_CACHE_MIB` overrides the per-device budget (default: what the arena would take).
+    let budget_override = std::env::var("BRECCIA_EXPERT_CACHE_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|m| m << 20);
+    counts.sort_by(|a, b| b.cmp(a).then(a.1.cmp(&b.1)));
+    // Global top-N by count per device (the replay study's `static` policy).
+    let mut used = vec![0u64; devices.len()];
+    let mut picked: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for &(_, b, e) in &counts {
+        let dev = placement.device_of(b);
+        let x = &layers[b].experts;
+        let per = (x.gate.bytes() + x.up.bytes() + x.down.bytes()) as u64;
+        if used[dev] + per <= budget_override.unwrap_or(bytes[dev]) {
+            used[dev] += per;
+            picked.entry(b).or_default().push(e);
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for (b, mut experts) in picked {
+        experts.sort_unstable();
+        let dev = placement.device_of(b);
+        let gpu = devices[dev].gpu();
+        let t0 = std::time::Instant::now();
+        let x = &layers[b].experts;
+        let (mut g, mut u, mut d) = (Vec::new(), Vec::new(), Vec::new());
+        let mut slot_of = vec![-1i32; x.n_experts];
+        for (i, &e) in experts.iter().enumerate() {
+            let s = x.slices(shards, e)?;
+            g.extend_from_slice(s.gate);
+            u.extend_from_slice(s.up);
+            d.extend_from_slice(s.down);
+            slot_of[e] = i as i32;
+        }
+        let mut ws = Vec::with_capacity(3);
+        for (role, data) in [("gate", &g), ("up", &u), ("down", &d)] {
+            let name = format!("blk.{b}.ffn_{role}_exps.weight");
+            let t = shards
+                .tensor(&name)
+                .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
+            let key = PipeKey::of(&t)?;
+            keys.insert(key);
+            let buf = breccia_kernels::gemv::upload(gpu, data)
+                .with_context(|| format!("uploading the {name} expert pool"))?;
+            ws.push(W { buf, key });
+        }
+        let down = ws.pop().expect("3");
+        let up = ws.pop().expect("2");
+        let gate = ws.pop().expect("1");
+        per_device_upload[dev] += t0.elapsed().as_secs_f64();
+        out.insert(
+            b,
+            ExpertCache {
+                device: dev,
+                gate,
+                up,
+                down,
+                slot_of,
+                slots: experts.len(),
+            },
+        );
+    }
+    for (dev, u) in used.iter().enumerate() {
+        let n: usize = out.values().filter(|c| c.device == dev).map(|c| c.slots).sum();
+        eprintln!(
+            "breccia: expert-cache: device {dev}: {n} experts in {} blocks, {:.2} GiB, profile {}",
+            out.values().filter(|c| c.device == dev).count(),
+            *u as f64 / (1u64 << 30) as f64,
+            path.display()
+        );
+    }
+    Ok(out)
 }
 
 fn w(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<W> {
