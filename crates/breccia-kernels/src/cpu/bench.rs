@@ -541,6 +541,17 @@ fn measure_token(
             }
             times.push(start.elapsed().as_secs_f64() * 1e3);
         }
+        if let Some(p) = pool.as_ref().filter(|_| super::expert::lane_stats_on()) {
+            let st = p.lane_stats;
+            eprintln!(
+                "lane {label}: phases {} wall {:.1} ms max-busy {:.1} ms mean-busy {:.1} ms sync {:.0} %",
+                st.phases,
+                st.wall_s * 1e3,
+                st.max_busy_s * 1e3,
+                st.mean_busy_s * 1e3,
+                st.sync_share() * 100.0
+            );
+        }
         drop(pool);
         let cold_ms = times[0];
         let best_ms = times.iter().copied().fold(f64::INFINITY, f64::min);

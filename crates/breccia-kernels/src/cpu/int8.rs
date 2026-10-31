@@ -111,7 +111,8 @@ pub(super) unsafe fn gemv(
 /// # Safety
 /// As [`gemv`]; `row` is whole weight blocks matching `q`'s length.
 pub(super) unsafe fn dot(vnni: bool, ty: QuantType, row: &[u8], q: &Q8) -> f32 {
-    debug_assert_eq!(row.len() / ty.block_bytes() * ty.block_elems(), q.qs.len());
+    // A real check: the kernels index `q` per block with unchecked loads.
+    assert_eq!(row.len() / ty.block_bytes() * ty.block_elems(), q.qs.len());
     // SAFETY: the caller checked the features of whichever kernel runs.
     unsafe {
         match (ty, vnni) {
@@ -451,6 +452,26 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn partial_weight_block_falls_back_to_the_exact_path() {
+        // cols 288 is a multiple of the 32-wide act block but not of IQ3_S's
+        // 256-wide weight block: int8 must not run (it would read past `q`).
+        if !avx2_available() {
+            return;
+        }
+        let (ty, rows, cols) = (QuantType::Iq3S, 2, 288);
+        let mut seed = 11;
+        let rb = crate::cpu::row_bytes(ty, cols);
+        let packed: Vec<u8> = (0..rows)
+            .flat_map(|_| row(ty, rb / ty.block_bytes(), &mut seed))
+            .collect();
+        let x = act(cols, &mut seed);
+        let (mut a, mut b) = (vec![0f32; rows], vec![0f32; rows]);
+        crate::cpu::gemv_into(crate::cpu::Path::Int8, ty, &packed, rows, cols, &x, &mut a);
+        crate::cpu::gemv_into(crate::cpu::Path::Avx2, ty, &packed, rows, cols, &x, &mut b);
+        assert_eq!(a, b);
     }
 
     #[test]

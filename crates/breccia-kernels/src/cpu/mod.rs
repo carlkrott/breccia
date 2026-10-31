@@ -373,6 +373,7 @@ pub fn gemv_into(
     if matches!(path, Path::Int8 | Path::Vnni)
         && int8::supported(ty)
         && cols.is_multiple_of(int8::act_block(ty))
+        && cols.is_multiple_of(ty.block_elems())
     {
         assert!(x.len() >= cols, "activation vector shorter than cols");
         // SAFETY: `normalized` kept Int8/Vnni only with their CPU features;
