@@ -2219,6 +2219,35 @@ fn feed_prompt(
     Ok(logits)
 }
 
+/// `BRECCIA_MTP_DRAFT_BENCH=N`: time N draft steps (synthetic R, real MTP
+/// weights, zeroed draft KV) on device 0. `BRECCIA_MTP_DIR` overrides the weights dir.
+fn mtp_draft_bench(model: &breccia_engine::model::Model, prompt_len: usize, n: usize) -> Result<()> {
+    let dir = std::env::var("BRECCIA_MTP_DIR").unwrap_or_else(|_| "/srv/strata-data/mtp/rt".into());
+    let t0 = std::time::Instant::now();
+    let mut d = breccia_engine::mtp_draft::MtpDraft::open(model, 0, &dir, prompt_len + 64)?;
+    println!("mtp-draft  built in {:.1} s, {} MiB device", t0.elapsed().as_secs_f64(), d.bytes >> 20);
+    let r: Vec<f32> = (0..10240).map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.02).collect();
+    d.set_r(&r)?;
+    let mut rows: Vec<[f64; 4]> = Vec::new();
+    let mut tok = 1000u32;
+    for i in 0..n {
+        let (t, ms) = d.step(tok, prompt_len + i % 32)?;
+        println!("mtp-draft  step {i:2}: tok {t:6} gather {:.2} record {:.2} gpu {:.2} read {:.2} ms", ms[0], ms[1], ms[2], ms[3]);
+        tok = t;
+        rows.push(ms);
+    }
+    let med = |c: usize| {
+        let mut v: Vec<f64> = rows.iter().skip(2).map(|r| r[c]).collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+    };
+    println!(
+        "mtp-draft  median (skip 2 warmup): gather {:.2} record {:.2} gpu {:.2} read {:.2}  step(no gather) {:.2} ms",
+        med(0), med(1), med(2), med(3), med(1) + med(2) + med(3)
+    );
+    Ok(())
+}
+
 /// `BRECCIA_SPEC_VERIFY_BENCH=T` (needs `--batching`, `--prefill-chunk` with
 /// `prefill_cap >= T`, one device): time one decode step against one T-row
 /// verify at the same position, check the verify rows against the decode steps,
@@ -3444,6 +3473,12 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             anyhow::bail!("BRECCIA_SPEC_VERIFY_BENCH={t}: T must be 2..=5");
         }
         spec_verify_bench(&mut sess, &l2, prompt.len(), t).context("the spec-verify bench")?;
+    }
+    if let Some(n) = std::env::var("BRECCIA_MTP_DRAFT_BENCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        mtp_draft_bench(&model, prompt.len(), n).context("the MTP draft bench")?;
     }
     let s1 = breccia_engine::LogitSummary::of_top(&l1, a.top_logits.max(10));
     let s2 = breccia_engine::LogitSummary::of(&l2);
