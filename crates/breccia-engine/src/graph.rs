@@ -663,6 +663,8 @@ pub struct Session<'m> {
     /// token ids (the PLE hash needs them).
     pf_ids: Vec<Vec<usize>>,
     pf_weights: Vec<Vec<f32>>,
+    /// Opt-in routed-expert tail skip (`BRECCIA_EXPERT_TAU`); `None` = off, the old behaviour.
+    prune: Option<breccia_kernels::prune::Prune>,
     pf_mixed: Vec<f32>,
     pf_toks: Vec<u32>,
     /// The merged pass's own counters (reset per measured window with the rest):
@@ -804,6 +806,13 @@ impl<'m> Session<'m> {
         let head_dev = model.head_device();
         let emb_ty = ty_of(model, "token_embd.weight")?;
         let ple_ty = ty_of(model, "per_layer_token_embd.weight")?;
+        let prune = breccia_kernels::prune::Prune::from_env(mc.n_expert_used)?;
+        if let Some(p) = prune {
+            eprintln!(
+                "breccia: expert tail-skip ON tau={} min_keep={} (BRECCIA_EXPERT_TAU)",
+                p.tau, p.min_keep
+            );
+        }
         let mut venues = Vec::with_capacity(model.devices.len());
         let mut stagings = Vec::with_capacity(model.devices.len());
         for (i, dev) in model.devices.iter().enumerate() {
@@ -837,7 +846,8 @@ impl<'m> Session<'m> {
             } else {
                 None
             };
-            let router = Router::new(gpu, mc.n_expert, mc.n_expert_used)?;
+            let mut router = Router::new(gpu, mc.n_expert, mc.n_expert_used)?;
+            router.set_prune(prune);
             let swiglu = SwiGlu::new(gpu)?;
             let emb = EmbGather::new(gpu, emb_ty, mc.n_embd)?;
             let emb_ple = EmbGather::new(gpu, ple_ty, mc.ple.dim)?;
@@ -1225,6 +1235,7 @@ impl<'m> Session<'m> {
             prefill_merged: cfg.prefill_merged,
             pf_ids: Vec::new(),
             pf_weights: Vec::new(),
+            prune,
             pf_mixed: Vec::new(),
             pf_toks: Vec::new(),
             pf_gemm_s: 0.0,
@@ -3260,9 +3271,15 @@ impl<'m> Session<'m> {
                     .chunks_exact(4)
                     .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
                     .collect();
-                self.pf_ids.push(ids);
-                self.pf_weights
-                    .push(f32_from_bytes(st.read_block(base + offs[2], k * 4)));
+                let weights = f32_from_bytes(st.read_block(base + offs[2], k * 4));
+                if self.prune.is_some() {
+                    let (ids, weights) = breccia_kernels::prune::strip_none(&ids, &weights);
+                    self.pf_ids.push(ids);
+                    self.pf_weights.push(weights);
+                } else {
+                    self.pf_ids.push(ids);
+                    self.pf_weights.push(weights);
+                }
                 shared
                     .extend_from_slice(&f32_from_bytes(st.read_block(base + offs[3], n_embd * 4)));
                 let g = st.read_block(base + offs[4], 4);
@@ -3773,10 +3790,15 @@ impl<'m> Session<'m> {
             .ids
             .read(&mut raw)?;
         let mut pairs: Vec<(usize, usize, usize)> = Vec::with_capacity(t * k);
+        let mut skipped = 0usize;
         for i in 0..t {
             for j in 0..k {
                 let o = (i * k + j) * 4;
                 let e = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
+                if self.prune.is_some() && e == breccia_kernels::prune::EXPERT_NONE as usize {
+                    skipped += 1; // tail-skipped: no list entry, `moe_fanin` skips the slot
+                    continue;
+                }
                 if e >= mc.n_expert {
                     bail!(
                         "router id {e} is outside the model's {} experts",
@@ -3790,7 +3812,8 @@ impl<'m> Session<'m> {
         // each distinct expert's users contiguous, which is exactly the GEMM's
         // `O[u * rows + row]` output layout.
         pairs.sort_unstable();
-        let mut slots = vec![0u32; t * k];
+        breccia_kernels::prune::note_skipped(skipped);
+        let mut slots = vec![if skipped > 0 { u32::MAX } else { 0u32 }; t * k];
         let mut groups: Vec<(usize, u32, Vec<usize>)> = Vec::new();
         let mut slot = 0u32;
         let mut at = 0usize;
@@ -4774,6 +4797,11 @@ impl<'m> Session<'m> {
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
             .collect();
         let weights = f32_from_bytes(&raw[2]);
+        let (ids, weights) = if self.prune.is_some() {
+            breccia_kernels::prune::strip_none(&ids, &weights)
+        } else {
+            (ids, weights)
+        };
         // A2 decode-side route rows: same sidecar, `d`-marked (append_route_row doc).
         if let Some(path) = std::env::var_os("BRECCIA_TRACE_ROUTE_FILE") {
             append_route_row(
@@ -5909,6 +5937,16 @@ impl Drop for Session<'_> {
             imp.release(&gpus);
         }
         if LIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            if let Some(p) = self.prune {
+                eprintln!(
+                    "breccia: expert tail-skip tau={} min_keep={}: {} (token, expert) slots skipped \
+                     on the host-visible paths (CPU lane, chunk prefill, merged prefill); \
+                     GPU-resident decode skips are not counted",
+                    p.tau,
+                    p.min_keep,
+                    breccia_kernels::prune::skipped()
+                );
+            }
             let _ = breccia_kernels::batch_cmd::shutdown();
         }
         for (i, v) in self.venues.iter_mut().enumerate() {

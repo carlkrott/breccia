@@ -413,6 +413,49 @@ fn router_ids_are_exact_and_weights_within_a_documented_bar() {
     }
 }
 
+// Tail skip (`BRECCIA_EXPERT_TAU`): the shader must emit the same kept ids, the
+// sentinel for the dropped suffix, and weights renormalised over the kept set.
+// Written against the f64 reference `cpu::router_pruned`; added without a GPU run
+// (the fault gate was closed), so it is compile-checked only until someone runs it.
+#[test]
+fn router_tail_skip_matches_the_cpu_reference() {
+    let fx = need_gpu!("router tail skip");
+    let gpu = fx.dev.gpu();
+    let mut r = Router::model(gpu).expect("pipeline");
+    for (tau, min_keep) in [(0.05f32, 4u32), (0.2, 2), (0.9, 4)] {
+        r.set_prune(Some(breccia_kernels::prune::Prune { tau, min_keep }));
+        let rows = 8usize;
+        let logits: Vec<f32> = normalish(0x51ab, rows * 512)
+            .into_iter()
+            .map(|v| v * 3.0)
+            .collect();
+        let lb = ops::upload_f32(gpu, &logits).expect("logits");
+        let idb = breccia_kernels::gemv::alloc(gpu, r.ids_bytes(rows)).expect("ids");
+        let wb = breccia_kernels::gemv::alloc(gpu, r.weights_bytes(rows)).expect("weights");
+        r.run(&lb, &idb, &wb, rows).expect("router");
+        let (ids, weights) = ops::bench::read_route(gpu, &idb, &wb, rows, 10).expect("read");
+        for t in 0..rows {
+            let want = cpu::router_pruned(
+                &logits[t * 512..(t + 1) * 512],
+                512,
+                10,
+                f64::from(tau),
+                min_keep as usize,
+            );
+            assert_eq!(
+                &ids[t * 10..(t + 1) * 10],
+                &want.ids[..],
+                "tau {tau} row {t}: kept ids / sentinel suffix differ"
+            );
+            let rel = max_rel(&weights[t * 10..(t + 1) * 10], &want.weights);
+            assert!(rel <= 1e-5, "tau {tau} row {t}: weight max rel {rel:e}");
+        }
+        for b in [&lb, &idb, &wb] {
+            gpu.destroy_buf(b);
+        }
+    }
+}
+
 #[test]
 fn embedding_gather_matches_the_dequant_reference() {
     let fx = need_gpu!("emb_gather");

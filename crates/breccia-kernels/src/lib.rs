@@ -53,6 +53,7 @@ pub mod gemv;
 pub mod moe;
 pub mod ops;
 pub mod proj;
+pub mod prune;
 pub mod qsa;
 pub mod quant;
 pub mod real;

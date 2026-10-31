@@ -195,6 +195,13 @@ void main() {
 
     const uint row_base = ROW_BASE(row);
     const uint xb = X_BASE(row); // vec4 units
+    // A tail-skipped expert row (`moe_map.comp` marker): keep the control flow
+    // uniform (same reduction, same store) but walk no blocks, so it writes 0.
+#ifdef BRECCIA_EXPERT_MAP
+    const uint b_stop = row_base == 0xFFFFFFFFu ? b_start : b_end;
+#else
+    const uint b_stop = b_end;
+#endif
 
 #ifdef BRECCIA_F16_ACCUM
     // fp16 accumulation (opt-in, `Accum::F16`; docs/phase-3/03-gaps-closed.md).
@@ -209,9 +216,9 @@ void main() {
 #endif
     float v[8];
 
-    for (uint b0 = b_start; b0 < b_end; b0 += STEP) {
+    for (uint b0 = b_start; b0 < b_stop; b0 += STEP) {
         uint b = b0 + b_off;
-        if (b < b_start || b >= b_end) {
+        if (b < b_start || b >= b_stop) {
             continue; // only reachable when UNITS < LANES (partial step)
         }
         uint e = b * QK + u * 8u;

@@ -49,7 +49,8 @@ layout(push_constant) uniform Params {
     uint rows;     // tokens
     uint n_expert; // experts (<= 512)
     uint k;        // experts to select (<= n_expert)
-    uint pad0;
+    uint min_keep; // tail-skip: never keep fewer than this many (1..=k); only read when tau > 0
+    float tau;     // tail-skip threshold on the normalised weight; 0 = off (old behaviour)
 } pc;
 
 #define WG_X_MAX 65535u
@@ -132,15 +133,42 @@ void main() {
     }
 
     // ---- renormalise with ggml's lower clamp (2^-14), ascending on one thread
+    //
+    // TAIL SKIP (opt-in, `pc.tau > 0`).  `s_sel` is non-increasing, so the experts
+    // whose normalised weight is below tau are always a suffix.  Keep the leading
+    // run with w >= tau (at least `min_keep`), renormalise over what is kept, and
+    // emit the dropped slots as id 0xFFFFFFFF / weight 0 so every consumer removes
+    // them from its dispatch list instead of multiplying by zero.  With tau == 0
+    // the old instruction sequence runs unchanged (bit-identical).
     if (tid == 0u) {
         float s = 0.0;
         for (uint i = 0u; i < k; ++i) {
             s += s_sel[i];
         }
         float sc = max(s, 6.103515625e-05);
+        uint keep = k;
+        if (pc.tau > 0.0) {
+            keep = 0u;
+            while (keep < k && s_sel[keep] / sc >= pc.tau) {
+                ++keep;
+            }
+            keep = min(max(keep, max(pc.min_keep, 1u)), k);
+            if (keep < k) {
+                float s2 = 0.0;
+                for (uint i = 0u; i < keep; ++i) {
+                    s2 += s_sel[i];
+                }
+                sc = max(s2, 6.103515625e-05);
+            }
+        }
         for (uint i = 0u; i < k; ++i) {
-            ID[row * k + i] = s_id[i];
-            W[row * k + i] = s_sel[i] / sc;
+            if (i < keep) {
+                ID[row * k + i] = s_id[i];
+                W[row * k + i] = s_sel[i] / sc;
+            } else {
+                ID[row * k + i] = 0xFFFFFFFFu;
+                W[row * k + i] = 0.0;
+            }
         }
     }
 }

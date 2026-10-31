@@ -230,6 +230,47 @@ pub fn router(logits: &[f32], n_expert: usize, k: usize) -> Route {
     }
 }
 
+/// The tail-skip rule on already-normalised, descending router weights: drop the
+/// suffix with `w < tau` (keep at least `min_keep`, never fewer than 1), then
+/// renormalise the kept weights to sum 1. Dropped slots come back as weight 0.
+/// Returns the weights and the number kept. `tau <= 0` is the identity.
+///
+/// This is the CPU reference of the rule in `ops_router.comp`; it does not run the shader.
+pub fn prune_tail(w: &[f64], tau: f64, min_keep: usize) -> (Vec<f64>, usize) {
+    let k = w.len();
+    let mut keep = k;
+    if tau > 0.0 {
+        keep = w.iter().take_while(|&&x| x >= tau).count();
+        keep = keep.max(min_keep.max(1)).min(k);
+    }
+    if keep == k {
+        return (w.to_vec(), k);
+    }
+    let s = w[..keep].iter().sum::<f64>().max(6.103_515_625e-05);
+    (
+        (0..k).map(|i| if i < keep { w[i] / s } else { 0.0 }).collect(),
+        keep,
+    )
+}
+
+/// [`router`] with the opt-in tail skip: dropped slots carry id
+/// `prune::EXPERT_NONE` and weight 0, exactly as the shader emits them.
+pub fn router_pruned(
+    logits: &[f32],
+    n_expert: usize,
+    k: usize,
+    tau: f64,
+    min_keep: usize,
+) -> Route {
+    let mut r = router(logits, n_expert, k);
+    let (w, keep) = prune_tail(&r.weights, tau, min_keep);
+    r.weights = w;
+    for id in &mut r.ids[keep..] {
+        *id = crate::prune::EXPERT_NONE;
+    }
+    r
+}
+
 /// One HC_READ stage, `f64`, over a single token (`docs/specs/…` §4.1).
 ///
 /// ```text
@@ -450,6 +491,58 @@ mod tests {
         for w in &r.weights {
             assert!((w - 1.0 / 3.0).abs() < 1e-12, "{w}");
         }
+    }
+
+    #[test]
+    fn prune_tail_drops_the_suffix_below_tau_and_renormalises() {
+        let w = [0.4, 0.3, 0.2, 0.07, 0.03];
+        let (p, keep) = prune_tail(&w, 0.1, 1);
+        assert_eq!(keep, 3);
+        assert_eq!(&p[3..], &[0.0, 0.0]);
+        assert!((p.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!((p[0] / p[1] - 0.4 / 0.3).abs() < 1e-12, "ratios kept");
+    }
+
+    #[test]
+    fn prune_tail_off_and_keep_all_are_the_identity() {
+        let w = [0.3, 0.25, 0.2, 0.15, 0.1];
+        assert_eq!(prune_tail(&w, 0.0, 1), (w.to_vec(), 5));
+        assert_eq!(prune_tail(&w, 0.1, 1), (w.to_vec(), 5), "w == tau is kept");
+    }
+
+    #[test]
+    fn prune_tail_min_keep_floors_the_count() {
+        let w = [0.9, 0.05, 0.03, 0.02];
+        assert_eq!(prune_tail(&w, 0.5, 3).1, 3);
+        assert_eq!(prune_tail(&w, 0.5, 1).1, 1);
+        assert_eq!(prune_tail(&w, 0.99, 0).1, 1, "never drops every expert");
+        assert_eq!(prune_tail(&w, 0.99, 99).1, 4, "min_keep > k is capped at k");
+    }
+
+    #[test]
+    fn prune_tail_all_equal_weights_keep_all_or_the_first_min_keep() {
+        let w = [0.1f64; 10];
+        assert_eq!(prune_tail(&w, 0.1, 4).1, 10);
+        let (p, keep) = prune_tail(&w, 0.11, 4);
+        assert_eq!(keep, 4);
+        assert!(p[..4].iter().all(|&x| (x - 0.25).abs() < 1e-12));
+        assert!(p[4..].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn router_pruned_marks_the_tail_with_the_sentinel_and_keeps_tie_order() {
+        // Six tied top experts (ids ascend), four tiny others: tau cuts the others.
+        let mut logits = vec![-9.0f32; 512];
+        for e in [37usize, 5, 300, 12, 411, 88] {
+            logits[e] = 3.0;
+        }
+        let off = router(&logits, 512, 10);
+        let r = router_pruned(&logits, 512, 10, 0.05, 4);
+        assert_eq!(&r.ids[..6], &off.ids[..6]);
+        assert!(r.ids[6..].iter().all(|&i| i == crate::prune::EXPERT_NONE));
+        assert!(r.weights[6..].iter().all(|&w| w == 0.0));
+        assert!((r.weights.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert_eq!(router_pruned(&logits, 512, 10, 0.0, 4), off, "tau 0 = off");
     }
 
     #[test]

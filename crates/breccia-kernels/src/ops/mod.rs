@@ -859,6 +859,8 @@ pub struct Router<'g> {
     pipe: Pipe<'g>,
     n_expert: usize,
     k: usize,
+    /// Opt-in tail skip; `None` = the old behaviour, bit for bit.
+    prune: Option<crate::prune::Prune>,
 }
 
 impl<'g> Router<'g> {
@@ -884,7 +886,14 @@ impl<'g> Router<'g> {
             )?,
             n_expert,
             k,
+            prune: None,
         })
+    }
+
+    /// Turn the tail skip on (`crate::prune`): selected experts whose normalised
+    /// weight is below `tau` come out as id `EXPERT_NONE` / weight 0.
+    pub fn set_prune(&mut self, prune: Option<crate::prune::Prune>) {
+        self.prune = prune;
     }
 
     /// The artifact's router: 512 experts, top-10.
@@ -920,7 +929,9 @@ impl<'g> Router<'g> {
             Pc::new()
                 .u(rows as u32)
                 .u(self.n_expert as u32)
-                .u(self.k as u32),
+                .u(self.k as u32)
+                .u(self.prune.map_or(0, |p| p.min_keep))
+                .f(self.prune.map_or(0.0, |p| p.tau)),
             (gx, gy, 1),
         )
     }

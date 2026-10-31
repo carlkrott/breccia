@@ -41,6 +41,11 @@ void main() {
         return;
     }
     uint r = row - j * pc.rows_per_expert;
-    MAP[row] = pc.base_words + IDS[j] * pc.blob_words + r * pc.bpr * pc.block_words;
+    // A tail-skipped slot (router id 0xFFFFFFFF) maps to the dead-row marker the
+    // expert GEMV recognises; its activation base stays valid.
+    uint id = IDS[j];
+    MAP[row] = id == 0xFFFFFFFFu
+        ? 0xFFFFFFFFu
+        : pc.base_words + id * pc.blob_words + r * pc.bpr * pc.block_words;
     MAP[pc.rows_total + row] = pc.per_expert_pc4 == 0u ? 0u : j * pc.per_expert_pc4;
 }

@@ -36,6 +36,9 @@ void main() {
     // Router order, so the sum matches the single-token combine exactly.
     for (uint j = 0u; j < k; ++j) {
         uint slot = SL[t * k + j];
+        if (slot == 0xFFFFFFFFu) {
+            continue; // tail-skipped (token, expert) pair: no scratch row exists
+        }
         acc += Wt[t * k + j] * S[slot * pc.cols + c];
     }
     float gate = G[t];
