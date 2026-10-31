@@ -635,6 +635,16 @@ fn paired_shared_gate_up_matches_gate_up_swiglu() {
             .fold(0f64, f64::max);
         println!("pair_gemm: m = {m}: {diff}/{n} differ, worst relative {worst:.3e}");
         assert_eq!(diff, 0, "m = {m}: the fused gate+up+swiglu must be bit-identical");
+        // The routed-expert form: the same blob at a word offset inside a larger buffer.
+        let pad = 4096usize;
+        let padded: Vec<u8> = [&vec![0xA5u8; pad * 2][..], cat.as_slice()].concat();
+        let wq = breccia_kernels::gemv::upload(gpu, &padded).expect("upload padded pair");
+        let oq = alloc(gpu, (n * 4) as u64).expect("out");
+        many.run_pair_at(&wq, &x, &oq, rows, cols, m, pad as u32).expect("pair_at");
+        let at = breccia_kernels::ops::download_f32(gpu, &oq, n).expect("down pair_at");
+        assert!(want.iter().zip(&at).all(|(a, b)| a.to_bits() == b.to_bits()), "m = {m}: run_pair_at");
+        gpu.destroy_buf(&wq);
+        gpu.destroy_buf(&oq);
         for o in [og, ou, oa, op, x] {
             gpu.destroy_buf(&o);
         }

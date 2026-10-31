@@ -267,6 +267,8 @@ pub struct PfChunk {
     sf_gate: Buf,
     sf_up: Buf,
     sf_down: Buf,
+    /// Gate then up, exact blob sizes back to back: the fused pair GEMM's weights.
+    sf_gu: Buf,
     /// Per-slot stride inside [`PfChunk::stream`], and the per-role byte counts.
     slot_stride: u64,
     g_bytes: u64,
@@ -306,6 +308,7 @@ impl PfChunk {
                 &self.sf_gate,
                 &self.sf_up,
                 &self.sf_down,
+                &self.sf_gu,
             ]
             .iter()
             .map(|b| b.size)
@@ -335,6 +338,7 @@ impl PfChunk {
             &self.sf_gate,
             &self.sf_up,
             &self.sf_down,
+            &self.sf_gu,
         ] {
             gpu.destroy_buf(b);
         }
@@ -948,6 +952,7 @@ impl<'m> Session<'m> {
                     sf_gate: alloc(gb.max(16), "streamed expert gate")?,
                     sf_up: alloc(ub.max(16), "streamed expert up")?,
                     sf_down: alloc(db.max(16), "streamed expert down")?,
+                    sf_gu: alloc((gb + ub).max(16), "streamed expert gate+up")?,
                     slot_stride,
                     g_bytes: gb,
                     u_bytes: ub,
@@ -3244,6 +3249,15 @@ impl<'m> Session<'m> {
         // STREAM_SLOTS experts bounds the host-visible staging (and is the ring
         // wait this pass reports).
         let mut expert_index = 0usize;
+        // Fused gate + up + SwiGLU per streamed group (`BRECCIA_PF_ROUTED_PAIR=0` opts out).
+        let (gx, ux) = (wgate as u64 * 2, wup as u64 * 2);
+        let pair = streamed
+            && routed_pair()
+            && gate_ty == up_ty
+            && gx.is_multiple_of(4)
+            && self.venues[edev].pipes.gemm(gate_ty).is_some_and(|g| g.has_pair())
+            && m.layers[b].experts.gate.bytes() as u64 == gx
+            && m.layers[b].experts.up.bytes() as u64 == ux;
         let mut prev_expert: Option<usize> = None;
         let mut stream_prev: Option<breccia_kernels::batch_cmd::Segment> = None;
         for (e, base, users) in groups.iter() {
@@ -3288,20 +3302,32 @@ impl<'m> Session<'m> {
                     let slot = (expert_index - 1) % (2 * STREAM_SLOTS);
                     // slot -> device, three region groups, one barrier.
                     let off = slot as u64 * pf.slot_stride;
-                    batch_cmd::record_copies(
-                        egpu,
-                        &[
-                            (&pf.sf_gate, 0, &pf.stream.buf, off, pf.g_bytes),
-                            (&pf.sf_up, 0, &pf.stream.buf, off + pf.g_bytes, pf.u_bytes),
-                            (
-                                &pf.sf_down,
-                                0,
-                                &pf.stream.buf,
-                                off + pf.g_bytes + pf.u_bytes,
-                                pf.d_bytes,
-                            ),
-                        ],
-                    )?;
+                    let down_copy = (
+                        &pf.sf_down,
+                        0,
+                        &pf.stream.buf,
+                        off + pf.g_bytes + pf.u_bytes,
+                        pf.d_bytes,
+                    );
+                    if pair {
+                        batch_cmd::record_copies(
+                            egpu,
+                            &[
+                                (&pf.sf_gu, 0, &pf.stream.buf, off, gx),
+                                (&pf.sf_gu, gx, &pf.stream.buf, off + pf.g_bytes, ux),
+                                down_copy,
+                            ],
+                        )?;
+                    } else {
+                        batch_cmd::record_copies(
+                            egpu,
+                            &[
+                                (&pf.sf_gate, 0, &pf.stream.buf, off, pf.g_bytes),
+                                (&pf.sf_up, 0, &pf.stream.buf, off + pf.g_bytes, pf.u_bytes),
+                                down_copy,
+                            ],
+                        )?;
+                    }
                 }
                 // Gather the group's activation rows (a run of consecutive tokens
                 // is one copy), then one weights read at the expert's arena base.
@@ -3335,12 +3361,16 @@ impl<'m> Session<'m> {
                     ),
                     None => (&pf.sf_gate, &pf.sf_up, &pf.sf_down, 0u32, 0u32, 0u32),
                 };
-                // `gate` and `up` read the same gather and write pf.gg / pf.uu:
-                // drop gate's trailing fence (§8z).
-                batch_cmd::skip_next_barrier();
-                gate.run_at(gbuf, &pf.x, &pf.gg, n_ff, n_embd, mu, gb)?;
-                up.run_at(ubuf, &pf.x, &pf.uu, n_ff, n_embd, mu, ub)?;
-                v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
+                if pair {
+                    gate.run_pair_at(&pf.sf_gu, &pf.x, &pf.act, n_ff, n_embd, mu, 0)?;
+                } else {
+                    // `gate` and `up` read the same gather and write pf.gg / pf.uu:
+                    // drop gate's trailing fence (§8z).
+                    batch_cmd::skip_next_barrier();
+                    gate.run_at(gbuf, &pf.x, &pf.gg, n_ff, n_embd, mu, gb)?;
+                    up.run_at(ubuf, &pf.x, &pf.uu, n_ff, n_embd, mu, ub)?;
+                    v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
+                }
                 down.run_at(dbuf, &pf.act, &pf.down, n_embd, n_ff, mu, db)?;
                 batch_cmd::record_copy(
                     egpu,
@@ -5059,6 +5089,13 @@ pub fn prefill_plan(len: usize, target: usize) -> Vec<usize> {
     let n = len.div_ceil(cap);
     let (base, rem) = (len / n, len % n);
     (0..n).map(|i| base + usize::from(i < rem)).collect()
+}
+
+/// `BRECCIA_PF_ROUTED_PAIR`: fused gate + up + SwiGLU for streamed routed experts
+/// (default on, `0` = the separate gate / up / SwiGLU dispatches).
+fn routed_pair() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_ROUTED_PAIR").as_deref() != Ok("0"))
 }
 
 /// `BRECCIA_PF_GROUP_USERS`: users per merged-prefill expert group (default 1024,
