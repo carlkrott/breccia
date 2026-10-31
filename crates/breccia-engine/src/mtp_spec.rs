@@ -82,7 +82,9 @@ struct Gate {
 impl Gate {
     fn new() -> Self {
         Gate {
-            num: [1.2; MAX_K],
+            // p=0.8 = measured first-position acceptance (code 81 %, prose 82 %); at p=0.6
+            // k=1 never beats plain and the gate never leaves k=0 (10-31 gt-job)
+            num: [1.6; MAX_K],
             den: [2.0; MAX_K],
             round_ms: [47.0, 92.0, 112.0, 130.0, 158.0, 179.0],
             seen: [false; MAX_K + 1],
@@ -382,5 +384,7 @@ mod tests {
             g.observe(1, 1, 80.0);
         }
         assert_eq!(g.pick(), 3);
+        // cold start must try spec (k=3 at the measured priors), not sit on plain
+        assert_eq!(Gate::new().pick(), 3);
     }
 }
