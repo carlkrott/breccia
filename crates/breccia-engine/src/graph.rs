@@ -5180,8 +5180,22 @@ impl<'m> Session<'m> {
             ple.block_chunk(&rs, &keys, &vals, &mut out)?;
         }
         let ple_t4 = ple_t0.elapsed();
-        let bytes = f32_to_bytes(&out);
-        {
+        if self.micro.is_some() && ple_wb_one() && self.venues[dev].r_chunk.is_some() {
+            // One contiguous write into the half's residual chunk, then the same GPU-side
+            // scatter into `r_slots` that B does; A's gather reads the slots next.
+            // SAFETY: f32 -> its little-endian bytes on a little-endian host, same length * 4.
+            let bytes = unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, out.len() * 4) };
+            let rc = self.venues[dev].r_chunk.as_ref().expect("checked above");
+            self.stagings[dev].write_regions(gpu, &[(rc, 0, bytes)])?;
+            self.ensure_batch(dev)?;
+            let v = &self.venues[dev];
+            let hb = (hc_dim * 4) as u64;
+            let rc = v.r_chunk.as_ref().expect("checked above");
+            let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> =
+                (0..t).map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb)).collect();
+            batch_cmd::record_copies(gpu, &scatter)?;
+        } else {
+            let bytes = f32_to_bytes(&out);
             let v = &self.venues[dev];
             let items: Vec<(&Buf, u64, &[u8])> = (0..t)
                 .map(|i| {
@@ -5700,6 +5714,13 @@ fn pf_group_users() -> usize {
 /// `BRECCIA_PF_MICRO=2`: split each prefill chunk into two micro-batches and pipeline
 /// them across the block card and the expert helper (default on since §12.13: plx
 /// +34 %, logits == flag-off chunk/2; unset or `2` enables, anything else disables).
+/// `BRECCIA_PLE_WB_ONE` (default off, `1` = on; A,B,A,B 302.2 vs 302.5 tok/s, inside noise): in a micro tick the PLE writeback is one
+/// contiguous write into the residual chunk plus a GPU scatter, not `t` per-slot copies.
+fn ple_wb_one() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PLE_WB_ONE").as_deref() == Ok("1"))
+}
+
 /// `BRECCIA_PLE_GEMM` (default on, `0` = off): the chunk's PLE key / value projections run as one tiled GEMM
 /// each instead of `t` mat-vecs. Same dot products, different reduction order (parity gate,
 /// not byte-identity).
