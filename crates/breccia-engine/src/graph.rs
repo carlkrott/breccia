@@ -40,13 +40,13 @@ use breccia_kernels::ops::{
     f32_from_bytes, f32_to_bytes, EmbGather, HcMixer, HcWeights, HcWorkspace, Router, SwiGlu,
 };
 use breccia_kernels::{
-    Gdn, GdnProjections, GdnState, GdnWeights, GdnWorkspace, Proj, Qsa, QsaProjections, QsaState,
-    QsaWeights, QsaWorkspace, QuantType,
+    Gdn, GdnProjections, GdnState, GdnTap, GdnWeights, GdnWorkspace, Proj, Qsa, QsaProjections,
+    QsaState, QsaWeights, QsaWorkspace, QuantType,
 };
 
 use crate::config::LayerKind;
 use crate::model::{HcW, Model, PipelineSet};
-use crate::ple::PleHost;
+use crate::ple::{PleHost, PleState};
 use crate::sampler::{Sampler, Sampling};
 use crate::stats::{Checksum, GdnTrace, LayerTrace};
 use crate::xfer::{Mailbox, Staging};
@@ -543,6 +543,51 @@ fn kind_name(m: &Model, b: usize) -> String {
 // threads at once. Shared references are not sent.
 unsafe impl Send for Session<'_> {}
 
+/// Rollback snapshots for speculative verify ([`Session::spec_enable`]).
+///
+/// Two modes, fixed at `spec_enable`. **Replay** (default): the verify is the
+/// merged-prefill chunk (batched GEMMs, chunked mixers, one T-row head GEMM).
+/// Slot 0 holds the state before the chunk and each layer taps what its mixer
+/// consumed (`gdn_tap`, `idx_k_tap`); `rollback_to(r)` restores slot 0 and re-runs
+/// just the state-update kernels over the first `r + 1` rows. **Rows**
+/// (`BRECCIA_SPEC_VERIFY_ROWS=1`, or a model the chunk path cannot take): the old
+/// per-row decode-style mixers with one slot per row; the A/B reference.
+///
+/// Slot `s` is the recurrent state after `s` rows of the chunk being verified.
+/// The chunk's last row is the live state, so a T-row verify fills slots
+/// `1..T-1`; slot 0 (before the chunk) is only read by the bench's base restore.
+/// QSA K/V needs no slot: attention masks `cell > pos` and the refed row at that
+/// position overwrites its own cell. The indexer's raw `idx_tail` does: a rejected
+/// row at block slot 0 clobbers a tail the refed completing cell still pools.
+/// `idx_pooled` entries of rejected rows sit past `n_blocks` and are recomputed.
+struct SpecSnap {
+    /// `[slot * n_layers + b]`
+    gdn: Vec<Option<GdnState>>,
+    tail: Vec<Option<Buf>>,
+    /// PLE history after `s` rows (index 0 unused); empty for a model without PLE.
+    ple_rows: Vec<Vec<f32>>,
+    /// PLE window before the chunk; rollback replays the accepted prefix on it.
+    ple_pre: Option<PleState>,
+    base_ple: Option<PleState>,
+    base_pos: usize,
+    base_tok: u32,
+    toks: Vec<u32>,
+    pos0: usize,
+    max_t: usize,
+    /// Set only inside `verify`: the per-row hooks in `prefill_block*` check it.
+    active: bool,
+    /// Replay mode (see above); the fields below exist only then.
+    replay: bool,
+    /// Per layer: the GDN chunk's conv input / gate / beta rows.
+    gdn_tap: Vec<Option<GdnTap>>,
+    /// Per layer: the QSA chunk's raw indexer keys `[max_t, IDX_DIM]`.
+    idx_k_tap: Vec<Option<Buf>>,
+    /// `[max_t, vocab]` head GEMM output.
+    head_logits: Option<Buf>,
+    /// Final-HC workspaces for `T = 2..=max_t` (row maps are per `T`).
+    head_ws: Vec<HcWorkspace>,
+}
+
 /// A loaded, ready-to-run session: pipelines, state, and the host expert pool.
 pub struct Session<'m> {
     pub model: &'m Model,
@@ -556,6 +601,8 @@ pub struct Session<'m> {
     ship_imp_off: bool,
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
+    /// Speculative-verify rollback slots; `None` (the default) leaves every path unchanged.
+    spec: Option<Box<SpecSnap>>,
     /// One `QsaWorkspace` per QSA layer, allocated at `ctx_capacity` and reused
     /// every token: the *buffers* stay fixed and only `n_blocks` / `max_ids` /
     /// `slots` are rewritten per call, which is what the forward pass reads.
@@ -1149,6 +1196,7 @@ impl<'m> Session<'m> {
             ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() == Ok("0"),
             gdn_state,
             qsa_state,
+            spec: None,
             qsa_ws,
             pool,
             ple,
@@ -2451,6 +2499,15 @@ impl<'m> Session<'m> {
     /// Requires a configured [`SessionCfg::prefill_chunk`]; a layer-split
     /// placement hands the chunk's residuals across devices ([`Self::handoff_slots`]).
     pub fn prefill(&mut self, toks: &[u32], pos0: usize) -> Result<Vec<f32>> {
+        Ok(self
+            .prefill_rows(toks, pos0, false)?
+            .pop()
+            .expect("the head ran on at least one row"))
+    }
+
+    /// [`Self::prefill`], with the head on every row when `all_rows` (one logits
+    /// vector per token) instead of the last one only.
+    fn prefill_rows(&mut self, toks: &[u32], pos0: usize, all_rows: bool) -> Result<Vec<Vec<f32>>> {
         let t = toks.len();
         if t == 0 {
             bail!("an empty prefill chunk");
@@ -2604,13 +2661,400 @@ impl<'m> Session<'m> {
         // ---- the head sees the chunk's last token only -----------------------
         self.timers.mark(FINAL_HC);
         let last = m.device_of(mc.n_layers - 1);
-        self.swap_r_in(last, t - 1);
-        self.submit_head()?;
-        let logits = self.finish_head()?;
-        self.swap_r_in(last, t - 1);
+        let mut logits = Vec::new();
+        if all_rows && self.spec.as_ref().is_some_and(|sp| sp.active && sp.replay) {
+            logits = self.spec_head(t)?;
+            self.pf_wall_s += wall0.elapsed().as_secs_f64();
+            return Ok(logits);
+        }
+        // shortcut: one head submit per row (~7 ms each) outside spec replay.
+        for i in if all_rows { 0..t } else { t - 1..t } {
+            self.swap_r_in(last, i);
+            self.submit_head()?;
+            logits.push(self.finish_head()?);
+            self.swap_r_in(last, i);
+        }
         self.timers.stop();
         self.pf_wall_s += wall0.elapsed().as_secs_f64();
         Ok(logits)
+    }
+
+    /// Inside a rows-mode verify: the per-row hooks apply and the mixers run per row.
+    fn spec_rows_active(&self) -> bool {
+        self.spec.as_ref().is_some_and(|sp| sp.active && !sp.replay)
+    }
+
+    /// Replay mode can take this model: merged prefill, every block's mixer and
+    /// expert types have a multi-user GEMM, and so does the head.
+    fn spec_replay_ok(&self) -> bool {
+        let m = self.model;
+        let v = &self.venues[0];
+        let pipes = &v.pipes;
+        std::env::var("BRECCIA_SPEC_VERIFY_ROWS").as_deref() != Ok("1")
+            && self.prefill_merged
+            && v.pf.is_some()
+            && v.r_chunk.is_some()
+            && v.logits.is_some()
+            && pipes.gemm(m.head.key.ty).is_some()
+            && m.head.key.rows == m.cfg.vocab
+            && (0..m.cfg.n_layers).all(|b| {
+                let plan = &m.layers[b].experts;
+                let (gt, ut, dt) = match m.placed.get(&b) {
+                    Some(pe) => (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty),
+                    None => (plan.gate.ty, plan.up.ty, plan.down.ty),
+                };
+                self.mixer_chunked(b, 0) && [gt, ut, dt].iter().all(|ty| pipes.gemm(*ty).is_some())
+            })
+    }
+
+    /// Allocate rollback slots for verifying up to `max_t` rows (~112 MiB of GDN
+    /// state per slot). Greedy, single device, `--batching` only.
+    pub fn spec_enable(&mut self, max_t: usize) -> Result<()> {
+        let m = self.model;
+        if m.devices.len() != 1 {
+            bail!("speculative verify is single-device only ({} devices)", m.devices.len());
+        }
+        if !self.batching {
+            bail!("speculative verify records into a dispatch batch: it needs --batching");
+        }
+        if max_t < 2 {
+            bail!("a verify chunk is at least 2 rows");
+        }
+        self.spec_release();
+        let gpu = m.devices[0].gpu();
+        let replay = self.spec_replay_ok();
+        let mut sp = Box::new(SpecSnap {
+            gdn: Vec::new(),
+            tail: Vec::new(),
+            ple_rows: vec![Vec::new(); max_t],
+            ple_pre: None,
+            base_ple: None,
+            base_pos: 0,
+            base_tok: 0,
+            toks: Vec::new(),
+            pos0: 0,
+            max_t,
+            active: false,
+            replay,
+            gdn_tap: Vec::new(),
+            idx_k_tap: Vec::new(),
+            head_logits: None,
+            head_ws: Vec::new(),
+        });
+        let mut made = Ok(());
+        'slots: for _ in 0..if replay { 1 } else { max_t } {
+            for b in 0..m.cfg.n_layers {
+                let g = match &self.gdn_state[b] {
+                    Some(_) => GdnState::new(gpu).map(Some),
+                    None => Ok(None),
+                };
+                let tl = match &self.qsa_state[b] {
+                    Some(_) => {
+                        let bytes = breccia_kernels::qsa::sizes::idx_tail_bytes();
+                        breccia_kernels::gemv::alloc(gpu, bytes).map(Some)
+                    }
+                    None => Ok(None),
+                };
+                match (g, tl) {
+                    (Ok(g), Ok(tl)) => {
+                        sp.gdn.push(g);
+                        sp.tail.push(tl);
+                    }
+                    (g, tl) => {
+                        if let Ok(Some(g)) = g {
+                            g.release(gpu);
+                        }
+                        if let Ok(Some(tl)) = &tl {
+                            gpu.destroy_buf(tl);
+                        }
+                        made = Err(anyhow!("allocating a speculative rollback slot"));
+                        break 'slots;
+                    }
+                }
+            }
+        }
+        if made.is_ok() && replay {
+            made = (|| -> Result<()> {
+                for b in 0..m.cfg.n_layers {
+                    sp.gdn_tap.push(match &self.gdn_state[b] {
+                        Some(_) => Some(GdnTap::new(gpu, max_t)?),
+                        None => None,
+                    });
+                    sp.idx_k_tap.push(match &self.qsa_state[b] {
+                        Some(_) => Some(breccia_kernels::gemv::alloc(
+                            gpu,
+                            (max_t * breccia_kernels::qsa::IDX_DIM * 4) as u64,
+                        )?),
+                        None => None,
+                    });
+                }
+                sp.head_logits = Some(breccia_kernels::gemv::alloc(gpu, (max_t * m.cfg.vocab * 4) as u64)?);
+                for t in 2..=max_t {
+                    sp.head_ws.push(self.venues[0].final_hc.workspace(gpu, t)?);
+                }
+                Ok(())
+            })();
+        }
+        self.spec = Some(sp);
+        if made.is_err() {
+            self.spec_release();
+        }
+        made
+    }
+
+    fn spec_release(&mut self) {
+        if let Some(mut sp) = self.spec.take() {
+            let gpu = self.model.devices[0].gpu();
+            for g in sp.gdn.drain(..).flatten() {
+                g.release(gpu);
+            }
+            for t in sp.tail.drain(..).flatten() {
+                gpu.destroy_buf(&t);
+            }
+            for g in sp.gdn_tap.drain(..).flatten() {
+                g.release(gpu);
+            }
+            for k in sp.idx_k_tap.drain(..).flatten() {
+                gpu.destroy_buf(&k);
+            }
+            if let Some(l) = sp.head_logits.take() {
+                gpu.destroy_buf(&l);
+            }
+            for ws in sp.head_ws.drain(..) {
+                self.venues[0].final_hc.release(gpu, ws);
+            }
+        }
+    }
+
+    /// Record the copy of block `b`'s recurrent state (GDN state + conv, or the
+    /// QSA indexer tail) between the live state and rollback slot `slot`.
+    fn spec_copy_block(&self, b: usize, slot: usize, save: bool) -> Result<()> {
+        let sp = self
+            .spec
+            .as_ref()
+            .ok_or_else(|| anyhow!("no speculative rollback slots: call spec_enable"))?;
+        let gpu = self.model.devices[0].gpu();
+        let at = slot * self.model.cfg.n_layers + b;
+        let copy = |live: &Buf, snap: &Buf, len: u64| {
+            let (dst, src) = if save { (snap, live) } else { (live, snap) };
+            batch_cmd::record_copy(gpu, dst, 0, src, 0, len)
+        };
+        if let (Some(live), Some(snap)) = (&self.gdn_state[b], &sp.gdn[at]) {
+            copy(&live.state, &snap.state, live.state.size)?;
+            copy(&live.conv, &snap.conv, live.conv.size)?;
+        }
+        if let (Some(live), Some(snap)) = (&self.qsa_state[b], &sp.tail[at]) {
+            copy(&live.idx_tail, snap, breccia_kernels::qsa::sizes::idx_tail_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Verify hook, after row `i`'s mixer: save block `b`'s state as "after
+    /// `i + 1` rows". The last row's state is the live one, so it needs no slot.
+    fn spec_row_state(&self, b: usize, i: usize, t: usize) -> Result<()> {
+        if self.spec_rows_active() && i + 1 < t {
+            self.spec_copy_block(b, i + 1, true)?;
+        }
+        Ok(())
+    }
+
+    /// Verify hook, after row `i`'s PLE block: the history "after `i + 1` rows".
+    fn spec_ple_row(&mut self, i: usize, t: usize) {
+        if i + 1 < t {
+            let sp = self.spec.as_mut().filter(|s| s.active);
+            if let (Some(sp), Some(p)) = (sp, self.ple.as_ref()) {
+                sp.ple_rows[i + 1] = p.state().hist;
+            }
+        }
+    }
+
+    /// Copy every block's state between the live state and `slot`, as one batch.
+    fn spec_sweep(&mut self, slot: usize, save: bool) -> Result<()> {
+        self.flush()?;
+        self.ensure_batch(0)?;
+        for b in 0..self.model.cfg.n_layers {
+            self.spec_copy_block(b, slot, save)?;
+        }
+        self.submit_batch()?;
+        self.flush()
+    }
+
+    /// Bench only: snapshot the whole state now (slot 0) so [`Self::spec_restore_base`]
+    /// can return to it. A real draft loop never needs this.
+    pub fn spec_save_base(&mut self) -> Result<()> {
+        self.spec_sweep(0, true)?;
+        let base_ple = self.ple.as_ref().map(|p| p.state());
+        let (pos, tok) = (self.pos, self.cur_tok);
+        let sp = self.spec.as_mut().ok_or_else(|| anyhow!("call spec_enable first"))?;
+        sp.base_ple = base_ple;
+        sp.base_pos = pos;
+        sp.base_tok = tok;
+        Ok(())
+    }
+
+    pub fn spec_restore_base(&mut self) -> Result<()> {
+        self.spec_sweep(0, false)?;
+        let sp = self.spec.as_ref().ok_or_else(|| anyhow!("call spec_enable first"))?;
+        if let (Some(p), Some(s)) = (self.ple.as_mut(), sp.base_ple.as_ref()) {
+            p.restore(s);
+        }
+        (self.pos, self.cur_tok) = (sp.base_pos, sp.base_tok);
+        Ok(())
+    }
+
+    /// Speculative verify: run `toks` (row 0 the last confirmed token, rows 1.. the
+    /// drafts) at `pos0` as one chunk and return every row's logits (row `i` is
+    /// the prediction after `toks[i]`). The state is left as if all rows were
+    /// decoded; [`Self::rollback_to`] undoes the rejected tail.
+    pub fn verify(&mut self, toks: &[u32], pos0: usize) -> Result<Vec<Vec<f32>>> {
+        let ple_pre = self.ple.as_ref().map(|p| p.state());
+        let sp = self
+            .spec
+            .as_mut()
+            .ok_or_else(|| anyhow!("verify needs spec_enable first"))?;
+        if toks.len() < 2 || toks.len() > sp.max_t {
+            bail!("verify takes 2..={} rows, got {}", sp.max_t, toks.len());
+        }
+        sp.toks = toks.to_vec();
+        sp.pos0 = pos0;
+        sp.ple_pre = ple_pre;
+        let replay = sp.replay;
+        // Replay: slot 0 = the state before the chunk, which rollback restores.
+        if replay {
+            self.spec_sweep(0, true)?;
+        }
+        if let Some(sp) = self.spec.as_mut() {
+            sp.active = true;
+        }
+        let rows = self.prefill_rows(toks, pos0, true);
+        if let Some(sp) = self.spec.as_mut() {
+            sp.active = false;
+        }
+        rows
+    }
+
+    /// After [`Self::verify`]: make the state what decoding `toks[..=row]` would
+    /// have left (accept `row` drafts), so the next token is `toks[row]`'s successor.
+    pub fn rollback_to(&mut self, row: usize) -> Result<()> {
+        let sp = self.spec.as_ref().ok_or_else(|| anyhow!("call spec_enable first"))?;
+        let n = row + 1;
+        if n > sp.toks.len() {
+            bail!("rollback_to({row}) on a verify of {} rows", sp.toks.len());
+        }
+        if n < sp.toks.len() {
+            if sp.replay {
+                self.spec_replay_to(n)?;
+            } else {
+                self.spec_sweep(n, false)?;
+            }
+            let sp = self.spec.as_ref().expect("checked above");
+            if let (Some(p), Some(pre)) = (self.ple.as_mut(), sp.ple_pre.as_ref()) {
+                p.restore(&PleState {
+                    hist: sp.ple_rows[n].clone(),
+                    recent: pre.recent.clone(),
+                });
+                for &tok in &sp.toks[..n] {
+                    p.rows_for(tok);
+                }
+            }
+        }
+        let sp = self.spec.as_ref().expect("checked above");
+        (self.pos, self.cur_tok) = (sp.pos0 + row, sp.toks[row]);
+        Ok(())
+    }
+
+    /// Replay-mode rollback: restore the pre-chunk state (slot 0), then re-run the
+    /// state-update kernels over the first `n` rows of what the chunk tapped.
+    fn spec_replay_to(&mut self, n: usize) -> Result<()> {
+        let m = self.model;
+        let pos0 = self.spec.as_ref().map_or(0, |sp| sp.pos0);
+        self.flush()?;
+        self.ensure_batch(0)?;
+        self.gdn_chunk_ws[0]
+            .as_mut()
+            .ok_or_else(|| anyhow!("no GDN chunk workspace: nothing was verified"))?
+            .tokens = n;
+        for b in 0..m.cfg.n_layers {
+            self.spec_copy_block(b, 0, false)?;
+            let sp = self.spec.as_ref().expect("replay needs spec_enable");
+            let v = &self.venues[0];
+            if let (Some(state), Some(tap), Some(gw)) =
+                (&self.gdn_state[b], &sp.gdn_tap[b], &m.layers[b].gdn)
+            {
+                let gdn = v.gdn.as_ref().ok_or_else(|| anyhow!("no GDN pipelines"))?;
+                let ws = self.gdn_chunk_ws[0].as_ref().expect("checked above");
+                gdn.replay(state, ws, &gw.conv, tap)?;
+            }
+            if let (Some(state), Some(tap)) = (&self.qsa_state[b], &sp.idx_k_tap[b]) {
+                let qsa = v.qsa.as_ref().ok_or_else(|| anyhow!("no QSA pipelines"))?;
+                qsa.idx_tail_raw(state, tap, n, pos0)?;
+            }
+        }
+        self.submit_batch()?;
+        self.flush()
+    }
+
+    /// Replay-mode head: the final HC read and ONE `t`-row head GEMM over the
+    /// chunk's residual slots, instead of `t` single-row heads.
+    fn spec_head(&mut self, t: usize) -> Result<Vec<Vec<f32>>> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let gpu = m.devices[0].gpu();
+        let hb = (mc.hc_dim() * 4) as u64;
+        self.flush()?;
+        self.timers.mark(FINAL_HC);
+        self.ensure_batch(0)?;
+        {
+            let sp = self.spec.as_ref().expect("replay needs spec_enable");
+            let v = &self.venues[0];
+            let rc = v.r_chunk.as_ref().expect("checked by spec_replay_ok");
+            let ws = &sp.head_ws[t - 2];
+            let out = sp.head_logits.as_ref().expect("replay allocates the head output");
+            let gather: Vec<(&Buf, u64, &Buf, u64, u64)> =
+                (0..t).map(|i| (rc, i as u64 * hb, &v.r_slots[i], 0, hb)).collect();
+            batch_cmd::record_copies(gpu, &gather)?;
+            let hw = HcWeights {
+                norm: &m.out_hc_norm,
+                down: &m.out_hc_down.buf,
+                up: &m.out_hc_up.buf,
+                inject: None,
+            };
+            v.final_hc.read(ws, rc, &hw)?;
+            self.timers.mark(HEAD);
+            v.pipes
+                .gemm(m.head.key.ty)
+                .expect("checked by spec_replay_ok")
+                .run(&m.head.buf, &ws.mixed, out, m.head.key.rows, m.head.key.cols, t)?;
+        }
+        self.submit_batch()?;
+        self.flush()?;
+        let raw = {
+            let sp = self.spec.as_ref().expect("replay needs spec_enable");
+            let out = sp.head_logits.as_ref().expect("replay allocates the head output");
+            // As many rows per readback as the staging buffer holds (a small
+            // `--prefill-chunk` sizes it for one or two rows).
+            let per = ((self.stagings[0].capacity() as usize) / (mc.vocab * 4)).max(1);
+            let mut raw = Vec::with_capacity(t);
+            for rows in (0..t).collect::<Vec<_>>().chunks(per) {
+                let items: Vec<(&Buf, u64, usize)> = rows
+                    .iter()
+                    .map(|&i| (out, (i * mc.vocab * 4) as u64, mc.vocab * 4))
+                    .collect();
+                raw.extend(self.stagings[0].read_batch(gpu, &items)?);
+            }
+            raw
+        };
+        self.timers.stop();
+        self.forwards += t;
+        raw.iter()
+            .map(|r| {
+                let values = f32_from_bytes(r);
+                match values.iter().position(|v| !v.is_finite()) {
+                    Some(i) => bail!("logit {i} is not finite ({})", values[i]),
+                    None => Ok(values),
+                }
+            })
+            .collect()
     }
 
     /// Layer-split chunked prefill: carry the chunk's `t` residual slots from the
@@ -2652,6 +3096,7 @@ impl<'m> Session<'m> {
             // token and no `BRECCIA_NO_PLE_BATCH` (the A/B arm, and the revert
             // path). Everything else keeps the per-token host round trip.
             let batched = t > 1
+                && !self.spec_rows_active()
                 && self.venues[dev].ple_emb_chunk.is_some()
                 && std::env::var_os("BRECCIA_NO_PLE_BATCH").is_none();
             if batched {
@@ -2686,6 +3131,7 @@ impl<'m> Session<'m> {
                     self.cur_tok = self.pf_toks[i];
                     self.ple_step_rows(b, rows)?;
                     self.swap_r_in(dev, i);
+                    self.spec_ple_row(i, t);
                 }
             }
         }
@@ -2716,6 +3162,7 @@ impl<'m> Session<'m> {
         for i in 0..t {
             self.swap_r_in(dev, i);
             self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace)?;
+            self.spec_row_state(b, i, t)?;
             if m.placed.contains_key(&b) {
                 // A device-resident block needs no host round trip; run it whole
                 // (documented per-token fallback for that block only).
@@ -3215,6 +3662,7 @@ impl<'m> Session<'m> {
                         self.mixer_from_chunk = None;
                         return Err(e);
                     }
+                    self.spec_row_state(b, i, t)?;
                     {
                         let v = &self.venues[dev];
                         let pf = v.pf.as_ref().expect("the merged prefill scratch");
@@ -4607,6 +5055,10 @@ impl<'m> Session<'m> {
     /// `BRECCIA_PF_QSACHUNK` (QSA) / `BRECCIA_PF_GDNCHUNK` (GDN) and every
     /// projection the block's mixer runs has a multi-user GEMM.
     fn mixer_chunked(&self, b: usize, dev: usize) -> bool {
+        // Rows-mode verify: the T-token mixer has no per-row state to snapshot.
+        if self.spec_rows_active() {
+            return false;
+        }
         let lw = &self.model.layers[b];
         let ws: Vec<&crate::model::W> = match lw.kind {
             LayerKind::Qsa if self.pf[dev][PF_QSACHUNK] => {
@@ -4794,7 +5246,17 @@ impl<'m> Session<'m> {
         };
         let pf = v.pf.as_ref().expect("the merged prefill scratch");
         let ws = self.qsa_chunk_ws[dev].as_ref().expect("made above");
-        qsa.forward(state, ws, &weights, &proj, &pf.mixed, &pf.out, pos0)
+        qsa.forward(state, ws, &weights, &proj, &pf.mixed, &pf.out, pos0)?;
+        let tap = self
+            .spec
+            .as_ref()
+            .filter(|s| s.active && s.replay)
+            .and_then(|s| s.idx_k_tap[b].as_ref());
+        if let Some(tap) = tap {
+            let len = (t * breccia_kernels::qsa::IDX_DIM * 4) as u64;
+            batch_cmd::record_copy(gpu, tap, 0, &ws.idx_k, 0, len)?;
+        }
+        Ok(())
     }
 
     /// The GDN half of [`Session::record_mixer_chunk`]: one `t`-token forward.
@@ -4857,7 +5319,12 @@ impl<'m> Session<'m> {
             .ok_or_else(|| anyhow!("block {b} has no GDN state"))?;
         let pf = v.pf.as_ref().expect("the merged prefill scratch");
         let ws = self.gdn_chunk_ws[dev].as_ref().expect("made above");
-        gdn.forward(state, ws, &weights, &proj, &pf.mixed, &pf.out)
+        let tap = self
+            .spec
+            .as_ref()
+            .filter(|s| s.active && s.replay)
+            .and_then(|s| s.gdn_tap[b].as_ref());
+        gdn.forward_tapped(state, ws, &weights, &proj, &pf.mixed, &pf.out, tap)
     }
 
     fn run_qsa(&mut self, b: usize, dev: usize, pos: usize) -> Result<()> {
@@ -5174,10 +5641,30 @@ impl<'m> Session<'m> {
                 .ple
                 .as_mut()
                 .ok_or_else(|| anyhow!("no PLE host state"))?;
-            let rs: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i])).collect();
-            let keys: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i + 1])).collect();
-            let vals: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i + 2])).collect();
-            ple.block_chunk(&rs, &keys, &vals, &mut out)?;
+            if self.spec.as_ref().is_some_and(|s| s.active) {
+                // Verify keeps the history after each row for rollback, so it
+                // runs the (bit-equal) in-sequence block, not `block_chunk`.
+                for i in 0..t {
+                    let r_host = f32_from_bytes(&parts[3 * i]);
+                    let key = f32_from_bytes(&parts[3 * i + 1]);
+                    let value = f32_from_bytes(&parts[3 * i + 2]);
+                    ple.block(
+                        &r_host,
+                        &key,
+                        &value,
+                        &mut out[i * hc_dim..(i + 1) * hc_dim],
+                    )?;
+                    // Verify: the history "after i + 1 rows", for rollback.
+                    if let Some(sp) = self.spec.as_mut().filter(|s| s.active && i + 1 < t) {
+                        sp.ple_rows[i + 1] = ple.state().hist;
+                    }
+                }
+            } else {
+                let rs: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i])).collect();
+                let keys: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i + 1])).collect();
+                let vals: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i + 2])).collect();
+                ple.block_chunk(&rs, &keys, &vals, &mut out)?;
+            }
         }
         let ple_t4 = ple_t0.elapsed();
         let bytes = f32_to_bytes(&out);
@@ -5466,6 +5953,7 @@ impl Drop for Session<'_> {
                 }
             }
         }
+        self.spec_release();
         for b in 0..m.cfg.n_layers {
             let gpu = m.devices[m.device_of(b)].gpu();
             if let Some(st) = &self.gdn_state[b] {

@@ -65,6 +65,13 @@ pub struct PleHost {
     pub gate: [f32; 8],
 }
 
+/// The sequence-dependent part of [`PleHost`], for speculative rollback.
+#[derive(Clone)]
+pub struct PleState {
+    pub hist: Vec<f32>,
+    pub recent: Vec<u32>,
+}
+
 impl PleHost {
     /// `norm_key`/`norm_query`/`norm_conv` are the raw f32 tensor bytes;
     /// `conv` is the raw F16 `[4, hc_dim]` tensor bytes.
@@ -135,6 +142,19 @@ impl PleHost {
     pub fn reset(&mut self) {
         self.hist.iter_mut().for_each(|v| *v = 0.0);
         self.recent.clear();
+    }
+
+    /// Copy of the sequence state (~368 KB of history); the weights stay put.
+    pub fn state(&self) -> PleState {
+        PleState {
+            hist: self.hist.clone(),
+            recent: self.recent.clone(),
+        }
+    }
+
+    pub fn restore(&mut self, s: &PleState) {
+        self.hist.copy_from_slice(&s.hist);
+        self.recent.clone_from(&s.recent);
     }
 
     /// The `n_head` table rows for `token` at the current position, and the
@@ -482,6 +502,22 @@ mod tests {
         for (h, &row) in rows.iter().enumerate().take(8) {
             assert_eq!(row as u64, mixed2 % p.vocab[h] + p.offsets[h]);
         }
+    }
+
+    /// Speculative rollback: restore the pre-chunk state, replay the accepted
+    /// tokens' hashing, and the window must match the one that never rolled back.
+    #[test]
+    fn restore_then_replay_rebuilds_the_window() {
+        let mut p = host();
+        let _ = p.rows_for(7);
+        let base = p.state();
+        let _ = p.rows_for(8);
+        let want = p.state().recent;
+        let _ = p.rows_for(9);
+        p.restore(&base);
+        let _ = p.rows_for(8);
+        assert_eq!(p.state().recent, want);
+        assert_eq!(p.state().hist, base.hist);
     }
 
     #[test]

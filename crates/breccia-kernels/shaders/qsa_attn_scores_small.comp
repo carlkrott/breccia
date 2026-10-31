@@ -1,0 +1,103 @@
+#version 450
+//
+// Small-T build of `qsa_attn_scores.comp` (speculative verify: 2..15 rows).
+//
+// The per-head kernel walks every selected slot with ONE subgroup per
+// (token, head): 24 subgroups at decode, each stepping through ~1100 slots with
+// a dependent IDS -> page table -> K load chain and a 5-step shuffle reduction
+// per slot. At ctx 1k that is ~1.3 ms per layer, 75 % of the attention stage.
+//
+// Here one THREAD owns one slot: its K row (256 f16, 512 B) is read once and
+// dotted with the 12 queries of the kv head, which sit in LDS (a broadcast read,
+// every lane asks for the same address). A workgroup covers 256 slots of one
+// (token, kv head), so a chunk fans out over `T * 2 * ceil(slots / 256)`
+// workgroups instead of `T * 24` subgroups. K is read once per (token, kv head)
+// for all 12 heads; the score layout, the `-1e30` mask and the causal rule are
+// the per-head kernel's. Only the summation order differs (a plain sequential
+// f32 sum per slot instead of per-lane partials + shuffle tree).
+//
+// Host contract: `n_head == GROUP * n_kv_head`, `head_dim == 256`.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QVec { float Q[]; }; // [T, n_head, head_dim]
+layout(std430, binding = 1) readonly buffer KPool { uint KP[]; }; // paged f16 pairs
+layout(std430, binding = 2) readonly buffer PageTable { uint PT[]; };
+layout(std430, binding = 3) readonly buffer Ids { uint IDS[]; }; // [T, max_blocks]
+layout(std430, binding = 4) readonly buffer Counts { uint CNT[]; }; // [T]
+layout(std430, binding = 5) writeonly buffer Scores { float SC[]; }; // [n_head*T, slots]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_head;
+    uint head_dim;
+    uint slots;
+    uint id_stride;
+    int pos0;
+    uint page_cells;
+    uint n_kv_head;
+} pc;
+
+#define WG_X_MAX 65535u
+#define MASK_DEAD (-1.0e30)
+#define KQ_SCALE 0.0625
+#define GROUP 12u
+#define HD 256u
+#define TILE 256u
+
+shared vec4 sq[GROUP * (HD / 4u)]; // the group's 12 queries
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint tiles = (pc.slots + TILE - 1u) / TILE;
+    uint tile = wg % tiles;
+    uint rest = wg / tiles;
+    uint t = rest / pc.n_kv_head;
+    if (t >= pc.tokens) {
+        return; // whole workgroup
+    }
+    uint kvh = rest - t * pc.n_kv_head;
+    uint row0 = t * pc.n_head + kvh * GROUP;
+    uint tid = gl_LocalInvocationID.x;
+
+    for (uint i = tid; i < GROUP * (HD / 4u); i += TILE) {
+        uint at = row0 * HD + i * 4u;
+        sq[i] = vec4(Q[at], Q[at + 1u], Q[at + 2u], Q[at + 3u]);
+    }
+    barrier();
+
+    uint s = tile * TILE + tid;
+    if (s >= pc.slots) {
+        return;
+    }
+    uint count = CNT[t];
+    int pos = pc.pos0 + int(t);
+    bool live = s < count * 4u;
+    int cell = live ? int(IDS[t * pc.id_stride + s / 4u]) * 4 + int(s % 4u) : -1;
+    if (cell < 0 || cell > pos) {
+        for (uint h = 0u; h < GROUP; ++h) {
+            SC[(row0 + h) * pc.slots + s] = MASK_DEAD;
+        }
+        return;
+    }
+    uint page = PT[uint(cell) / pc.page_cells];
+    uint in_page = uint(cell) % pc.page_cells;
+    // Row base in uint words (head_dim is even, so rows are word aligned).
+    uint base = ((page * pc.n_kv_head + kvh) * pc.page_cells + in_page) * (HD / 2u);
+
+    float acc[GROUP];
+    for (uint h = 0u; h < GROUP; ++h) {
+        acc[h] = 0.0;
+    }
+    for (uint i = 0u; i < HD / 4u; ++i) {
+        vec2 k0 = unpackHalf2x16(KP[base + 2u * i]);
+        vec2 k1 = unpackHalf2x16(KP[base + 2u * i + 1u]);
+        vec4 k = vec4(k0, k1);
+        for (uint h = 0u; h < GROUP; ++h) {
+            acc[h] += dot(sq[h * (HD / 4u) + i], k);
+        }
+    }
+    for (uint h = 0u; h < GROUP; ++h) {
+        SC[(row0 + h) * pc.slots + s] = acc[h] * KQ_SCALE;
+    }
+}

@@ -2219,6 +2219,87 @@ fn feed_prompt(
     Ok(logits)
 }
 
+/// `BRECCIA_SPEC_VERIFY_BENCH=T` (needs `--batching`, `--prefill-chunk` with
+/// `prefill_cap >= T`, one device): time one decode step against one T-row
+/// verify at the same position, check the verify rows against the decode steps,
+/// and check that `rollback_to(row)` leaves the state a plain decode would have.
+/// Runs on the state `feed_prompt` left; `first` is the prompt's last logits.
+fn spec_verify_bench(
+    sess: &mut breccia_engine::Session<'_>,
+    first: &[f32],
+    prompt_len: usize,
+    t: usize,
+) -> Result<()> {
+    const N: usize = 16; // decode steps timed; N >= T + 9 covers the rollback check
+    const REPS: usize = 5;
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.total_cmp(b));
+        v[v.len() / 2]
+    };
+    let p = prompt_len;
+    sess.spec_enable(t)?;
+    sess.spec_save_base()?;
+    // Plain greedy: g[i + 1] follows g[i]; d[i] is the logits after feeding g[i].
+    let mut g = vec![argmax(first) as u32];
+    let (mut dec_ms, mut d) = (Vec::new(), Vec::new());
+    for i in 0..N {
+        let t0 = std::time::Instant::now();
+        let l = sess.token(g[i], p + i, None)?;
+        dec_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        g.push(argmax(&l) as u32);
+        if i < t {
+            d.push(l);
+        }
+    }
+    let decode_ms = median(&mut dec_ms);
+
+    let (mut ver_ms, mut rows) = (Vec::new(), Vec::new());
+    for rep in 0..=REPS {
+        sess.spec_restore_base()?;
+        let t0 = std::time::Instant::now();
+        rows = sess.verify(&g[..t], p)?;
+        if rep > 0 {
+            ver_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    let verify_ms = median(&mut ver_ms);
+    let top1 = (0..t).filter(|&i| argmax(&rows[i]) as u32 == g[i + 1]).count();
+    let max_diff = (0..t)
+        .flat_map(|i| rows[i].iter().zip(&d[i]).map(|(a, b)| (a - b).abs()))
+        .fold(0f32, f32::max);
+    println!("spec-verify rows vs decode steps: max |logit diff| {max_diff:.3e}");
+
+    // Accept `row` drafts, then decode on: must match plain greedy from there.
+    let mut pass = true;
+    for row in 0..t {
+        sess.spec_restore_base()?;
+        sess.verify(&g[..t], p)?;
+        sess.rollback_to(row)?;
+        let mut cur = g[row + 1];
+        let mut got = Vec::new();
+        for j in 0..8 {
+            let l = sess.token(cur, p + row + 1 + j, None)?;
+            cur = argmax(&l) as u32;
+            got.push(cur);
+        }
+        let ok = got == g[row + 2..row + 10];
+        // Early divergence = bad snapshot; late = decode-vs-prefill numerics.
+        let first_bad = got.iter().zip(&g[row + 2..]).position(|(a, b)| a != b);
+        println!(
+            "spec-verify rollback_to({row}) then 8 greedy: {} (first divergence {first_bad:?})",
+            if ok { "match" } else { "MISMATCH" }
+        );
+        pass &= ok;
+    }
+    sess.spec_restore_base()?;
+    println!(
+        "spec-verify T={t} decode_ms={decode_ms:.2} verify_ms={verify_ms:.2} ratio={:.2} top1={top1}/{t} rollback={}",
+        verify_ms / decode_ms,
+        if pass { "PASS" } else { "FAIL" }
+    );
+    Ok(())
+}
+
 /// Two (or more) sequences, one per device, interleaved at the block level.
 ///
 /// The number that matters is the **aggregate** token rate: each stream's own
@@ -3355,6 +3436,15 @@ fn bench_token(a: TokenArgs) -> Result<()> {
     let l1 = feed_prompt(&mut sess, &prompt, a.prefill_chunk).context("the first forward pass")?;
     let first_seconds = t_first.elapsed().as_secs_f64();
     let l2 = feed_prompt(&mut sess, &prompt, a.prefill_chunk).context("the repeat forward pass")?;
+    if let Some(t) = std::env::var("BRECCIA_SPEC_VERIFY_BENCH")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        if !(2..=5).contains(&t) {
+            anyhow::bail!("BRECCIA_SPEC_VERIFY_BENCH={t}: T must be 2..=5");
+        }
+        spec_verify_bench(&mut sess, &l2, prompt.len(), t).context("the spec-verify bench")?;
+    }
     let s1 = breccia_engine::LogitSummary::of_top(&l1, a.top_logits.max(10));
     let s2 = breccia_engine::LogitSummary::of(&l2);
     if let Some(path) = &a.dump_logits {

@@ -118,6 +118,22 @@ fn gqa_scores(tokens: usize) -> bool {
         && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_GQA_SCORES").map_or(true, |v| v != "0"))
 }
 
+/// Calls of `1..GQA_MIN_TOKENS` rows (decode, speculative verify) score with
+/// `qsa_attn_scores_small.comp`: a thread per slot, K read once per kv head. Decode at
+/// ctx 1k: 70 -> 52-60 ms/token, same 32 tokens as the per-head kernel (not bit-equal).
+/// `BRECCIA_QSA_SMALL_MIN=2` keeps decode on the per-head kernel, `=99` turns it off.
+fn small_scores(tokens: usize) -> bool {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    tokens < GQA_MIN_TOKENS
+        && tokens
+            >= *MIN.get_or_init(|| {
+                std::env::var("BRECCIA_QSA_SMALL_MIN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1)
+            })
+}
+
 /// Bytes of one 16-cell page of one layer, K and V together (32 KiB).
 pub fn page_bytes() -> u64 {
     (2 * MODEL_N_KV_HEAD * PAGE_CELLS * MODEL_HEAD_DIM * 2) as u64
@@ -561,6 +577,7 @@ pub struct Qsa<'g> {
     topk: Pipe<'g>,
     attn_scores: Pipe<'g>,
     attn_scores_gqa: Pipe<'g>,
+    attn_scores_small: Pipe<'g>,
     attn_apply: Pipe<'g>,
     /// `BRECCIA_KV_Q8V`: read V as q8_0, dequantise in registers in the dot.
     attn_apply_q8: Pipe<'g>,
@@ -636,6 +653,12 @@ impl<'g> Qsa<'g> {
             6,
             "qsa attention scores (kv-head groups)",
         )?;
+        let attn_scores_small = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_scores_small.spv")),
+            6,
+            "qsa attention scores (small T)",
+        )?;
         let attn_apply = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply.spv")),
@@ -677,6 +700,7 @@ impl<'g> Qsa<'g> {
             topk,
             attn_scores,
             attn_scores_gqa,
+            attn_scores_small,
             attn_apply,
             attn_apply_q8,
             attn_apply_gqa,
@@ -961,14 +985,20 @@ impl<'g> Qsa<'g> {
 
     /// Store this call's raw indexer keys into the rolling 3-slot tail.
     pub fn idx_tail(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        self.idx_tail_raw(state, &ws.idx_k, ws.tokens, pos0)
+    }
+
+    /// [`Self::idx_tail`] for `tokens` raw keys held in `idx_k` (`[tokens, 128]`):
+    /// a speculative rollback re-stores a saved prefix of a chunk's keys.
+    pub fn idx_tail_raw(&self, state: &QsaState, idx_k: &Buf, tokens: usize, pos0: usize) -> Result<()> {
         let pc = Pc::new()
-            .u(ws.tokens as u32)
+            .u(tokens as u32)
             .i(pos0 as i32)
             .u(IDX_DIM as u32)
             .u(IDX_BLOCK as u32);
-        let (gx, gy) = grid_for(ws.tokens * IDX_DIM, 128);
+        let (gx, gy) = grid_for(tokens * IDX_DIM, 128);
         self.idx_tail
-            .run(&[&ws.idx_k, &state.idx_tail], &pc, (gx, gy, 1))
+            .run(&[idx_k, &state.idx_tail], &pc, (gx, gy, 1))
     }
 
     /// Score every completed block against every token's indexer query.
@@ -1041,6 +1071,11 @@ impl<'g> Qsa<'g> {
             .u(MODEL_N_KV_HEAD as u32);
         let (pipe, units) = if gqa_scores(ws.tokens) {
             (&self.attn_scores_gqa, ws.tokens * MODEL_N_KV_HEAD)
+        } else if small_scores(ws.tokens) {
+            (
+                &self.attn_scores_small,
+                ws.tokens * MODEL_N_KV_HEAD * ws.slots.div_ceil(256),
+            )
         } else {
             (&self.attn_scores, ws.tokens * MODEL_N_HEAD)
         };
