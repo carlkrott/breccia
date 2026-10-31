@@ -638,6 +638,25 @@ impl Drop for ShipImport {
 /// [`ShipImport`] hand-off. The barriers add the HOST stage both ways: the other
 /// side of the memory is another card's DMA, reusing the same addresses every ship.
 pub fn copy_fenced(gpu: &Gpu, copies: &[(&Buf, &Buf, u64, u64, u64)]) -> Result<f64> {
+    copy_submit(gpu, copies)?.wait(gpu)
+}
+
+/// A [`copy_submit`] copy in flight on the device's one-shot transfer buffer: nothing
+/// else may record on that buffer (`copy_*`, staged reads/writes) before [`Self::wait`].
+pub struct PendingCopy {
+    fence: vk::Fence,
+    t0: std::time::Instant,
+}
+
+impl PendingCopy {
+    pub fn wait(self, gpu: &Gpu) -> Result<f64> {
+        gpu.wait_fence(self.fence).map_err(|e| anyhow!("waiting for the ship copy: {e}"))?;
+        Ok(self.t0.elapsed().as_secs_f64())
+    }
+}
+
+/// [`copy_fenced`] without the wait: the host is free to work while the DMA runs.
+pub fn copy_submit(gpu: &Gpu, copies: &[(&Buf, &Buf, u64, u64, u64)]) -> Result<PendingCopy> {
     for (s, d, so, dof, n) in copies {
         if so.saturating_add(*n) > s.size || dof.saturating_add(*n) > d.size {
             return Err(anyhow!(
@@ -663,6 +682,5 @@ pub fn copy_fenced(gpu: &Gpu, copies: &[(&Buf, &Buf, u64, u64, u64)]) -> Result<
     })
     .map_err(|e| anyhow!("recording the ship copy: {e}"))?;
     let fence = gpu.submit(Qc::C).map_err(|e| anyhow!("submitting the ship copy: {e}"))?;
-    gpu.wait_fence(fence).map_err(|e| anyhow!("waiting for the ship copy: {e}"))?;
-    Ok(t0.elapsed().as_secs_f64())
+    Ok(PendingCopy { fence, t0 })
 }
