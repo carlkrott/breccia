@@ -2767,11 +2767,13 @@ impl<'m> Session<'m> {
     }
 
     /// Allocate rollback slots for verifying up to `max_t` rows (~112 MiB of GDN
-    /// state per slot). Greedy, single device, `--batching` only.
+    /// state per slot). Greedy, blocks + head on device 0, `--batching` only.
     pub fn spec_enable(&mut self, max_t: usize) -> Result<()> {
         let m = self.model;
-        if m.devices.len() != 1 {
-            bail!("speculative verify is single-device only ({} devices)", m.devices.len());
+        // Spec state (rollback slots, head, staging) lives on device 0; other devices
+        // may only serve as expert helpers (`--split-blocks N,0` + BRECCIA_PF_EXPERT_DEVICE).
+        if m.head_device() != 0 || (0..m.cfg.n_layers).any(|b| m.device_of(b) != 0) {
+            bail!("speculative verify needs every block and the head on device 0 (--split-blocks N,0)");
         }
         if !self.batching {
             bail!("speculative verify records into a dispatch batch: it needs --batching");

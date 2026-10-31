@@ -412,8 +412,17 @@ enum BenchKind {
 fn main() {
     let cli = Cli::parse();
     // §12 defaults: cached host staging (§11f) everywhere. Set before any thread starts.
-    if std::env::var_os("BRECCIA_STAGING_CACHED").is_none() {
-        std::env::set_var("BRECCIA_STAGING_CACHED", "1");
+    // Carl 10-31: top-8 routing (§12.10, approximate: KL 5.4e-3, top-1 same) and the
+    // 50 % verify host split (§12.16) on by default. `BRECCIA_EXPERTS_USED=10` /
+    // `BRECCIA_PF_SPLIT_HOST=0` restore the exact path.
+    for (k, v) in [
+        ("BRECCIA_STAGING_CACHED", "1"),
+        ("BRECCIA_EXPERTS_USED", "8"),
+        ("BRECCIA_PF_SPLIT_HOST", "50%"),
+    ] {
+        if std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+        }
     }
     if let Err(e) = run(cli) {
         eprintln!("breccia: {e:#}");
