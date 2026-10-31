@@ -310,6 +310,17 @@ pub struct PfChunk {
     g_bytes: u64,
     u_bytes: u64,
     d_bytes: u64,
+    /// `BRECCIA_GPU_DISPATCH`: the device-built bucket lists (`None` when the flag is off).
+    gb: Option<GpuBuckets>,
+}
+
+/// The device-built expert lists of the merged prefill (`BRECCIA_GPU_DISPATCH`):
+/// `tok[slot]` = the token that fills sorted slot `slot`, and `off[e]` = expert `e`'s
+/// first slot (`off[n_expert]` = the pair count, `off[n_expert + 1]` = out-of-range ids).
+/// `off` is the only thing the host reads back (n_expert + 2 words).
+struct GpuBuckets {
+    tok: Buf,
+    off: Mailbox,
 }
 
 /// In-flight streamed experts per submit (see [`PfChunk::stream`]).
@@ -328,6 +339,7 @@ impl PfChunk {
         .iter()
         .map(|b| b.size)
         .sum::<u64>()
+            + self.gb.as_ref().map_or(0, |g| g.tok.size + g.off.buf.size)
             + [
                 &self.scratch,
                 &self.x,
@@ -355,6 +367,10 @@ impl PfChunk {
         self.ids.release(gpu);
         self.slots.release(gpu);
         self.stream.release(gpu);
+        if let Some(g) = &self.gb {
+            gpu.destroy_buf(&g.tok);
+            g.off.release(gpu);
+        }
         for b in [
             &self.w,
             &self.mixed,
@@ -441,6 +457,9 @@ pub struct Venue<'m> {
     pub moe_combine: breccia_kernels::MoeCombine<'m>,
     /// The chunk's weighted expert fan-in (§8v), used by the merged prefill pass.
     pub moe_fanin: breccia_kernels::MoeFanIn<'m>,
+    /// `BRECCIA_GPU_DISPATCH`: the device-side expert bucketing and row gather of the
+    /// merged prefill (`Some` only with the flag on and a model that fits the kernel).
+    pub moe_bucket: Option<(breccia_kernels::MoeBucket<'m>, breccia_kernels::MoeGatherRows<'m>)>,
     /// The merged prefill pass's chunk scratch on this device (`Some` only when
     /// `--prefill-merged` is on).
     pub pf: Option<PfChunk>,
@@ -1020,6 +1039,16 @@ impl<'m> Session<'m> {
             let moe_map = breccia_kernels::MoeMap::new(gpu)?;
             let moe_combine = breccia_kernels::MoeCombine::new(gpu)?;
             let moe_fanin = breccia_kernels::MoeFanIn::new(gpu)?;
+            let want_gb = gpu_dispatch()
+                && chunk > 0
+                && cfg.prefill_merged
+                && !model.placed.is_empty()
+                && mc.n_expert <= breccia_kernels::BUCKET_MAX_EXPERTS;
+            let moe_bucket = if want_gb {
+                Some((breccia_kernels::MoeBucket::new(gpu)?, breccia_kernels::MoeGatherRows::new(gpu)?))
+            } else {
+                None
+            };
             // The merged prefill pass's chunk scratch (§8v): only when the flag is
             // on, so a session that does not use it pays nothing.
             let pf = if chunk > 0 && cfg.prefill_merged && !model.placed.is_empty() {
@@ -1071,6 +1100,14 @@ impl<'m> Session<'m> {
                     g_bytes: gb,
                     u_bytes: ub,
                     d_bytes: db,
+                    gb: if want_gb {
+                        Some(GpuBuckets {
+                            tok: alloc(chunk as u64 * k as u64 * 4, "prefill bucket token list")?,
+                            off: Mailbox::new(gpu, (mc.n_expert as u64 + 2) * 4)?,
+                        })
+                    } else {
+                        None
+                    },
                 })
             } else {
                 None
@@ -1117,6 +1154,7 @@ impl<'m> Session<'m> {
                 moe_map,
                 moe_combine,
                 moe_fanin,
+                moe_bucket,
                 pf,
                 r_chunk,
                 r_slots,
@@ -1314,6 +1352,18 @@ impl<'m> Session<'m> {
                 v
             },
         })
+    }
+
+    /// `BRECCIA_GPU_DISPATCH`: record the device-side bucketing of `pf.ids` on `dev`
+    /// (slot map, token list, per-expert offsets), stamped as its own probe stage.
+    fn record_gpu_bucket(&self, dev: usize, t: usize) -> Result<()> {
+        let mc = &self.model.cfg;
+        let v = &self.venues[dev];
+        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let gb = pf.gb.as_ref().expect("gpu_bucket");
+        let (bucket, _) = v.moe_bucket.as_ref().expect("gpu_bucket");
+        self.probe_mark(dev, batch_cmd::probe::MOE_BUCKET);
+        bucket.run(&pf.ids.buf, &pf.slots.buf, &gb.tok, &gb.off.buf, t, mc.n_expert_used, mc.n_expert)
     }
 
     /// This session's devices (one model's placement).
@@ -3672,6 +3722,15 @@ impl<'m> Session<'m> {
             && xdev.is_some()
             && std::env::var("BRECCIA_PF_SHARED_UNDER").as_deref() != Ok("0");
         let bound_t0 = std::time::Instant::now();
+        // `BRECCIA_GPU_DISPATCH`: the lists are built where the expert GEMMs run. Without
+        // an expert device that is pass 1's own batch, which a micro tick does not have.
+        let bdev = xdev.unwrap_or(dev);
+        let gpu_bucket = gpu_dispatch()
+            && (xdev.is_some() || !micro)
+            && mc.n_expert <= breccia_kernels::BUCKET_MAX_EXPERTS
+            && self.venues[bdev].moe_bucket.is_some()
+            && self.venues[bdev].pf.as_ref().is_some_and(|p| p.gb.is_some())
+            && self.venues[dev].pf.is_some();
 
         // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
         if !micro {
@@ -3741,6 +3800,9 @@ impl<'m> Session<'m> {
             if shared_chunk && !defer_shared {
                 self.record_shared_chunk(b, dev, t)?;
             }
+            if gpu_bucket && xdev.is_none() {
+                self.record_gpu_bucket(dev, t)?;
+            }
             batch_cmd::record_barrier_to_host(gpu)?;
             self.submit_batch()?;
             self.flush()?;
@@ -3765,65 +3827,60 @@ impl<'m> Session<'m> {
             down_pending = Some(crate::xfer::copy_submit(gpu, &down)?);
         }
         let bucket_t0 = std::time::Instant::now();
-        let mut raw = vec![0u8; t * k * 4];
-        self.venues[dev]
-            .pf
-            .as_ref()
-            .expect("the merged prefill scratch")
-            .ids
-            .read(&mut raw)?;
-        let mut pairs: Vec<(usize, usize, usize)> = Vec::with_capacity(t * k);
-        for i in 0..t {
-            for j in 0..k {
-                let o = (i * k + j) * 4;
-                let e = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
-                if e >= mc.n_expert {
-                    bail!(
-                        "router id {e} is outside the model's {} experts",
-                        mc.n_expert
-                    );
-                }
-                pairs.push((e, i, j));
+        let (slot_bytes, groups, distinct) = if gpu_bucket {
+            if let Some(x) = xdev {
+                // The ids are on the block card; the lists are built on the helper.
+                let mut ids = vec![0u8; t * k * 4];
+                self.venues[dev].pf.as_ref().expect("the merged prefill scratch").ids.read(&mut ids)?;
+                self.venues[x].pf.as_ref().expect("the merged prefill scratch").ids.write(&ids)?;
+                self.ensure_batch(x)?;
+                self.record_gpu_bucket(x, t)?;
+                batch_cmd::record_barrier_to_host(m.devices[x].gpu())?;
+                self.submit_batch()?;
+                self.flush()?;
             }
-        }
-        // Router order within a token, expert order across: the slot map keeps
-        // each distinct expert's users contiguous, which is exactly the GEMM's
-        // `O[u * rows + row]` output layout.
-        pairs.sort_unstable();
-        let mut slots = vec![0u32; t * k];
-        let mut groups: Vec<(usize, u32, Vec<usize>)> = Vec::new();
-        let mut slot = 0u32;
-        let mut at = 0usize;
-        let mut distinct = 0usize;
-        while at < pairs.len() {
-            let e = pairs[at].0;
-            let end = pairs[at..]
-                .iter()
-                .position(|p| p.0 != e)
-                .map_or(pairs.len(), |d| at + d);
-            distinct += 1;
-            let mut u = at;
-            while u < end {
-                let g_end = (u + pf_group_users()).min(end);
-                let base = slot;
-                let mut users = Vec::with_capacity(g_end - u);
-                for &(_, ti, j) in &pairs[u..g_end] {
-                    slots[ti * k + j] = slot;
-                    users.push(ti);
-                    slot += 1;
-                }
-                groups.push((e, base, users));
-                u = g_end;
+            let gb = self.venues[bdev].pf.as_ref().and_then(|p| p.gb.as_ref()).expect("gpu_bucket");
+            let mut raw = vec![0u8; (mc.n_expert + 2) * 4];
+            gb.off.read(&mut raw)?;
+            let off: Vec<u32> = raw
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            if off[mc.n_expert + 1] != 0 || off[mc.n_expert] as usize != t * k {
+                bail!(
+                    "router id outside the model's {} experts ({} of {} pairs bucketed, {} out of range)",
+                    mc.n_expert,
+                    off[mc.n_expert],
+                    t * k,
+                    off[mc.n_expert + 1]
+                );
             }
-            at = end;
-        }
-        let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
-        self.venues[dev]
-            .pf
-            .as_ref()
-            .expect("the merged prefill scratch")
-            .slots
-            .write(&slot_bytes)?;
+            let (groups, distinct) =
+                breccia_kernels::groups_from_offsets(&off[..=mc.n_expert], pf_group_users());
+            (Vec::new(), groups, distinct)
+        } else {
+            let mut raw = vec![0u8; t * k * 4];
+            self.venues[dev]
+                .pf
+                .as_ref()
+                .expect("the merged prefill scratch")
+                .ids
+                .read(&mut raw)?;
+            let ids: Vec<u32> = raw
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                .collect();
+            let (slots, groups, distinct) =
+                breccia_kernels::bucket_host(&ids, k, mc.n_expert, pf_group_users())?;
+            let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
+            self.venues[dev]
+                .pf
+                .as_ref()
+                .expect("the merged prefill scratch")
+                .slots
+                .write(&slot_bytes)?;
+            (slot_bytes, groups, distinct)
+        };
         let bucket_s = bucket_t0.elapsed().as_secs_f64();
 
         let mut ship_s = 0.0f64;
@@ -3837,7 +3894,9 @@ impl<'m> Session<'m> {
                 None => crate::xfer::copy_fenced(gpu, &down)?,
             };
             ship_p[1] = crate::xfer::copy_fenced(m.devices[x].gpu(), &up)?;
-            xpf.slots.write(&slot_bytes)?;
+            if !gpu_bucket {
+                xpf.slots.write(&slot_bytes)?;
+            }
             ship_s += t0.elapsed().as_secs_f64();
         } else if let Some(x) = xdev {
             let t0 = std::time::Instant::now();
@@ -3864,7 +3923,9 @@ impl<'m> Session<'m> {
                 .map(|(&(_, _, buf), d)| (buf, 0, d.as_slice()))
                 .collect();
             ship_p[1] = self.stagings[x].write_regions(m.devices[x].gpu(), &regions)?;
-            xpf.slots.write(&slot_bytes)?;
+            if !gpu_bucket {
+                xpf.slots.write(&slot_bytes)?;
+            }
             ship_s += t0.elapsed().as_secs_f64();
         }
         // The device the expert GEMMs and the fan-in run on.
@@ -3909,8 +3970,8 @@ impl<'m> Session<'m> {
             && m.layers[b].experts.up.bytes() as u64 == ux;
         let mut prev_expert: Option<usize> = None;
         let mut stream_prev: Option<breccia_kernels::batch_cmd::Segment> = None;
-        for (e, base, users) in groups.iter() {
-            let mu = users.len();
+        for (e, base, mu, users) in groups.iter() {
+            let mu = *mu;
             // First group of a new distinct expert: stream it (once per chunk).
             let new_expert = Some(*e) != prev_expert;
             if streamed && new_expert {
@@ -3979,24 +4040,31 @@ impl<'m> Session<'m> {
                     }
                 }
                 // Gather the group's activation rows (a run of consecutive tokens
-                // is one copy), then one weights read at the expert's arena base.
-                let mut rows: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
-                let mut a = 0usize;
-                while a < mu {
-                    let mut z = a + 1;
-                    while z < mu && users[z] == users[z - 1] + 1 {
-                        z += 1;
+                // is one copy; with `BRECCIA_GPU_DISPATCH` one dispatch off the device
+                // token list), then one weights read at the expert's arena base.
+                if gpu_bucket {
+                    let gb = pf.gb.as_ref().expect("gpu_bucket");
+                    let (_, gather) = v.moe_bucket.as_ref().expect("gpu_bucket");
+                    gather.run(&pf.mixed, &gb.tok, &pf.x, n_embd, *base, mu)?;
+                } else {
+                    let mut rows: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
+                    let mut a = 0usize;
+                    while a < mu {
+                        let mut z = a + 1;
+                        while z < mu && users[z] == users[z - 1] + 1 {
+                            z += 1;
+                        }
+                        rows.push((
+                            &pf.x,
+                            (a * n_embd * 4) as u64,
+                            &pf.mixed,
+                            (users[a] * n_embd * 4) as u64,
+                            ((z - a) * n_embd * 4) as u64,
+                        ));
+                        a = z;
                     }
-                    rows.push((
-                        &pf.x,
-                        (a * n_embd * 4) as u64,
-                        &pf.mixed,
-                        (users[a] * n_embd * 4) as u64,
-                        ((z - a) * n_embd * 4) as u64,
-                    ));
-                    a = z;
+                    batch_cmd::record_copies(egpu, &rows)?;
                 }
-                batch_cmd::record_copies(egpu, &rows)?;
                 // Resident: the arena holds all 512 experts, so the base is the
                 // expert's own offset. Streamed: the slot *is* expert `e`, base 0.
                 let (gbuf, ubuf, dbuf, gb, ub, db) = match pe {
@@ -4200,11 +4268,12 @@ impl<'m> Session<'m> {
                 self.pf_stream_wait_s,
             );
             eprintln!(
-                "merged blk {b:>2} t={t} {}{} distinct={distinct} groups={} slots={} \
+                "merged blk {b:>2} t={t} {}{}{} distinct={distinct} groups={} slots={} \
                  gemm={:.2} ms fanin={:.3} ms ship={:.2} ms (rd {:.2} wr {:.2} | back rd {:.2} wr {:.2}) dispatches={dispatches} \
                  arena={:.1} MiB streamed(cum)={:.1} MiB fill={:.1} ms wait={:.1} ms bucket={:.3} ms",
                 if streamed { "streamed" } else { "resident" },
                 if xdev.is_some() { "@x" } else { "" },
+                if gpu_bucket { "+gb" } else { "" },
                 groups.len(),
                 t * k,
                 gemm_s * 1e3,
@@ -6202,6 +6271,14 @@ pub fn prefill_plan(len: usize, target: usize) -> Vec<usize> {
 fn routed_pair() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("BRECCIA_PF_ROUTED_PAIR").as_deref() != Ok("0"))
+}
+
+/// `BRECCIA_GPU_DISPATCH=1`: the merged prefill builds its expert lists on the GPU (counting
+/// sort of the router ids, `moe_bucket.comp`) instead of reading the ids back and sorting on
+/// the host (default off).
+fn gpu_dispatch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_GPU_DISPATCH").as_deref() == Ok("1"))
 }
 
 /// `BRECCIA_PF_GROUP_USERS`: users per merged-prefill expert group (default 1024,

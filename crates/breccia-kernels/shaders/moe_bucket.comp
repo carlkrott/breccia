@@ -1,0 +1,77 @@
+#version 450
+//
+// Device-side expert bucketing for the merged prefill (`BRECCIA_GPU_DISPATCH`): the
+// host's "read the ids, sort (expert, token, slot), write the slot map" step as one
+// workgroup. Ids in, three lists out:
+//
+//   slots[p]  = position of pair p = (token p / k, j = p % k) in the (expert, token, j)-
+//               sorted order (what the fan-in reads)
+//   tok[s]    = the token of sorted position s (what the row gather reads)
+//   off[e]    = first sorted position of expert e; off[n_expert] = pair count;
+//               off[n_expert + 1] = how many ids were >= n_expert (host bails if nonzero)
+//
+// Order: expert, then pair index p = token * k + j — a stable counting sort, so every
+// expert's users are in token order exactly as the host's `pairs.sort_unstable()` gives
+// (a token never routes to one expert twice, so (e, token, j) and (e, p) agree).
+// Count (shared atomics: order-free), exclusive scan (one thread, n_expert <= 1024),
+// scatter (thread-per-expert scan of the ids in order: deterministic, no atomics).
+layout(local_size_x = 512) in;
+
+layout(std430, binding = 0) readonly buffer Ids { uint IDS[]; };
+layout(std430, binding = 1) writeonly buffer Slots { uint SLOTS[]; };
+layout(std430, binding = 2) writeonly buffer Tok { uint TOK[]; };
+layout(std430, binding = 3) writeonly buffer Off { uint OFF[]; };
+
+layout(push_constant) uniform PC {
+    uint pairs;     // tokens * k
+    uint k;
+    uint n_expert;  // <= 1024
+} pc;
+
+shared uint sh_cnt[1024];
+shared uint sh_off[1024];
+shared uint sh_bad;
+
+void main() {
+    uint th = gl_LocalInvocationID.x;
+    uint ne = pc.n_expert;
+    for (uint e = th; e < ne; e += 512u) {
+        sh_cnt[e] = 0u;
+    }
+    if (th == 0u) {
+        sh_bad = 0u;
+    }
+    barrier();
+    for (uint p = th; p < pc.pairs; p += 512u) {
+        uint e = IDS[p];
+        if (e < ne) {
+            atomicAdd(sh_cnt[e], 1u);
+        } else {
+            atomicAdd(sh_bad, 1u);
+            SLOTS[p] = 0u;
+        }
+    }
+    barrier();
+    if (th == 0u) {
+        uint run = 0u;
+        for (uint e = 0u; e < ne; ++e) {
+            sh_off[e] = run;
+            OFF[e] = run;
+            run += sh_cnt[e];
+        }
+        OFF[ne] = run;
+        OFF[ne + 1u] = sh_bad;
+    }
+    barrier();
+    for (uint e = th; e < ne; e += 512u) {
+        uint pos = sh_off[e];
+        uint end = pos + sh_cnt[e];
+        for (uint p = 0u; pos < end; ++p) {
+            if (IDS[p] == e) {
+                SLOTS[p] = pos;
+                TOK[pos] = p / pc.k;
+                ++pos;
+            }
+        }
+    }
+}

@@ -1,0 +1,25 @@
+#version 450
+//
+// One expert group's activation gather for the merged prefill (`BRECCIA_GPU_DISPATCH`):
+//   dst[u][c] = src[tok[base + u]][c]    for u in 0..mu
+// the device twin of the host's per-run `cmd_copy_buffer` list (a pure f32 copy, so
+// bit-identical). Grid (ceil(cols / 64), mu).
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Src { float S[]; };
+layout(std430, binding = 1) readonly buffer Tok { uint TOK[]; };
+layout(std430, binding = 2) writeonly buffer Dst { float D[]; };
+
+layout(push_constant) uniform PC {
+    uint cols;
+    uint base;
+} pc;
+
+void main() {
+    uint c = gl_GlobalInvocationID.x;
+    uint u = gl_GlobalInvocationID.y;
+    if (c >= pc.cols) {
+        return;
+    }
+    D[u * pc.cols + c] = S[TOK[pc.base + u] * pc.cols + c];
+}

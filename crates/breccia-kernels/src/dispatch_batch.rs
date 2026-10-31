@@ -492,6 +492,8 @@ pub mod probe {
     pub const HC_REDUCE: u8 = 34;
     pub const HC_UP: u8 = 35;
     pub const HC_GATED: u8 = 36;
+    /// The device-side expert bucketing of the merged prefill (`BRECCIA_GPU_DISPATCH`).
+    pub const MOE_BUCKET: u8 = 37;
     pub const GDN_Z: u8 = 29;
     pub const GDN_BETA: u8 = 30;
     pub const GDN_ALPHA: u8 = 31;
@@ -535,7 +537,7 @@ pub mod probe {
         "hc-reduce",
         "hc-up",
         "hc-gated",
-        "",
+        "moe-bucket",
         "",
         "",
     ];

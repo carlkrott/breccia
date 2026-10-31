@@ -68,7 +68,10 @@ pub use device::Device;
 pub use dispatch_batch as batch_cmd;
 pub use gdn::{Gdn, GdnProjections, GdnState, GdnTap, GdnWeights, GdnWorkspace};
 pub use gemv::{dequant_to_f32, Accum, Gemv, GemvTiming};
-pub use moe::{MoeCombine, MoeFanIn, MoeMap};
+pub use moe::{
+    bucket_host, bucket_model, groups_from_offsets, BucketGroup, MoeBucket, MoeCombine, MoeFanIn,
+    MoeGatherRows, MoeMap, BUCKET_MAX_EXPERTS,
+};
 pub use ops::bench::{run_ops_bench, OpKind, OpsBenchOptions, OpsReport};
 pub use ops::{HcMixer, HcWeights, HcWorkspace, Q8Quantize, RmsNorm, Rope, RopeTable, Router};
 pub use proj::Proj;

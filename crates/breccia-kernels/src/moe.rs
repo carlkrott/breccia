@@ -164,3 +164,259 @@ impl<'g> MoeFanIn<'g> {
         )
     }
 }
+
+/// Most experts [`MoeBucket`] handles (its shared-memory histogram).
+pub const BUCKET_MAX_EXPERTS: usize = 1024;
+
+/// Device-side expert bucketing for the merged prefill (`BRECCIA_GPU_DISPATCH`): the
+/// router's `[tokens, k]` ids in, the sorted-slot map, the per-slot token list and the
+/// per-expert offsets out (layouts in `moe_bucket.comp`). One workgroup.
+pub struct MoeBucket<'g> {
+    pipe: Pipe<'g>,
+}
+
+impl<'g> MoeBucket<'g> {
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Ok(MoeBucket {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/moe_bucket.spv")),
+                4,
+                "moe bucket",
+            )?,
+        })
+    }
+
+    /// `ids`/`slots` are `[tokens, k]` u32, `tok` `[tokens * k]` u32, `off`
+    /// `[n_expert + 2]` u32.
+    pub fn run(
+        &self,
+        ids: &Buf,
+        slots: &Buf,
+        tok: &Buf,
+        off: &Buf,
+        tokens: usize,
+        k: usize,
+        n_expert: usize,
+    ) -> Result<()> {
+        if tokens == 0 || k == 0 || n_expert == 0 || n_expert > BUCKET_MAX_EXPERTS {
+            return Err(anyhow!(
+                "moe bucket needs tokens, k > 0 and 1..={BUCKET_MAX_EXPERTS} experts"
+            ));
+        }
+        let pc = Pc::new()
+            .u((tokens * k) as u32)
+            .u(k as u32)
+            .u(n_expert as u32);
+        self.pipe.run(&[ids, slots, tok, off], &pc, (1, 1, 1))
+    }
+}
+
+/// `dst[u] = src[tok[base + u]]` for `u < mu`, rows of `cols` f32 (the group's activation
+/// gather, on the device).
+pub struct MoeGatherRows<'g> {
+    pipe: Pipe<'g>,
+}
+
+impl<'g> MoeGatherRows<'g> {
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Ok(MoeGatherRows {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/moe_gather_rows.spv")),
+                3,
+                "moe gather rows",
+            )?,
+        })
+    }
+
+    pub fn run(
+        &self,
+        src: &Buf,
+        tok: &Buf,
+        dst: &Buf,
+        cols: usize,
+        base: u32,
+        mu: usize,
+    ) -> Result<()> {
+        if cols == 0 || mu == 0 {
+            return Err(anyhow!("moe gather needs cols and mu > 0"));
+        }
+        let pc = Pc::new().u(cols as u32).u(base);
+        self.pipe.run(
+            &[src, tok, dst],
+            &pc,
+            (cols.div_ceil(64) as u32, mu as u32, 1),
+        )
+    }
+}
+
+/// One expert group of the merged prefill: `(expert, first slot, users, user tokens)`.
+/// `users` is `mu` entries from [`bucket_host`], empty from [`groups_from_offsets`]
+/// (the device gathers by slot instead).
+pub type BucketGroup = (usize, u32, usize, Vec<usize>);
+
+/// The host bucketing the merged prefill has always done: sort `(expert, token, j)`,
+/// slot = sorted position, groups of at most `cap` users per expert.
+/// Returns `(slots[token * k + j], groups, distinct experts)`.
+pub fn bucket_host(
+    ids: &[u32],
+    k: usize,
+    n_expert: usize,
+    cap: usize,
+) -> Result<(Vec<u32>, Vec<BucketGroup>, usize)> {
+    let mut pairs: Vec<(usize, usize, usize)> = Vec::with_capacity(ids.len());
+    for (p, &e) in ids.iter().enumerate() {
+        let e = e as usize;
+        if e >= n_expert {
+            return Err(anyhow!(
+                "router id {e} is outside the model's {n_expert} experts"
+            ));
+        }
+        pairs.push((e, p / k, p % k));
+    }
+    // Router order within a token, expert order across: the slot map keeps
+    // each distinct expert's users contiguous, which is exactly the GEMM's
+    // `O[u * rows + row]` output layout.
+    pairs.sort_unstable();
+    let mut slots = vec![0u32; ids.len()];
+    let mut groups: Vec<BucketGroup> = Vec::new();
+    let mut slot = 0u32;
+    let mut at = 0usize;
+    let mut distinct = 0usize;
+    while at < pairs.len() {
+        let e = pairs[at].0;
+        let end = pairs[at..]
+            .iter()
+            .position(|p| p.0 != e)
+            .map_or(pairs.len(), |d| at + d);
+        distinct += 1;
+        let mut u = at;
+        while u < end {
+            let g_end = (u + cap).min(end);
+            let base = slot;
+            let mut users = Vec::with_capacity(g_end - u);
+            for &(_, ti, j) in &pairs[u..g_end] {
+                slots[ti * k + j] = slot;
+                users.push(ti);
+                slot += 1;
+            }
+            groups.push((e, base, users.len(), users));
+            u = g_end;
+        }
+        at = end;
+    }
+    Ok((slots, groups, distinct))
+}
+
+/// The same groups from the device's `off[0..=n_expert]` (user lists left empty).
+/// Returns `(groups, distinct experts)`.
+pub fn groups_from_offsets(off: &[u32], cap: usize) -> (Vec<BucketGroup>, usize) {
+    let mut groups = Vec::new();
+    let mut distinct = 0;
+    for (e, w) in off.windows(2).enumerate() {
+        let (mut s, end) = (w[0], w[1]);
+        distinct += usize::from(end > s);
+        while s < end {
+            let mu = ((end - s) as usize).min(cap);
+            groups.push((e, s, mu, Vec::new()));
+            s += mu as u32;
+        }
+    }
+    (groups, distinct)
+}
+
+/// What `moe_bucket.comp` computes, as a plain counting sort: `(slots, tok, off)` with
+/// `off` of length `n_expert + 2` (pair count, then the out-of-range id count).
+/// Ids `>= n_expert` get slot 0 and no `tok` entry, like the shader.
+pub fn bucket_model(ids: &[u32], k: usize, n_expert: usize) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    let mut off = vec![0u32; n_expert + 2];
+    for &e in ids {
+        match off.get_mut(e as usize).filter(|_| (e as usize) < n_expert) {
+            Some(c) => *c += 1,
+            None => off[n_expert + 1] += 1,
+        }
+    }
+    let mut run = 0;
+    for c in off.iter_mut().take(n_expert) {
+        (*c, run) = (run, run + *c);
+    }
+    off[n_expert] = run;
+    let mut next = off.clone();
+    let (mut slots, mut tok) = (vec![0u32; ids.len()], vec![0u32; run as usize]);
+    for (p, &e) in ids.iter().enumerate() {
+        if (e as usize) < n_expert {
+            slots[p] = next[e as usize];
+            tok[next[e as usize] as usize] = (p / k) as u32;
+            next[e as usize] += 1;
+        }
+    }
+    (slots, tok, off)
+}
+
+#[cfg(test)]
+mod bucket_tests {
+    use super::*;
+
+    /// Router-like ids: `k` distinct experts per token, deterministic xorshift.
+    fn routing(tokens: usize, k: usize, n_expert: usize, seed: u64) -> Vec<u32> {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut ids = Vec::new();
+        for _ in 0..tokens {
+            let mut row: Vec<u32> = Vec::new();
+            while row.len() < k {
+                let e = (next() % n_expert as u64) as u32;
+                if !row.contains(&e) {
+                    row.push(e);
+                }
+            }
+            ids.extend(row);
+        }
+        ids
+    }
+
+    #[test]
+    fn device_model_matches_the_host_sort() {
+        for &(t, k, ne, cap) in &[
+            (64, 10, 512, 1024),
+            (257, 10, 512, 7),
+            (1024, 10, 512, 1024),
+            (5, 3, 8, 2),
+            (1, 10, 512, 1024),
+        ] {
+            let ids = routing(t, k, ne, (t * 31 + ne) as u64);
+            let (hs, hg, hd) = bucket_host(&ids, k, ne, cap).unwrap();
+            let (ms, mt, off) = bucket_model(&ids, k, ne);
+            assert_eq!(hs, ms, "slots t={t}");
+            assert_eq!(off[ne] as usize, t * k);
+            assert_eq!(off[ne + 1], 0);
+            // The host's per-slot token list is the groups' users, concatenated.
+            let users: Vec<u32> = hg
+                .iter()
+                .flat_map(|g| g.3.iter().map(|&u| u as u32))
+                .collect();
+            assert_eq!(users, mt, "tok t={t}");
+            let (og, od) = groups_from_offsets(&off[..=ne], cap);
+            assert_eq!(od, hd);
+            let strip = |g: &[BucketGroup]| g.iter().map(|g| (g.0, g.1, g.2)).collect::<Vec<_>>();
+            assert_eq!(strip(&og), strip(&hg), "groups t={t} cap={cap}");
+            assert!(hg.iter().all(|g| g.2 == g.3.len() && g.2 <= cap));
+        }
+    }
+
+    #[test]
+    fn out_of_range_ids_are_counted_not_slotted() {
+        assert!(bucket_host(&[0, 9], 2, 8, 4).is_err());
+        let (slots, tok, off) = bucket_model(&[3, 9, 3, 1], 2, 8);
+        assert_eq!(off[8], 3);
+        assert_eq!(off[9], 1);
+        assert_eq!(tok.len(), 3);
+        assert_eq!(slots[1], 0);
+    }
+}

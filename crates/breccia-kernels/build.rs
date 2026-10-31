@@ -128,6 +128,9 @@ const SHADERS: &[&str] = &[
     // Host-free MoE: device-side expert indirection + the routed combine.
     "moe_map",
     "moe_combine",
+    // Device-side expert bucketing + row gather (BRECCIA_GPU_DISPATCH).
+    "moe_bucket",
+    "moe_gather_rows",
 ];
 
 /// GEMV stems that get the `silu_div` epilogue build (`_hcact`), i.e. the ones
