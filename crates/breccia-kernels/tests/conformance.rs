@@ -481,6 +481,80 @@ fn split_k_matches_the_single_pass_kernel() {
     }
 }
 
+/// Tail-skip sentinel: a map entry of `0xFFFFFFFF` is a dead row. The batched GEMV
+/// must write exactly 0 for it (without reading W) and leave every other expert
+/// bit-identical to the run with no sentinel.
+#[test]
+fn batched_gemv_skips_sentinel_rows() {
+    let fx = need_gpu!();
+    let dev = fx.dev;
+    let gpu = dev.gpu();
+    let experts = 5usize;
+    let dead = [1usize, 4];
+    for ty in types_under_test() {
+        let cols = ty.block_elems() * 5 + ty.block_elems() / 3;
+        let shape = bench::Shape::new(13, cols);
+        let batch = GemvBatch::new(gpu, ty, shape.rows, shape.cols).expect("batch pipeline");
+        let blob = batch.blob_bytes() as usize;
+        let mut w_bytes = vec![0u8; blob * experts];
+        let mut x_all = Vec::new();
+        for e in 0..experts {
+            let (packed, x) =
+                real::synthetic_inputs(ty, shape, 0x5e17 ^ (e as u64).wrapping_mul(7919));
+            w_bytes[e * blob..(e + 1) * blob].copy_from_slice(&packed);
+            x_all.extend_from_slice(&x);
+        }
+        let w = breccia_kernels::gemv::upload(gpu, &w_bytes).expect("upload W");
+        let xb = breccia_kernels::gemv::upload(gpu, &bench::f32_to_bytes(&x_all)).expect("x");
+        let words: Vec<u32> = (0..experts)
+            .map(|e| e as u32 * batch.blob_words())
+            .collect();
+        let run = |map_host: &[u32]| -> Vec<f32> {
+            let map =
+                breccia_kernels::gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(map_host))
+                    .expect("map");
+            let out =
+                breccia_kernels::gemv::alloc(gpu, (shape.rows * experts * 4) as u64).expect("out");
+            batch
+                .run(&w, &xb, &out, &map, experts)
+                .expect("batched gemv");
+            let got = bench::read_out(dev, &out, shape.rows * experts).expect("read out");
+            gpu.destroy_buf(&map);
+            gpu.destroy_buf(&out);
+            got
+        };
+        let mut map_host = batch.map_for_blobs(&words, XLayout::PerExpert);
+        let full = run(&map_host);
+        for &e in &dead {
+            for r in 0..shape.rows {
+                map_host[e * shape.rows + r] = u32::MAX;
+            }
+        }
+        let pruned = run(&map_host);
+        for e in 0..experts {
+            let (g, f) = (
+                &pruned[e * shape.rows..(e + 1) * shape.rows],
+                &full[e * shape.rows..(e + 1) * shape.rows],
+            );
+            if dead.contains(&e) {
+                assert!(
+                    g.iter().all(|v| *v == 0.0),
+                    "{ty}: dead expert {e} must write 0, got {g:?}"
+                );
+            } else {
+                assert_eq!(
+                    g, f,
+                    "{ty}: live expert {e} changed by a neighbour's sentinel"
+                );
+            }
+        }
+        for b in [&w, &xb] {
+            gpu.destroy_buf(b);
+        }
+        println!("sentinel {ty:<8}: dead experts {dead:?} write 0, live experts bit-identical");
+    }
+}
+
 /// The batched multi-expert dispatch must reproduce the per-expert loop exactly
 /// when the experts are **scattered** in the weight buffer (the top-10 of 512
 /// case: each blob is contiguous, the set is not) and each expert has its own

@@ -84,6 +84,42 @@ fn device_map_equals_the_host_map() -> Result<()> {
     Ok(())
 }
 
+/// A tail-skipped router id (`0xFFFFFFFF`) maps every row of its slot to the dead-row
+/// marker; the other slots and the whole activation half stay exactly the host map.
+#[test]
+fn device_map_marks_sentinel_slots_dead() -> Result<()> {
+    let Some(dev) = device() else { return Ok(()) };
+    let gpu = dev.gpu();
+    let map_pipe = MoeMap::new(gpu)?;
+    let ids: Vec<u32> = vec![7, 0, u32::MAX, 3, u32::MAX, 64];
+    let ids_buf = breccia_kernels::gemv::upload(gpu, &breccia_kernels::ops::u32_to_bytes(&ids))?;
+    let batch = GemvBatch::new(gpu, QuantType::Q2_0, 2560, 640)?;
+    let rows = batch.rows(ids.len());
+    let map = breccia_kernels::gemv::alloc(gpu, batch.map_bytes(ids.len()))?;
+    let base = 4_096u32;
+    map_pipe.run(&ids_buf, &map, &batch, ids.len(), base, true)?;
+    let blobs: Vec<u32> = ids
+        .iter()
+        .map(|&id| {
+            if id == u32::MAX {
+                0
+            } else {
+                base + id * batch.blob_words()
+            }
+        })
+        .collect();
+    let want = batch.map_for_blobs(&blobs, XLayout::PerExpert);
+    let got = breccia_kernels::ops::download_u32(gpu, &map, rows * 2)?;
+    let per = 2560usize;
+    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+        let dead = i < rows && ids[i / per] == u32::MAX;
+        assert_eq!(*g, if dead { u32::MAX } else { *w }, "map[{i}]");
+    }
+    gpu.destroy_buf(&map);
+    gpu.destroy_buf(&ids_buf);
+    Ok(())
+}
+
 /// `MoeCombine` must equal `Σ w_j·in_j + shared·sigmoid(g)` computed on the host.
 #[test]
 fn device_combine_equals_the_host_expression() -> Result<()> {
