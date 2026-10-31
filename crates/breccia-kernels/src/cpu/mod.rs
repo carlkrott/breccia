@@ -46,6 +46,7 @@ use crate::reference;
 mod avx2;
 mod bench;
 mod expert;
+mod int8;
 mod scalar;
 
 pub use bench::{
@@ -144,6 +145,11 @@ pub enum Path {
     Avx2,
     /// Portable fused scalar port ([`scalar`]).
     Scalar,
+    /// Opt-in q8 activations + int8 dot via `vpmaddubsw` (AVX2, [`int8`]).
+    /// Approximate (activation rounding); types without an int8 kernel use AVX2.
+    Int8,
+    /// As [`Path::Int8`] with AVX-512 VNNI `vpdpbusd`; bit-identical to it.
+    Vnni,
     /// Bench only: reads every packed byte and does no math (memory ceiling).
     /// [`path`] never returns it; the result is not a dot product.
     Touch,
@@ -154,6 +160,8 @@ impl Path {
         match self {
             Path::Avx2 => "avx2",
             Path::Scalar => "scalar",
+            Path::Int8 => "int8",
+            Path::Vnni => "vnni",
             Path::Touch => "touch",
         }
     }
@@ -183,6 +191,31 @@ pub fn avx2_available() -> bool {
         {
             false
         }
+    })
+}
+
+/// AVX-512 VNNI + VL on top of [`avx2_available`].
+pub fn vnni_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            avx2_available()
+                && is_x86_feature_detected!("avx512vnni")
+                && is_x86_feature_detected!("avx512vl")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
+
+/// `BRECCIA_CPU_INT8=1` opts into the approximate int8 kernels.
+pub fn int8_requested() -> bool {
+    std::env::var_os("BRECCIA_CPU_INT8").is_some_and(|v| {
+        let s = v.to_string_lossy();
+        !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("false")
     })
 }
 
@@ -267,6 +300,12 @@ pub fn pin_current(cpus: &[usize]) -> bool {
 pub fn path() -> Path {
     if forced_scalar() || !avx2_available() {
         Path::Scalar
+    } else if int8_requested() {
+        if vnni_available() {
+            Path::Vnni
+        } else {
+            Path::Int8
+        }
     } else {
         Path::Avx2
     }
@@ -287,7 +326,8 @@ pub fn dot_row_with(path: Path, ty: QuantType, row: &[u8], cols: usize, x: &[f32
         let packed = &row[..full * bb];
         let xp = &x[..full * qk];
         acc = match normalized(path) {
-            Path::Avx2 => avx2::dot(ty, packed, xp),
+            // Single-row callers stay exact; int8 pays off only per GEMV.
+            Path::Avx2 | Path::Int8 | Path::Vnni => avx2::dot(ty, packed, xp),
             Path::Scalar => scalar::dot(ty, packed, xp),
             Path::Touch => touch(packed),
         };
@@ -330,6 +370,26 @@ pub fn gemv_into(
         rows * row_bytes
     );
     assert!(out.len() >= rows, "output shorter than rows");
+    if matches!(path, Path::Int8 | Path::Vnni)
+        && int8::supported(ty)
+        && cols.is_multiple_of(int8::act_block(ty))
+    {
+        assert!(x.len() >= cols, "activation vector shorter than cols");
+        // SAFETY: `normalized` kept Int8/Vnni only with their CPU features;
+        // the type, alignment and lengths were checked above.
+        unsafe {
+            int8::gemv(
+                path == Path::Vnni,
+                ty,
+                packed,
+                rows,
+                row_bytes,
+                &x[..cols],
+                out,
+            )
+        };
+        return;
+    }
     for r in 0..rows {
         out[r] = dot_row_with(path, ty, &packed[r * row_bytes..], cols, x);
     }
@@ -342,15 +402,16 @@ pub fn row_bytes(ty: QuantType, cols: usize) -> usize {
 
 /// Sum the bytes as u64 words so every cache line is loaded; ignores x.
 fn touch(packed: &[u8]) -> f32 {
-    let s = packed
-        .chunks_exact(8)
-        .fold(0u64, |a, c| a.wrapping_add(u64::from_ne_bytes(c.try_into().unwrap())));
+    let s = packed.chunks_exact(8).fold(0u64, |a, c| {
+        a.wrapping_add(u64::from_ne_bytes(c.try_into().unwrap()))
+    });
     (std::hint::black_box(s) & 1) as f32
 }
 
 fn normalized(path: Path) -> Path {
     match path {
-        Path::Avx2 if !avx2_available() => Path::Scalar,
+        Path::Avx2 | Path::Int8 | Path::Vnni if !avx2_available() => Path::Scalar,
+        Path::Vnni if !vnni_available() => Path::Int8,
         p => p,
     }
 }

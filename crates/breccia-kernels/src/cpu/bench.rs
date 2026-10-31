@@ -197,6 +197,9 @@ pub struct CpuTypeCell {
     pub avx2_gbps: f64,
     pub scalar_ms: f64,
     pub scalar_gbps: f64,
+    /// Opt-in int8 paths (0 when the type has no int8 kernel or no VNNI).
+    pub int8_gbps: f64,
+    pub vnni_gbps: f64,
     /// `scalar_ms / avx2_ms` — the intrinsics' speedup on this cell.
     pub speedup: f64,
 }
@@ -445,6 +448,16 @@ fn measure_one(
     let bytes = (r.rows * row_bytes(r.ty, r.cols) * ids.len()) as u64;
     let avx2_ms = run(Path::Avx2)? * 1e3;
     let scalar_ms = run(Path::Scalar)? * 1e3;
+    let int8_gbps = if super::int8::supported(r.ty) {
+        gbps(bytes, run(Path::Int8)? * 1e3)
+    } else {
+        0.0
+    };
+    let vnni_gbps = if super::int8::supported(r.ty) && super::vnni_available() {
+        gbps(bytes, run(Path::Vnni)? * 1e3)
+    } else {
+        0.0
+    };
     Ok(CpuTypeCell {
         ty: r.ty,
         role: role.to_string(),
@@ -458,6 +471,8 @@ fn measure_one(
         avx2_gbps: gbps(bytes, avx2_ms),
         scalar_ms,
         scalar_gbps: gbps(bytes, scalar_ms),
+        int8_gbps,
+        vnni_gbps,
         speedup: if avx2_ms > 0.0 {
             scalar_ms / avx2_ms
         } else {
@@ -548,11 +563,22 @@ fn measure_token(
 
     // One thread first: it is the kernel-level number and it warms nothing the
     // multi-threaded run then measures cold.
+    // Int8 cells use the best int8 kernel; types without one run AVX2 inside them.
+    let (i8_path, i8_1t, i8_pool) = if super::vnni_available() {
+        (Path::Vnni, "vnni-1t", "vnni-pool")
+    } else {
+        (Path::Int8, "int8-1t", "int8-pool")
+    };
     cells.push(pass("avx2-1t", Path::Avx2, 1)?);
+    cells.push(pass(i8_1t, i8_path, 1)?);
     if threads > 1 {
+        // Sandwiched so drift between passes shows as avx2 != avx2.
         cells.push(pass("avx2-pool", Path::Avx2, threads)?);
-        cells.push(pass("touch-pool", Path::Touch, threads)?);
+        cells.push(pass(i8_pool, i8_path, threads)?);
         cells.push(pass("avx2-pool", Path::Avx2, threads)?);
+        if std::env::var_os("BRECCIA_BENCH_TOUCH").is_some() {
+            cells.push(pass("touch-pool", Path::Touch, threads)?);
+        }
     }
     if !quick {
         cells.push(pass("scalar-1t", Path::Scalar, 1)?);
@@ -592,12 +618,12 @@ pub fn print_summary(rep: &CpuExpertReport) {
         rep.per_type.first().map_or(0, |c| c.reps)
     );
     println!(
-        "  {:<6} {:<4} {:>7} {:>6} {:>10} {:>9} {:>9} {:>8}",
-        "type", "role", "rows", "cols", "bytes", "avx2 GB/s", "scalar", "speedup"
+        "  {:<6} {:<4} {:>7} {:>6} {:>10} {:>9} {:>9} {:>8} {:>6} {:>6}",
+        "type", "role", "rows", "cols", "bytes", "avx2 GB/s", "scalar", "speedup", "int8", "vnni"
     );
     for c in &rep.per_type {
         println!(
-            "  {:<6} {:<4} {:>7} {:>6} {:>10} {:>9.2} {:>9.2} {:>7.2}x",
+            "  {:<6} {:<4} {:>7} {:>6} {:>10} {:>9.2} {:>9.2} {:>7.2}x {:>6.2} {:>6.2}",
             c.ty.name(),
             c.role,
             c.rows,
@@ -605,7 +631,9 @@ pub fn print_summary(rep: &CpuExpertReport) {
             byte_scale(c.bytes),
             c.avx2_gbps,
             c.scalar_gbps,
-            c.speedup
+            c.speedup,
+            c.int8_gbps,
+            c.vnni_gbps
         );
     }
     println!(
