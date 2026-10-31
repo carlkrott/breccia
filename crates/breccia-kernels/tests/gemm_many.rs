@@ -358,9 +358,14 @@ fn dense_shared_expert_gemm_matches_the_gemv() {
         // `BRECCIA_GEMM_TENSOR` picks one role instead (the router shapes).
         let names = match std::env::var("BRECCIA_GEMM_TENSOR") {
             Ok(n) => vec![n],
-            Err(_) => ["ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp", "indexer.q_proj"]
-                .map(String::from)
-                .to_vec(),
+            Err(_) => [
+                "ffn_gate_shexp",
+                "ffn_up_shexp",
+                "ffn_down_shexp",
+                "indexer.q_proj",
+            ]
+            .map(String::from)
+            .to_vec(),
         };
         for name in &names {
             let name = format!("blk.{b}.{name}.weight");
@@ -501,7 +506,8 @@ fn q8_gemm_tracks_the_fp32_gemm() {
 
     gemm.run(&w, &x, &out, rows, cols, N).expect("fp32 gemm");
     let want = breccia_kernels::ops::download_f32(gpu, &out, N * rows).expect("download");
-    gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, N, 0).expect("q8 gemm");
+    gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, N, 0)
+        .expect("q8 gemm");
     let full = breccia_kernels::ops::download_f32(gpu, &out, N * rows).expect("download");
 
     let (mut num, mut den) = (0f64, 0f64);
@@ -512,10 +518,16 @@ fn q8_gemm_tracks_the_fp32_gemm() {
     let rel = (num / den).sqrt();
     let mut same_bits = true;
     for m in [1usize, 2, 4, 6, 8, 12, 16] {
-        gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, m, 0).expect("q8 gemm");
+        gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, m, 0)
+            .expect("q8 gemm");
         let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("download");
-        same_bits &= got.iter().zip(&full).all(|(a, b)| a.to_bits() == b.to_bits());
-        let tf = gemm.run_timed(&w, &x, &out, rows, cols, m, 0.2).expect("timed");
+        same_bits &= got
+            .iter()
+            .zip(&full)
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        let tf = gemm
+            .run_timed(&w, &x, &out, rows, cols, m, 0.2)
+            .expect("timed");
         let tq = gemm
             .run_timed_q8(&w, &xq, &xd, &out, rows, cols, m, 0.2)
             .expect("timed q8");
@@ -535,11 +547,20 @@ fn q8_gemm_tracks_the_fp32_gemm() {
         for m in [2usize, 4, 6, 8, 16] {
             gemm.run(&w, &x, &out, rows, cols, m).expect("fp32 gemm");
             let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("download");
-            same_bits &= got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits());
-            gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, m, 0).expect("q8 gemm");
+            same_bits &= got
+                .iter()
+                .zip(&want)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            gemm.run_at_q8(&w, &xq, &xd, &out, rows, cols, m, 0)
+                .expect("q8 gemm");
             let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("download");
-            same_bits &= got.iter().zip(&full).all(|(a, b)| a.to_bits() == b.to_bits());
-            let tf = gemm.run_timed(&w, &x, &out, rows, cols, m, 0.2).expect("timed");
+            same_bits &= got
+                .iter()
+                .zip(&full)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            let tf = gemm
+                .run_timed(&w, &x, &out, rows, cols, m, 0.2)
+                .expect("timed");
             let tq = gemm
                 .run_timed_q8(&w, &xq, &xd, &out, rows, cols, m, 0.2)
                 .expect("timed q8");
@@ -599,11 +620,18 @@ fn paired_shared_gate_up_matches_gate_up_swiglu() {
         })
     });
     let Some(b) = block else {
-        eprintln!("pair_gemm: no layer with both shared gate and up in {}", ty.name());
+        eprintln!(
+            "pair_gemm: no layer with both shared gate and up in {}",
+            ty.name()
+        );
         return;
     };
-    let g = set.tensor(&format!("blk.{b}.ffn_gate_shexp.weight")).expect("gate");
-    let u = set.tensor(&format!("blk.{b}.ffn_up_shexp.weight")).expect("up");
+    let g = set
+        .tensor(&format!("blk.{b}.ffn_gate_shexp.weight"))
+        .expect("gate");
+    let u = set
+        .tensor(&format!("blk.{b}.ffn_up_shexp.weight"))
+        .expect("up");
     let (rows, cols) = (g.ne1() as usize, g.ne0() as usize);
     println!("pair_gemm: blk.{b} [{rows} x {cols}] {}", ty.name());
     let gpu = &dev.gpu;
@@ -627,22 +655,35 @@ fn paired_shared_gate_up_matches_gate_up_swiglu() {
         many.run_pair(&wp, &x, &op, rows, cols, m).expect("pair");
         let want = breccia_kernels::ops::download_f32(gpu, &oa, n).expect("down ref");
         let got = breccia_kernels::ops::download_f32(gpu, &op, n).expect("down pair");
-        let diff = want.iter().zip(&got).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+        let diff = want
+            .iter()
+            .zip(&got)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
         let worst = want
             .iter()
             .zip(&got)
             .map(|(a, b)| ((a - b).abs() / a.abs().max(1e-6)) as f64)
             .fold(0f64, f64::max);
         println!("pair_gemm: m = {m}: {diff}/{n} differ, worst relative {worst:.3e}");
-        assert_eq!(diff, 0, "m = {m}: the fused gate+up+swiglu must be bit-identical");
+        assert_eq!(
+            diff, 0,
+            "m = {m}: the fused gate+up+swiglu must be bit-identical"
+        );
         // The routed-expert form: the same blob at a word offset inside a larger buffer.
         let pad = 4096usize;
         let padded: Vec<u8> = [&vec![0xA5u8; pad * 2][..], cat.as_slice()].concat();
         let wq = breccia_kernels::gemv::upload(gpu, &padded).expect("upload padded pair");
         let oq = alloc(gpu, (n * 4) as u64).expect("out");
-        many.run_pair_at(&wq, &x, &oq, rows, cols, m, pad as u32).expect("pair_at");
+        many.run_pair_at(&wq, &x, &oq, rows, cols, m, pad as u32)
+            .expect("pair_at");
         let at = breccia_kernels::ops::download_f32(gpu, &oq, n).expect("down pair_at");
-        assert!(want.iter().zip(&at).all(|(a, b)| a.to_bits() == b.to_bits()), "m = {m}: run_pair_at");
+        assert!(
+            want.iter()
+                .zip(&at)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "m = {m}: run_pair_at"
+        );
         gpu.destroy_buf(&wq);
         gpu.destroy_buf(&oq);
         for o in [og, ou, oa, op, x] {
@@ -688,7 +729,8 @@ fn blocked_gemm_is_bit_identical_to_the_plain_gemm() {
         return;
     };
     let gpu = &dev.gpu;
-    let w = breccia_kernels::gemv::upload(gpu, set.tensor(&name).unwrap().as_slice()).expect("upload");
+    let w =
+        breccia_kernels::gemv::upload(gpu, set.tensor(&name).unwrap().as_slice()).expect("upload");
     for m in [37usize, 1024] {
         let flat: Vec<f32> = (0..m * cols)
             .map(|i| (((i * 7 + (i / cols) * 13) % 29) as f32 - 14.0) * 0.011)
@@ -702,7 +744,9 @@ fn blocked_gemm_is_bit_identical_to_the_plain_gemm() {
             let used = g.variant_for(rows, m);
             g.run(&w, &x, &out, rows, cols, m).expect("gemm");
             let got = breccia_kernels::ops::download_f32(gpu, &out, m * rows).expect("down");
-            let t = g.run_timed(&w, &x, &out, rows, cols, m, 0.002).expect("timed");
+            let t = g
+                .run_timed(&w, &x, &out, rows, cols, m, 0.002)
+                .expect("timed");
             println!(
                 "rpl_gemm: {name} [{rows} x {cols}] {} m = {m} {v:?} (used {used:?}): {:.3} ms",
                 ty.name(),
@@ -713,8 +757,17 @@ fn blocked_gemm_is_bit_identical_to_the_plain_gemm() {
                 Some(b) => {
                     // A shape too small for the blocked grid falls back to plain, by design.
                     assert!(used == v || used == (1, 8), "{v:?} -> {used:?} for m = {m}");
-                    let diff = b.iter().zip(&got).filter(|(a, c)| a.to_bits() != c.to_bits()).count();
-                    assert_eq!(diff, 0, "{}: {v:?} m = {m}: {diff} outputs differ", ty.name());
+                    let diff = b
+                        .iter()
+                        .zip(&got)
+                        .filter(|(a, c)| a.to_bits() != c.to_bits())
+                        .count();
+                    assert_eq!(
+                        diff,
+                        0,
+                        "{}: {v:?} m = {m}: {diff} outputs differ",
+                        ty.name()
+                    );
                 }
             }
         }
@@ -760,7 +813,8 @@ fn tiled_gemm_matches_plain() {
         return;
     };
     let gpu = &dev.gpu;
-    let w = breccia_kernels::gemv::upload(gpu, set.tensor(&name).unwrap().as_slice()).expect("upload");
+    let w =
+        breccia_kernels::gemv::upload(gpu, set.tensor(&name).unwrap().as_slice()).expect("upload");
     let mut plain = GemmMany::new(gpu, ty).expect("gemm pipeline");
     plain.set_tile(None);
     let mut base = GemmMany::new(gpu, ty).expect("gemm pipeline");
@@ -786,7 +840,9 @@ fn tiled_gemm_matches_plain() {
         let scale = refv.iter().fold(0f32, |a, v| a.max(v.abs()));
         let timed = c == cols;
         if timed {
-            let t = plain.run_timed(&w, &x, &out, rows, c, m, 0.002).expect("timed");
+            let t = plain
+                .run_timed(&w, &x, &out, rows, c, m, 0.002)
+                .expect("timed");
             println!(
                 "tile_gemm: {name} [{rows} x {c}] {} m = {m} incumbent {:?}: {:.3} ms",
                 ty.name(),
@@ -811,11 +867,17 @@ fn tiled_gemm_matches_plain() {
                 ty.name()
             );
             if timed {
-                let tm = g.run_timed_tiled(t, &w, &x, &out, rows, c, m, 0.002).expect("timed");
+                let tm = g
+                    .run_timed_tiled(t, &w, &x, &out, rows, c, m, 0.002)
+                    .expect("timed");
                 print!("  {:.3} ms", tm.per_iter_s * 1e3);
             }
             println!();
-            assert!(max_abs <= 1e-4 * scale, "{}: {t:?} m = {m} cols = {c}: max abs {max_abs} vs scale {scale}", ty.name());
+            assert!(
+                max_abs <= 1e-4 * scale,
+                "{}: {t:?} m = {m} cols = {c}: max abs {max_abs} vs scale {scale}",
+                ty.name()
+            );
         }
         gpu.destroy_buf(&out);
         gpu.destroy_buf(&x);

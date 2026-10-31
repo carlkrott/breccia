@@ -747,7 +747,9 @@ impl<'g> Q8Quantize<'g> {
     /// Quantise `x[..k]` into `q8[..k]` (int8) and `d[..k/32]` (f16); `k % 32 == 0`.
     pub fn run(&self, x: &Buf, q8: &Buf, d: &Buf, k: usize) -> Result<()> {
         if k == 0 || k % 32 != 0 {
-            return Err(anyhow!("q8 quantise needs k a non-zero multiple of 32, got {k}"));
+            return Err(anyhow!(
+                "q8 quantise needs k a non-zero multiple of 32, got {k}"
+            ));
         }
         let groups = k / 32;
         // The shader indexes by gl_GlobalInvocationID.x only: no y fold.
@@ -1879,7 +1881,11 @@ impl<'g> HcMixer<'g> {
     /// `true` when `read` at `tokens` tokens runs the `up` GEMM + gated-mean epilogue
     /// (default on): built, and the plain `up` GEMM would be the default 4x4 tile.
     pub fn tile_fused(&self, tokens: usize) -> bool {
-        self.tile_chunks > 0 && self.gemm.as_ref().is_some_and(|g| g.hc_tile_gated_for(tokens))
+        self.tile_chunks > 0
+            && self
+                .gemm
+                .as_ref()
+                .is_some_and(|g| g.hc_tile_gated_for(tokens))
     }
 
     /// The chunk count of the **separate** gated-mean kernel (the bench paths that
@@ -2055,7 +2061,16 @@ impl<'g> HcMixer<'g> {
             if let Some(g) = &self.gemm {
                 crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_UP_GATED);
                 return g.run_up_gated(
-                    w.up, &ws.lo, &ws.gate, &ws.xn, winj, &ws.inject, &ws.mixed, self.n_embd, self.hc_lr, t,
+                    w.up,
+                    &ws.lo,
+                    &ws.gate,
+                    &ws.xn,
+                    winj,
+                    &ws.inject,
+                    &ws.mixed,
+                    self.n_embd,
+                    self.hc_lr,
+                    t,
                 );
             }
         }
@@ -2172,7 +2187,14 @@ impl<'g> HcMixer<'g> {
     fn run_down(&self, ws: &HcWorkspace, w: &HcWeights<'_>) -> Result<()> {
         if let (Some(g), true) = (&self.gemm, ws.tokens > 1) {
             let rows = self.hc_lr;
-            g.run(w.down, &ws.xn, &ws.lo_raw, rows, self.hc * self.n_embd, ws.tokens)?;
+            g.run(
+                w.down,
+                &ws.xn,
+                &ws.lo_raw,
+                rows,
+                self.hc * self.n_embd,
+                ws.tokens,
+            )?;
             // The GEMM has no epilogue; without the fused one `read` runs `Act`.
             if self.fused_act {
                 self.act
@@ -2193,8 +2215,14 @@ impl<'g> HcMixer<'g> {
     /// HC_WRITE: `out[c] = r[c] + block * 2*sigmoid(inject[c]/hc)` for
     /// `ws.tokens` tokens. Reads `ws.inject` from the last [`HcMixer::read`].
     pub fn write(&self, ws: &HcWorkspace, r: &Buf, block: &Buf, out: &Buf) -> Result<()> {
-        self.write
-            .run(r, block, &ws.inject, out, ws.tokens, self.read_chunks(ws.tokens))
+        self.write.run(
+            r,
+            block,
+            &ws.inject,
+            out,
+            ws.tokens,
+            self.read_chunks(ws.tokens),
+        )
     }
 
     /// The inject partial count [`HcMixer::read`] wrote for `tokens` tokens: the

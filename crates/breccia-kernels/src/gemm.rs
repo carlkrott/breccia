@@ -76,7 +76,11 @@ pub fn tile_dims(t: Tile) -> (usize, usize) {
 /// `BRECCIA_GEMM_TILE`: `0` = never tiled, `1` = the per-device default tile,
 /// `RMxRN` (e.g. `8x4`) = that tile (A/B only). Unset = [`tile_default`].
 fn env_tile(subgroup: u32, ty: QuantType) -> Option<Tile> {
-    match std::env::var("BRECCIA_GEMM_TILE").ok().as_deref().map(str::trim) {
+    match std::env::var("BRECCIA_GEMM_TILE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
         Some("0") => None,
         Some("1") => Some(TILE_FALLBACK),
         Some(v) if v.contains('x') => v
@@ -154,7 +158,10 @@ const LDSX_MIN_USERS: usize = 8;
 fn subgroup_size(gpu: &Gpu) -> u32 {
     let mut sg = vk::PhysicalDeviceSubgroupProperties::default();
     let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
-    unsafe { gpu.instance.get_physical_device_properties2(gpu.pdev, &mut p2) };
+    unsafe {
+        gpu.instance
+            .get_physical_device_properties2(gpu.pdev, &mut p2)
+    };
     sg.subgroup_size
 }
 
@@ -266,7 +273,10 @@ impl<'g> GemmMany<'g> {
             .kernel(spv, 4)
             .map_err(|e| anyhow!("creating the {ty} multi-user GEMM pipeline: {e}"))?;
         let q8_spv: Option<&[u8]> = match ty {
-            QuantType::Iq3S => Some(include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq3_s_q8.spv"))),
+            QuantType::Iq3S => Some(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/gemm_iq3_s_q8.spv"
+            ))),
             _ => None,
         };
         let q8 = match q8_spv.map(|spv| gpu.kernel(spv, 6)).transpose() {
@@ -277,7 +287,10 @@ impl<'g> GemmMany<'g> {
             }
         };
         let pair_spv: Option<&[u8]> = match ty {
-            QuantType::Iq3S => Some(include_bytes!(concat!(env!("OUT_DIR"), "/gemm_iq3_s_pair.spv"))),
+            QuantType::Iq3S => Some(include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/gemm_iq3_s_pair.spv"
+            ))),
             _ => None,
         };
         debug_assert_eq!(pair_spv.is_some(), has_pair_shader(ty));
@@ -293,7 +306,10 @@ impl<'g> GemmMany<'g> {
         };
         let mut blocked = Vec::new();
         let sets: &[bool] = if ldsx(gpu) { &[true, false] } else { &[false] };
-        for (x, (rpl, spv)) in sets.iter().flat_map(|&x| blocked_spv(ty, x).into_iter().map(move |b| (x, b))) {
+        for (x, (rpl, spv)) in sets
+            .iter()
+            .flat_map(|&x| blocked_spv(ty, x).into_iter().map(move |b| (x, b)))
+        {
             match gpu.kernel(spv, 4) {
                 Ok(k) => blocked.push((rpl, x, k)),
                 Err(e) => {
@@ -313,7 +329,11 @@ impl<'g> GemmMany<'g> {
                 Ok(k) => tiles.push((t, k)),
                 Err(e) => {
                     gpu.destroy_kernel(&kernel);
-                    for k in q8.iter().chain(pair.iter()).chain(blocked.iter().map(|(_, _, k)| k)) {
+                    for k in q8
+                        .iter()
+                        .chain(pair.iter())
+                        .chain(blocked.iter().map(|(_, _, k)| k))
+                    {
                         gpu.destroy_kernel(k);
                     }
                     for (_, k) in &tiles {
@@ -430,7 +450,10 @@ impl<'g> GemmMany<'g> {
     /// The tiled pipeline `run_at` would use for `rows x users`, if any.
     fn tiled(&self, users: usize) -> Option<(&breccia_vk::ctx::Kernel, Tile)> {
         let t = self.want_tile.filter(|_| users >= TILE_MIN_USERS)?;
-        self.tiles.iter().find(|(c, _)| *c == t).map(|(c, k)| (k, *c))
+        self.tiles
+            .iter()
+            .find(|(c, _)| *c == t)
+            .map(|(c, k)| (k, *c))
     }
 
     /// The tiled pipeline for exactly `t` (tests), ignoring the user threshold.
@@ -441,7 +464,11 @@ impl<'g> GemmMany<'g> {
     /// Dispatch grid of tile `t`: `(ceil(rows / TM), ceil(users / TN), 1)`.
     fn tile_grid(t: Tile, rows: usize, users: usize) -> (u32, u32, u32) {
         let (tm, tn) = tile_dims(t);
-        (rows.div_ceil(tm).max(1) as u32, users.div_ceil(tn).max(1) as u32, 1)
+        (
+            rows.div_ceil(tm).max(1) as u32,
+            users.div_ceil(tn).max(1) as u32,
+            1,
+        )
     }
 
     /// [`GemmMany::run_at`] on the tiled build `t` (tests / A/B); `None` if `t` is not built.
@@ -459,9 +486,16 @@ impl<'g> GemmMany<'g> {
         if users == 0 {
             return Err(anyhow!("users must be at least 1"));
         }
-        let kernel = self.tile_kernel(t).ok_or_else(|| anyhow!("no tiled build {t:?} for {}", self.ty))?;
+        let kernel = self
+            .tile_kernel(t)
+            .ok_or_else(|| anyhow!("no tiled build {t:?} for {}", self.ty))?;
         let pc = self.pc(rows, cols, users, 0);
-        self.dispatch_grid(kernel, &[w, x, out, &self.tables], &pc, Self::tile_grid(t, rows, users))
+        self.dispatch_grid(
+            kernel,
+            &[w, x, out, &self.tables],
+            &pc,
+            Self::tile_grid(t, rows, users),
+        )
     }
 
     /// Timed [`GemmMany::run_tiled`].
@@ -477,9 +511,17 @@ impl<'g> GemmMany<'g> {
         users: usize,
         target_s: f64,
     ) -> Result<GemvTiming> {
-        let kernel = self.tile_kernel(t).ok_or_else(|| anyhow!("no tiled build {t:?} for {}", self.ty))?;
+        let kernel = self
+            .tile_kernel(t)
+            .ok_or_else(|| anyhow!("no tiled build {t:?} for {}", self.ty))?;
         let pc = self.pc(rows, cols, users, 0);
-        self.timed_grid(kernel, &[w, x, out, &self.tables], &pc, Self::tile_grid(t, rows, users), target_s)
+        self.timed_grid(
+            kernel,
+            &[w, x, out, &self.tables],
+            &pc,
+            Self::tile_grid(t, rows, users),
+            target_s,
+        )
     }
 
     /// Force the build: rows per lane group (1, 2 or 4) and users per decode
@@ -514,7 +556,14 @@ impl<'g> GemmMany<'g> {
 
     /// [`GemmMany::pc`] for a `(rpl, umax)` build: the z split sees `rows / rpl`
     /// lane groups (the count [`GemmMany::dispatch`] gets) and up to `umax` users.
-    fn pc_v(&self, rows: usize, cols: usize, users: usize, base_words: u32, v: Variant) -> [u8; 24] {
+    fn pc_v(
+        &self,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        base_words: u32,
+        v: Variant,
+    ) -> [u8; 24] {
         let (rpl, umax) = v;
         let bpr = self.blocks_per_row(cols);
         let mut pc = [0u8; 24];
@@ -558,7 +607,12 @@ impl<'g> GemmMany<'g> {
         }
         if let Some((kernel, t)) = self.tiled(users) {
             let pc = self.pc(rows, cols, users, base_words);
-            return self.dispatch_grid(kernel, &[w, x, out, &self.tables], &pc, Self::tile_grid(t, rows, users));
+            return self.dispatch_grid(
+                kernel,
+                &[w, x, out, &self.tables],
+                &pc,
+                Self::tile_grid(t, rows, users),
+            );
         }
         let (kernel, v) = self.plain(rows, users);
         let pc = self.pc_v(rows, cols, users, base_words, v);
@@ -582,9 +636,13 @@ impl<'g> GemmMany<'g> {
                     && (rows / r).div_ceil(ROWS_PER_WG) * users.div_ceil(*u) >= WG_TARGET
             })
             .map_or((&self.kernel, (1, USERS_MAX)), |(v, _, k)| {
-                static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                static SEEN: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
                 if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    eprintln!("gemm: blocked build {v:?} in use ({} {rows} x {users})", self.ty.name());
+                    eprintln!(
+                        "gemm: blocked build {v:?} in use ({} {rows} x {users})",
+                        self.ty.name()
+                    );
                 }
                 (k, *v)
             })
@@ -650,7 +708,13 @@ impl<'g> GemmMany<'g> {
     ) -> Result<()> {
         let (kernel, pc) = self.q8_launch(rows, cols, users, base_words)?;
         // Binding 1 (the fp32 X the body does not read) is bound to xq.
-        self.dispatch(kernel, &[w, xq, out, &self.tables, xq, xd], &pc, rows, users)
+        self.dispatch(
+            kernel,
+            &[w, xq, out, &self.tables, xq, xd],
+            &pc,
+            rows,
+            users,
+        )
     }
 
     fn q8_launch(
@@ -690,7 +754,11 @@ impl<'g> GemmMany<'g> {
     /// Grid of the GEMV-shaped builds: 8 row groups per x, one z slice per `upz` users.
     fn std_grid(rows: usize, users: usize, pc: &[u8; 24]) -> (u32, u32, u32) {
         let groups = rows.div_ceil(ROWS_PER_WG).max(1) as u32;
-        (groups.min(WG_X_MAX), groups.div_ceil(WG_X_MAX), users.div_ceil(pushed_upz(pc)) as u32)
+        (
+            groups.min(WG_X_MAX),
+            groups.div_ceil(WG_X_MAX),
+            users.div_ceil(pushed_upz(pc)) as u32,
+        )
     }
 
     fn dispatch_grid(
@@ -746,7 +814,14 @@ impl<'g> GemmMany<'g> {
         }
         let (kernel, v) = self.plain(rows, users);
         let pc = self.pc_v(rows, cols, users, 0, v);
-        self.timed(kernel, &[w, x, out, &self.tables], &pc, rows / v.0, users, target_s)
+        self.timed(
+            kernel,
+            &[w, x, out, &self.tables],
+            &pc,
+            rows / v.0,
+            users,
+            target_s,
+        )
     }
 
     /// Timed variant of [`GemmMany::run_at_q8`] (base 0).
@@ -763,7 +838,14 @@ impl<'g> GemmMany<'g> {
         target_s: f64,
     ) -> Result<GemvTiming> {
         let (kernel, pc) = self.q8_launch(rows, cols, users, 0)?;
-        self.timed(kernel, &[w, xq, out, &self.tables, xq, xd], &pc, rows, users, target_s)
+        self.timed(
+            kernel,
+            &[w, xq, out, &self.tables, xq, xd],
+            &pc,
+            rows,
+            users,
+            target_s,
+        )
     }
 
     fn timed(

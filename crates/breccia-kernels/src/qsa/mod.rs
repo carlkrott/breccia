@@ -1060,7 +1060,13 @@ impl<'g> Qsa<'g> {
 
     /// [`Self::idx_tail`] for `tokens` raw keys held in `idx_k` (`[tokens, 128]`):
     /// a speculative rollback re-stores a saved prefix of a chunk's keys.
-    pub fn idx_tail_raw(&self, state: &QsaState, idx_k: &Buf, tokens: usize, pos0: usize) -> Result<()> {
+    pub fn idx_tail_raw(
+        &self,
+        state: &QsaState,
+        idx_k: &Buf,
+        tokens: usize,
+        pos0: usize,
+    ) -> Result<()> {
         let pc = Pc::new()
             .u(tokens as u32)
             .i(pos0 as i32)

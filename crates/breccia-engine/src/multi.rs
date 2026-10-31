@@ -199,7 +199,11 @@ impl<'m> Multi<'m> {
     /// Workspaces are sized at `Session::new`, so the chunk is fixed here.
     pub fn with_chunks(models: &[&'m Model], cfg: &SessionCfg, chunks: &[usize]) -> Result<Self> {
         if chunks.len() != models.len() {
-            bail!("{} prefill chunks for {} streams", chunks.len(), models.len());
+            bail!(
+                "{} prefill chunks for {} streams",
+                chunks.len(),
+                models.len()
+            );
         }
         // The token-by-token pass interleaves every stream, so it is all or none.
         if chunks.iter().any(|&c| c == 0) && chunks.iter().any(|&c| c > 0) {

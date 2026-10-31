@@ -301,7 +301,9 @@ impl<'a> TransferRing<'a> {
             // already orders the other queue's reads before this write.
             let x_compute = self.gpu.x_compute;
             let src = if x_compute {
-                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_WRITE
             } else {
                 vk::AccessFlags::TRANSFER_WRITE
             };

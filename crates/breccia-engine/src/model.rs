@@ -426,7 +426,13 @@ impl Model {
                 let named: usize = counts.iter().filter(|&&c| c != usize::MAX).sum();
                 let counts: Vec<usize> = counts
                     .iter()
-                    .map(|&c| if c == usize::MAX { layer_bytes.len().saturating_sub(named) } else { c })
+                    .map(|&c| {
+                        if c == usize::MAX {
+                            layer_bytes.len().saturating_sub(named)
+                        } else {
+                            c
+                        }
+                    })
                     .collect();
                 Placement::explicit(specs, &layer_bytes, tail_bytes, &counts)?
             }
@@ -450,7 +456,10 @@ impl Model {
         let last_dev = placement.device_of(cfg.n_layers - 1);
         let entries = profile_entries(&devices, opts.profile.as_deref(), opts.verbose);
         let candidates = head_candidates(&devices, &entries);
-        let pf_verdicts = entries.iter().map(|e| e.as_ref().and_then(|e| e.prefill.clone())).collect();
+        let pf_verdicts = entries
+            .iter()
+            .map(|e| e.as_ref().and_then(|e| e.prefill.clone()))
+            .collect();
         let mut head_choice = head::resolve(&opts.head_device, &candidates, last_dev)?;
         // **The device-crossing hand-off is removed, not disabled.** It produced a
         // wrong greedy sequence in 2 of 16 exclusive processes (`scripts/
@@ -516,8 +525,7 @@ impl Model {
                 down: w(gpu, &shards, &format!("blk.{block}.ffn_down_shexp.weight"))?,
                 gate_up: None,
             };
-            if moe.gate.key == moe.up.key
-                && breccia_kernels::gemm::has_pair_shader(moe.gate.key.ty)
+            if moe.gate.key == moe.up.key && breccia_kernels::gemm::has_pair_shader(moe.gate.key.ty)
             {
                 moe.gate_up = Some(w_concat(
                     gpu,
@@ -846,12 +854,16 @@ impl Model {
                 }
                 let got: Result<[W; 3]> = (|| {
                     let mut ws = Vec::with_capacity(3);
-                    for (r, role) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().enumerate() {
+                    for (r, role) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]
+                        .iter()
+                        .enumerate()
+                    {
                         let name = format!("blk.{b}.{role}.weight");
                         let t = shards
                             .tensor(&name)
                             .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
-                        let (ptr, len) = arena.blob_import_range(3 * i + r).map_err(|e| anyhow!(e))?;
+                        let (ptr, len) =
+                            arena.blob_import_range(3 * i + r).map_err(|e| anyhow!(e))?;
                         let usage = ash::vk::BufferUsageFlags::STORAGE_BUFFER
                             | ash::vk::BufferUsageFlags::TRANSFER_SRC;
                         // BRECCIA_HOST_IMPORT_GTT=1: copy into driver GTT instead of a userptr
@@ -859,17 +871,27 @@ impl Model {
                         let buf = if gtt_copy {
                             use ash::vk::MemoryPropertyFlags as M;
                             let b = gpu
-                                .buf(len, usage, M::HOST_VISIBLE | M::HOST_COHERENT | M::HOST_CACHED, M::empty())
+                                .buf(
+                                    len,
+                                    usage,
+                                    M::HOST_VISIBLE | M::HOST_COHERENT | M::HOST_CACHED,
+                                    M::empty(),
+                                )
                                 .map_err(|e| anyhow!("{name}: GTT alloc: {e}"))?;
-                            gpu.write_host(&b, unsafe { std::slice::from_raw_parts(ptr, len as usize) })
-                                .map_err(|e| anyhow!("{name}: GTT fill: {e}"))?;
+                            gpu.write_host(&b, unsafe {
+                                std::slice::from_raw_parts(ptr, len as usize)
+                            })
+                            .map_err(|e| anyhow!("{name}: GTT fill: {e}"))?;
                             gtt_bytes += len;
                             b
                         } else {
                             breccia_vk::transfer::import_from_host_ptr(gpu, ptr, len, usage)
                                 .map_err(|e| anyhow!("{name}: {e}"))?
                         };
-                        ws.push(W { buf, key: PipeKey::of(&t)? });
+                        ws.push(W {
+                            buf,
+                            key: PipeKey::of(&t)?,
+                        });
                     }
                     let [g, u, d]: [W; 3] = ws.try_into().map_err(|_| anyhow!("three roles"))?;
                     Ok([g, u, d])
@@ -881,18 +903,34 @@ impl Model {
                         keys.insert(down.key);
                         placed.insert(
                             b,
-                            PlacedExperts { block: b, device: dev, gate, up, down, host_imported: true },
+                            PlacedExperts {
+                                block: b,
+                                device: dev,
+                                gate,
+                                up,
+                                down,
+                                host_imported: true,
+                            },
                         );
                         done.push(b);
                     }
                     // A partial import leaks at most two Bufs until exit; the block stays on the host lane.
-                    Err(e) => eprintln!("breccia: host-import-gpu: blk.{b} stays on the host lane: {e:#}"),
+                    Err(e) => {
+                        eprintln!("breccia: host-import-gpu: blk.{b} stays on the host lane: {e:#}")
+                    }
                 }
             }
             eprintln!(
                 "breccia: host-import-gpu: {} block(s) GPU-read from {}: {:?}",
                 done.len(),
-                if gtt_copy { format!("driver GTT copies ({:.2} GiB, not charged to the cgroup)", gtt_bytes as f64 / (1u64 << 30) as f64) } else { "host pages (userptr)".into() },
+                if gtt_copy {
+                    format!(
+                        "driver GTT copies ({:.2} GiB, not charged to the cgroup)",
+                        gtt_bytes as f64 / (1u64 << 30) as f64
+                    )
+                } else {
+                    "host pages (userptr)".into()
+                },
                 done
             );
         }

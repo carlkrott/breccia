@@ -847,8 +847,12 @@ fn qsa_dense_skip_selects_the_scored_set() {
     let qsa = Qsa::new(gpu, max_pos).expect("qsa");
     let state = QsaState::new(gpu, 2048, max_pos).expect("state");
     let pooled = normalish(0xF2, (2048 / qsa::IDX_BLOCK + 1) * qsa::IDX_DIM);
-    breccia_kernels::gemv::upload_into(gpu, &state.idx_pooled, &breccia_kernels::ops::f32_to_bytes(&pooled))
-        .expect("pooled");
+    breccia_kernels::gemv::upload_into(
+        gpu,
+        &state.idx_pooled,
+        &breccia_kernels::ops::f32_to_bytes(&pooled),
+    )
+    .expect("pooled");
     // (tokens, pos0): 1k prefill chunk, decode at a block edge, decode with 3 tail
     // cells (own block not yet pooled), 2nd 1k chunk reaching exactly 512 blocks.
     for (tokens, pos0) in [(1024usize, 0usize), (1, 1055), (1, 1058), (1024, 1024)] {
@@ -858,7 +862,8 @@ fn qsa_dense_skip_selects_the_scored_set() {
         breccia_kernels::gemv::upload_into(gpu, &ws.idx_q, &breccia_kernels::ops::f32_to_bytes(&q))
             .expect("idx q");
         let read = |ws: &qsa::QsaWorkspace| {
-            let ids = breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).expect("ids");
+            let ids =
+                breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).expect("ids");
             let cnt = breccia_kernels::ops::download_u32(gpu, &ws.counts, tokens).expect("counts");
             (0..tokens)
                 .map(|t| {
@@ -879,7 +884,10 @@ fn qsa_dense_skip_selects_the_scored_set() {
             ws.n_blocks,
             dense[tokens - 1].len()
         );
-        assert_eq!(bad, 0, "tokens={tokens} pos0={pos0}: dense set differs at {bad} rows");
+        assert_eq!(
+            bad, 0,
+            "tokens={tokens} pos0={pos0}: dense set differs at {bad} rows"
+        );
         qsa.release(gpu, ws);
     }
 }
@@ -1461,15 +1469,30 @@ fn qsa_topk_ties_and_dead_blocks_match_the_reference() {
         let mut gpu_sc = vec![0f32; tokens * n_blocks];
         let mut cpu_sc = vec![0f64; tokens * n_blocks];
         for i in 0..tokens * n_blocks {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let dead = (i % n_blocks) % 7 == 3;
-            gpu_sc[i] = if dead { -1.0e30 } else { ((s >> 33) % 3) as f32 };
-            cpu_sc[i] = if dead { f64::NEG_INFINITY } else { gpu_sc[i] as f64 };
+            gpu_sc[i] = if dead {
+                -1.0e30
+            } else {
+                ((s >> 33) % 3) as f32
+            };
+            cpu_sc[i] = if dead {
+                f64::NEG_INFINITY
+            } else {
+                gpu_sc[i] as f64
+            };
         }
-        breccia_kernels::gemv::upload_into(gpu, &ws.idx_scores, &breccia_kernels::ops::f32_to_bytes(&gpu_sc))
-            .expect("scores");
+        breccia_kernels::gemv::upload_into(
+            gpu,
+            &ws.idx_scores,
+            &breccia_kernels::ops::f32_to_bytes(&gpu_sc),
+        )
+        .expect("scores");
         qsa.topk(&ws, pos0).expect("topk");
-        let ids = breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).expect("ids");
+        let ids =
+            breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).expect("ids");
         let counts = breccia_kernels::ops::download_u32(gpu, &ws.counts, tokens).expect("counts");
         for t in 0..tokens {
             let want = qsa::cpu::topk_blocks(
@@ -1479,7 +1502,11 @@ fn qsa_topk_ties_and_dead_blocks_match_the_reference() {
             );
             let c = counts[t] as usize;
             assert_eq!(c, want.len(), "cells={cells} t={t}: count");
-            assert_eq!(&ids[t * ws.max_ids..][..c], &want[..], "cells={cells} t={t}: ids/order");
+            assert_eq!(
+                &ids[t * ws.max_ids..][..c],
+                &want[..],
+                "cells={cells} t={t}: ids/order"
+            );
         }
         qsa.release(gpu, ws);
     }

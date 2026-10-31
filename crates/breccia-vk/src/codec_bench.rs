@@ -163,7 +163,10 @@ fn load_frames(path: &Path) -> R<Frames> {
         return Err(format!("{}: bad header {h:?}", path.display()));
     }
     if frame_raw % (4 * lanes as usize) != 0 {
-        return Err(format!("{}: frame_raw {frame_raw} not a multiple of 4*lanes", path.display()));
+        return Err(format!(
+            "{}: frame_raw {frame_raw} not a multiple of 4*lanes",
+            path.display()
+        ));
     }
     let tab_end = 32 + 256 + n_ctx as usize * CTX_BYTES;
     let tables = b.get(32..tab_end).ok_or("truncated tables")?.to_vec();
@@ -172,7 +175,9 @@ fn load_frames(path: &Path) -> R<Frames> {
     for fi in 0..n_frames {
         let n = le(&b, at)? as usize;
         at += 4;
-        let img = b.get(at..at + n).ok_or_else(|| format!("frame {fi}: truncated image"))?;
+        let img = b
+            .get(at..at + n)
+            .ok_or_else(|| format!("frame {fi}: truncated image"))?;
         let raw = b
             .get(at + n..at + n + frame_raw)
             .ok_or_else(|| format!("frame {fi}: truncated raw"))?;
@@ -212,7 +217,9 @@ impl Sets {
             let sizes = [vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(n * per)];
-            let dpci = vk::DescriptorPoolCreateInfo::default().max_sets(n).pool_sizes(&sizes);
+            let dpci = vk::DescriptorPoolCreateInfo::default()
+                .max_sets(n)
+                .pool_sizes(&sizes);
             let pool = crate::ctx::vk(
                 gpu.device.create_descriptor_pool(&dpci, None),
                 "vkCreateDescriptorPool(codec)",
@@ -294,10 +301,24 @@ fn download_eq(gpu: &Gpu, stage: &Buf, src: &Buf, want: &[u8]) -> R<bool> {
     Ok(got == want)
 }
 
-fn record_decode(d: &ash::Device, cmd: vk::CommandBuffer, k: &Kernel, set: vk::DescriptorSet, push: &[u8; 28], lanes: u32) {
+fn record_decode(
+    d: &ash::Device,
+    cmd: vk::CommandBuffer,
+    k: &Kernel,
+    set: vk::DescriptorSet,
+    push: &[u8; 28],
+    lanes: u32,
+) {
     unsafe {
         d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipe);
-        d.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, k.layout, 0, &[set], &[]);
+        d.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::COMPUTE,
+            k.layout,
+            0,
+            &[set],
+            &[],
+        );
         d.cmd_push_constants(cmd, k.layout, vk::ShaderStageFlags::COMPUTE, 0, push);
         d.cmd_dispatch(cmd, lanes.div_ceil(256), 1, 1);
         Gpu::barrier_all(d, cmd);
@@ -319,7 +340,9 @@ pub fn run_codec_bench(opts: &CodecBenchOptions) -> anyhow::Result<CodecReport> 
         .collect::<R<_>>()
         .map_err(|e| anyhow::anyhow!("breccia-vk codec: {e}"))?;
     let host = Host::new().map_err(|e| anyhow::anyhow!("breccia-vk: {e}"))?;
-    let devices = host.devices().map_err(|e| anyhow::anyhow!("breccia-vk: {e}"))?;
+    let devices = host
+        .devices()
+        .map_err(|e| anyhow::anyhow!("breccia-vk: {e}"))?;
     let topts = TransferBenchOptions {
         quick: opts.quick,
         devices: opts.devices.clone(),
@@ -333,18 +356,35 @@ pub fn run_codec_bench(opts: &CodecBenchOptions) -> anyhow::Result<CodecReport> 
     };
     let mut out = Vec::new();
     for index in selected {
-        let dev: &Dev = devices.iter().find(|d| d.index == index).expect("selected device exists");
-        println!("breccia-vk: codec bench on {} [{}]", dev.name, dev.pci_address);
+        let dev: &Dev = devices
+            .iter()
+            .find(|d| d.index == index)
+            .expect("selected device exists");
+        println!(
+            "breccia-vk: codec bench on {} [{}]",
+            dev.name, dev.pci_address
+        );
         let gpu = match Gpu::create(&host, dev, dev.index) {
             Ok(g) => g,
             Err(e) => {
-                out.push(DeviceCodec { device: bench::device_id(dev), classes: vec![], error: Some(e) });
+                out.push(DeviceCodec {
+                    device: bench::device_id(dev),
+                    classes: vec![],
+                    error: Some(e),
+                });
                 continue;
             }
         };
-        let classes = sets.iter().map(|f| bench_class(&gpu, f, opts.quick)).collect();
+        let classes = sets
+            .iter()
+            .map(|f| bench_class(&gpu, f, opts.quick))
+            .collect();
         gpu.destroy();
-        out.push(DeviceCodec { device: bench::device_id(dev), classes, error: None });
+        out.push(DeviceCodec {
+            device: bench::device_id(dev),
+            classes,
+            error: None,
+        });
     }
     host.destroy();
     Ok(CodecReport {
@@ -397,7 +437,10 @@ fn bench_class(gpu: &Gpu, f: &Frames, quick: bool) -> ClassResult {
     println!(
         "  {}: ratio {:.4}, decode {:.2} GB/s (bit-exact {}), raw DMA {:.2} GB/s, need > {:.2}, \
          ring image-DMA-only {:.2}, ring decode-only {:.2}{}",
-        Path::new(&f.file).file_name().map(|s| s.to_string_lossy()).unwrap_or_default(),
+        Path::new(&f.file)
+            .file_name()
+            .map(|s| s.to_string_lossy())
+            .unwrap_or_default(),
         r.ratio,
         r.decode_gbps_all,
         r.decode_bit_exact,
@@ -405,7 +448,10 @@ fn bench_class(gpu: &Gpu, f: &Frames, quick: bool) -> ClassResult {
         r.needed_decode_gbps,
         r.image_dma_raw_gbps,
         r.ring_decode_gbps,
-        r.error.as_deref().map(|e| format!(" ERROR {e}")).unwrap_or_default()
+        r.error
+            .as_deref()
+            .map(|e| format!(" ERROR {e}"))
+            .unwrap_or_default()
     );
     for a in &r.arms {
         println!(
@@ -430,9 +476,14 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
 
     // --- F2: idle decode rate per frame + bit-exact --------------------------
     let res = (|| -> R<()> {
-        let imgs: Vec<Buf> = (0..n).map(|_| dev_buf(gpu, max_img as u64 + 64)).collect::<R<_>>()?;
+        let imgs: Vec<Buf> = (0..n)
+            .map(|_| dev_buf(gpu, max_img as u64 + 64))
+            .collect::<R<_>>()?;
         let out = dev_buf(gpu, slot_bytes)?;
-        let rows: Vec<Vec<vk::Buffer>> = imgs.iter().map(|i| vec![bufs[1].buf, i.buf, out.buf]).collect();
+        let rows: Vec<Vec<vk::Buffer>> = imgs
+            .iter()
+            .map(|i| vec![bufs[1].buf, i.buf, out.buf])
+            .collect();
         let ds = Sets::new(gpu, &kd, &rows)?;
         let mut exact = true;
         let mut total_s = 0.0;
@@ -471,16 +522,21 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
         let mut ring = TransferRing::new(gpu, RingConfig::new(slots, slot_bytes))?;
         let threads: u32 = if quick { 1 << 17 } else { 1 << 18 };
         let groups = threads / 256;
-        let outs: Vec<Buf> = (0..slots).map(|_| dev_buf(gpu, slot_bytes)).collect::<R<_>>()?;
+        let outs: Vec<Buf> = (0..slots)
+            .map(|_| dev_buf(gpu, slot_bytes))
+            .collect::<R<_>>()?;
         let acc = gpu.buf(
             threads as u64 * 4,
             vk::BufferUsageFlags::STORAGE_BUFFER,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             vk::MemoryPropertyFlags::empty(),
         )?;
-        let dec_rows: Vec<Vec<vk::Buffer>> =
-            (0..slots).map(|s| vec![bufs[1].buf, ring.slot_buffer(s), outs[s as usize].buf]).collect();
-        let raw_rows: Vec<Vec<vk::Buffer>> = (0..slots).map(|s| vec![ring.slot_buffer(s), acc.buf]).collect();
+        let dec_rows: Vec<Vec<vk::Buffer>> = (0..slots)
+            .map(|s| vec![bufs[1].buf, ring.slot_buffer(s), outs[s as usize].buf])
+            .collect();
+        let raw_rows: Vec<Vec<vk::Buffer>> = (0..slots)
+            .map(|s| vec![ring.slot_buffer(s), acc.buf])
+            .collect();
         let out_rows: Vec<Vec<vk::Buffer>> = outs.iter().map(|o| vec![o.buf, acc.buf]).collect();
         let ds = Sets::new(gpu, &kd, &dec_rows)?;
         let rs = Sets::new(gpu, &kc, &raw_rows)?;
@@ -489,10 +545,15 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
         let repeats = if quick { 3 } else { 5 };
         let pushes: Vec<[u8; 28]> = (0..slots as usize).map(|s| f.push(s % n)).collect();
         let raw_len = f.frame_raw as u64;
-        let img_len: Vec<u64> = (0..slots as usize).map(|s| f.frames[s % n].0.len() as u64).collect();
+        let img_len: Vec<u64> = (0..slots as usize)
+            .map(|s| f.frames[s % n].0.len() as u64)
+            .collect();
 
         // diag only: 1 drops the pre-decode barrier, 2 adds one before the consumer
-        let nobar: u8 = std::env::var("BRECCIA_CODEC_BAR").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let nobar: u8 = std::env::var("BRECCIA_CODEC_BAR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
         // diag only: 1 decode without the output store, 2 fill 16 MiB of outs[s] after the consumer
         let extra = std::cell::Cell::new(0u8);
         // diag only (BRECCIA_CODEC_TS): (query pool, blobs) the run stamps into
@@ -507,7 +568,12 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
             };
             // one run: `blobs` frames through the ring; returns delivered raw GB/s.
             // copy: 0 raw frame, 1 image, 2 a 256 B prefix of the image already in the slot
-            let run = |ring: &mut TransferRing<'_>, dsets: &Sets, copy: u8, decode: bool, iters: Option<u32>| -> R<f64> {
+            let run = |ring: &mut TransferRing<'_>,
+                       dsets: &Sets,
+                       copy: u8,
+                       decode: bool,
+                       iters: Option<u32>|
+             -> R<f64> {
                 let codec = decode;
                 let v0 = ring.last_value();
                 let t0 = Instant::now();
@@ -528,7 +594,9 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                         ring.submit_compute(s, v, |d, cmd| {
                             let stamp = |stage, k: u32| {
                                 if let Some((p, nb)) = tp {
-                                    unsafe { d.cmd_write_timestamp(cmd, stage, p, 2 * nb + 3 * b + k) };
+                                    unsafe {
+                                        d.cmd_write_timestamp(cmd, stage, p, 2 * nb + 3 * b + k)
+                                    };
                                 }
                             };
                             stamp(vk::PipelineStageFlags::TOP_OF_PIPE, 0);
@@ -553,10 +621,25 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                                 if nobar == 2 {
                                     unsafe { Gpu::barrier_all(d, cmd) };
                                 }
-                                let set = if codec { os.sets[s as usize] } else { rs.sets[s as usize] };
-                                record_dispatch(d, cmd, &kc, set, groups, (raw_len / 16) as u32, threads, it);
+                                let set = if codec {
+                                    os.sets[s as usize]
+                                } else {
+                                    rs.sets[s as usize]
+                                };
+                                record_dispatch(
+                                    d,
+                                    cmd,
+                                    &kc,
+                                    set,
+                                    groups,
+                                    (raw_len / 16) as u32,
+                                    threads,
+                                    it,
+                                );
                                 if extra.get() == 2 {
-                                    unsafe { d.cmd_fill_buffer(cmd, outs[s as usize].buf, 0, raw_len, 0) };
+                                    unsafe {
+                                        d.cmd_fill_buffer(cmd, outs[s as usize].buf, 0, raw_len, 0)
+                                    };
                                 }
                             }
                             stamp(vk::PipelineStageFlags::BOTTOM_OF_PIPE, 2);
@@ -576,13 +659,25 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
             // raw DMA rate L of these frames (warm-up run discarded)
             stage_all(&ring, false)?;
             run(&mut ring, &ds, 0, false, None)?;
-            let l: Vec<f64> = (0..3).map(|_| run(&mut ring, &ds, 0, false, None)).collect::<R<_>>()?;
+            let l: Vec<f64> = (0..3)
+                .map(|_| run(&mut ring, &ds, 0, false, None))
+                .collect::<R<_>>()?;
             r.raw_dma_gbps = mean_spread(&l).0;
             r.needed_decode_gbps = r.raw_dma_gbps * r.ratio;
             stage_all(&ring, true)?;
             run(&mut ring, &ds, 1, false, None)?;
-            r.image_dma_raw_gbps = (0..3).map(|_| run(&mut ring, &ds, 1, false, None)).collect::<R<Vec<_>>>()?.iter().sum::<f64>() / 3.0;
-            r.ring_decode_gbps = (0..3).map(|_| run(&mut ring, &ds, 2, true, None)).collect::<R<Vec<_>>>()?.iter().sum::<f64>() / 3.0;
+            r.image_dma_raw_gbps = (0..3)
+                .map(|_| run(&mut ring, &ds, 1, false, None))
+                .collect::<R<Vec<_>>>()?
+                .iter()
+                .sum::<f64>()
+                / 3.0;
+            r.ring_decode_gbps = (0..3)
+                .map(|_| run(&mut ring, &ds, 2, true, None))
+                .collect::<R<Vec<_>>>()?
+                .iter()
+                .sum::<f64>()
+                / 3.0;
             if std::env::var_os("BRECCIA_CODEC_DIAG").is_some() {
                 ring.reset_stats();
                 let g = run(&mut ring, &ds, 1, true, None)?;
@@ -590,21 +685,32 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 // a consumer as long as one decode, on image copies: does plain compute overlap the DMA?
                 let target = (1u64 << 20) as f64 / (r.ring_decode_gbps * 1e9);
                 let cal = calibrate_consumer(gpu, &kc, rs.sets[0], threads, groups, target)?;
-                let it = Some(((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32);
+                let it = Some(
+                    ((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32,
+                );
                 ring.reset_stats();
                 let g = run(&mut ring, &ds, 1, false, it)?;
-                println!("    diag image copy + decode-length consumer {g:.3} GB/s stats {:?}", ring.stats());
+                println!(
+                    "    diag image copy + decode-length consumer {g:.3} GB/s stats {:?}",
+                    ring.stats()
+                );
                 // decode reading a resident copy of the image while the ring copies: contention or slot coupling?
-                let res: Vec<Buf> = (0..slots).map(|_| dev_buf(gpu, max_img as u64 + 64)).collect::<R<_>>()?;
+                let res: Vec<Buf> = (0..slots)
+                    .map(|_| dev_buf(gpu, max_img as u64 + 64))
+                    .collect::<R<_>>()?;
                 for s in 0..slots as usize {
                     upload(gpu, &bufs[0], &res[s], &f.frames[s % n].0)?;
                 }
-                let rows: Vec<Vec<vk::Buffer>> =
-                    (0..slots as usize).map(|s| vec![bufs[1].buf, res[s].buf, outs[s].buf]).collect();
+                let rows: Vec<Vec<vk::Buffer>> = (0..slots as usize)
+                    .map(|s| vec![bufs[1].buf, res[s].buf, outs[s].buf])
+                    .collect();
                 let rds = Sets::new(gpu, &kd, &rows)?;
                 ring.reset_stats();
                 let g = run(&mut ring, &rds, 1, true, None)?;
-                println!("    diag image copy + decode of a resident image {g:.3} GB/s stats {:?}", ring.stats());
+                println!(
+                    "    diag image copy + decode of a resident image {g:.3} GB/s stats {:?}",
+                    ring.stats()
+                );
                 let g = run(&mut ring, &rds, 2, true, None)?;
                 println!("    diag resident decode, no copy {g:.3} GB/s");
                 extra.set(1);
@@ -621,7 +727,9 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 // the x0.5 consumer on image copies, with and without the decode in front of it
                 let target = (1u64 << 20) as f64 / (r.raw_dma_gbps * 1e9) * 0.5;
                 let cal = calibrate_consumer(gpu, &kc, rs.sets[0], threads, groups, target)?;
-                let it5 = Some(((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32);
+                let it5 = Some(
+                    ((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32,
+                );
                 let g = run(&mut ring, &ds, 1, false, it5)?;
                 println!("    diag image copy + x0.5 consumer (slot) {g:.3} GB/s");
                 let g = run(&mut ring, &ds, 1, true, it5)?;
@@ -640,7 +748,10 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 }
             }
 
-            if let Some(secs) = std::env::var("BRECCIA_CODEC_LINK").ok().and_then(|v| v.parse::<f64>().ok()) {
+            if let Some(secs) = std::env::var("BRECCIA_CODEC_LINK")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+            {
                 let dev = dev_buf(gpu, raw_len)?;
                 let host = bufs[0].buf;
                 let rate = |up: bool| -> R<f64> {
@@ -648,7 +759,16 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                     let t = gpu.run_timed(Qc::X, secs, |d, cmd, k| unsafe {
                         Gpu::barrier_all(d, cmd);
                         for _ in 0..k {
-                            d.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: raw_len }]);
+                            d.cmd_copy_buffer(
+                                cmd,
+                                src,
+                                dst,
+                                &[vk::BufferCopy {
+                                    src_offset: 0,
+                                    dst_offset: 0,
+                                    size: raw_len,
+                                }],
+                            );
                             Gpu::barrier_all(d, cmd);
                         }
                     })?;
@@ -656,14 +776,22 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 };
                 // GPU->GPU host-bounce runs: one direction per process (LINK_DIR), started together (LINK_AT, unix secs)
                 let dir = std::env::var("BRECCIA_CODEC_LINK_DIR").unwrap_or_default();
-                if let Some(at) = std::env::var("BRECCIA_CODEC_LINK_AT").ok().and_then(|v| v.parse::<f64>().ok()) {
-                    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64();
+                if let Some(at) = std::env::var("BRECCIA_CODEC_LINK_AT")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs_f64();
                     std::thread::sleep(std::time::Duration::from_secs_f64((at - now).max(0.0)));
                 }
-                let res: R<(f64, f64)> = (|| Ok((
-                    if dir != "d2h" { rate(true)? } else { 0.0 },
-                    if dir != "h2d" { rate(false)? } else { 0.0 },
-                )))();
+                let res: R<(f64, f64)> = (|| {
+                    Ok((
+                        if dir != "d2h" { rate(true)? } else { 0.0 },
+                        if dir != "h2d" { rate(false)? } else { 0.0 },
+                    ))
+                })();
                 gpu.destroy_buf(&dev);
                 (r.h2d_gbps, r.d2h_gbps) = res?;
             }
@@ -673,7 +801,9 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 let pool = gpu.query_pool(q)?;
                 let target = (1u64 << 20) as f64 / (r.raw_dma_gbps * 1e9) * 0.5;
                 let cal = calibrate_consumer(gpu, &kc, rs.sets[0], threads, groups, target)?;
-                let it5 = Some(((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32);
+                let it5 = Some(
+                    ((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32,
+                );
                 tsp.set(Some((pool, blobs)));
                 let arms: [(&str, u8, bool, Option<u32>); 6] = [
                     ("raw copy only", 0, false, None),
@@ -690,8 +820,18 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                         gpu.reset_queries(pool, q);
                         let g = run(&mut ring, &ds, copy, dec, it)?;
                         let compute = dec || it.is_some();
-                        let ticks = gpu.timestamp_stamps(pool, if compute { q } else { 2 * blobs })?;
-                        println!("    ts {name}: {g:.3} GB/s  {}", timeline(&ticks, blobs as usize, slots as usize, compute, gpu.timestamp_period_ns));
+                        let ticks =
+                            gpu.timestamp_stamps(pool, if compute { q } else { 2 * blobs })?;
+                        println!(
+                            "    ts {name}: {g:.3} GB/s  {}",
+                            timeline(
+                                &ticks,
+                                blobs as usize,
+                                slots as usize,
+                                compute,
+                                gpu.timestamp_period_ns
+                            )
+                        );
                     }
                     Ok(())
                 })();
@@ -704,7 +844,9 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 let iters = if factor > 0.0 {
                     let target = (1u64 << 20) as f64 / (r.raw_dma_gbps * 1e9) * factor;
                     let cal = calibrate_consumer(gpu, &kc, rs.sets[0], threads, groups, target)?;
-                    Some(((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32)
+                    Some(
+                        ((cal.iters_per_mib as u64 * (raw_len >> 20).max(1)).min(4_000_000)) as u32,
+                    )
                 } else {
                     None
                 };
@@ -723,7 +865,9 @@ fn bench_class_inner(gpu: &Gpu, f: &Frames, quick: bool, r: &mut ClassResult) ->
                 let (cm, csd) = mean_spread(&cg);
                 r.arms.push(ArmPoint {
                     consumer_factor: factor,
-                    consumer_iters_per_mib: iters.map(|i| i / (raw_len >> 20).max(1) as u32).unwrap_or(0),
+                    consumer_iters_per_mib: iters
+                        .map(|i| i / (raw_len >> 20).max(1) as u32)
+                        .unwrap_or(0),
                     blobs_per_run: blobs,
                     raw_gbps: rg,
                     codec_gbps: cg,
@@ -768,7 +912,9 @@ fn timeline(t: &[u64], blobs: usize, slots: usize, compute: bool, period_ns: f64
         v[v.len() / 2]
     };
     let ss = slots.min(blobs - 1)..blobs;
-    let span = (0..blobs).map(|b| if compute { k(b, 2) } else { ce(b) }).fold(0.0, f64::max);
+    let span = (0..blobs)
+        .map(|b| if compute { k(b, 2) } else { ce(b) })
+        .fold(0.0, f64::max);
     let mut out = format!(
         "per-blob {:.3} ms  copy {:.3}  copy-idle {:.3}",
         span / blobs as f64,
@@ -782,7 +928,9 @@ fn timeline(t: &[u64], blobs: usize, slots: usize, compute: bool, period_ns: f64
             let (a, z) = (cb(b), ce(b));
             tot += z - a;
             // compute intervals are serial on one queue, so they do not overlap each other
-            ov += (0..blobs).map(|j| (z.min(k(j, 2)) - a.max(k(j, 0))).max(0.0)).sum::<f64>();
+            ov += (0..blobs)
+                .map(|j| (z.min(k(j, 2)) - a.max(k(j, 0))).max(0.0))
+                .sum::<f64>();
         }
         let bad = (0..blobs).filter(|&b| k(b, 0) < ce(b)).count();
         out += &format!(
@@ -801,13 +949,22 @@ fn timeline(t: &[u64], blobs: usize, slots: usize, compute: bool, period_ns: f64
 /// CPU twin of `rans_decode.comp`: lanes split over all cores, each thread steps its lanes
 /// word by word so the strided output stores stay contiguous per thread.
 fn cpu_decode(f: &Frames, img: &[u8], out: &mut [u32], threads: usize) {
-    let w: Vec<u32> = img.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+    let w: Vec<u32> = img
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
     let lanes = f.lanes as usize;
     let wpl = f.wpl() as usize;
     let tab = &f.tables;
     let ctxmap = &tab[..256];
     let lut = |c: usize| &tab[256 + c * CTX_BYTES..][..4096];
-    let fc = |c: usize, s: usize| u32::from_le_bytes(tab[256 + c * CTX_BYTES + 4096 + 4 * s..][..4].try_into().unwrap());
+    let fc = |c: usize, s: usize| {
+        u32::from_le_bytes(
+            tab[256 + c * CTX_BYTES + 4096 + 4 * s..][..4]
+                .try_into()
+                .unwrap(),
+        )
+    };
     let sb = lanes + 1;
     let plane = sb + w[lanes] as usize; // plane_base, as in Frames::push
     let blk = f.blk as usize;
@@ -847,7 +1004,11 @@ fn cpu_decode(f: &Frames, img: &[u8], out: &mut [u32], threads: usize) {
                                 word |= dec(j, ctxmap[q] as usize) << (8 * bb);
                                 q = if q + 1 >= blk { q + 1 - blk } else { q + 1 };
                             }
-                            p[j] = if p[j] + step >= blk { (p[j] + step) % blk } else { p[j] + step };
+                            p[j] = if p[j] + step >= blk {
+                                (p[j] + step) % blk
+                            } else {
+                                p[j] + step
+                            };
                             word
                         } else {
                             let (e0, e1) = (dec(j, 0), dec(j, 0));
@@ -867,12 +1028,17 @@ fn cpu_decode(f: &Frames, img: &[u8], out: &mut [u32], threads: usize) {
 
 /// CPU receiver decode rate over all frames (raw GB/s) and whether every frame matched.
 fn cpu_decode_rate(f: &Frames, secs: f64) -> (f64, bool) {
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
     let mut out = vec![0u32; f.frame_raw / 4];
     let mut ok = true;
     for (img, raw) in &f.frames {
         cpu_decode(f, img, &mut out, threads);
-        ok &= out.iter().flat_map(|v| v.to_le_bytes()).eq(raw.iter().copied());
+        ok &= out
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .eq(raw.iter().copied());
     }
     let t0 = Instant::now();
     let mut bytes = 0usize;

@@ -33,12 +33,11 @@ const SERVICE_ARGS_TEMPLATE: &str = r#"
 "#;
 
 fn path_var(name: &'static str) -> &'static str {
-    CELL.get_or_init(|| {
-        match std::env::var(name) {
-            Ok(v) if !v.trim().is_empty() => v.trim_end_matches('/').to_string(),
-            _ => panic!("{name} must be set for launch_surface tests"),
-        }
-    }).as_str()
+    CELL.get_or_init(|| match std::env::var(name) {
+        Ok(v) if !v.trim().is_empty() => v.trim_end_matches('/').to_string(),
+        _ => panic!("{name} must be set for launch_surface tests"),
+    })
+    .as_str()
 }
 
 fn service_args() -> String {
@@ -60,9 +59,10 @@ fn parses_the_verbatim_production_line() {
 
     assert_eq!(
         plan.binary,
-        Some(PathBuf::from(
-            format!("{}/bin/llama-server", path_var("BRECCIA_MODEL_ROOT"))
-        ))
+        Some(PathBuf::from(format!(
+            "{}/bin/llama-server",
+            path_var("BRECCIA_MODEL_ROOT")
+        )))
     );
     assert_eq!(
         plan.model,
@@ -122,9 +122,10 @@ fn parses_the_verbatim_production_line() {
     assert_eq!(plan.flash_attn, Some(Switch::On));
     assert_eq!(
         plan.slot_save_path,
-        Some(PathBuf::from(
-            format!("{}/kv-slots/IQ3_XXS-q4_0-rocm-1x200k-1b70350c9/", path_var("BRECCIA_SLOT_ROOT"))
-        ))
+        Some(PathBuf::from(format!(
+            "{}/kv-slots/IQ3_XXS-q4_0-rocm-1x200k-1b70350c9/",
+            path_var("BRECCIA_SLOT_ROOT")
+        )))
     );
     assert_eq!(
         plan.mmproj,

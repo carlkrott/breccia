@@ -19,8 +19,8 @@
 //! dispatch order so the result is bit-reproducible regardless of which worker
 //! finishes first.
 
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;

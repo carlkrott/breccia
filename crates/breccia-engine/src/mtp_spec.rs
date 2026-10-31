@@ -41,9 +41,16 @@ pub struct Accept {
 pub fn parse_arm(s: &str) -> Option<(Policy, Accept)> {
     let mut it = s.split(':');
     let pol = Policy::parse(it.next()?)?;
-    let mut acc = Accept { special_from: u32::MAX, ..Accept::default() };
+    let mut acc = Accept {
+        special_from: u32::MAX,
+        ..Accept::default()
+    };
     for part in it {
-        let v: f32 = part.get(1..)?.parse().ok().filter(|v: &f32| (0.0..=1.0).contains(v))?;
+        let v: f32 = part
+            .get(1..)?
+            .parse()
+            .ok()
+            .filter(|v: &f32| (0.0..=1.0).contains(v))?;
         match part.as_bytes()[0] {
             b'r' => acc.relax = v,
             b'm' => acc.min_p = v,
@@ -58,7 +65,11 @@ impl Policy {
         match s {
             "plain" => Some(Self::Plain),
             "gate" => Some(Self::Gate),
-            k => k.parse::<usize>().ok().filter(|k| (1..=MAX_K).contains(k)).map(Self::Fixed),
+            k => k
+                .parse::<usize>()
+                .ok()
+                .filter(|k| (1..=MAX_K).contains(k))
+                .map(Self::Fixed),
         }
     }
 }
@@ -123,7 +134,11 @@ impl Gate {
 
     fn observe(&mut self, k: usize, accepted: usize, ms: f64) {
         let r = &mut self.round_ms[k];
-        *r = if self.seen[k] { 0.8 * *r + 0.2 * ms } else { ms };
+        *r = if self.seen[k] {
+            0.8 * *r + 0.2 * ms
+        } else {
+            ms
+        };
         self.seen[k] = true;
         // position j was offered iff j <= accepted (the prefix before it all passed)
         for j in 0..k.min(accepted + 1) {
@@ -312,7 +327,11 @@ pub fn generate(
         while a < k {
             let d = drafts[a];
             if argmax(&rows[a]) != d {
-                let lp = if acc.relax > 0.0 && d < acc.special_from { log_p(&rows[a], d) } else { f64::NEG_INFINITY };
+                let lp = if acc.relax > 0.0 && d < acc.special_from {
+                    log_p(&rows[a], d)
+                } else {
+                    f64::NEG_INFINITY
+                };
                 if lp.exp() < acc.relax as f64 || acc.relax == 0.0 {
                     break;
                 }
@@ -362,7 +381,11 @@ mod tests {
         let (p, a) = parse_arm("5:r0.2:m0.4").unwrap();
         assert_eq!((p, a.relax, a.min_p), (Policy::Fixed(5), 0.2, 0.4));
         assert_eq!(parse_arm("3").unwrap().1.relax, 0.0);
-        assert!(parse_arm("3:x0.1").is_none() && parse_arm("3:r2").is_none() && parse_arm("8").is_none());
+        assert!(
+            parse_arm("3:x0.1").is_none()
+                && parse_arm("3:r2").is_none()
+                && parse_arm("8").is_none()
+        );
     }
 
     #[test]
@@ -382,7 +405,7 @@ mod tests {
         let picks: Vec<usize> = (0..32).map(|_| g.pick()).collect();
         assert_eq!(picks.iter().filter(|&&k| k == 0).count(), 24);
         assert_ne!(picks[3], 0); // from plain, every 4th pick probes a spec depth
-        // always-accepting draft with cheap verify: deepest wins
+                                 // always-accepting draft with cheap verify: deepest wins
         let mut g = Gate::new();
         for _ in 0..200 {
             g.observe(3, 3, 100.0);

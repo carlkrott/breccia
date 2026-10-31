@@ -1081,7 +1081,10 @@ impl<'m> Session<'m> {
                     sh_g: alloc(chunk as u64 * nsb, "prefill chunk shared gate")?,
                     sh_u: alloc(chunk as u64 * nsb, "prefill chunk shared up")?,
                     sh_a: alloc(chunk as u64 * nsb, "prefill chunk shared act")?,
-                    logits: alloc(chunk as u64 * mc.n_expert as u64 * 4, "prefill chunk router logits")?,
+                    logits: alloc(
+                        chunk as u64 * mc.n_expert as u64 * 4,
+                        "prefill chunk router logits",
+                    )?,
                     // Two halves, so the host fills one while the GPU copies the other.
                     stream: Mailbox::new(gpu, 2 * STREAM_SLOTS as u64 * slot_stride)?,
                     sf_gate: alloc(gb.max(16), "streamed expert gate")?,
@@ -1482,11 +1485,26 @@ impl<'m> Session<'m> {
     /// card; any failure logs once and leaves the staged path on.
     /// The imported-memory ship of a chunk's helper inputs as `(src, dst, src off, dst
     /// off, bytes)` lists: block card -> host (`down`) and host -> helper (`up`).
-    fn ship_lists(&self, dev: usize, x: usize, t: usize, k: usize, defer_shared: bool) -> (Vec<ShipCopy<'_>>, Vec<ShipCopy<'_>>) {
+    fn ship_lists(
+        &self,
+        dev: usize,
+        x: usize,
+        t: usize,
+        k: usize,
+        defer_shared: bool,
+    ) -> (Vec<ShipCopy<'_>>, Vec<ShipCopy<'_>>) {
         let n_embd = self.model.cfg.n_embd;
         let nb = (n_embd * 4) as u64;
-        let lens = [t as u64 * nb, (t * k * 4) as u64, t as u64 * nb, (t * 4) as u64];
-        let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+        let lens = [
+            t as u64 * nb,
+            (t * k * 4) as u64,
+            t as u64 * nb,
+            (t * 4) as u64,
+        ];
+        let pf = self.venues[dev]
+            .pf
+            .as_ref()
+            .expect("the merged prefill scratch");
         let xpf = self.venues[x].pf.as_ref().expect("checked above");
         let imp = self.ship_imp.as_ref().expect("ship_ready");
         let (hd, hx) = (imp.get(dev), imp.get(x));
@@ -1517,7 +1535,9 @@ impl<'m> Session<'m> {
                 let ship = [dev, x]
                     .iter()
                     .filter_map(|&d| self.venues[d].pf.as_ref())
-                    .map(|pf| (pf.mixed.size + pf.w.size + pf.shared.size + pf.gate.size).max(pf.out.size))
+                    .map(|pf| {
+                        (pf.mixed.size + pf.w.size + pf.shared.size + pf.gate.size).max(pf.out.size)
+                    })
                     .max()
                     .unwrap_or(0);
                 // The overlapped micro-batch tick keeps the MoE result past the ship regions.
@@ -2051,9 +2071,19 @@ impl<'m> Session<'m> {
     /// bytes, `p<pos>-b<block>-<part>.bin`. Every `BRECCIA_DUMP_EVERY` positions (64),
     /// at most `BRECCIA_DUMP_MAX` snapshots (8). Bench/lab only: it stalls the token.
     fn dump_state(&mut self, pos: usize) -> Result<()> {
-        let Ok(dir) = std::env::var("BRECCIA_DUMP_STATE") else { return Ok(()) };
-        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        let (every, max) = (env("BRECCIA_DUMP_EVERY", 64).max(1), env("BRECCIA_DUMP_MAX", 8));
+        let Ok(dir) = std::env::var("BRECCIA_DUMP_STATE") else {
+            return Ok(());
+        };
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (every, max) = (
+            env("BRECCIA_DUMP_EVERY", 64).max(1),
+            env("BRECCIA_DUMP_MAX", 8),
+        );
         if pos % every != 0 || self.dumps >= max {
             return Ok(());
         }
@@ -2225,7 +2255,11 @@ impl<'m> Session<'m> {
         if let Some((dir, _)) = hc_capture() {
             use std::io::Write;
             std::fs::create_dir_all(dir)?;
-            std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/tokens.u32"))?.write_all(&tok.to_le_bytes())?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("{dir}/tokens.u32"))?
+                .write_all(&tok.to_le_bytes())?;
         }
         let n = self.model.cfg.n_layers;
         for b in 0..n {
@@ -2249,8 +2283,10 @@ impl<'m> Session<'m> {
         let (dev, mc) = (self.model.device_of(b), &self.model.cfg);
         let (hc, d) = (mc.hc, mc.n_embd);
         self.flush()?;
-        let raw = self.stagings[dev]
-            .read_batch(self.model.devices[dev].gpu(), &[(&self.venues[dev].r, 0, hc * d * 4)])?;
+        let raw = self.stagings[dev].read_batch(
+            self.model.devices[dev].gpu(),
+            &[(&self.venues[dev].r, 0, hc * d * 4)],
+        )?;
         let r = f32_from_bytes(&raw[0]);
         let mut out = Vec::with_capacity(d * 4);
         for i in 0..d {
@@ -2639,9 +2675,16 @@ impl<'m> Session<'m> {
         self.flush()?;
         self.timers.mark(PLE);
 
-        let micro_blocked = if pf_micro() { self.micro_blocker(t, pos0) } else { Some(String::new()) };
+        let micro_blocked = if pf_micro() {
+            self.micro_blocker(t, pos0)
+        } else {
+            Some(String::new())
+        };
         // Only say why when asked for explicitly: default-on falls back silently.
-        if let Some(why) = micro_blocked.as_ref().filter(|w| !w.is_empty() && std::env::var_os("BRECCIA_PF_MICRO").is_some()) {
+        if let Some(why) = micro_blocked
+            .as_ref()
+            .filter(|w| !w.is_empty() && std::env::var_os("BRECCIA_PF_MICRO").is_some())
+        {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("breccia: BRECCIA_PF_MICRO=2 off for this prefill: {why}");
@@ -2849,7 +2892,10 @@ impl<'m> Session<'m> {
                         None => None,
                     });
                 }
-                sp.head_logits = Some(breccia_kernels::gemv::alloc(gpu, (max_t * m.cfg.vocab * 4) as u64)?);
+                sp.head_logits = Some(breccia_kernels::gemv::alloc(
+                    gpu,
+                    (max_t * m.cfg.vocab * 4) as u64,
+                )?);
                 for t in 2..=max_t {
                     sp.head_ws.push(self.venues[0].final_hc.workspace(gpu, t)?);
                 }
@@ -2905,7 +2951,11 @@ impl<'m> Session<'m> {
             copy(&live.conv, &snap.conv, live.conv.size)?;
         }
         if let (Some(live), Some(snap)) = (&self.qsa_state[b], &sp.tail[at]) {
-            copy(&live.idx_tail, snap, breccia_kernels::qsa::sizes::idx_tail_bytes())?;
+            copy(
+                &live.idx_tail,
+                snap,
+                breccia_kernels::qsa::sizes::idx_tail_bytes(),
+            )?;
         }
         Ok(())
     }
@@ -2946,7 +2996,10 @@ impl<'m> Session<'m> {
         self.spec_sweep(0, true)?;
         let base_ple = self.ple.as_ref().map(|p| p.state());
         let (pos, tok) = (self.pos, self.cur_tok);
-        let sp = self.spec.as_mut().ok_or_else(|| anyhow!("call spec_enable first"))?;
+        let sp = self
+            .spec
+            .as_mut()
+            .ok_or_else(|| anyhow!("call spec_enable first"))?;
         sp.base_ple = base_ple;
         sp.base_pos = pos;
         sp.base_tok = tok;
@@ -2955,7 +3008,10 @@ impl<'m> Session<'m> {
 
     pub fn spec_restore_base(&mut self) -> Result<()> {
         self.spec_sweep(0, false)?;
-        let sp = self.spec.as_ref().ok_or_else(|| anyhow!("call spec_enable first"))?;
+        let sp = self
+            .spec
+            .as_ref()
+            .ok_or_else(|| anyhow!("call spec_enable first"))?;
         if let (Some(p), Some(s)) = (self.ple.as_mut(), sp.base_ple.as_ref()) {
             p.restore(s);
         }
@@ -2997,7 +3053,10 @@ impl<'m> Session<'m> {
     /// After [`Self::verify`]: make the state what decoding `toks[..=row]` would
     /// have left (accept `row` drafts), so the next token is `toks[row]`'s successor.
     pub fn rollback_to(&mut self, row: usize) -> Result<()> {
-        let sp = self.spec.as_ref().ok_or_else(|| anyhow!("call spec_enable first"))?;
+        let sp = self
+            .spec
+            .as_ref()
+            .ok_or_else(|| anyhow!("call spec_enable first"))?;
         let n = row + 1;
         if n > sp.toks.len() {
             bail!("rollback_to({row}) on a verify of {} rows", sp.toks.len());
@@ -3033,11 +3092,16 @@ impl<'m> Session<'m> {
         let dev = m.device_of(m.cfg.n_layers - 1);
         let hb = m.cfg.hc_dim() * 4;
         if n > self.venues[dev].r_slots.len() {
-            bail!("final_r_slots({n}): only {} slots", self.venues[dev].r_slots.len());
+            bail!(
+                "final_r_slots({n}): only {} slots",
+                self.venues[dev].r_slots.len()
+            );
         }
         self.flush()?;
-        let items: Vec<(&Buf, u64, usize)> =
-            self.venues[dev].r_slots[..n].iter().map(|s| (s, 0, hb)).collect();
+        let items: Vec<(&Buf, u64, usize)> = self.venues[dev].r_slots[..n]
+            .iter()
+            .map(|s| (s, 0, hb))
+            .collect();
         let per = (self.stagings[dev].capacity() as usize / hb).max(1);
         let mut out = Vec::with_capacity(n);
         for part in items.chunks(per) {
@@ -3053,8 +3117,10 @@ impl<'m> Session<'m> {
         let m = self.model;
         let dev = m.device_of(m.cfg.n_layers - 1);
         self.flush()?;
-        let raw = self.stagings[dev]
-            .read_batch(m.devices[dev].gpu(), &[(&self.venues[dev].r, 0, m.cfg.hc_dim() * 4)])?;
+        let raw = self.stagings[dev].read_batch(
+            m.devices[dev].gpu(),
+            &[(&self.venues[dev].r, 0, m.cfg.hc_dim() * 4)],
+        )?;
         Ok(f32_from_bytes(&raw[0]))
     }
 
@@ -3104,9 +3170,13 @@ impl<'m> Session<'m> {
             let v = &self.venues[0];
             let rc = v.r_chunk.as_ref().expect("checked by spec_replay_ok");
             let ws = &sp.head_ws[t - 2];
-            let out = sp.head_logits.as_ref().expect("replay allocates the head output");
-            let gather: Vec<(&Buf, u64, &Buf, u64, u64)> =
-                (0..t).map(|i| (rc, i as u64 * hb, &v.r_slots[i], 0, hb)).collect();
+            let out = sp
+                .head_logits
+                .as_ref()
+                .expect("replay allocates the head output");
+            let gather: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
+                .map(|i| (rc, i as u64 * hb, &v.r_slots[i], 0, hb))
+                .collect();
             batch_cmd::record_copies(gpu, &gather)?;
             let hw = HcWeights {
                 norm: &m.out_hc_norm,
@@ -3119,13 +3189,23 @@ impl<'m> Session<'m> {
             v.pipes
                 .gemm(m.head.key.ty)
                 .expect("checked by spec_replay_ok")
-                .run(&m.head.buf, &ws.mixed, out, m.head.key.rows, m.head.key.cols, t)?;
+                .run(
+                    &m.head.buf,
+                    &ws.mixed,
+                    out,
+                    m.head.key.rows,
+                    m.head.key.cols,
+                    t,
+                )?;
         }
         self.submit_batch()?;
         self.flush()?;
         let raw = {
             let sp = self.spec.as_ref().expect("replay needs spec_enable");
-            let out = sp.head_logits.as_ref().expect("replay allocates the head output");
+            let out = sp
+                .head_logits
+                .as_ref()
+                .expect("replay allocates the head output");
             // As many rows per readback as the staging buffer holds (a small
             // `--prefill-chunk` sizes it for one or two rows).
             let per = ((self.stagings[0].capacity() as usize) / (mc.vocab * 4)).max(1);
@@ -3161,8 +3241,10 @@ impl<'m> Session<'m> {
         let hb = m.cfg.hc_dim() * 4;
         self.flush()?;
         self.timers.mark(HANDOFF);
-        let items: Vec<(&Buf, u64, usize)> =
-            self.venues[from].r_slots[..t].iter().map(|s| (s, 0, hb)).collect();
+        let items: Vec<(&Buf, u64, usize)> = self.venues[from].r_slots[..t]
+            .iter()
+            .map(|s| (s, 0, hb))
+            .collect();
         let bytes = self.stagings[from].read_batch(m.devices[from].gpu(), &items)?;
         let regions: Vec<(&Buf, u64, &[u8])> = self.venues[to].r_slots[..t]
             .iter()
@@ -3500,25 +3582,31 @@ impl<'m> Session<'m> {
             );
             // A VRAM-placed block has no blobs (`BRECCIA_PF_EXPERT_ALL`): the mmap.
             let vram = m.placed.get(&b).is_some_and(|pe| !pe.host_imported);
-            m.imported_experts.as_ref().filter(|_| !vram).and_then(|arena| {
-                // Blob order skips VRAM-resident blocks: the ordinal is b minus
-                // every VRAM-placed block below it (host-imported ones keep blobs).
-                let streamed_before =
-                    b - m.placed.range(..b).filter(|(_, pe)| !pe.host_imported).count();
-                // The arena is a capped prefix of the streamed blocks; later ones
-                // keep streaming from the mmap.
-                if 3 * streamed_before + 3 > arena.blobs().len() {
-                    return None;
-                }
-                Some(Self::imported_role_slices(
-                    arena,
-                    streamed_before,
-                    expert,
-                    g as usize,
-                    u as usize,
-                    d as usize,
-                ))
-            })
+            m.imported_experts
+                .as_ref()
+                .filter(|_| !vram)
+                .and_then(|arena| {
+                    // Blob order skips VRAM-resident blocks: the ordinal is b minus
+                    // every VRAM-placed block below it (host-imported ones keep blobs).
+                    let streamed_before = b - m
+                        .placed
+                        .range(..b)
+                        .filter(|(_, pe)| !pe.host_imported)
+                        .count();
+                    // The arena is a capped prefix of the streamed blocks; later ones
+                    // keep streaming from the mmap.
+                    if 3 * streamed_before + 3 > arena.blobs().len() {
+                        return None;
+                    }
+                    Some(Self::imported_role_slices(
+                        arena,
+                        streamed_before,
+                        expert,
+                        g as usize,
+                        u as usize,
+                        d as usize,
+                    ))
+                })
         };
         let total = {
             let pf = self.venues[dev]
@@ -3813,7 +3901,10 @@ impl<'m> Session<'m> {
                 self.record_shared_chunk(b, dev, t)?;
             }
             if split_on {
-                let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+                let pf = self.venues[dev]
+                    .pf
+                    .as_ref()
+                    .expect("the merged prefill scratch");
                 let hx = &pf.split.as_ref().expect("split scratch").0;
                 let nb = (n_embd * 4) as u64;
                 batch_cmd::record_copies(
@@ -3918,7 +4009,10 @@ impl<'m> Session<'m> {
                 .rev()
                 .take(n)
                 .collect();
-            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let pf = self.venues[dev]
+                .pf
+                .as_ref()
+                .expect("the merged prefill scratch");
             let (hx, _) = pf.split.as_ref().expect("split scratch");
             let mut hbuf = vec![0u8; t * (n_embd + k) * 4];
             hx.read(&mut hbuf)?;
@@ -3934,7 +4028,8 @@ impl<'m> Session<'m> {
             for ti in 0..t {
                 for j in 0..k {
                     let o = (ti * k + j) * 4;
-                    let e = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
+                    let e =
+                        u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
                     if host_set.contains(&e) {
                         routes[ti].0.push(e);
                         routes[ti].1.push(w[ti * k + j]);
@@ -3983,7 +4078,10 @@ impl<'m> Session<'m> {
         } else if let Some(x) = xdev {
             let t0 = std::time::Instant::now();
             let nb = n_embd * 4;
-            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let pf = self.venues[dev]
+                .pf
+                .as_ref()
+                .expect("the merged prefill scratch");
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
             let pairs: Vec<(&Buf, usize, &Buf)> = [
                 (&pf.mixed, t * nb, &xpf.mixed),
@@ -4045,7 +4143,10 @@ impl<'m> Session<'m> {
             && routed_pair()
             && gate_ty == up_ty
             && gx.is_multiple_of(4)
-            && self.venues[edev].pipes.gemm(gate_ty).is_some_and(|g| g.has_pair())
+            && self.venues[edev]
+                .pipes
+                .gemm(gate_ty)
+                .is_some_and(|g| g.has_pair())
             && m.layers[b].experts.gate.bytes() as u64 == gx
             && m.layers[b].experts.up.bytes() as u64 == ux;
         let mut prev_expert: Option<usize> = None;
@@ -4185,17 +4286,25 @@ impl<'m> Session<'m> {
         if let Some(x) = xdev.filter(|_| defer_shared) {
             let t0 = std::time::Instant::now();
             let n = (t * n_embd * 4) as u64;
-            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let pf = self.venues[dev]
+                .pf
+                .as_ref()
+                .expect("the merged prefill scratch");
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
             if ship_imp {
                 // The offset the ship above left for it: after `mixed` and `w`.
                 let at = n + (t * k * 4) as u64;
                 let imp = self.ship_imp.as_ref().expect("ship_ready");
-                ship_p[0] += crate::xfer::copy_fenced(gpu, &[(&pf.shared, imp.get(dev), 0, at, n)])?;
-                ship_p[1] += crate::xfer::copy_fenced(m.devices[x].gpu(), &[(imp.get(x), &xpf.shared, at, 0, n)])?;
+                ship_p[0] +=
+                    crate::xfer::copy_fenced(gpu, &[(&pf.shared, imp.get(dev), 0, at, n)])?;
+                ship_p[1] += crate::xfer::copy_fenced(
+                    m.devices[x].gpu(),
+                    &[(imp.get(x), &xpf.shared, at, 0, n)],
+                )?;
             } else {
                 let bytes = self.stagings[dev].read_batch(gpu, &[(&pf.shared, 0, n as usize)])?;
-                ship_p[1] += self.stagings[x].write_regions(m.devices[x].gpu(), &[(&xpf.shared, 0, bytes[0].as_slice())])?;
+                ship_p[1] += self.stagings[x]
+                    .write_regions(m.devices[x].gpu(), &[(&xpf.shared, 0, bytes[0].as_slice())])?;
             }
             ship_s += t0.elapsed().as_secs_f64();
         }
@@ -4209,7 +4318,10 @@ impl<'m> Session<'m> {
             let at = n + (t * k * 4) as u64;
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
             let imp = self.ship_imp.as_ref().expect("ship_ready");
-            sh_pending = Some(crate::xfer::copy_submit(egpu, &[(imp.get(x), &xpf.shared, at, 0, n)])?);
+            sh_pending = Some(crate::xfer::copy_submit(
+                egpu,
+                &[(imp.get(x), &xpf.shared, at, 0, n)],
+            )?);
         }
 
         // ---- the fan-in: one dispatch, then the chunk's MoE result per token --
@@ -4218,10 +4330,20 @@ impl<'m> Session<'m> {
         if !host_set.is_empty() {
             // The zero row the host experts' pairs point at (a block may have left
             // anything in it).
-            let pf = self.venues[edev].pf.as_ref().expect("the merged prefill scratch");
+            let pf = self.venues[edev]
+                .pf
+                .as_ref()
+                .expect("the merged prefill scratch");
             let hp = &pf.split.as_ref().expect("split scratch").1;
             let nb = (n_embd * 4) as u64;
-            batch_cmd::record_copy(egpu, &pf.scratch, (t * k) as u64 * nb, &hp.buf, SPLIT_T_MAX as u64 * nb, nb)?;
+            batch_cmd::record_copy(
+                egpu,
+                &pf.scratch,
+                (t * k) as u64 * nb,
+                &hp.buf,
+                SPLIT_T_MAX as u64 * nb,
+                nb,
+            )?;
         }
         {
             let v = &self.venues[edev];
@@ -4271,11 +4393,18 @@ impl<'m> Session<'m> {
             self.micro_upw_wait()?;
             let t0 = std::time::Instant::now();
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
-            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let pf = self.venues[dev]
+                .pf
+                .as_ref()
+                .expect("the merged prefill scratch");
             if ship_imp {
                 let imp = self.ship_imp.as_ref().expect("ship_ready");
                 let n = (t * n_embd * 4) as u64;
-                let ro = if micro && micro_ovl() { self.ship_res_off } else { 0 };
+                let ro = if micro && micro_ovl() {
+                    self.ship_res_off
+                } else {
+                    0
+                };
                 ship_p[2] = crate::xfer::copy_fenced(egpu, &[(&xpf.out, imp.get(x), 0, ro, n)])?;
                 if micro {
                     self.micro_up = Some(MicroUp::Imported(n));
@@ -4288,7 +4417,8 @@ impl<'m> Session<'m> {
                 if micro {
                     self.micro_up = bytes.into_iter().next().map(MicroUp::Bytes);
                 } else {
-                    ship_p[3] = self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
+                    ship_p[3] = self.stagings[dev]
+                        .write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
                 }
             }
             ship_s += t0.elapsed().as_secs_f64();
@@ -4328,8 +4458,7 @@ impl<'m> Session<'m> {
                 // workspace), then the residual back into the per-token slots.
                 let v = &self.venues[dev];
                 let rc = v.r_chunk.as_ref().expect("checked above");
-                let ws = self
-                    .hc_chunk_ws[dev]
+                let ws = self.hc_chunk_ws[dev]
                     .iter()
                     .find(|w| w.tokens == t)
                     .expect("made in pass 1");
@@ -4487,12 +4616,19 @@ impl<'m> Session<'m> {
     fn micro_up_write(&mut self, dev: usize) -> Result<()> {
         let m = self.model;
         let gpu = m.devices[dev].gpu();
-        let sh = if micro_ovl() { self.micro_sh.take() } else { None };
+        let sh = if micro_ovl() {
+            self.micro_sh.take()
+        } else {
+            None
+        };
         let up = self.micro_up.take();
         if sh.is_none() && up.is_none() {
             return Ok(());
         }
-        let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+        let pf = self.venues[dev]
+            .pf
+            .as_ref()
+            .expect("the merged prefill scratch");
         let mut cps: Vec<ShipCopy<'_>> = Vec::new();
         match up {
             Some(MicroUp::Bytes(b)) => {
@@ -4596,7 +4732,9 @@ impl<'m> Session<'m> {
             return Some("--prefill-merged is off".into());
         }
         if t % 2 != 0 || (t / 2) % 4 != 0 || t < 8 || pos0 % 4 != 0 {
-            return Some(format!("chunk t={t} pos0={pos0} does not split into two multiples of 4"));
+            return Some(format!(
+                "chunk t={t} pos0={pos0} does not split into two multiples of 4"
+            ));
         }
         if self.venues[dev].r_chunk.is_none() || self.venues[dev].pf.is_none() {
             return Some("no chunk residual / merged scratch".into());
@@ -4616,7 +4754,9 @@ impl<'m> Session<'m> {
         for b in 0..mc.n_layers {
             let p = self.merged_plan(b, dev, m.placed.get(&b));
             let Some(x) = p.xdev else {
-                return Some(format!("block {b} has no expert device (BRECCIA_PF_EXPERT_DEVICE)"));
+                return Some(format!(
+                    "block {b} has no expert device (BRECCIA_PF_EXPERT_DEVICE)"
+                ));
             };
             if !(p.streamed && p.shared_chunk && p.hc_chunk) {
                 return Some(format!("block {b} lacks the streamed / chunked paths"));
@@ -5278,18 +5418,14 @@ impl<'m> Session<'m> {
         }
         let lw = &self.model.layers[b];
         let ws: Vec<&crate::model::W> = match lw.kind {
-            LayerKind::Qsa if self.pf[dev][PF_QSACHUNK] => {
-                match lw.qsa.as_ref() {
-                    Some(q) => vec![&q.q, &q.k, &q.v, &q.idx_q, &q.idx_k, &q.out],
-                    None => return false,
-                }
-            }
-            LayerKind::Gdn if self.pf[dev][PF_GDNCHUNK] => {
-                match lw.gdn.as_ref() {
-                    Some(g) => vec![&g.qkv, &g.z, &g.beta, &g.alpha, &g.beta_alpha, &g.out],
-                    None => return false,
-                }
-            }
+            LayerKind::Qsa if self.pf[dev][PF_QSACHUNK] => match lw.qsa.as_ref() {
+                Some(q) => vec![&q.q, &q.k, &q.v, &q.idx_q, &q.idx_k, &q.out],
+                None => return false,
+            },
+            LayerKind::Gdn if self.pf[dev][PF_GDNCHUNK] => match lw.gdn.as_ref() {
+                Some(g) => vec![&g.qkv, &g.z, &g.beta, &g.alpha, &g.beta_alpha, &g.out],
+                None => return false,
+            },
             _ => return false,
         };
         let pipes = &self.venues[dev].pipes;
@@ -5350,7 +5486,14 @@ impl<'m> Session<'m> {
         let moe = &m.layers[b].moe;
         let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked by the caller");
         batch_cmd::probe::enter(gpu, batch_cmd::probe::ROUTER);
-        g(&moe.router).run(&moe.router.buf, &pf.mixed, &pf.logits, mc.n_expert, mc.n_embd, t)?;
+        g(&moe.router).run(
+            &moe.router.buf,
+            &pf.mixed,
+            &pf.logits,
+            mc.n_expert,
+            mc.n_embd,
+            t,
+        )?;
         v.router.run(&pf.logits, &pf.ids.buf, &pf.w, t)?;
         g(&moe.shexp_gate).run(&moe.shexp_gate.buf, &pf.mixed, &pf.gate, 1, mc.n_embd, t)
     }
@@ -5402,7 +5545,10 @@ impl<'m> Session<'m> {
             .ok_or_else(|| anyhow!("block {b} has no QSA state"))?
             .capacity_cells;
         if pos0 + t > cap {
-            bail!("block {b}: a chunk ending at {} needs more than the cache's {cap} KV cells", pos0 + t);
+            bail!(
+                "block {b}: a chunk ending at {} needs more than the cache's {cap} KV cells",
+                pos0 + t
+            );
         }
         if self.qsa_chunk_ws[dev].is_none() {
             let qsa = self.venues[dev]
@@ -5764,7 +5910,9 @@ impl<'m> Session<'m> {
                 .pipes
                 .gemm(raw.key.key.ty)
                 .zip(v.pipes.gemm(raw.value.key.ty))
-                .filter(|(a, b)| a.padded_cols(n_embd) == n_embd && b.padded_cols(n_embd) == n_embd);
+                .filter(|(a, b)| {
+                    a.padded_cols(n_embd) == n_embd && b.padded_cols(n_embd) == n_embd
+                });
             let emb_chunk = v
                 .ple_emb_chunk
                 .as_ref()
@@ -5796,7 +5944,14 @@ impl<'m> Session<'m> {
                 (Some((x, kout, vout)), Some(gk)) => {
                     // Compact the t embeddings, then one GEMM per projection.
                     for i in 0..t {
-                        batch_cmd::record_copy(gpu, x, (i * n_embd * 4) as u64, emb_chunk, i as u64 * view, (n_embd * 4) as u64)?;
+                        batch_cmd::record_copy(
+                            gpu,
+                            x,
+                            (i * n_embd * 4) as u64,
+                            emb_chunk,
+                            i as u64 * view,
+                            (n_embd * 4) as u64,
+                        )?;
                     }
                     gk.0.run(&raw.key.buf, x, kout, hc_dim, n_embd, t)?;
                     gk.1.run(&raw.value.buf, x, vout, n_embd, n_embd, t)?;
@@ -5814,9 +5969,11 @@ impl<'m> Session<'m> {
                         v.pipes
                             .get(&raw.key.key)?
                             .run(&raw.key.buf, &v.ple_emb, &key_slots[i])?;
-                        v.pipes
-                            .get(&raw.value.key)?
-                            .run(&raw.value.buf, &v.ple_emb, &value_slots[i])?;
+                        v.pipes.get(&raw.value.key)?.run(
+                            &raw.value.buf,
+                            &v.ple_emb,
+                            &value_slots[i],
+                        )?;
                     }
                 }
             }
@@ -5878,8 +6035,10 @@ impl<'m> Session<'m> {
                 }
             } else {
                 let rs: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i])).collect();
-                let keys: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i + 1])).collect();
-                let vals: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i + 2])).collect();
+                let keys: Vec<Vec<f32>> =
+                    (0..t).map(|i| f32_from_bytes(&parts[3 * i + 1])).collect();
+                let vals: Vec<Vec<f32>> =
+                    (0..t).map(|i| f32_from_bytes(&parts[3 * i + 2])).collect();
                 ple.block_chunk(&rs, &keys, &vals, &mut out)?;
             }
         }
@@ -6402,7 +6561,10 @@ fn pf_split_host() -> Option<(usize, bool)> {
             Some(n) => (n, true),
             None => (v.as_str(), false),
         };
-        num.parse::<usize>().ok().filter(|&n| n > 0).map(|n| (n, pct))
+        num.parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .map(|n| (n, pct))
     })
 }
 
@@ -6450,7 +6612,12 @@ fn micro_sh() -> bool {
 
 fn pf_micro() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| matches!(std::env::var("BRECCIA_PF_MICRO").as_deref(), Err(_) | Ok("2")))
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("BRECCIA_PF_MICRO").as_deref(),
+            Err(_) | Ok("2")
+        )
+    })
 }
 
 /// The merged-prefill optimisation flags, in [`Session::pf`] order.
@@ -6491,7 +6658,10 @@ fn pf_resolve(m: &Model) -> Vec<[bool; 5]> {
             std::array::from_fn(|i| match std::env::var_os(PF_FLAGS[i]) {
                 Some(x) => x != "0",
                 None => v.as_ref().is_none_or(|v| {
-                    v.flags.iter().find(|f| f.name == PF_FLAGS[i]).is_some_and(|f| f.on)
+                    v.flags
+                        .iter()
+                        .find(|f| f.name == PF_FLAGS[i])
+                        .is_some_and(|f| f.on)
                 }),
             })
         })
@@ -6499,7 +6669,12 @@ fn pf_resolve(m: &Model) -> Vec<[bool; 5]> {
 }
 
 fn hc_read(v: &Venue<'_>, w: &HcW, r: &Buf) -> Result<()> {
-    hc_read_ws(v, v.hc_ws.as_ref().expect("the session's hc workspace"), w, r)
+    hc_read_ws(
+        v,
+        v.hc_ws.as_ref().expect("the session's hc workspace"),
+        w,
+        r,
+    )
 }
 
 /// [`hc_read`] on an explicit workspace (the T-token chunk one).

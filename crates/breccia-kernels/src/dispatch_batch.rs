@@ -167,7 +167,12 @@ fn open_slot(gpu: &Gpu) -> Option<usize> {
 
 fn open_cmd(gpu: &Gpu) -> Option<(usize, vk::CommandBuffer)> {
     let dev = gpu.device.handle();
-    OPEN.with(|o| o.borrow().iter().find(|x| x.dev == dev).map(|x| (x.slot, x.cmd)))
+    OPEN.with(|o| {
+        o.borrow()
+            .iter()
+            .find(|x| x.dev == dev)
+            .map(|x| (x.slot, x.cmd))
+    })
 }
 
 fn bump_open(gpu: &Gpu) {
@@ -301,7 +306,11 @@ pub fn shutdown() -> Result<()> {
     SETS.with(|c| c.borrow_mut().clear());
     // A slot's owner handle outlives its device otherwise, and a model loaded
     // after this one (a new logical device) would find every slot "taken".
-    DEVICES.with(|d| d.borrow_mut().iter_mut().for_each(|h| *h = vk::Device::null()));
+    DEVICES.with(|d| {
+        d.borrow_mut()
+            .iter_mut()
+            .for_each(|h| *h = vk::Device::null())
+    });
     if std::env::var_os("BRECCIA_TRACE_BATCH").is_some() {
         eprintln!("batch ring: freed {freed} descriptor pool(s) at shutdown");
     }
@@ -932,7 +941,9 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
     }
     SLOT_DEV.with(|d| d.borrow_mut()[slot] = Some(gpu.device.clone()));
     DEVICES.with(|d| d.borrow_mut()[slot] = dev);
-    let cmd = gpu.ring_cmd(slot).map_err(|e| anyhow!("batch command buffer: {e}"))?;
+    let cmd = gpu
+        .ring_cmd(slot)
+        .map_err(|e| anyhow!("batch command buffer: {e}"))?;
     unsafe {
         gpu.device
             .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
@@ -1145,8 +1156,7 @@ pub fn record_copy(
             dst.size
         ));
     }
-    let (_, cmd) =
-open_cmd(gpu).ok_or_else(|| anyhow!("record_copy without an open batch"))?;
+    let (_, cmd) = open_cmd(gpu).ok_or_else(|| anyhow!("record_copy without an open batch"))?;
     let region = vk::BufferCopy::default()
         .src_offset(src_off)
         .dst_offset(dst_off)
@@ -1189,8 +1199,7 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
         }
         return Ok(());
     }
-    let (_, cmd) =
-open_cmd(gpu).ok_or_else(|| anyhow!("record_copies without an open batch"))?;
+    let (_, cmd) = open_cmd(gpu).ok_or_else(|| anyhow!("record_copies without an open batch"))?;
     // A region array is per source *and* per destination buffer: Vulkan's
     // `cmd_copy_buffer` takes one (src, dst) pair, so group by pair and emit one
     // packet per group with every region of that group inside it.
@@ -1258,7 +1267,7 @@ open_cmd(gpu).ok_or_else(|| anyhow!("record_copies without an open batch"))?;
 /// submission latency the host pays on top of the GPU's work.
 pub fn record_timestamp(gpu: &Gpu, pool: vk::QueryPool, query: u32) -> Result<()> {
     let (_, cmd) =
-open_cmd(gpu).ok_or_else(|| anyhow!("record_timestamp without an open batch"))?;
+        open_cmd(gpu).ok_or_else(|| anyhow!("record_timestamp without an open batch"))?;
     unsafe {
         gpu.device
             .cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, query);
@@ -1274,7 +1283,7 @@ pub fn record_barrier_to_host(gpu: &Gpu) -> Result<()> {
         return Err(anyhow!("record_barrier_to_host without an open batch"));
     }
     let (_, cmd) =
-open_cmd(gpu).ok_or_else(|| anyhow!("record_barrier_to_host without an open batch"))?;
+        open_cmd(gpu).ok_or_else(|| anyhow!("record_barrier_to_host without an open batch"))?;
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::HOST_READ);
@@ -1359,7 +1368,7 @@ pub(crate) fn record(
     // (checked once, cached), which takes the path from 266 to ~70 ns.
     let t0 = std::time::Instant::now();
     let (slot, cmd) =
-open_cmd(gpu).ok_or_else(|| anyhow!("recording a dispatch without an open batch"))?;
+        open_cmd(gpu).ok_or_else(|| anyhow!("recording a dispatch without an open batch"))?;
     let pool = POOLS.with(|p| p.borrow()[slot]);
     if pool == vk::DescriptorPool::null() {
         return Err(anyhow!("recording a dispatch without an open batch"));

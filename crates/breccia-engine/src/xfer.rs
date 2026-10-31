@@ -600,7 +600,12 @@ impl ShipImport {
         if ptr.is_null() {
             return Err(anyhow!("ship import alloc of {cap} bytes failed"));
         }
-        Ok(Self { ptr, layout, cap, bufs: (0..n_devices).map(|_| None).collect() })
+        Ok(Self {
+            ptr,
+            layout,
+            cap,
+            bufs: (0..n_devices).map(|_| None).collect(),
+        })
     }
 
     /// Import the range on device `i` if it is not already.
@@ -619,7 +624,9 @@ impl ShipImport {
     }
 
     pub fn get(&self, i: usize) -> &Buf {
-        self.bufs[i].as_ref().expect("ShipImport::ensure ran for this device")
+        self.bufs[i]
+            .as_ref()
+            .expect("ShipImport::ensure ran for this device")
     }
 
     /// Destroy the imports; the host range is freed on drop, after this.
@@ -659,7 +666,8 @@ pub struct PendingCopy {
 
 impl PendingCopy {
     pub fn wait(self, gpu: &Gpu) -> Result<f64> {
-        gpu.wait_fence(self.fence).map_err(|e| anyhow!("waiting for the ship copy: {e}"))?;
+        gpu.wait_fence(self.fence)
+            .map_err(|e| anyhow!("waiting for the ship copy: {e}"))?;
         Ok(self.t0.elapsed().as_secs_f64())
     }
 }
@@ -680,16 +688,41 @@ pub fn copy_submit(gpu: &Gpu, copies: &[(&Buf, &Buf, u64, u64, u64)]) -> Result<
     let host = vk::AccessFlags::HOST_READ | vk::AccessFlags::HOST_WRITE;
     let all = vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST;
     gpu.record(Qc::C, |d, cmd| unsafe {
-        let pre = vk::MemoryBarrier::default().src_access_mask(rw | host).dst_access_mask(rw);
-        d.cmd_pipeline_barrier(cmd, all, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[pre], &[], &[]);
+        let pre = vk::MemoryBarrier::default()
+            .src_access_mask(rw | host)
+            .dst_access_mask(rw);
+        d.cmd_pipeline_barrier(
+            cmd,
+            all,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::DependencyFlags::empty(),
+            &[pre],
+            &[],
+            &[],
+        );
         for (s, dst, so, dof, n) in copies {
-            let r = vk::BufferCopy::default().src_offset(*so).dst_offset(*dof).size(*n);
+            let r = vk::BufferCopy::default()
+                .src_offset(*so)
+                .dst_offset(*dof)
+                .size(*n);
             d.cmd_copy_buffer(cmd, s.buf, dst.buf, std::slice::from_ref(&r));
         }
-        let post = vk::MemoryBarrier::default().src_access_mask(rw).dst_access_mask(rw | host);
-        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, all, vk::DependencyFlags::empty(), &[post], &[], &[]);
+        let post = vk::MemoryBarrier::default()
+            .src_access_mask(rw)
+            .dst_access_mask(rw | host);
+        d.cmd_pipeline_barrier(
+            cmd,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            all,
+            vk::DependencyFlags::empty(),
+            &[post],
+            &[],
+            &[],
+        );
     })
     .map_err(|e| anyhow!("recording the ship copy: {e}"))?;
-    let fence = gpu.submit(Qc::C).map_err(|e| anyhow!("submitting the ship copy: {e}"))?;
+    let fence = gpu
+        .submit(Qc::C)
+        .map_err(|e| anyhow!("submitting the ship copy: {e}"))?;
     Ok(PendingCopy { fence, t0 })
 }

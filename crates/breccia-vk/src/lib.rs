@@ -24,8 +24,8 @@
 pub mod bench;
 pub mod codec_bench;
 pub mod ctx;
-pub mod pci;
 pub mod pagecache;
+pub mod pci;
 pub mod probe;
 pub mod report;
 pub mod transfer;

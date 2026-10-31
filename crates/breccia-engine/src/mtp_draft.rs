@@ -17,7 +17,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use breccia_format::MtpRt;
 use breccia_kernels::batch::alloc_map;
 use breccia_kernels::gemv::{alloc, download, upload};
-use breccia_kernels::ops::{f32_from_bytes, f32_to_bytes, Add, EmbGather, HcMixer, HcWeights, HcWorkspace, RmsNorm, Router, SwiGlu};
+use breccia_kernels::ops::{
+    f32_from_bytes, f32_to_bytes, Add, EmbGather, HcMixer, HcWeights, HcWorkspace, RmsNorm, Router,
+    SwiGlu,
+};
 use breccia_kernels::proj::batch_map_buf;
 use breccia_kernels::{
     batch_cmd, Gemv, GemvBatch, MoeCombine, MoeMap, Qsa, QsaState, QsaWorkspace, QuantType,
@@ -225,9 +228,8 @@ impl<'g> MtpDraft<'g> {
             bytes += b.len() as u64;
             upload(gpu, b)
         };
-        let dense = |n: &str| -> Result<&[u8]> {
-            rt.dense_bytes(n).map_err(|e| anyhow!("{n}: {e}"))
-        };
+        let dense =
+            |n: &str| -> Result<&[u8]> { rt.dense_bytes(n).map_err(|e| anyhow!("{n}: {e}")) };
         let f16w = |n: &str| -> Result<Vec<u8>> { Ok(q8_0_to_f16(dense(n)?)) };
 
         let emb_t = model
@@ -239,7 +241,10 @@ impl<'g> MtpDraft<'g> {
 
         let fc = GemvBatch::new(gpu, QuantType::F16, N_EMBD, N_EMBD)?;
         if fc.padded_cols() != N_EMBD {
-            bail!("fc batch pads {} cols, the 4-row trick needs {N_EMBD}", fc.padded_cols());
+            bail!(
+                "fc batch pads {} cols, the 4-row trick needs {N_EMBD}",
+                fc.padded_cols()
+            );
         }
         let fc_map = batch_map_buf(gpu, &fc, HC)?;
         let w_fc_e = up(&f16w("fc_embedding.weight")?)?;
@@ -278,20 +283,46 @@ impl<'g> MtpDraft<'g> {
         let q_norm = up(dense("self_attn.q_norm.weight")?)?;
         let k_norm = up(dense("self_attn.k_norm.weight")?)?;
 
-        let mut proj = |name: &str, ty: QuantType, rows: usize, cols: usize, q8: bool| -> Result<P<'g>> {
-            let w = if q8 { up(&f16w(name)?)? } else { up(dense(name)?)? };
-            Ok(P { w, g: Gemv::new(gpu, ty, rows, cols)? })
-        };
+        let mut proj =
+            |name: &str, ty: QuantType, rows: usize, cols: usize, q8: bool| -> Result<P<'g>> {
+                let w = if q8 {
+                    up(&f16w(name)?)?
+                } else {
+                    up(dense(name)?)?
+                };
+                Ok(P {
+                    w,
+                    g: Gemv::new(gpu, ty, rows, cols)?,
+                })
+            };
         let f16 = QuantType::F16;
         let pq = proj("self_attn.q_proj.weight", f16, 12288, N_EMBD, true)?;
         let pk = proj("self_attn.k_proj.weight", f16, 512, N_EMBD, true)?;
         let pv = proj("self_attn.v_proj.weight", f16, 512, N_EMBD, true)?;
         let po = proj("self_attn.o_proj.weight", f16, N_EMBD, 6144, true)?;
         let prouter = proj("mlp.gate.weight", QuantType::Bf16, N_EXPERT, N_EMBD, false)?;
-        let psh_g = proj("mlp.shared_expert.gate_proj.weight", f16, N_FF, N_EMBD, true)?;
+        let psh_g = proj(
+            "mlp.shared_expert.gate_proj.weight",
+            f16,
+            N_FF,
+            N_EMBD,
+            true,
+        )?;
         let psh_u = proj("mlp.shared_expert.up_proj.weight", f16, N_FF, N_EMBD, true)?;
-        let psh_d = proj("mlp.shared_expert.down_proj.weight", f16, N_EMBD, N_FF, true)?;
-        let pshgate = proj("mlp.shared_expert_gate.weight", QuantType::Bf16, 1, N_EMBD, false)?;
+        let psh_d = proj(
+            "mlp.shared_expert.down_proj.weight",
+            f16,
+            N_EMBD,
+            N_FF,
+            true,
+        )?;
+        let pshgate = proj(
+            "mlp.shared_expert_gate.weight",
+            QuantType::Bf16,
+            1,
+            N_EMBD,
+            false,
+        )?;
 
         let router = Router::new(gpu, N_EXPERT, K_USED)?;
         let swiglu = SwiGlu::new(gpu)?;
@@ -303,7 +334,10 @@ impl<'g> MtpDraft<'g> {
         let down_b = GemvBatch::new(gpu, q2, N_EMBD, N_FF)?;
         for b in [&gate_b, &up_b, &down_b] {
             if b.blob_bytes() as usize != PROJ_BYTES {
-                bail!("expert projection is {} B, repack assumes {PROJ_BYTES}", b.blob_bytes());
+                bail!(
+                    "expert projection is {} B, repack assumes {PROJ_BYTES}",
+                    b.blob_bytes()
+                );
             }
         }
         // One role at a time: each repack is a 236 MB host vector.
@@ -320,7 +354,8 @@ impl<'g> MtpDraft<'g> {
             .shards
             .tensor("output.weight")
             .ok_or_else(|| anyhow!("no output.weight"))?;
-        let head_ty = QuantType::from_ggml(out_t.ty()).ok_or_else(|| anyhow!("output.weight type"))?;
+        let head_ty =
+            QuantType::from_ggml(out_t.ty()).ok_or_else(|| anyhow!("output.weight type"))?;
         let row_bytes = N_EMBD / head_ty.block_elems() * head_ty.block_bytes();
         let all = out_t.as_slice();
         let rt_tokens: Vec<i32> = rt.draft_tokens().collect();
@@ -333,7 +368,10 @@ impl<'g> MtpDraft<'g> {
                     .ok_or_else(|| anyhow!("draft token {t} is outside output.weight"))?,
             );
         }
-        let head = P { w: up(&packed)?, g: Gemv::new(gpu, head_ty, n_draft, N_EMBD)? };
+        let head = P {
+            w: up(&packed)?,
+            g: Gemv::new(gpu, head_ty, n_draft, N_EMBD)?,
+        };
         drop(packed);
 
         let mut act_bytes = 0u64;
@@ -440,10 +478,13 @@ impl<'g> MtpDraft<'g> {
     /// Record the front for `tok` conditioned on `r_in` into `self.r_a`, append
     /// the draft K/V at cell `pos`. Must run inside an open batch.
     fn record_front(&self, pos: usize) -> Result<()> {
-        self.rms_e.run(&self.emb4, Some(&self.g_en), &self.en4, HC)?;
-        self.fc.run(&self.w_fc_e, &self.en4, &self.e2x4, &self.fc_map, HC)?;
+        self.rms_e
+            .run(&self.emb4, Some(&self.g_en), &self.en4, HC)?;
+        self.fc
+            .run(&self.w_fc_e, &self.en4, &self.e2x4, &self.fc_map, HC)?;
         self.rms_h.run(&self.r_in, Some(&self.g_hn), &self.hn, 1)?;
-        self.fc.run(&self.w_fc_h, &self.hn, &self.h2, &self.fc_map, HC)?;
+        self.fc
+            .run(&self.w_fc_h, &self.hn, &self.h2, &self.fc_map, HC)?;
         self.add.run(&self.h2, &self.e2x4, &self.r_a, HC_DIM, 1.0)?;
         self.hc.read(
             &self.hc_ws,
@@ -484,7 +525,8 @@ impl<'g> MtpDraft<'g> {
         self.qsa.attend(&self.qsa_state, ws, pos)?;
         self.qsa.apply(&self.qsa_state, ws, pos)?;
         self.po.g.run(&self.po.w, &ws.attn_out, &self.block_out)?;
-        self.hc.write(&self.hc_ws, &self.r_a, &self.block_out, &self.r_b)?;
+        self.hc
+            .write(&self.hc_ws, &self.r_a, &self.block_out, &self.r_b)?;
 
         self.hc.read(
             &self.hc_ws,
@@ -497,21 +539,56 @@ impl<'g> MtpDraft<'g> {
             },
         )?;
         let mixed = &self.hc_ws.mixed;
-        self.prouter.g.run(&self.prouter.w, mixed, &self.router_logits)?;
-        self.router.run(&self.router_logits, &self.router_ids, &self.router_w, 1)?;
+        self.prouter
+            .g
+            .run(&self.prouter.w, mixed, &self.router_logits)?;
+        self.router
+            .run(&self.router_logits, &self.router_ids, &self.router_w, 1)?;
         self.psh_g.g.run(&self.psh_g.w, mixed, &self.sh_g)?;
         self.psh_u.g.run(&self.psh_u.w, mixed, &self.sh_u)?;
-        self.swiglu.run(&self.sh_g, &self.sh_u, &self.sh_act, N_FF)?;
+        self.swiglu
+            .run(&self.sh_g, &self.sh_u, &self.sh_act, N_FF)?;
         self.psh_d.g.run(&self.psh_d.w, &self.sh_act, &self.sh)?;
-        self.pshgate.g.run(&self.pshgate.w, mixed, &self.sh_gate_logit)?;
+        self.pshgate
+            .g
+            .run(&self.pshgate.w, mixed, &self.sh_gate_logit)?;
         // routed experts, all on device
-        self.moe_map.run(&self.router_ids, &self.map_gate, &self.gate_b, K_USED, 0, false)?;
-        self.gate_b.run(&self.gate_all, mixed, &self.moe_gate, &self.map_gate, K_USED)?;
-        self.moe_map.run(&self.router_ids, &self.map_up, &self.up_b, K_USED, 0, false)?;
-        self.up_b.run(&self.up_all, mixed, &self.moe_up, &self.map_up, K_USED)?;
-        self.swiglu.run(&self.moe_gate, &self.moe_up, &self.moe_act, K_USED * N_FF)?;
-        self.moe_map.run(&self.router_ids, &self.map_down, &self.down_b, K_USED, 0, true)?;
-        self.down_b.run(&self.down_all, &self.moe_act, &self.moe_down, &self.map_down, K_USED)?;
+        self.moe_map.run(
+            &self.router_ids,
+            &self.map_gate,
+            &self.gate_b,
+            K_USED,
+            0,
+            false,
+        )?;
+        self.gate_b.run(
+            &self.gate_all,
+            mixed,
+            &self.moe_gate,
+            &self.map_gate,
+            K_USED,
+        )?;
+        self.moe_map
+            .run(&self.router_ids, &self.map_up, &self.up_b, K_USED, 0, false)?;
+        self.up_b
+            .run(&self.up_all, mixed, &self.moe_up, &self.map_up, K_USED)?;
+        self.swiglu
+            .run(&self.moe_gate, &self.moe_up, &self.moe_act, K_USED * N_FF)?;
+        self.moe_map.run(
+            &self.router_ids,
+            &self.map_down,
+            &self.down_b,
+            K_USED,
+            0,
+            true,
+        )?;
+        self.down_b.run(
+            &self.down_all,
+            &self.moe_act,
+            &self.moe_down,
+            &self.map_down,
+            K_USED,
+        )?;
         self.moe_combine.run(
             &self.moe_down,
             &self.router_w,
@@ -521,7 +598,8 @@ impl<'g> MtpDraft<'g> {
             K_USED,
             N_EMBD,
         )?;
-        self.hc.write(&self.hc_ws, &self.r_b, &self.block_out, &self.r_c)?;
+        self.hc
+            .write(&self.hc_ws, &self.r_b, &self.block_out, &self.r_c)?;
 
         self.fin.read(
             &self.fin_ws,
@@ -533,7 +611,9 @@ impl<'g> MtpDraft<'g> {
                 inject: None,
             },
         )?;
-        self.head.g.run(&self.head.w, &self.fin_ws.mixed, &self.logits)?;
+        self.head
+            .g
+            .run(&self.head.w, &self.fin_ws.mixed, &self.logits)?;
         Ok(())
     }
 

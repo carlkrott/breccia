@@ -624,10 +624,10 @@ fn hc_tile_gated_fusion_matches_the_separate_path() {
     let gbuf = ops::upload_f32(gpu, &gamma).expect("gamma");
     let dbuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x2222, hc_lr * hc_dim)))
         .expect("down");
-    let ubuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x3333, hc_dim * hc_lr)))
-        .expect("up");
-    let ibuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x4444, hc * hc_dim)))
-        .expect("inject");
+    let ubuf =
+        breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x3333, hc_dim * hc_lr))).expect("up");
+    let ibuf =
+        breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x4444, hc * hc_dim))).expect("inject");
     let w = HcWeights {
         norm: &gbuf,
         down: &dbuf,
@@ -640,7 +640,10 @@ fn hc_tile_gated_fusion_matches_the_separate_path() {
         .expect("tile-fused mixer");
 
     for tokens in [64usize, 100, 130] {
-        assert!(!sep.tile_fused(tokens), "T={tokens}: flag off must not fuse");
+        assert!(
+            !sep.tile_fused(tokens),
+            "T={tokens}: flag off must not fuse"
+        );
         assert!(tiled.tile_fused(tokens), "T={tokens}: flag on must fuse");
         assert_eq!(sep.read_chunks(tokens), n_embd / 256);
         assert_eq!(tiled.read_chunks(tokens), n_embd / 16);
@@ -685,7 +688,10 @@ fn hc_fused_mixer_batched_matches_single_tokens() {
     let fx = need_gpu!("hc");
     let gpu = fx.dev.gpu();
     // `BRECCIA_HC_T` overrides the token count (the engine's chunk is 512).
-    let tokens = std::env::var("BRECCIA_HC_T").ok().and_then(|v| v.parse().ok()).unwrap_or(3usize);
+    let tokens = std::env::var("BRECCIA_HC_T")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3usize);
     let (n_embd, hc, hc_lr) = (2560usize, 4usize, 320usize);
     let hc_dim = hc * n_embd;
     let bf16 = |v: &[f32]| -> Vec<u8> {
@@ -700,10 +706,10 @@ fn hc_fused_mixer_batched_matches_single_tokens() {
     let gbuf = ops::upload_f32(gpu, &gamma).expect("gamma");
     let dbuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x2222, hc_lr * hc_dim)))
         .expect("down");
-    let ubuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x3333, hc_dim * hc_lr)))
-        .expect("up");
-    let ibuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x4444, hc * hc_dim)))
-        .expect("inject");
+    let ubuf =
+        breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x3333, hc_dim * hc_lr))).expect("up");
+    let ibuf =
+        breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x4444, hc * hc_dim))).expect("inject");
     let w = HcWeights {
         norm: &gbuf,
         down: &dbuf,
@@ -712,8 +718,8 @@ fn hc_fused_mixer_batched_matches_single_tokens() {
     };
     let r = normalish(0x5555, hc_dim * tokens);
     let block = normalish(0x6666, n_embd * tokens);
-    let mixer = HcMixer::with_fusion(gpu, QuantType::Bf16, n_embd, hc, hc_lr, true, true)
-        .expect("mixer");
+    let mixer =
+        HcMixer::with_fusion(gpu, QuantType::Bf16, n_embd, hc, hc_lr, true, true).expect("mixer");
     assert!(mixer.fused_gated(), "fusion must be on for this test");
 
     // Batched.

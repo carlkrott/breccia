@@ -553,7 +553,14 @@ impl<'g> Gdn<'g> {
 
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_SCAN);
         if let Some(tap) = tap {
-            crate::batch_cmd::record_copy(gpu, &tap.qkv, 0, &ws.qkv, 0, (t * CONV_CHANNELS * 4) as u64)?;
+            crate::batch_cmd::record_copy(
+                gpu,
+                &tap.qkv,
+                0,
+                &ws.qkv,
+                0,
+                (t * CONV_CHANNELS * 4) as u64,
+            )?;
         }
         self.conv(state, &ws.qkv, w.conv, t)?;
         self.qk_l2_norm(&ws.qkv, t)?;
@@ -574,11 +581,24 @@ impl<'g> Gdn<'g> {
     /// rows of `tap` against `state` (which the caller restored to the chunk's
     /// start): the state a `forward` of just those rows would have left. `ws` is
     /// scratch; its `qkv`/`gate`/`beta`/`step` are overwritten.
-    pub fn replay(&self, state: &GdnState, ws: &GdnWorkspace, w_conv: &Buf, tap: &GdnTap) -> Result<()> {
+    pub fn replay(
+        &self,
+        state: &GdnState,
+        ws: &GdnWorkspace,
+        w_conv: &Buf,
+        tap: &GdnTap,
+    ) -> Result<()> {
         let t = ws.tokens;
         let gpu = self.conv.gpu();
         let n = (t * MODEL_H_V * 4) as u64;
-        crate::batch_cmd::record_copy(gpu, &ws.qkv, 0, &tap.qkv, 0, (t * CONV_CHANNELS * 4) as u64)?;
+        crate::batch_cmd::record_copy(
+            gpu,
+            &ws.qkv,
+            0,
+            &tap.qkv,
+            0,
+            (t * CONV_CHANNELS * 4) as u64,
+        )?;
         crate::batch_cmd::record_copy(gpu, &ws.gate, 0, &tap.gate, 0, n)?;
         crate::batch_cmd::record_copy(gpu, &ws.beta, 0, &tap.beta, 0, n)?;
         self.conv(state, &ws.qkv, w_conv, t)?;

@@ -231,9 +231,21 @@ fn main() {
                     defs.push(format!("BRECCIA_GEMM_UMAX={umax}u"));
                 }
                 let mut defs: Vec<&str> = defs.iter().map(String::as_str).collect();
-                compile(&glslc, &out_dir, name, &format!("{name}_r{rpl}u{umax}"), &defs);
+                compile(
+                    &glslc,
+                    &out_dir,
+                    name,
+                    &format!("{name}_r{rpl}u{umax}"),
+                    &defs,
+                );
                 defs.push("BRECCIA_GEMM_LDSX");
-                compile(&glslc, &out_dir, name, &format!("{name}_r{rpl}u{umax}x"), &defs);
+                compile(
+                    &glslc,
+                    &out_dir,
+                    name,
+                    &format!("{name}_r{rpl}u{umax}x"),
+                    &defs,
+                );
             }
             for (rm, rn) in GEMM_TILES {
                 let defs = [
@@ -254,7 +266,12 @@ fn main() {
                 &out_dir,
                 name,
                 "gemm_bf16_t4x4_hcgate",
-                &["BRECCIA_GEMM_TILE=1", "TILE_RM=4u", "TILE_RN=4u", "BRECCIA_HC_TILE_GATED"],
+                &[
+                    "BRECCIA_GEMM_TILE=1",
+                    "TILE_RM=4u",
+                    "TILE_RN=4u",
+                    "BRECCIA_HC_TILE_GATED",
+                ],
             );
         }
         if *name == "gemv_bf16" {
@@ -332,7 +349,13 @@ fn spirv_hash(out_dir: &Path) {
     names.sort();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for p in &names {
-        for b in p.file_name().unwrap().as_encoded_bytes().iter().chain(&std::fs::read(p).expect("a compiled module")) {
+        for b in p
+            .file_name()
+            .unwrap()
+            .as_encoded_bytes()
+            .iter()
+            .chain(&std::fs::read(p).expect("a compiled module"))
+        {
             h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
         }
     }

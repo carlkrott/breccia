@@ -174,7 +174,10 @@ impl HostArena {
         let b = self.blobs.get(i).ok_or_else(|| format!("no blob {i}"))?;
         let len = slot(b.len());
         if b.start % PAGE != 0 || b.start + len > self.len as u64 {
-            return Err(format!("blob {i} [{}, +{len}) is not an importable range", b.start));
+            return Err(format!(
+                "blob {i} [{}, +{len}) is not an importable range",
+                b.start
+            ));
         }
         // SAFETY: start + len <= self.len, checked above.
         Ok((unsafe { self.ptr.add(b.start as usize) }, len))
@@ -239,7 +242,11 @@ mod tests {
             },
         ];
         let mut a = HostArena::new(HostArena::padded_total(&src)).expect("mlock under limit");
-        assert_eq!(a.pin_bytes(), 6 * 4096, "a page-sized blob plus its tail slack is two pages");
+        assert_eq!(
+            a.pin_bytes(),
+            6 * 4096,
+            "a page-sized blob plus its tail slack is two pages"
+        );
         a.fill(&src, &files).expect("pread fill");
         assert_eq!(a.blobs().len(), 3);
         assert_eq!(
@@ -299,16 +306,33 @@ mod tests {
         let path = temp_shard(&dir, &[3000, 5000]);
         let files = vec![Arc::new(Mutex::new(File::open(&path).unwrap()))];
         let src = vec![
-            BlobSource { file: 0, offset: 0, len: 3000 },
-            BlobSource { file: 0, offset: 3000, len: 5000 },
+            BlobSource {
+                file: 0,
+                offset: 0,
+                len: 3000,
+            },
+            BlobSource {
+                file: 0,
+                offset: 3000,
+                len: 5000,
+            },
         ];
         assert_eq!(HostArena::padded_total(&src), 4096 + 8192);
         let mut a = HostArena::new(HostArena::padded_total(&src)).expect("mlock under limit");
         a.fill(&src, &files).expect("pread fill");
-        assert_eq!(a.blobs()[1], ArenaBlob { start: 4096, end: 9096 });
+        assert_eq!(
+            a.blobs()[1],
+            ArenaBlob {
+                start: 4096,
+                end: 9096
+            }
+        );
         assert!(a.blob(1).unwrap().iter().all(|b| *b == 2));
         let (p0, l0) = a.blob_import_range(0).unwrap();
         let (p1, l1) = a.blob_import_range(1).unwrap();
-        assert_eq!((p0 as usize % 4096, l0, p1 as usize - p0 as usize, l1), (0, 4096, 4096, 8192));
+        assert_eq!(
+            (p0 as usize % 4096, l0, p1 as usize - p0 as usize, l1),
+            (0, 4096, 4096, 8192)
+        );
     }
 }

@@ -223,7 +223,13 @@ impl PleHost {
         self.s = s;
         self.gate = gate;
         let (hist, hc_dim, rows) = (&self.hist, self.hc_dim, self.hist_rows);
-        self.conv_out(r, &gated, &cur, |back| &hist[(rows - back) * hc_dim..(rows - back + 1) * hc_dim], out)?;
+        self.conv_out(
+            r,
+            &gated,
+            &cur,
+            |back| &hist[(rows - back) * hc_dim..(rows - back + 1) * hc_dim],
+            out,
+        )?;
         // Shift the history: drop the oldest row, append the new `cur`.
         self.hist.drain(..self.hc_dim);
         self.hist.extend_from_slice(&cur);
@@ -244,22 +250,35 @@ impl PleHost {
         let t = r.len();
         let hc_dim = self.hc_dim;
         if t == 0 || key_raw.len() != t || value.len() != t || out.len() != t * hc_dim {
-            bail!("PLE block_chunk: {t} tokens, {} keys, {} values, {} outputs", key_raw.len(), value.len(), out.len());
+            bail!(
+                "PLE block_chunk: {t} tokens, {} keys, {} values, {} outputs",
+                key_raw.len(),
+                value.len(),
+                out.len()
+            );
         }
-        let workers = std::thread::available_parallelism().map_or(1, |n| n.get()).clamp(1, 16).min(t);
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .clamp(1, 16)
+            .min(t);
         let per = t.div_ceil(workers);
         let this = &*self;
-        let prep: Vec<Result<Vec<(Vec<f32>, Vec<f32>, [f32; 8], [f32; 8])>>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..t)
-                .step_by(per)
-                .map(|lo| {
-                    sc.spawn(move || {
-                        (lo..(lo + per).min(t)).map(|i| this.gated_cur(&r[i], &key_raw[i], &value[i])).collect()
+        let prep: Vec<Result<Vec<(Vec<f32>, Vec<f32>, [f32; 8], [f32; 8])>>> =
+            std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..t)
+                    .step_by(per)
+                    .map(|lo| {
+                        sc.spawn(move || {
+                            (lo..(lo + per).min(t))
+                                .map(|i| this.gated_cur(&r[i], &key_raw[i], &value[i]))
+                                .collect()
+                        })
                     })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().expect("PLE worker")).collect()
-        });
+                    .collect();
+                hs.into_iter()
+                    .map(|h| h.join().expect("PLE worker"))
+                    .collect()
+            });
         let mut gated = Vec::with_capacity(t);
         let mut cur = Vec::with_capacity(t);
         let (mut s_last, mut g_last) = ([0.0; 8], [0.0; 8]);
@@ -301,7 +320,9 @@ impl PleHost {
                     })
                 })
                 .collect();
-            hs.into_iter().map(|h| h.join().expect("PLE worker")).collect()
+            hs.into_iter()
+                .map(|h| h.join().expect("PLE worker"))
+                .collect()
         });
         for x in res {
             x?;
@@ -324,7 +345,12 @@ impl PleHost {
 
     /// The per-token half of the block: `(gated, cur, s, gate)`.
     #[allow(clippy::type_complexity)]
-    fn gated_cur(&self, r: &[f32], key_raw: &[f32], value: &[f32]) -> Result<(Vec<f32>, Vec<f32>, [f32; 8], [f32; 8])> {
+    fn gated_cur(
+        &self,
+        r: &[f32],
+        key_raw: &[f32],
+        value: &[f32],
+    ) -> Result<(Vec<f32>, Vec<f32>, [f32; 8], [f32; 8])> {
         let hc = self.hc;
         if self.hc_dim == 0 || r.len() != self.hc_dim {
             bail!(
@@ -393,7 +419,14 @@ impl PleHost {
     /// Dilated causal conv, kernel 4, dilation = ngram (3):
     ///   conv[c] = Σ_k w[k][c] * x[t - (K-1-k)*dil][c]
     /// with x = history (9 rows, oldest first) ++ current.
-    fn conv_out<'a>(&self, r: &[f32], gated: &[f32], cur: &[f32], hist_row: impl Fn(usize) -> &'a [f32], out: &mut [f32]) -> Result<()> {
+    fn conv_out<'a>(
+        &self,
+        r: &[f32],
+        gated: &[f32],
+        cur: &[f32],
+        hist_row: impl Fn(usize) -> &'a [f32],
+        out: &mut [f32],
+    ) -> Result<()> {
         let kern = self.conv_w.len() / self.hc_dim;
         if kern != 4 {
             bail!("ple_conv1d has {kern} taps, expected 4");
@@ -577,24 +610,51 @@ mod tests {
     fn a_chunk_is_bit_identical_to_the_tokens_in_sequence() {
         let hc_dim = 10240;
         let mut seq = host();
-        seq.conv_w.iter_mut().enumerate().for_each(|(i, v)| *v = ((i * 7 % 13) as f32 - 6.0) * 0.1);
-        seq.hist.iter_mut().enumerate().for_each(|(i, v)| *v = ((i * 5 % 11) as f32 - 5.0) * 0.07);
+        seq.conv_w
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v = ((i * 7 % 13) as f32 - 6.0) * 0.1);
+        seq.hist
+            .iter_mut()
+            .enumerate()
+            .for_each(|(i, v)| *v = ((i * 5 % 11) as f32 - 5.0) * 0.07);
         let mut chunk = host();
         chunk.conv_w = seq.conv_w.clone();
         chunk.hist = seq.hist.clone();
-        let rnd = |n: usize, k: usize| -> Vec<f32> { (0..n).map(|i| (((i * 31 + k * 17) % 97) as f32 - 48.0) * 0.03).collect() };
+        let rnd = |n: usize, k: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 31 + k * 17) % 97) as f32 - 48.0) * 0.03)
+                .collect()
+        };
         for t in [1usize, 5, 12] {
             let r: Vec<Vec<f32>> = (0..t).map(|k| rnd(hc_dim, k)).collect();
             let kr: Vec<Vec<f32>> = (0..t).map(|k| rnd(hc_dim, k + 100)).collect();
             let v: Vec<Vec<f32>> = (0..t).map(|k| rnd(2560, k + 200)).collect();
             let mut want = vec![0f32; t * hc_dim];
             for i in 0..t {
-                seq.block(&r[i], &kr[i], &v[i], &mut want[i * hc_dim..(i + 1) * hc_dim]).unwrap();
+                seq.block(
+                    &r[i],
+                    &kr[i],
+                    &v[i],
+                    &mut want[i * hc_dim..(i + 1) * hc_dim],
+                )
+                .unwrap();
             }
             let mut got = vec![0f32; t * hc_dim];
             chunk.block_chunk(&r, &kr, &v, &mut got).unwrap();
-            assert!(want.iter().zip(&got).all(|(a, b)| a.to_bits() == b.to_bits()), "t={t} out");
-            assert!(seq.hist.iter().zip(&chunk.hist).all(|(a, b)| a.to_bits() == b.to_bits()), "t={t} hist");
+            assert!(
+                want.iter()
+                    .zip(&got)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "t={t} out"
+            );
+            assert!(
+                seq.hist
+                    .iter()
+                    .zip(&chunk.hist)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "t={t} hist"
+            );
             assert_eq!(seq.s.map(f32::to_bits), chunk.s.map(f32::to_bits));
             assert_eq!(seq.gate.map(f32::to_bits), chunk.gate.map(f32::to_bits));
         }

@@ -1003,7 +1003,9 @@ impl Gpu {
             family_x,
             queue_x_index,
             xfer_mode,
-            x_compute: dev.families[family_x as usize].queue_flags.contains(vk::QueueFlags::COMPUTE),
+            x_compute: dev.families[family_x as usize]
+                .queue_flags
+                .contains(vk::QueueFlags::COMPUTE),
             pool_c,
             cmd_c,
             cmds_c,
@@ -1096,7 +1098,8 @@ impl Gpu {
         let t = match v.iter().position(|t| t.thread == me) {
             Some(p) => &v[p],
             None => {
-                let (pool_c, cmds_c) = make_cmd_pool_n(&self.device, self.family_c, 1 + BATCH_CMDS)?;
+                let (pool_c, cmds_c) =
+                    make_cmd_pool_n(&self.device, self.family_c, 1 + BATCH_CMDS)?;
                 let (pool_x, cmd_x) = match make_cmd_pool(&self.device, self.family_x) {
                     Ok(x) => x,
                     Err(e) => {
@@ -1881,7 +1884,12 @@ impl Gpu {
     pub fn destroy(self) {
         unsafe {
             let _ = self.device.device_wait_idle();
-            for t in self.thread_cmds.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
+            for t in self
+                .thread_cmds
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain(..)
+            {
                 self.device.destroy_command_pool(t.pool_x, None);
                 self.device.destroy_command_pool(t.pool_c, None);
             }

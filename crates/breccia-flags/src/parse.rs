@@ -702,7 +702,9 @@ mod tests {
         assert!(!parse_str("").unwrap().host_expert_import); // default OFF
         let plan = parse_str("--host-expert-import").unwrap();
         assert!(plan.host_expert_import);
-        assert!(plan.render_args().contains(&"--host-expert-import".to_string()));
+        assert!(plan
+            .render_args()
+            .contains(&"--host-expert-import".to_string()));
         let plan = parse_str("--host-expert-import=false").unwrap();
         assert!(!plan.host_expert_import);
         let err = parse_str("--host-expert-import --host-expert-import").unwrap_err();
@@ -714,9 +716,7 @@ mod tests {
         assert!(!parse_str("").unwrap().page_hint_trim); // default OFF
         let plan = parse_str("--page-hint-trim").unwrap();
         assert!(plan.page_hint_trim);
-        assert!(plan
-            .render_args()
-            .contains(&"--page-hint-trim".to_string()));
+        assert!(plan.render_args().contains(&"--page-hint-trim".to_string()));
         let err = parse_str("--page-hint-trim --page-hint-trim").unwrap_err();
         assert!(err.to_string().contains("duplicates"), "{err}");
     }

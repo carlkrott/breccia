@@ -237,7 +237,10 @@ impl ModelConfig {
             n_ctx_max: u64_kv(md, &prefix, "context_length")?,
         };
         // §12 approximate methods: BRECCIA_EXPERTS_USED=k routes to top-k below the file value; router and arena read k from here.
-        if let Some(k) = std::env::var("BRECCIA_EXPERTS_USED").ok().and_then(|v| v.parse::<usize>().ok()) {
+        if let Some(k) = std::env::var("BRECCIA_EXPERTS_USED")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
             cfg.n_expert_used = k.clamp(1, cfg.n_expert_used);
         }
         cfg.validate()?;

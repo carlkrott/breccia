@@ -14,7 +14,8 @@ use crate::ctx::{api_version_string, Dev, Gpu, Host, Kernel, Qc, R};
 use crate::report::DeviceId;
 use crate::transfer::{probe_host_memory, HostMemoryCaps, RingConfig, RingStats, TransferRing};
 
-pub(crate) const SPV_SLOT_CONSUMER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/slot_consumer.spv"));
+pub(crate) const SPV_SLOT_CONSUMER: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/slot_consumer.spv"));
 
 /// Bump when the JSON shape changes incompatibly.
 pub const TRANSFER_SCHEMA_VERSION: u32 = 1;
@@ -40,7 +41,10 @@ pub struct TransferBenchOptions {
     pub devices: Vec<DeviceSelector>,
 }
 
-pub(crate) fn select_devices(devices: &[Dev], opts: &TransferBenchOptions) -> Result<Vec<u32>, String> {
+pub(crate) fn select_devices(
+    devices: &[Dev],
+    opts: &TransferBenchOptions,
+) -> Result<Vec<u32>, String> {
     if opts.devices.is_empty() {
         let discrete: Vec<u32> = devices
             .iter()
