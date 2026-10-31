@@ -144,6 +144,9 @@ pub enum Path {
     Avx2,
     /// Portable fused scalar port ([`scalar`]).
     Scalar,
+    /// Bench only: reads every packed byte and does no math (memory ceiling).
+    /// [`path`] never returns it; the result is not a dot product.
+    Touch,
 }
 
 impl Path {
@@ -151,6 +154,7 @@ impl Path {
         match self {
             Path::Avx2 => "avx2",
             Path::Scalar => "scalar",
+            Path::Touch => "touch",
         }
     }
 }
@@ -285,6 +289,7 @@ pub fn dot_row_with(path: Path, ty: QuantType, row: &[u8], cols: usize, x: &[f32
         acc = match normalized(path) {
             Path::Avx2 => avx2::dot(ty, packed, xp),
             Path::Scalar => scalar::dot(ty, packed, xp),
+            Path::Touch => touch(packed),
         };
     }
     let tail = cols - full * qk;
@@ -333,6 +338,14 @@ pub fn gemv_into(
 /// Bytes of one packed row of `cols` values (whole blocks; see [`row_bytes_exact`]).
 pub fn row_bytes(ty: QuantType, cols: usize) -> usize {
     ty.block_bytes() * cols.div_ceil(ty.block_elems())
+}
+
+/// Sum the bytes as u64 words so every cache line is loaded; ignores x.
+fn touch(packed: &[u8]) -> f32 {
+    let s = packed
+        .chunks_exact(8)
+        .fold(0u64, |a, c| a.wrapping_add(u64::from_ne_bytes(c.try_into().unwrap())));
+    (std::hint::black_box(s) & 1) as f32
 }
 
 fn normalized(path: Path) -> Path {

@@ -551,6 +551,8 @@ fn measure_token(
     cells.push(pass("avx2-1t", Path::Avx2, 1)?);
     if threads > 1 {
         cells.push(pass("avx2-pool", Path::Avx2, threads)?);
+        cells.push(pass("touch-pool", Path::Touch, threads)?);
+        cells.push(pass("avx2-pool", Path::Avx2, threads)?);
     }
     if !quick {
         cells.push(pass("scalar-1t", Path::Scalar, 1)?);
