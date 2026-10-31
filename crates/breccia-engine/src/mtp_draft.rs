@@ -534,14 +534,30 @@ impl<'g> MtpDraft<'g> {
         Ok(())
     }
 
-    /// One full draft step: embed `tok`, run the layer at KV cell `pos`
-    /// (the cell is written, `len` becomes `pos + 1`), return the argmax draft
-    /// token id and the per-phase milliseconds `(gather, record, gpu, readback)`.
-    pub fn step(&mut self, tok: u32, pos: usize) -> Result<(u32, [f64; 4])> {
+    /// Forget every draft cell (zero the draft KV).
+    pub fn reset(&mut self) -> Result<()> {
+        self.len = 0;
+        self.qsa_state.reset(self.gpu)
+    }
+
+    /// Front only (K/V of cell `pos` from host `r` and `tok`), no prediction:
+    /// the catch-up for a cell whose trunk residual is known.
+    pub fn catchup(&mut self, r: &[f32], tok: u32, pos: usize) -> Result<()> {
         if pos >= self.cells {
             bail!("draft KV cell {pos} is past its {} cells", self.cells);
         }
-        let t0 = std::time::Instant::now();
+        self.set_r(r)?;
+        self.gather(tok)?;
+        batch_cmd::begin(self.gpu)?;
+        let rec = self.record_front(pos);
+        let end = batch_cmd::end(self.gpu);
+        rec?;
+        end?;
+        self.len = self.len.max(pos + 1);
+        Ok(())
+    }
+
+    fn gather(&self, tok: u32) -> Result<()> {
         // The gather uploads and waits by itself, so it goes before the batch opens.
         let staged = self.emb.gather_staged(
             self.gpu,
@@ -550,9 +566,30 @@ impl<'g> MtpDraft<'g> {
             &self.emb4,
         )?;
         self.emb.release(self.gpu, &staged);
+        Ok(())
+    }
+
+    /// One full draft step with `r` already set ([`Self::set_r`]).
+    pub fn step(&mut self, tok: u32, pos: usize) -> Result<(u32, [f64; 4])> {
+        self.step_ex(tok, pos, false)
+    }
+
+    /// One full draft step: embed `tok`, run the layer at KV cell `pos`, return
+    /// the argmax draft token id and the per-phase milliseconds
+    /// `(gather, record, gpu, readback)`. `chain`: condition on the previous
+    /// step's own output stack instead of the host-set `r`.
+    pub fn step_ex(&mut self, tok: u32, pos: usize, chain: bool) -> Result<(u32, [f64; 4])> {
+        if pos >= self.cells {
+            bail!("draft KV cell {pos} is past its {} cells", self.cells);
+        }
+        let t0 = std::time::Instant::now();
+        self.gather(tok)?;
         let t1 = std::time::Instant::now();
         batch_cmd::begin(self.gpu)?;
         let rec = (|| -> Result<()> {
+            if chain {
+                batch_cmd::record_copy(self.gpu, &self.r_in, 0, &self.r_c, 0, (HC_DIM * 4) as u64)?;
+            }
             self.record_front(pos)?;
             self.record_rest(pos)
         })();
@@ -574,7 +611,7 @@ impl<'g> MtpDraft<'g> {
             }
         }
         let t4 = std::time::Instant::now();
-        self.len = pos + 1;
+        self.len = self.len.max(pos + 1);
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
         Ok((
             self.rt_tokens[best] as u32,

@@ -2963,6 +2963,40 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// The final-layer residual stack (`hc_dim` floats) of the first `n` rows of
+    /// the last [`Self::prefill`] / [`Self::verify`] chunk, read back from the
+    /// per-token slots. The MTP draft conditions on these.
+    /// shortcut: single card holding the last block (the draft runs there too).
+    pub fn final_r_slots(&mut self, n: usize) -> Result<Vec<Vec<f32>>> {
+        let m = self.model;
+        let dev = m.device_of(m.cfg.n_layers - 1);
+        let hb = m.cfg.hc_dim() * 4;
+        if n > self.venues[dev].r_slots.len() {
+            bail!("final_r_slots({n}): only {} slots", self.venues[dev].r_slots.len());
+        }
+        self.flush()?;
+        let items: Vec<(&Buf, u64, usize)> =
+            self.venues[dev].r_slots[..n].iter().map(|s| (s, 0, hb)).collect();
+        let per = (self.stagings[dev].capacity() as usize / hb).max(1);
+        let mut out = Vec::with_capacity(n);
+        for part in items.chunks(per) {
+            for raw in self.stagings[dev].read_batch(m.devices[dev].gpu(), part)? {
+                out.push(f32_from_bytes(&raw));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The final-layer residual stack of the token the last [`Self::token`] ran.
+    pub fn final_r_decode(&mut self) -> Result<Vec<f32>> {
+        let m = self.model;
+        let dev = m.device_of(m.cfg.n_layers - 1);
+        self.flush()?;
+        let raw = self.stagings[dev]
+            .read_batch(m.devices[dev].gpu(), &[(&self.venues[dev].r, 0, m.cfg.hc_dim() * 4)])?;
+        Ok(f32_from_bytes(&raw[0]))
+    }
+
     /// Replay-mode rollback: restore the pre-chunk state (slot 0), then re-run the
     /// state-update kernels over the first `n` rows of what the chunk tapped.
     fn spec_replay_to(&mut self, n: usize) -> Result<()> {

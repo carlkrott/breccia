@@ -2219,6 +2219,43 @@ fn feed_prompt(
     Ok(logits)
 }
 
+/// `BRECCIA_MTP_SPEC_BENCH=1,2,3,gate`: for each arm, ABAB against plain decode
+/// (re-prefilling each time), greedy parity compared in-process. `BRECCIA_MTP_GEN`
+/// tokens (default 64), `BRECCIA_MTP_REPS` pairs per arm (default 2).
+fn mtp_spec_bench(
+    model: &breccia_engine::model::Model,
+    sess: &mut breccia_engine::Session<'_>,
+    prompt: &[u32],
+    chunk: usize,
+    arms: &str,
+) -> Result<()> {
+    use breccia_engine::mtp_spec::{generate, Policy};
+    let env_n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+    let (gen, reps) = (env_n("BRECCIA_MTP_GEN", 64), env_n("BRECCIA_MTP_REPS", 2));
+    let dir = std::env::var("BRECCIA_MTP_DIR").unwrap_or_else(|_| "/srv/strata-data/mtp/rt".into());
+    sess.spec_enable(4).context("spec_enable(4)")?;
+    let mut d = breccia_engine::mtp_draft::MtpDraft::open(model, 0, &dir, prompt.len() + gen + 16)?;
+    println!("mtp-spec  draft {} MiB device, prompt {} gen {gen} reps {reps}", d.bytes >> 20, prompt.len());
+    for arm in arms.split(',') {
+        let pol = Policy::parse(arm).with_context(|| format!("BRECCIA_MTP_SPEC_BENCH arm {arm:?}"))?;
+        for rep in 0..reps {
+            let (a, sa) = generate(sess, None, prompt, chunk, gen, Policy::Plain)?;
+            let (b, sb) = generate(sess, Some(&mut d), prompt, chunk, gen, pol)?;
+            let (ta, tb) = (a.len() as f64 / sa.decode_s, b.len() as f64 / sb.decode_s);
+            println!(
+                "mtp-spec  arm {arm} rep {rep}: plain {ta:.2} tok/s | spec {tb:.2} tok/s ({:.3}x) | greedy {} ({} tokens)",
+                tb / ta,
+                if a == b { "IDENTICAL".to_string() } else {
+                    format!("DIFFER at {:?}", a.iter().zip(&b).position(|(x, y)| x != y))
+                },
+                b.len()
+            );
+            println!("mtp-spec  arm {arm} rep {rep}: {sb}");
+        }
+    }
+    Ok(())
+}
+
 /// `BRECCIA_MTP_DRAFT_BENCH=N`: time N draft steps (synthetic R, real MTP
 /// weights, zeroed draft KV) on device 0. `BRECCIA_MTP_DIR` overrides the weights dir.
 fn mtp_draft_bench(model: &breccia_engine::model::Model, prompt_len: usize, n: usize) -> Result<()> {
@@ -3479,6 +3516,9 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
     {
         mtp_draft_bench(&model, prompt.len(), n).context("the MTP draft bench")?;
+    }
+    if let Ok(arms) = std::env::var("BRECCIA_MTP_SPEC_BENCH") {
+        mtp_spec_bench(&model, &mut sess, &prompt, a.prefill_chunk, &arms).context("the MTP spec bench")?;
     }
     let s1 = breccia_engine::LogitSummary::of_top(&l1, a.top_logits.max(10));
     let s2 = breccia_engine::LogitSummary::of(&l2);
