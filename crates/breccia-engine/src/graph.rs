@@ -3099,6 +3099,10 @@ impl<'m> Session<'m> {
         batch_cmd::record_barrier_to_host(gpu)?;
         self.submit_batch()?;
         self.flush()?;
+        // Spec-decode timing probe (off by default): experts on the host lane in place.
+        if hc_chunk && xdev.is_none() && std::env::var_os("BRECCIA_SPEC_HOSTLANE").is_some() {
+            return self.spec_hostlane_tail(b, dev, t);
+        }
 
         // ---- the bucket list: per distinct expert, its users -----------------
         let mut raw = vec![0u8; t * k * 4];
@@ -3505,6 +3509,87 @@ impl<'m> Session<'m> {
                 sw * 1e3
             );
         }
+        Ok(())
+    }
+
+    /// Sum of per-block distinct-expert counts the grouped lane has touched (spec probe).
+    pub fn distinct_total(&self) -> usize {
+        self.pf_distinct
+    }
+
+    /// `BRECCIA_SPEC_HOSTLANE=1` tail of [`Self::prefill_block_merged`]: after the batched
+    /// dense chain, the chunk's routed experts run once per distinct expert on the host
+    /// lane (`moe_topk_chunk`, read in place like decode) instead of streaming to a GEMM.
+    /// A timing probe for multi-row verify cost; state is not committed for speculation.
+    fn spec_hostlane_tail(&mut self, b: usize, dev: usize, t: usize) -> Result<()> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let (n_embd, k) = (mc.n_embd, mc.n_expert_used);
+        let gpu = m.devices[dev].gpu();
+        let (mixed, w, shared, gates) = {
+            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let r = self.stagings[dev].read_batch(
+                gpu,
+                &[
+                    (&pf.mixed, 0, t * n_embd * 4),
+                    (&pf.w, 0, t * k * 4),
+                    (&pf.shared, 0, t * n_embd * 4),
+                    (&pf.gate, 0, t * 4),
+                ],
+            )?;
+            (f32_from_bytes(&r[0]), f32_from_bytes(&r[1]), f32_from_bytes(&r[2]), f32_from_bytes(&r[3]))
+        };
+        let mut raw = vec![0u8; t * k * 4];
+        self.venues[dev].pf.as_ref().expect("the merged prefill scratch").ids.read(&mut raw)?;
+        let ids: Vec<usize> = raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+            .collect();
+        if let Some(e) = ids.iter().find(|&&e| e >= mc.n_expert) {
+            bail!("router id {e} is outside the model's {} experts", mc.n_expert);
+        }
+        let routes: Vec<breccia_kernels::cpu::ChunkRoute<'_>> = (0..t)
+            .map(|i| breccia_kernels::cpu::ChunkRoute {
+                ids: &ids[i * k..(i + 1) * k],
+                weights: &w[i * k..(i + 1) * k],
+            })
+            .collect();
+        let mut out = vec![0f32; t * n_embd];
+        let t_lane = std::time::Instant::now();
+        let distinct = {
+            let mut pool = self.pool.lock().expect("the expert pool's lock");
+            pool.moe_topk_chunk(&m.layers[b].experts, &routes, &mixed, &mut out)
+                .with_context(|| format!("the grouped expert lane on block {b}"))?;
+            pool.last_distinct
+        };
+        self.lane_s += t_lane.elapsed().as_secs_f64();
+        self.pf_distinct += distinct;
+        self.pf_merged_bytes += distinct as u64 * m.layers[b].experts.expert_bytes() as u64;
+        for i in 0..t {
+            let g = 1.0 / (1.0 + (-gates[i]).exp());
+            let row = i * n_embd..(i + 1) * n_embd;
+            for (o, sv) in out[row.clone()].iter_mut().zip(&shared[row]) {
+                *o += sv * g;
+            }
+        }
+        {
+            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, f32_to_bytes(&out).as_slice())])?;
+        }
+        self.ensure_batch(dev)?;
+        {
+            let v = &self.venues[dev];
+            let rc = v.r_chunk.as_ref().expect("hc_chunk checked");
+            let ws = self.hc_chunk_ws[dev].iter().find(|w| w.tokens == t).expect("made in pass 1");
+            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            v.hc.write(ws, rc, &pf.out, rc)?;
+            let hb = (mc.hc_dim() * 4) as u64;
+            let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> =
+                (0..t).map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb)).collect();
+            batch_cmd::record_copies(gpu, &scatter)?;
+        }
+        self.submit_batch()?;
+        self.flush()?;
         Ok(())
     }
 

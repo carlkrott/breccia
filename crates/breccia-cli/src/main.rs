@@ -3281,8 +3281,11 @@ fn spec_probe(
     decode(sess, g0, &mut pos, &mut i)?;
     let base = decode(sess, 4, &mut pos, &mut i)?;
     println!("spec-probe  decode at pos {pos}: {base:.2} ms/step");
+    let blocks = env_n("BRECCIA_SPEC_PROBE_BLOCKS", 48);
+    let mut step1: Option<f64> = None;
     for &t in &ts {
         let mut ms = Vec::new();
+        let d0 = sess.distinct_total();
         for _ in 0..w {
             let t0 = std::time::Instant::now();
             sess.prefill(&gen[i..i + t], pos)?;
@@ -3290,16 +3293,49 @@ fn spec_probe(
             i += t;
             pos += t;
         }
+        let union = (sess.distinct_total() - d0) as f64 / (w * blocks) as f64;
         let dec = decode(sess, 4, &mut pos, &mut i)?;
         let warm = &ms[1..];
+        let mean = warm.iter().sum::<f64>() / warm.len().max(1) as f64;
+        if t == 1 {
+            step1 = Some(mean);
+        }
+        let alpha = |s1: f64| (mean - s1) / ((t.max(2) - 1) as f64 * s1);
         println!(
-            "spec-probe  t={t} rows: windows ms {:?} · mean(excl. first) {:.2} ms = {:.2} x decode · \
-             {:.2} ms/row · decode after {dec:.2} ms/step",
+            "spec-probe  t={t} rows: windows ms {:?} · step {mean:.2} ms · union/block {union:.2} · \
+             alpha vs t=1 {} · alpha vs decode {:.3} · decode after {dec:.2} ms/step",
             ms.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>(),
-            warm.iter().sum::<f64>() / warm.len().max(1) as f64,
-            warm.iter().sum::<f64>() / warm.len().max(1) as f64 / base,
-            warm.iter().sum::<f64>() / warm.len().max(1) as f64 / t as f64,
+            step1.filter(|_| t > 1).map_or("n/a".into(), |s1| format!("{:.3}", alpha(s1))),
+            alpha(base),
         );
+    }
+    // Correctness: the last row of a T-row window must match T decode steps from the same state.
+    let tmax = ts.iter().copied().max().unwrap_or(0);
+    if tmax > 0 {
+        let kl = |p: &[f32], q: &[f32]| -> (f64, bool) {
+            let lse = |x: &[f32]| {
+                let m = x.iter().cloned().fold(f32::MIN, f32::max) as f64;
+                m + x.iter().map(|v| (*v as f64 - m).exp()).sum::<f64>().ln()
+            };
+            let (lp, lq) = (lse(p), lse(q));
+            let kl = p.iter().zip(q).map(|(a, b)| {
+                let (a, b) = (*a as f64 - lp, *b as f64 - lq);
+                a.exp() * (a - b)
+            }).sum::<f64>();
+            let am = |x: &[f32]| x.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|x| x.0);
+            (kl, am(p) == am(q))
+        };
+        feed_prompt(sess, prompt, a.prefill_chunk)?;
+        let mut refs = Vec::new();
+        for (j, &tok) in gen[..tmax].iter().enumerate() {
+            refs.push(sess.token(tok, prompt.len() + j, None)?);
+        }
+        for &t in &ts {
+            feed_prompt(sess, prompt, a.prefill_chunk)?;
+            let l = sess.prefill(&gen[..t], prompt.len())?;
+            let (d, same) = kl(&refs[t - 1], &l);
+            println!("spec-probe  check t={t}: KL(decode||window last row) {d:.3e} · top1 same {same}");
+        }
     }
     Ok(())
 }
