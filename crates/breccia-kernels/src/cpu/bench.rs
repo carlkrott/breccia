@@ -544,12 +544,14 @@ fn measure_token(
         if let Some(p) = pool.as_ref().filter(|_| super::expert::lane_stats_on()) {
             let st = p.lane_stats;
             eprintln!(
-                "lane {label}: phases {} wall {:.1} ms max-busy {:.1} ms mean-busy {:.1} ms sync {:.0} %",
+                "lane {label}: phases {} wall {:.1} ms max-busy {:.1} ms mean-busy {:.1} ms sync {:.0} % dispatch {:.1} ms start-skew {:.1} ms",
                 st.phases,
                 st.wall_s * 1e3,
                 st.max_busy_s * 1e3,
                 st.mean_busy_s * 1e3,
-                st.sync_share() * 100.0
+                st.sync_share() * 100.0,
+                st.dispatch_s * 1e3,
+                st.start_skew_s * 1e3
             );
         }
         drop(pool);

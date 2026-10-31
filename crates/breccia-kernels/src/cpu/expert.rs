@@ -307,8 +307,10 @@ pub struct ExpertPool {
     pub last_distinct: usize,
     /// Phase timing since the caller last reset it (`BRECCIA_LANE_STATS=1`).
     pub lane_stats: LaneStats,
-    tx: Vec<Sender<Msg>>,
+    tx: Arc<[Sender<Msg>]>,
     rx: Receiver<Done>,
+    /// Tree-wake fan-out ([`wake_fanout`]); 0 = the coordinator wakes every worker.
+    fanout: usize,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -325,6 +327,12 @@ enum Msg {
 struct Claim {
     tasks: Vec<Shard>,
     next: AtomicUsize,
+    /// Tree wake: worker `i` forwards the claim to workers `(i+1)·fanout ..` (< `wake`)
+    /// before claiming, so the last worker starts O(log n) sends after the first,
+    /// not O(n) (the serial loop cost 65-140 µs/phase at 16-32 threads).
+    peers: Arc<[Sender<Msg>]>,
+    fanout: usize,
+    wake: usize,
 }
 
 /// A worker's whole share of a phase, in one message.
@@ -372,6 +380,8 @@ struct Done {
     results: Vec<(usize, Vec<f32>)>,
     /// Nanoseconds the worker spent on the batch (0 unless [`lane_stats_on`]).
     busy_ns: u64,
+    /// When the worker started the batch (only under [`lane_stats_on`]).
+    start: Option<Instant>,
 }
 
 /// Workers claim shards from a shared cursor (coord §10 test 1: decode +2.5 %, less
@@ -392,6 +402,14 @@ fn pool_shards() -> Option<usize> {
     })
 }
 
+/// `BRECCIA_POOL_WAKE_FANOUT=n`: tree-wake fan-out (default 2; 0 = serial wake loop).
+fn wake_fanout() -> usize {
+    std::env::var("BRECCIA_POOL_WAKE_FANOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2)
+}
+
 /// `BRECCIA_LANE_STATS=1`: time every pool phase (coord plan Phase 0).
 pub fn lane_stats_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -405,6 +423,10 @@ pub struct LaneStats {
     pub wall_s: f64,
     pub max_busy_s: f64,
     pub mean_busy_s: f64,
+    /// Coordinator time from the first to the last wake message sent.
+    pub dispatch_s: f64,
+    /// Latest worker start after the first send (wake latency incl. dispatch).
+    pub start_skew_s: f64,
 }
 
 impl LaneStats {
@@ -452,11 +474,11 @@ impl ExpertPool {
     pub fn new(set: Arc<ShardSet>, threads: usize, path: Path) -> Self {
         let threads = threads.max(1);
         let (done_tx, rx) = mpsc::channel::<Done>();
-        let mut tx = Vec::with_capacity(threads);
+        let (tx, job_rxs): (Vec<_>, Vec<_>) = (0..threads).map(|_| mpsc::channel::<Msg>()).unzip();
+        let tx: Arc<[Sender<Msg>]> = tx.into();
         let mut handles = Vec::with_capacity(threads);
         let pin = crate::cpu::cpu_pin();
-        for id in 0..threads {
-            let (job_tx, job_rx) = mpsc::channel::<Msg>();
+        for (id, job_rx) in job_rxs.into_iter().enumerate() {
             let done = done_tx.clone();
             let set = Arc::clone(&set);
             let cpu = pin.as_ref().map(|p| p.workers[id % p.workers.len()]);
@@ -466,10 +488,9 @@ impl ExpertPool {
                     if let Some(c) = cpu {
                         crate::cpu::pin_current(&[c]);
                     }
-                    worker_loop(&set, path, &job_rx, &done)
+                    worker_loop(id, &set, path, &job_rx, &done)
                 })
                 .expect("spawning an expert worker");
-            tx.push(job_tx);
             handles.push(handle);
         }
         drop(done_tx);
@@ -479,6 +500,7 @@ impl ExpertPool {
             lane_stats: LaneStats::default(),
             tx,
             rx,
+            fanout: wake_fanout(),
             handles,
         }
     }
@@ -550,14 +572,23 @@ impl ExpertPool {
         let claim = Arc::new(Claim {
             tasks,
             next: AtomicUsize::new(0),
+            peers: Arc::clone(&self.tx),
+            fanout: self.fanout,
+            wake,
         });
+        let first = if self.fanout == 0 {
+            wake
+        } else {
+            self.fanout.min(wake)
+        };
         let t0 = lane_stats_on().then(Instant::now);
-        for w in 0..wake {
+        for w in 0..first {
             self.tx[w]
                 .send(Msg::Claim(Arc::clone(&claim)))
                 .map_err(|_| anyhow::anyhow!("expert worker {w} is gone"))?;
         }
-        let (mut max_ns, mut sum_ns) = (0u64, 0u64);
+        let dispatch = t0.map(|t| t.elapsed().as_secs_f64());
+        let (mut max_ns, mut sum_ns, mut skew) = (0u64, 0u64, 0f64);
         for _ in 0..wake {
             let done = self
                 .rx
@@ -565,6 +596,9 @@ impl ExpertPool {
                 .map_err(|_| anyhow::anyhow!("expert pool result channel closed"))?;
             max_ns = max_ns.max(done.busy_ns);
             sum_ns += done.busy_ns;
+            if let (Some(t0), Some(s)) = (t0, done.start) {
+                skew = skew.max(s.saturating_duration_since(t0).as_secs_f64());
+            }
             for (seq, values) in done.results {
                 if let Some(slot) = slots.get_mut(seq) {
                     *slot = Some(values);
@@ -577,6 +611,8 @@ impl ExpertPool {
             st.wall_s += t0.elapsed().as_secs_f64();
             st.max_busy_s += max_ns as f64 / 1e9;
             st.mean_busy_s += sum_ns as f64 / 1e9 / wake as f64;
+            st.dispatch_s += dispatch.unwrap_or(0.0);
+            st.start_skew_s += skew;
         }
         Ok(slots)
     }
@@ -975,7 +1011,7 @@ impl ExpertPool {
 
 impl Drop for ExpertPool {
     fn drop(&mut self) {
-        for tx in &self.tx {
+        for tx in self.tx.iter() {
             let _ = tx.send(Msg::Exit);
         }
         for h in self.handles.drain(..) {
@@ -984,7 +1020,7 @@ impl Drop for ExpertPool {
     }
 }
 
-fn worker_loop(set: &ShardSet, path: Path, rx: &Receiver<Msg>, done: &Sender<Done>) {
+fn worker_loop(id: usize, set: &ShardSet, path: Path, rx: &Receiver<Msg>, done: &Sender<Done>) {
     while let Ok(msg) = rx.recv() {
         match msg {
             Msg::Exit => break,
@@ -998,12 +1034,26 @@ fn worker_loop(set: &ShardSet, path: Path, rx: &Receiver<Msg>, done: &Sender<Don
                     results.push((shard.seq, values));
                 }
                 let busy_ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
-                if done.send(Done { results, busy_ns }).is_err() {
+                if done
+                    .send(Done {
+                        results,
+                        busy_ns,
+                        start: t0,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
             Msg::Claim(claim) => {
                 let t0 = lane_stats_on().then(Instant::now);
+                if claim.fanout > 0 {
+                    let lo = (id + 1) * claim.fanout;
+                    for child in lo..(lo + claim.fanout).min(claim.wake) {
+                        // shortcut: a dead child hangs the phase, as a worker panic mid-claim already does.
+                        let _ = claim.peers[child].send(Msg::Claim(Arc::clone(&claim)));
+                    }
+                }
                 let mut results = Vec::new();
                 loop {
                     let i = claim.next.fetch_add(1, Ordering::Relaxed);
@@ -1016,7 +1066,14 @@ fn worker_loop(set: &ShardSet, path: Path, rx: &Receiver<Msg>, done: &Sender<Don
                 }
                 drop(claim);
                 let busy_ns = t0.map_or(0, |t| t.elapsed().as_nanos() as u64);
-                if done.send(Done { results, busy_ns }).is_err() {
+                if done
+                    .send(Done {
+                        results,
+                        busy_ns,
+                        start: t0,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }

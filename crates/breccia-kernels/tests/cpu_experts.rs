@@ -334,7 +334,8 @@ fn topk_pool_is_bit_identical_to_the_single_threaded_path() {
     let bytes_seq =
         moe_topk_sequential(&set, Path::Avx2, &plan, &ids, &weights, &x, &mut seq).expect("seq");
 
-    for threads in [2usize, 4, 8] {
+    // 5 and 32 leave partial tree-wake levels (fan-out 2).
+    for threads in [2usize, 4, 5, 8, 16, 32] {
         let mut out = vec![0f32; plan.n_embd];
         let mut pool = ExpertPool::new(Arc::clone(&set), threads, Path::Avx2);
         let bytes = pool
