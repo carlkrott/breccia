@@ -2283,8 +2283,10 @@ fn spec_verify_bench(
             got.push(cur);
         }
         let ok = got == g[row + 2..row + 10];
+        // Early divergence = bad snapshot; late = decode-vs-prefill numerics.
+        let first_bad = got.iter().zip(&g[row + 2..]).position(|(a, b)| a != b);
         println!(
-            "spec-verify rollback_to({row}) then 8 greedy: {}",
+            "spec-verify rollback_to({row}) then 8 greedy: {} (first divergence {first_bad:?})",
             if ok { "match" } else { "MISMATCH" }
         );
         pass &= ok;
