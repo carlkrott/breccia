@@ -5024,6 +5024,7 @@ impl<'m> Session<'m> {
         }
         let m = self.model;
         let mc = &m.cfg;
+        let ple_t0 = std::time::Instant::now();
         let raw = m
             .ple
             .as_ref()
@@ -5056,6 +5057,7 @@ impl<'m> Session<'m> {
         prefetch_rows(table, &rows, row_bytes);
         self.pf_ple_prefetch_s += t_prefetch.elapsed().as_secs_f64();
         let packed = EmbGather::pack_rows(table, row_bytes, &rows)?;
+        let ple_t1 = ple_t0.elapsed();
 
         // ---- 2. one batch: upload, gather, `2t` projections, `t` view copies --
         self.ensure_batch(dev)?;
@@ -5106,6 +5108,7 @@ impl<'m> Session<'m> {
             }
         }
         self.submit_batch()?;
+        let ple_t2 = ple_t0.elapsed();
 
         // ---- 3. one readback for the whole chunk ------------------------------
         //
@@ -5122,25 +5125,20 @@ impl<'m> Session<'m> {
             self.stagings[dev].read_batch(gpu, &items)?
         };
 
-        // ---- 4. the host blocks, in sequence, then one writeback --------------
+        let ple_t3 = ple_t0.elapsed();
+        // ---- 4. the host blocks (threaded, bit-equal to in sequence), then one writeback --------------
         let mut out = vec![0f32; t * hc_dim];
         {
             let ple = self
                 .ple
                 .as_mut()
                 .ok_or_else(|| anyhow!("no PLE host state"))?;
-            for i in 0..t {
-                let r_host = f32_from_bytes(&parts[3 * i]);
-                let key = f32_from_bytes(&parts[3 * i + 1]);
-                let value = f32_from_bytes(&parts[3 * i + 2]);
-                ple.block(
-                    &r_host,
-                    &key,
-                    &value,
-                    &mut out[i * hc_dim..(i + 1) * hc_dim],
-                )?;
-            }
+            let rs: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i])).collect();
+            let keys: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i + 1])).collect();
+            let vals: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i + 2])).collect();
+            ple.block_chunk(&rs, &keys, &vals, &mut out)?;
         }
+        let ple_t4 = ple_t0.elapsed();
         let bytes = f32_to_bytes(&out);
         {
             let v = &self.venues[dev];
@@ -5156,6 +5154,17 @@ impl<'m> Session<'m> {
             self.stagings[dev].write_regions(gpu, &items)?;
         }
         self.cur_tok = self.pf_toks[t - 1];
+        if std::env::var_os("BRECCIA_TRACE_MERGED").is_some() {
+            let e = ple_t0.elapsed();
+            eprintln!(
+                "ple_chunk b={b} t={t}: hash+prefetch+pack {:.1} ms, record+submit {:.1} ms, readback {:.1} ms, host block {:.1} ms, writeback {:.1} ms",
+                ple_t1.as_secs_f64() * 1e3,
+                (ple_t2 - ple_t1).as_secs_f64() * 1e3,
+                (ple_t3 - ple_t2).as_secs_f64() * 1e3,
+                (ple_t4 - ple_t3).as_secs_f64() * 1e3,
+                (e - ple_t4).as_secs_f64() * 1e3
+            );
+        }
         Ok(())
     }
 
