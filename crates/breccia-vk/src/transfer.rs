@@ -859,6 +859,7 @@ pub fn import_from_host_ptr(
             buf,
             mem,
             size: bytes,
+            id: Buf::next_id(),
         })
     }
 }

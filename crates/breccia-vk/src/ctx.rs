@@ -314,6 +314,18 @@ pub struct Buf {
     pub buf: vk::Buffer,
     pub mem: vk::DeviceMemory,
     pub size: u64,
+    /// Process-unique, never reused. Caches that outlive a buffer (the persistent
+    /// descriptor sets) key on this, not on `buf`: the driver recycles destroyed
+    /// `VkBuffer` handle values, so a handle-keyed entry can alias freed memory.
+    pub id: u64,
+}
+
+static BUF_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl Buf {
+    pub fn next_id() -> u64 {
+        BUF_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// `VK_EXT_memory_budget`'s numbers for one device, summed over its
@@ -1185,6 +1197,7 @@ impl Gpu {
                 buf: buffer,
                 mem,
                 size,
+                id: Buf::next_id(),
             })
         }
     }
@@ -1923,5 +1936,16 @@ fn make_timer(device: &ash::Device) -> R<vk::QueryPool> {
             device.create_query_pool(&qpci, None),
             "vkCreateQueryPool(TIMESTAMP)",
         )
+    }
+}
+
+#[cfg(test)]
+mod buf_id_tests {
+    use super::Buf;
+
+    #[test]
+    fn buf_ids_are_unique_and_increasing() {
+        let (a, b) = (Buf::next_id(), Buf::next_id());
+        assert!(b > a);
     }
 }

@@ -99,9 +99,9 @@ thread_local! {
     /// **Persistent descriptor sets** (§8ao): one set per
     /// `(pipeline layout, buffer set)` — the decode shape is frozen per config, so
     /// every token asks for exactly the same bindings and the set can be written
-    /// once, off the hot path. Keyed by the pipeline handle and the bound buffer
-    /// handles; allocated from a per-device pool that lives until `shutdown`.
-    static SETS: RefCell<std::collections::HashMap<(u64, Vec<vk::Buffer>), vk::DescriptorSet>> =
+    /// once, off the hot path. Keyed by the pipeline handle and the bound buffers'
+    /// `Buf::id`s; allocated from a per-device pool that lives until `shutdown`.
+    static SETS: RefCell<std::collections::HashMap<(u64, Vec<u64>), vk::DescriptorSet>> =
         RefCell::new(std::collections::HashMap::new());
     static SET_POOLS: RefCell<Vec<(ash::vk::Device, vk::DescriptorPool, ash::Device)>> =
         const { RefCell::new(Vec::new()) };
@@ -1369,9 +1369,11 @@ open_cmd(gpu).ok_or_else(|| anyhow!("recording a dispatch without an open batch"
     // fresh set was the ~3 µs/dispatch this removes.
     let prof_on = profile_on();
     let mut t_ph = prof_on.then(std::time::Instant::now);
-    let key: (u64, Vec<vk::Buffer>) = (
+    // Keyed by `Buf::id`, not the VkBuffer handle: handles of destroyed buffers get
+    // recycled, and a set written for the old buffer would alias its freed memory.
+    let key: (u64, Vec<u64>) = (
         ash::vk::Handle::as_raw(kernel.pipe),
-        bufs.iter().map(|b| b.buf).collect(),
+        bufs.iter().map(|b| b.id).collect(),
     );
     let cached = SETS.with(|c| c.borrow().get(&key).copied());
     let persistent = if track_disabled() {
