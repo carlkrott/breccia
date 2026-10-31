@@ -119,6 +119,7 @@ const SHADERS: &[&str] = &[
     "qsa_topk",
     "qsa_attn_scores",
     "qsa_attn_scores_gqa",
+    "qsa_attn_scores_small",
     "qsa_attn_apply",
     "qsa_attn_apply_gqa",
     // int8-dot decode path (§8bb): the q8_1 quantiser and the IQ3_S dp4a GEMV.
