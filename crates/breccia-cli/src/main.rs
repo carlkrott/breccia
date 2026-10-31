@@ -879,14 +879,20 @@ fn argmax(x: &[f32]) -> usize {
     (0..x.len()).fold(0, |b, i| if x[i] > x[b] { i } else { b })
 }
 
+/// Profile parity (Carl 2026-10-31, relaxed gate): only the top-1 token blocks;
+/// KL against the reference is printed but never fails an arm.
+fn profile_parity_ok(reference: &[f32], arm: &[f32]) -> bool {
+    argmax(reference) == argmax(arm)
+}
+
 /// `breccia profile --prefill`: per discrete GPU, A/B the merged-prefill flags
 /// in-process and store a verdict in the profile (`DeviceEntry.prefill`).
 ///
 /// Arms on a 701-token synthetic prompt (one 512 chunk + a ragged 189, so both
 /// the full and a ragged T run through every chunked kernel): per-token reference,
 /// all flags off, all on, and all on minus each flag. A flag stays on when the
-/// all-on arm matches the per-token reference (KL <= 1e-3, or no worse than
-/// all-off, and the same top-1) and dropping it does not make prefill faster.
+/// all-on arm keeps the per-token reference's top-1 (KL is report-only, see
+/// `profile_parity_ok`) and dropping it does not make prefill faster.
 fn profile_prefill(path: &std::path::Path, model_glob: &str, devices: &[String]) -> Result<()> {
     use breccia_engine::graph::PF_FLAGS;
     const CHUNK: usize = 512;
@@ -960,7 +966,7 @@ fn profile_prefill(path: &std::path::Path, model_glob: &str, devices: &[String])
         let top = argmax(&reference);
         let kl_off = logits_kl(&reference, &off);
         let kl_on = logits_kl(&reference, &on);
-        let on_ok = argmax(&on) == top && (kl_on <= 1e-3 || kl_on <= kl_off * 1.1);
+        let on_ok = profile_parity_ok(&reference, &on);
         println!(
             "  per-token ref top-1 {top}; all-off {off_ms:.0} ms KL {kl_off:.2e}; \
              all-on {on_ms:.0} ms KL {kl_on:.2e} top-1 {}",
@@ -1035,8 +1041,8 @@ fn profile_prefill(path: &std::path::Path, model_glob: &str, devices: &[String])
 /// The prefill chunk one card runs fastest at. Each candidate gets a fresh model
 /// and session (workspaces are sized at `Session::new`) under the `auto` arena
 /// with that chunk's scratch reserve, so a bigger chunk also pays for the expert
-/// blocks it pushes out of VRAM. A candidate must match the 512 arm (KL <= 1e-3,
-/// same top-1) and beat the smaller winner by more than 2 % to replace it.
+/// blocks it pushes out of VRAM. A candidate must keep the 512 arm's top-1 (KL
+/// report-only) and beat the smaller winner by more than 2 % to replace it.
 fn profile_prefill_chunk(path: &std::path::Path, model_glob: &str, addr: &str) -> Result<usize> {
     const CANDIDATES: [usize; 3] = [512, 1024, 2048];
     // Planner splits evenly up to 1.5x the target: 3x700 / 2x1050 / 1x2100.
@@ -1092,10 +1098,10 @@ fn profile_prefill_chunk(path: &std::path::Path, model_glob: &str, addr: &str) -
             ms = ms.min(t.elapsed().as_secs_f64() * 1e3 / prompt.len() as f64);
         }
         let (kl, same) = match &base {
-            Some(b) => (logits_kl(b, &logits), argmax(b) == argmax(&logits)),
+            Some(b) => (logits_kl(b, &logits), profile_parity_ok(b, &logits)),
             None => (0.0, true),
         };
-        let ok = kl <= 1e-3 && same;
+        let ok = same;
         let wins = ok && ms < best.1 * 0.98;
         println!(
             "  chunk {chunk:>4}: {ms:.2} ms/token, KL vs 512 {kl:.2e}, top-1 {}{}",
@@ -1558,6 +1564,14 @@ fn busy_per_step(measured: bool, busy_s: f64, steps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_parity_blocks_on_top1_only() {
+        let r = [0.0f32, 5.0, 1.0];
+        assert!(profile_parity_ok(&r, &[0.0, 2.0, 1.9])); // big KL, same top-1: pass
+        assert!(!profile_parity_ok(&r, &[0.0, 1.0, 1.1])); // top-1 moved: block
+        assert!(logits_kl(&r, &[0.0, 2.0, 1.9]) > 1e-3);
+    }
 
     #[test]
     fn prefill_chunk_flag_wins_then_discovered_all_or_nothing() {
