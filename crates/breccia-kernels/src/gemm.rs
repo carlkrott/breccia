@@ -371,7 +371,7 @@ impl<'g> GemmMany<'g> {
         self.want_tile = t;
     }
 
-    /// Build the HC `up` + gated-mean pipeline (BF16 only; `BRECCIA_FUSE_HC=1`).
+    /// Build the HC `up` + gated-mean pipeline (BF16 only; default on, `BRECCIA_FUSE_HC=0` opts out).
     /// A no-op for other types. See [`GemmMany::run_up_gated`].
     pub fn enable_hc_tile_gated(&mut self) -> Result<()> {
         if self.ty != QuantType::Bf16 || self.hcgate.is_some() {

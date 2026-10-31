@@ -1668,7 +1668,7 @@ pub struct HcMixer<'g> {
     /// the number `HcWrite` must sum. Unused when `up_gated` is `None`.
     fused_chunks: usize,
     /// `n_embd / 16` when the opt-in `up` GEMM + gated-mean epilogue is built
-    /// (`BRECCIA_FUSE_HC=1`, [`HcMixer::tile_fused`]), else 0: the inject partials
+    /// (default on, `BRECCIA_FUSE_HC=0` opts out; [`HcMixer::tile_fused`]), else 0: the inject partials
     /// per token that path writes at `T >= 64`.
     tile_chunks: usize,
     /// Bound as the gated-mean's inject weight when the mixer has no `inject`
@@ -1714,7 +1714,7 @@ impl<'g> HcMixer<'g> {
     }
 
     /// [`HcMixer::with_fusion`] with the opt-in **`up` GEMM + gated-mean epilogue**
-    /// chosen explicitly (`BRECCIA_FUSE_HC=1` is the env form; the conformance suite
+    /// chosen explicitly (`BRECCIA_FUSE_HC=0` is the env opt-out; the conformance suite
     /// builds both arms in one process). At `T >= 64`, with the default 4x4 tile, a
     /// BF16 mixer with `inject`, `hc == 4` and `n_embd % 16 == 0`, `read` then runs
     /// one dispatch (probe `hc-up-gated`) instead of `up` + `gated`; every other
@@ -1877,7 +1877,7 @@ impl<'g> HcMixer<'g> {
     }
 
     /// `true` when `read` at `tokens` tokens runs the `up` GEMM + gated-mean epilogue
-    /// (`BRECCIA_FUSE_HC=1`): built, and the plain `up` GEMM would be the default 4x4 tile.
+    /// (default on): built, and the plain `up` GEMM would be the default 4x4 tile.
     pub fn tile_fused(&self, tokens: usize) -> bool {
         self.tile_chunks > 0 && self.gemm.as_ref().is_some_and(|g| g.hc_tile_gated_for(tokens))
     }
