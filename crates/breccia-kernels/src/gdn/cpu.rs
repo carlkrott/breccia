@@ -163,6 +163,123 @@ pub fn delta_step(
     o
 }
 
+/// Chunkwise (WY / UT-transform) form of [`delta_step`], the CPU twin of
+/// `gdn_wy_prep.comp` + `gdn_wy_scan.comp`. Same arguments plus the chunk size `c`.
+///
+/// Per v-head and chunk of `c` rows, with `G` the inclusive cumulative log-decay,
+/// `A[t][s] = beta_t (k_t.k_s) e^{G_t-G_s}` (s < t), `X = (I+A)^-1 B` by forward
+/// substitution, `W = X(beta e^G k)`, `U = X(beta v)`, `D = U - W S0`,
+/// `O = e^G q S0 + Qk D` (`Qk[t][s] = (q_t.k_s) e^{G_t-G_s}`, s <= t) and
+/// `S = e^{G_c} S0 + sum_s e^{G_c-G_s} k_s D_s`. Every exponent is <= 0. Rows past
+/// `tokens` in the last chunk are padded with g = beta = q = k = v = 0, an exact
+/// no-op on the state, which is what lets the shader take a partial last chunk.
+/// Generated for `f64` (the exact twin) and `f32` (what the GPU accumulates in).
+macro_rules! delta_step_wy_impl {
+    ($name:ident, $t:ty) => {
+        #[allow(clippy::too_many_arguments)]
+        pub fn $name(
+            state: &mut [f64],
+            qkv: &[f64],
+            gate: &[f64],
+            beta: &[f64],
+            tokens: usize,
+            h_k: usize,
+            h_v: usize,
+            s: usize,
+            channels: usize,
+            c: usize,
+        ) -> Vec<f64> {
+            let mut o = vec![0.0f64; tokens * h_v * s];
+            for h in 0..h_v {
+                let gh = h % h_k;
+                let mut st: Vec<$t> = (0..s * s)
+                    .map(|ij| state[((ij / s) * h_v + h) * s + ij % s] as $t)
+                    .collect();
+                let mut c0 = 0;
+                while c0 < tokens {
+                    let n = c.min(tokens - c0);
+                    let live = |t: usize| t < n;
+                    let row = |t: usize, base: usize| -> Vec<$t> {
+                        (0..s)
+                            .map(|i| if live(t) { qkv[(c0 + t) * channels + base + i] as $t } else { 0.0 })
+                            .collect()
+                    };
+                    let q: Vec<Vec<$t>> = (0..c).map(|t| row(t, gh * s)).collect();
+                    let k: Vec<Vec<$t>> = (0..c).map(|t| row(t, h_k * s + gh * s)).collect();
+                    let v: Vec<Vec<$t>> = (0..c).map(|t| row(t, 2 * h_k * s + h * s)).collect();
+                    let b: Vec<$t> = (0..c)
+                        .map(|t| if live(t) { beta[(c0 + t) * h_v + h] as $t } else { 0.0 })
+                        .collect();
+                    let mut g: Vec<$t> = vec![0.0; c];
+                    let mut acc: $t = 0.0;
+                    for t in 0..c {
+                        if live(t) {
+                            acc += gate[(c0 + t) * h_v + h] as $t;
+                        }
+                        g[t] = acc;
+                    }
+                    let dot = |a: &[$t], b: &[$t]| -> $t { a.iter().zip(b).map(|(x, y)| x * y).sum() };
+                    let mut a = vec![vec![0.0 as $t; c]; c];
+                    let mut qk = vec![vec![0.0 as $t; c]; c];
+                    for t in 0..c {
+                        for u in 0..=t {
+                            let e = (g[t] - g[u]).exp();
+                            if u < t {
+                                a[t][u] = b[t] * dot(&k[t], &k[u]) * e;
+                            }
+                            qk[t][u] = dot(&q[t], &k[u]) * e;
+                        }
+                    }
+                    // X_t = B_t - sum_{u<t} A[t][u] X_u, once for W (width s) and once for U.
+                    let solve = |bm: Vec<Vec<$t>>| -> Vec<Vec<$t>> {
+                        let mut x = bm;
+                        for t in 0..c {
+                            for u in 0..t {
+                                for i in 0..s {
+                                    let xu = x[u][i];
+                                    x[t][i] -= a[t][u] * xu;
+                                }
+                            }
+                        }
+                        x
+                    };
+                    let w = solve((0..c).map(|t| k[t].iter().map(|x| b[t] * g[t].exp() * x).collect()).collect());
+                    let u = solve((0..c).map(|t| v[t].iter().map(|x| b[t] * x).collect()).collect());
+                    // D = U - W S0
+                    let mut d = u;
+                    for t in 0..c {
+                        for j in 0..s {
+                            let ws: $t = (0..s).map(|i| w[t][i] * st[i * s + j]).sum();
+                            d[t][j] -= ws;
+                        }
+                    }
+                    for t in 0..n {
+                        for j in 0..s {
+                            let o1: $t = (0..s).map(|i| q[t][i] * st[i * s + j]).sum();
+                            let o2: $t = (0..=t).map(|u| qk[t][u] * d[u][j]).sum();
+                            o[(c0 + t) * h_v * s + h * s + j] = (g[t].exp() * o1 + o2) as f64;
+                        }
+                    }
+                    let gc = g[c - 1];
+                    for i in 0..s {
+                        for j in 0..s {
+                            let upd: $t = (0..c).map(|u| (gc - g[u]).exp() * k[u][i] * d[u][j]).sum();
+                            st[i * s + j] = gc.exp() * st[i * s + j] + upd;
+                        }
+                    }
+                    c0 += c;
+                }
+                for ij in 0..s * s {
+                    state[((ij / s) * h_v + h) * s + ij % s] = st[ij] as f64;
+                }
+            }
+            o
+        }
+    };
+}
+delta_step_wy_impl!(delta_step_wy, f64);
+delta_step_wy_impl!(delta_step_wy_f32, f32);
+
 /// `out[h][j] = rmsnorm_128(y[h])[j] * gamma[j] * sigmoid(z[h][j])`.
 pub fn norm_gate(y: &[f64], gamma: &[f64], z: &[f64], rows: usize, s: usize, eps: f64) -> Vec<f64> {
     let mut out = vec![0.0f64; rows * s];
@@ -270,6 +387,8 @@ mod tests {
     const H_K: usize = super::super::MODEL_H_K;
     const H_V: usize = super::super::MODEL_H_V;
     const S: usize = super::super::MODEL_S;
+
+    type WyFn = fn(&mut [f64], &[f64], &[f64], &[f64], usize, usize, usize, usize, usize, usize) -> Vec<f64>;
 
     fn pseudo(seed: u64, n: usize) -> Vec<f64> {
         let mut s = seed | 1;
@@ -401,6 +520,35 @@ mod tests {
         assert!((buf[1] - 4.0 / 5.0 / 2f64.sqrt()).abs() < 1e-12);
         assert!((buf[2] - 3.0 / 5.0).abs() < 1e-12);
         assert!((buf[3] - 4.0 / 5.0).abs() < 1e-12);
+    }
+
+    /// The chunked WY form equals the sequential recurrence: output and carried
+    /// state, across several chunks and a partial last chunk, f64 and f32.
+    #[test]
+    fn wy_chunks_match_the_sequential_scan() {
+        let (hk, hv, s) = (2usize, 4usize, 16usize);
+        let channels = 2 * hk * s + hv * s;
+        for (tokens, c) in [(8usize, 4usize), (11, 4), (13, 8), (5, 8)] {
+            let mut qkv = pseudo(21 + tokens as u64, tokens * channels);
+            qk_l2_norm(&mut qkv, tokens, hk, s, channels, 1e-6);
+            let gate: Vec<f64> = pseudo(5, tokens * hv).iter().map(|x| -0.05 - 0.9 * x.abs()).collect();
+            let beta: Vec<f64> = pseudo(9, tokens * hv).iter().map(|x| sigmoid(*x)).collect();
+            let st0 = pseudo(33, s * hv * s);
+            let mut st_ref = st0.clone();
+            let o_ref = delta_step(&mut st_ref, &qkv, &gate, &beta, tokens, hk, hv, s, channels);
+            let scale = o_ref.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+            let sscale = st_ref.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+            for (name, f, tol) in [
+                ("f64", delta_step_wy as WyFn, 1e-12),
+                ("f32", delta_step_wy_f32 as WyFn, 1e-5),
+            ] {
+                let mut st = st0.clone();
+                let o = f(&mut st, &qkv, &gate, &beta, tokens, hk, hv, s, channels, c);
+                let eo = o.iter().zip(&o_ref).fold(0.0f64, |m, (a, b)| m.max((a - b).abs())) / scale;
+                let es = st.iter().zip(&st_ref).fold(0.0f64, |m, (a, b)| m.max((a - b).abs())) / sscale;
+                assert!(eo < tol && es < tol, "{name} T={tokens} C={c}: out {eo:e} state {es:e}");
+            }
+        }
     }
 
     #[test]

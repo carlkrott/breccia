@@ -1,0 +1,187 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+//
+// Chunkwise (WY) gated delta rule, kernel B: the part that carries the state.
+// One workgroup per (v-head, 32-column tile of the 128-wide state), looping over
+// the chunks in order. Kernel A (`gdn_wy_prep.comp`) produced W, U and Qk.
+// CPU twin: `delta_step_wy` in `src/gdn/cpu.rs`.
+//
+// Per chunk, with S0 the tile at chunk start (S x JT, `(i, j)`), G as in kernel A:
+//
+//   D        = U - W S0                       [C x JT]
+//   O        = diag(e^G) Q S0 + Qk D          Qk lower-triangular incl. diagonal
+//   S        = e^{G_C} S0 + K~^T D            K~_s = e^{G_C - G_s} k_s
+//
+// O is written in place over U (`UO`): a column's U is read in the D pass and only
+// that column's O is written afterwards, by the same thread, so nothing is lost.
+// The state is read from / written to `(i*h_v + h)*S + j` once per call, so the
+// final state equals the sequential scan's.
+//
+// # LDS (S = 128, JT = 32, C = 64): 57 856 B < 64 KiB
+//
+//   Sst 128 x 32 f32  state tile (16 KiB)
+//   Dm   64 x 32 f32  D           (8 KiB)
+//   Stg  64 x 129 f32 staging for W / Q / Qk / K~ (stride 129: conflict-free)
+//   gc   64 f32       cumulative G (same summation order as kernel A, so the
+//                     two kernels agree bit for bit)
+//
+// Thread map: jl = tid % 32 (column), rg = tid / 32 (row group). Output passes
+// give a thread the rows t = rg + 4m (16 accumulators); the state update gives it
+// i = rg + 4m (32). A wave32 shares one `rg`, so the Stg reads are broadcasts; on
+// Wave64 two `rg` values are two broadcasts. No subgroup ops.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer State { float ST[]; };            // [(i*h_v + h)*S + j]
+layout(std430, binding = 1) readonly buffer Qkv { float QKV[]; };    // [T, channels]
+layout(std430, binding = 2) readonly buffer GateVec { float GATE[]; }; // [T, h_v]
+layout(std430, binding = 3) readonly buffer WIn { float WI[]; };     // [T, h_v*S]
+layout(std430, binding = 4) buffer UOVec { float UO[]; };            // U in, O out
+layout(std430, binding = 5) readonly buffer QkIn { float QKS[]; };   // [chunks*h_v, C, C]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint h_k;      // 16
+    uint h_v;      // 48
+    uint channels; // 2*h_k*S + h_v*S
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uint pad3;
+} pc;
+
+#define WG_X_MAX 65535u
+#define CH 64u   // chunk size C; mirrored by `WY_C` in `src/gdn/mod.rs`
+#define SD 128u  // head dim S (asserted == MODEL_S in `src/gdn/mod.rs`)
+#define JT 32u   // state columns per workgroup; mirrored by `WY_JT`
+#define KS 129u  // Stg row stride
+
+shared float Sst[SD * JT];
+shared float Dm[CH * JT];
+shared float Stg[CH * KS];
+shared float gc[CH];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint unit = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint tiles = SD / JT;
+    uint h = unit / tiles;
+    uint jt = unit - h * tiles;
+    uint jl = tid % JT;
+    uint rg = tid / JT;
+    uint j = jt * JT + jl;
+    uint gh = h % pc.h_k;
+
+    uint q_base = gh * SD;
+    uint k_base = pc.h_k * SD + gh * SD;
+    uint vd = pc.h_v * SD;
+    uint chunks = (pc.tokens + CH - 1u) / CH;
+
+    [[unroll]] for (uint m = 0u; m < SD / 4u; ++m) {
+        uint i = rg + 4u * m;
+        Sst[i * JT + jl] = ST[(i * pc.h_v + h) * SD + j];
+    }
+
+    for (uint chunk = 0u; chunk < chunks; ++chunk) {
+        uint c0 = chunk * CH;
+        uint n = min(CH, pc.tokens - c0);
+
+        if (tid < CH) {
+            float g = 0.0;
+            uint last = min(tid, n - 1u);
+            for (uint u = 0u; u <= last; ++u) {
+                g += GATE[(c0 + u) * pc.h_v + h];
+            }
+            gc[tid] = g;
+        }
+        for (uint idx = tid; idx < CH * SD; idx += 128u) {
+            uint t = idx / SD;
+            uint i = idx - t * SD;
+            Stg[t * KS + i] = t < n ? WI[(c0 + t) * vd + h * SD + i] : 0.0;
+        }
+        barrier();
+
+        // ---- D = U - W S0 ------------------------------------------------------
+        float acc[16];
+        [[unroll]] for (uint m = 0u; m < 16u; ++m) acc[m] = 0.0;
+        for (uint i = 0u; i < SD; ++i) {
+            float sv = Sst[i * JT + jl];
+            [[unroll]] for (uint m = 0u; m < 16u; ++m) {
+                acc[m] += Stg[(rg + 4u * m) * KS + i] * sv;
+            }
+        }
+        [[unroll]] for (uint m = 0u; m < 16u; ++m) {
+            uint t = rg + 4u * m;
+            Dm[t * JT + jl] = t < n ? UO[(c0 + t) * vd + h * SD + j] - acc[m] : 0.0;
+        }
+        barrier();
+
+        // ---- O1 = e^G Q S0 -----------------------------------------------------
+        for (uint idx = tid; idx < CH * SD; idx += 128u) {
+            uint t = idx / SD;
+            uint i = idx - t * SD;
+            Stg[t * KS + i] = t < n ? QKV[(c0 + t) * pc.channels + q_base + i] : 0.0;
+        }
+        barrier();
+        [[unroll]] for (uint m = 0u; m < 16u; ++m) acc[m] = 0.0;
+        for (uint i = 0u; i < SD; ++i) {
+            float sv = Sst[i * JT + jl];
+            [[unroll]] for (uint m = 0u; m < 16u; ++m) {
+                acc[m] += Stg[(rg + 4u * m) * KS + i] * sv;
+            }
+        }
+        [[unroll]] for (uint m = 0u; m < 16u; ++m) {
+            acc[m] *= exp(gc[rg + 4u * m]);
+        }
+        barrier();
+
+        // ---- O = O1 + Qk D, written over U ---------------------------------------
+        uint qoff = (chunk * pc.h_v + h) * CH * CH;
+        for (uint idx = tid; idx < CH * CH; idx += 128u) {
+            uint t = idx / CH;
+            uint s = idx - t * CH;
+            Stg[t * KS + s] = QKS[qoff + idx];
+        }
+        barrier();
+        [[unroll]] for (uint m = 0u; m < 16u; ++m) {
+            uint t = rg + 4u * m;
+            float o = acc[m];
+            for (uint s = 0u; s <= t; ++s) {
+                o += Stg[t * KS + s] * Dm[s * JT + jl];
+            }
+            if (t < n) {
+                UO[(c0 + t) * vd + h * SD + j] = o;
+            }
+        }
+        barrier();
+
+        // ---- S = e^{G_C} S0 + K~^T D --------------------------------------------
+        float gC = gc[CH - 1u];
+        for (uint idx = tid; idx < CH * SD; idx += 128u) {
+            uint t = idx / SD;
+            uint i = idx - t * SD;
+            Stg[t * KS + i] =
+                t < n ? exp(gC - gc[t]) * QKV[(c0 + t) * pc.channels + k_base + i] : 0.0;
+        }
+        barrier();
+        float up[32];
+        [[unroll]] for (uint m = 0u; m < 32u; ++m) up[m] = 0.0;
+        for (uint s = 0u; s < CH; ++s) {
+            float d = Dm[s * JT + jl];
+            [[unroll]] for (uint m = 0u; m < 32u; ++m) {
+                up[m] += Stg[s * KS + rg + 4u * m] * d;
+            }
+        }
+        float ge = exp(gC);
+        [[unroll]] for (uint m = 0u; m < 32u; ++m) {
+            uint i = rg + 4u * m;
+            Sst[i * JT + jl] = ge * Sst[i * JT + jl] + up[m];
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint m = 0u; m < SD / 4u; ++m) {
+        uint i = rg + 4u * m;
+        ST[(i * pc.h_v + h) * SD + j] = Sst[i * JT + jl];
+    }
+}

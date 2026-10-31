@@ -141,6 +141,10 @@ pub struct GdnWorkspace {
     pub step: Buf,
     /// `[T, 6144]` `rmsnorm(step) * sigmoid(z)` — the `ssm_out` GEMV's input.
     pub normed: Buf,
+    /// `[ceil(T/C), 48, C, C]` the WY scan's masked `(q.k) e^{G_t-G_s}` rows. Only
+    /// allocated when `BRECCIA_GDN_WY` is on and `T >= C`; `None` selects the
+    /// sequential scan. Not part of the positional `take()` list below.
+    pub wy_qk: Option<Buf>,
 }
 
 impl GdnWorkspace {
@@ -158,7 +162,8 @@ impl GdnWorkspace {
         ]
         .iter()
         .map(|b| b.size)
-        .sum()
+        .sum::<u64>()
+            + self.wy_qk.as_ref().map_or(0, |b| b.size)
     }
 }
 
@@ -184,6 +189,9 @@ pub struct Gdn<'g> {
     gate: Pipe<'g>,
     step: Pipe<'g>,
     norm_gate: Pipe<'g>,
+    /// Chunkwise-WY prefill scan (`gdn_wy_prep`, `gdn_wy_scan`); built only when
+    /// [`wy_enabled`] so the default path creates nothing new.
+    wy: Option<(Pipe<'g>, Pipe<'g>)>,
 }
 
 /// `beta` and `alpha` (both `[48, n_embd]`) are run as **one** 96-row GEMV
@@ -198,6 +206,20 @@ pub struct Gdn<'g> {
 pub fn beta_alpha_merged() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BRECCIA_NO_GDN_MERGE").is_none())
+}
+
+/// Chunk size C of the WY scan; mirrors `#define CH` in both `gdn_wy_*.comp`
+/// (`Pipe` has no spec-constant support, so it is a shader constant, not a spec one).
+pub const WY_C: usize = 64;
+/// State columns per workgroup of `gdn_wy_scan.comp`; mirrors `#define JT`.
+pub const WY_JT: usize = 32;
+
+/// `BRECCIA_GDN_WY=1` runs prefill's GDN scan as chunkwise WY (C = [`WY_C`]) when
+/// the call holds at least one full chunk. Default off, decode never uses it.
+/// Cached: read once.
+pub fn wy_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_GDN_WY").is_some_and(|v| v != "0"))
 }
 
 impl<'g> Gdn<'g> {
@@ -241,6 +263,25 @@ impl<'g> Gdn<'g> {
                 4,
                 "gdn norm+gate",
             )?,
+            wy: if wy_enabled() {
+                const { assert!(MODEL_S == 128 && MODEL_S % WY_JT == 0) };
+                Some((
+                    Pipe::new(
+                        gpu,
+                        include_bytes!(concat!(env!("OUT_DIR"), "/gdn_wy_prep.spv")),
+                        6,
+                        "gdn wy prep",
+                    )?,
+                    Pipe::new(
+                        gpu,
+                        include_bytes!(concat!(env!("OUT_DIR"), "/gdn_wy_scan.spv")),
+                        6,
+                        "gdn wy scan",
+                    )?,
+                ))
+            } else {
+                None
+            },
         })
     }
 
@@ -302,6 +343,14 @@ impl<'g> Gdn<'g> {
             it.next()
                 .expect("nine gdn workspace buffers were allocated")
         };
+        // The WY scratch is best effort: if it does not fit (the MI50 has little
+        // headroom), the layer just runs the sequential scan.
+        let wy_qk = if self.wy.is_some() && tokens >= WY_C {
+            let n = tokens.div_ceil(WY_C) * MODEL_H_V * WY_C * WY_C;
+            alloc(gpu, (n * 4) as u64).ok()
+        } else {
+            None
+        };
         Ok(GdnWorkspace {
             tokens,
             qkv: take(),
@@ -313,6 +362,7 @@ impl<'g> Gdn<'g> {
             gate: take(),
             step: take(),
             normed: take(),
+            wy_qk,
         })
     }
 
@@ -328,6 +378,9 @@ impl<'g> Gdn<'g> {
             &ws.step,
             &ws.normed,
         ] {
+            gpu.destroy_buf(b);
+        }
+        if let Some(b) = &ws.wy_qk {
             gpu.destroy_buf(b);
         }
     }
@@ -416,6 +469,39 @@ impl<'g> Gdn<'g> {
         )
     }
 
+    /// The chunkwise-WY form of [`Gdn::delta_step`] (`BRECCIA_GDN_WY=1`): kernel A
+    /// builds W and U (into `ws.normed` / `out`) and the Qk rows per (chunk, head),
+    /// kernel B carries the state across chunks and overwrites U with the output.
+    /// `ws.normed` is dead until `norm_gate`, so it hosts W for free. `None` when
+    /// the WY path is not available for this call (flag off, `T < C`, no scratch).
+    pub fn delta_step_wy(
+        &self,
+        state: &GdnState,
+        ws: &GdnWorkspace,
+        out: &Buf,
+    ) -> Option<Result<()>> {
+        let ((prep, scan), qk) = (self.wy.as_ref()?, ws.wy_qk.as_ref()?);
+        if ws.tokens < WY_C {
+            return None;
+        }
+        let pc = Pc::new()
+            .u(ws.tokens as u32)
+            .u(MODEL_H_K as u32)
+            .u(MODEL_H_V as u32)
+            .u(CONV_CHANNELS as u32);
+        let chunks = ws.tokens.div_ceil(WY_C);
+        let (ax, ay) = grid_for(chunks * MODEL_H_V, 1);
+        let (bx, by) = grid_for(MODEL_H_V * (MODEL_S / WY_JT), 1);
+        Some((|| {
+            prep.run(&[&ws.qkv, &ws.gate, &ws.beta, &ws.normed, out, qk], &pc, (ax, ay, 1))?;
+            scan.run(
+                &[&state.state, &ws.qkv, &ws.gate, &ws.normed, out, qk],
+                &pc,
+                (bx, by, 1),
+            )
+        })())
+    }
+
     pub fn delta_step_timed(
         &self,
         state: &GdnState,
@@ -499,7 +585,17 @@ impl<'g> Gdn<'g> {
         self.conv(state, &ws.qkv, w.conv, t)?;
         self.qk_l2_norm(&ws.qkv, t)?;
         self.beta_gate(ws, w)?;
-        self.delta_step(state, ws, &ws.step)?;
+        if self.wy.is_some() && ws.wy_qk.is_some() && t >= WY_C {
+            // Its own probe column, so `gdn-scan` (conv, norm, gate, norm_gate) and
+            // `gdn-wy` (the two WY kernels) sum to the sequential path's `gdn-scan`.
+            crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_WY);
+            if let Some(r) = self.delta_step_wy(state, ws, &ws.step) {
+                r?;
+            }
+            crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_SCAN);
+        } else {
+            self.delta_step(state, ws, &ws.step)?;
+        }
         self.norm_gate(&ws.step, w.ssm_norm, &ws.z, &ws.normed)?;
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_OUT);
         proj.out.run(proj.w_out, &ws.normed, out, t)?;

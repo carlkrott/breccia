@@ -495,6 +495,10 @@ pub mod probe {
     pub const GDN_Z: u8 = 29;
     pub const GDN_BETA: u8 = 30;
     pub const GDN_ALPHA: u8 = 31;
+    /// The chunkwise-WY scan kernels (`BRECCIA_GDN_WY=1`, `gdn_wy_prep` +
+    /// `gdn_wy_scan`). Stamped only when that flag is on, so the A/B is `gdn-scan`
+    /// (flag off) against `gdn-scan` + `gdn-wy` (flag on).
+    pub const GDN_WY: u8 = 37;
 
     /// Column names, indexed by id. `""` is a column that nothing stamps.
     pub const NAMES: [&str; MAX] = [
@@ -535,7 +539,7 @@ pub mod probe {
         "hc-reduce",
         "hc-up",
         "hc-gated",
-        "",
+        "gdn-wy",
         "",
         "",
     ];

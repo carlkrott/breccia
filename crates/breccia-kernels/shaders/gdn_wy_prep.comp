@@ -1,0 +1,143 @@
+#version 450
+//
+// Chunkwise (WY / UT-transform) gated delta rule, kernel A: everything in a chunk
+// that does NOT depend on the carried state. One workgroup per (chunk, v-head).
+// CPU twin and the algebra: `delta_step_wy` in `src/gdn/cpu.rs`.
+//
+// With G the inclusive cumulative log-decay of the chunk (`gate` is the pre-exp
+// value, <= 0, so every `exp(G_t - G_s)` with s <= t is <= 1):
+//
+//   A[t][s]  = beta_t (k_t . k_s) e^{G_t - G_s}          s < t   (strictly lower)
+//   X        = (I + A)^-1 B     forward substitution:  X_t = B_t - sum_{s<t} A[t][s] X_s
+//   W        = X (beta e^G k)                           -> WO  [T, h_v*S]
+//   U        = X (beta v)                               -> UO  [T, h_v*S]
+//   Qk[t][s] = (q_t . k_s) e^{G_t - G_s}                s <= t  -> QKS [chunk, h_v, C, C]
+//
+// Kernel B (`gdn_wy_scan.comp`) turns these plus the carried state into D, the
+// output and the new state. Rows t >= n of a partial last chunk are padded with
+// g = beta = q = k = v = 0, an exact no-op, so a partial chunk needs no tail path.
+//
+// # LDS (C = 64, S = 128): 49 920 B < 64 KiB
+//
+//   Kt  64 x 129 f32  K tile, stride 129 so `Kt[s*129 + i]` is conflict-free
+//   Am  64 x 64  f32  A
+//   gc, bt 64 f32     cumulative G, beta
+//
+// The forward substitution has one thread per column `c` of the 128-wide rows and
+// runs IN PLACE in `Kt[.*129 + c]`: that slot holds k_t[c] (the W right-hand side
+// is beta e^G k) and is then overwritten by X_t[c]. Each thread touches only its
+// own column, so there is no barrier between the two passes (U reloads v from
+// global). No subgroup ops: correct on Wave32 and Wave64.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer Qkv { float QKV[]; };   // [T, channels]
+layout(std430, binding = 1) readonly buffer GateVec { float GATE[]; }; // [T, h_v]
+layout(std430, binding = 2) readonly buffer BetaVec { float BETA[]; }; // [T, h_v]
+layout(std430, binding = 3) writeonly buffer WOut { float WO[]; };  // [T, h_v*S]
+layout(std430, binding = 4) writeonly buffer UOut { float UO[]; };  // [T, h_v*S]
+layout(std430, binding = 5) writeonly buffer QkOut { float QKS[]; }; // [chunks*h_v, C, C]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint h_k;      // 16
+    uint h_v;      // 48
+    uint channels; // 2*h_k*S + h_v*S
+    uint pad0;
+    uint pad1;
+    uint pad2;
+    uint pad3;
+} pc;
+
+#define WG_X_MAX 65535u
+#define CH 64u   // chunk size C; mirrored by `WY_C` in `src/gdn/mod.rs`
+#define SD 128u  // head dim S (asserted == MODEL_S in `src/gdn/mod.rs`)
+#define KS 129u  // Kt row stride
+
+shared float Kt[CH * KS];
+shared float Am[CH * CH];
+shared float gc[CH];
+shared float bt[CH];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint unit = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint chunk = unit / pc.h_v;
+    uint h = unit - chunk * pc.h_v;
+    uint gh = h % pc.h_k; // MODULO pairing, as gdn_step.comp
+    uint c0 = chunk * CH;
+    uint n = min(CH, pc.tokens - c0); // live rows in this chunk, >= 1
+
+    uint q_base = gh * SD;
+    uint k_base = pc.h_k * SD + gh * SD;
+    uint v_base = 2u * pc.h_k * SD + h * SD;
+    uint vd = pc.h_v * SD;
+
+    if (tid < CH) {
+        float g = 0.0;
+        uint last = min(tid, n - 1u); // padded rows keep the last live G
+        for (uint u = 0u; u <= last; ++u) {
+            g += GATE[(c0 + u) * pc.h_v + h];
+        }
+        gc[tid] = g;
+        bt[tid] = tid < n ? BETA[(c0 + tid) * pc.h_v + h] : 0.0;
+    }
+    for (uint idx = tid; idx < CH * SD; idx += 128u) {
+        uint t = idx / SD;
+        uint i = idx - t * SD;
+        Kt[t * KS + i] = t < n ? QKV[(c0 + t) * pc.channels + k_base + i] : 0.0;
+    }
+    barrier();
+
+    // ---- A (lanes 0..63) and Qk (lanes 64..127): lane = key row s ----------
+    uint s = tid % CH;
+    bool isq = tid >= CH;
+    uint qoff = unit * CH * CH;
+    for (uint t = 0u; t < CH; ++t) {
+        float val = 0.0;
+        if (s <= t) {
+            float acc = 0.0;
+            if (!isq) {
+                for (uint i = 0u; i < SD; ++i) {
+                    acc += Kt[t * KS + i] * Kt[s * KS + i];
+                }
+            } else if (t < n) {
+                uint qrow = (c0 + t) * pc.channels + q_base;
+                for (uint i = 0u; i < SD; ++i) {
+                    acc += QKV[qrow + i] * Kt[s * KS + i];
+                }
+            }
+            float e = exp(gc[t] - gc[s]);
+            val = isq ? acc * e : (s < t ? bt[t] * acc * e : 0.0);
+        }
+        if (isq) {
+            QKS[qoff + t * CH + s] = val;
+        } else {
+            Am[t * CH + s] = val;
+        }
+    }
+    barrier();
+
+    // ---- W: X = (I+A)^-1 (beta e^G k), in place in this thread's Kt column ---
+    for (uint t = 0u; t < CH; ++t) {
+        float x = Kt[t * KS + tid] * (bt[t] * exp(gc[t]));
+        for (uint u = 0u; u < t; ++u) {
+            x -= Am[t * CH + u] * Kt[u * KS + tid];
+        }
+        Kt[t * KS + tid] = x;
+        if (t < n) {
+            WO[(c0 + t) * vd + h * SD + tid] = x;
+        }
+    }
+    // ---- U: X = (I+A)^-1 (beta v), same slots, v reloaded from global --------
+    for (uint t = 0u; t < CH; ++t) {
+        float x = t < n ? bt[t] * QKV[(c0 + t) * pc.channels + v_base + tid] : 0.0;
+        for (uint u = 0u; u < t; ++u) {
+            x -= Am[t * CH + u] * Kt[u * KS + tid];
+        }
+        Kt[t * KS + tid] = x;
+        if (t < n) {
+            UO[(c0 + t) * vd + h * SD + tid] = x;
+        }
+    }
+}

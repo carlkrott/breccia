@@ -109,6 +109,8 @@ const SHADERS: &[&str] = &[
     "gdn_qk_l2",
     "gdn_gate",
     "gdn_step",
+    "gdn_wy_prep",
+    "gdn_wy_scan",
     "gdn_norm_gate",
     // QSA attention + lightning indexer (`src/qsa`, docs/phase-3/06).
     "qsa_q_norm",
