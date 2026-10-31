@@ -115,6 +115,40 @@ const GPU_PROBE_BATCHES: usize = 256;
 /// batches so short that the submissions dominate.
 const MERGED_BATCH_CAP: u32 = 6000;
 
+/// `BRECCIA_PF_MICRO=2` tick state (see [`Session::prefill_micro`]): one half-step of
+/// the two-micro-batch pipeline while its expert half runs on the helper card.
+struct MicroTick {
+    n: usize,
+    th: usize,
+    pos0: usize,
+    /// The block card's in-flight segment (B(n-1) then A(n+1)), waited for after the
+    /// expert half returns.
+    seg: Option<breccia_kernels::batch_cmd::Segment>,
+    start: std::time::Instant,
+    launch_end: std::time::Instant,
+    bound_s: f64,
+    launch_s: f64,
+}
+
+/// The MoE result of the previous half-step, on its way back to the block card's
+/// `pf.out`: the write is deferred to the tick boundary, when that card is idle.
+enum MicroUp {
+    Bytes(Vec<u8>),
+    Imported(u64),
+}
+
+/// What [`Session::merged_plan`] decides for one block of the merged prefill.
+struct MergedPlan<'m> {
+    pe: Option<&'m crate::model::PlacedExperts>,
+    gate_ty: QuantType,
+    up_ty: QuantType,
+    down_ty: QuantType,
+    streamed: bool,
+    xdev: Option<usize>,
+    shared_chunk: bool,
+    hc_chunk: bool,
+}
+
 /// One row of [`Session::gpu_time_table`]: a stage's GPU execution time for one
 /// decode step.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -603,6 +637,18 @@ pub struct Session<'m> {
     /// `BRECCIA_PF_HCCHUNK`: the T-token HC workspaces over `r_chunk`, one per chunk
     /// size (the batched GEMV row maps are built for an exact `T`).
     hc_chunk_ws: Vec<Vec<HcWorkspace>>,
+    /// `BRECCIA_PF_MICRO=2`: when `Some`, [`Session::prefill_block_merged`] runs only
+    /// the expert half of the block (the block card's dense halves are recorded by
+    /// [`Session::micro_launch`]).
+    micro: Option<MicroTick>,
+    micro_up: Option<MicroUp>,
+    /// Per micro-batch half: its residual chunk and its hc workspaces, swapped into
+    /// `r_chunk` / `hc_chunk_ws` while that half's dense steps are recorded.
+    micro_rc: [Option<Buf>; 2],
+    micro_hcws: [Vec<HcWorkspace>; 2],
+    /// Wait helpers see only this device while the helper card's expert half runs
+    /// beside the block card's submitted segment.
+    wait_scope: Option<usize>,
     /// Per device, the [`PF_FLAGS`] this session runs ([`pf_resolve`]); public so
     /// `breccia profile --prefill` can A/B them in one process.
     pub pf: Vec<[bool; 5]>,
@@ -1120,6 +1166,11 @@ impl<'m> Session<'m> {
             qsa_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
             gdn_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
             hc_chunk_ws: (0..model.devices.len()).map(|_| Vec::new()).collect(),
+            micro: None,
+            micro_up: None,
+            micro_rc: [None, None],
+            micro_hcws: [Vec::new(), Vec::new()],
+            wait_scope: None,
             pf: pf_resolve(model),
             mixer_from_chunk: None,
             pf_ple_prefetch_s: 0.0,
@@ -1194,6 +1245,9 @@ impl<'m> Session<'m> {
 
     /// This session's devices (one model's placement).
     fn device_gpus(&self) -> Vec<&breccia_vk::ctx::Gpu> {
+        if let Some(d) = self.wait_scope {
+            return vec![self.model.devices[d].gpu()];
+        }
         self.model.devices.iter().map(|d| d.gpu()).collect()
     }
 
@@ -2414,11 +2468,22 @@ impl<'m> Session<'m> {
         self.flush()?;
         self.timers.mark(PLE);
 
-        for b in 0..mc.n_layers {
-            if b > 0 && m.device_of(b - 1) != m.device_of(b) {
-                self.handoff_slots(m.device_of(b - 1), m.device_of(b), t)?;
+        let micro_blocked = if pf_micro() { self.micro_blocker(t, pos0) } else { Some(String::new()) };
+        if let Some(why) = micro_blocked.as_ref().filter(|w| !w.is_empty()) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("breccia: BRECCIA_PF_MICRO=2 off for this prefill: {why}");
             }
-            self.prefill_block(b, t, pos0)?;
+        }
+        if micro_blocked.is_none() {
+            self.prefill_micro(t, pos0)?;
+        } else {
+            for b in 0..mc.n_layers {
+                if b > 0 && m.device_of(b - 1) != m.device_of(b) {
+                    self.handoff_slots(m.device_of(b - 1), m.device_of(b), t)?;
+                }
+                self.prefill_block(b, t, pos0)?;
+            }
         }
         // `BRECCIA_TRACE_PREFILL=1`: the chunk's own stage split, ms per prompt
         // token, so "the dense chain" and "the expert lane" are numbers and not
@@ -2942,20 +3007,16 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
-    fn prefill_block_merged(
-        &mut self,
+    /// What the merged prefill does for block `b`: where its experts run and which
+    /// chunk-wide paths are available. Shared by [`Session::prefill_block_merged`] and
+    /// the `BRECCIA_PF_MICRO` eligibility check.
+    fn merged_plan(
+        &self,
         b: usize,
-        t: usize,
-        pos0: usize,
+        dev: usize,
         pe: Option<&'m crate::model::PlacedExperts>,
-    ) -> Result<()> {
+    ) -> MergedPlan<'m> {
         let m = self.model;
-        let mc = &m.cfg;
-        let dev = m.device_of(b);
-        let n_embd = mc.n_embd;
-        let n_ff = mc.n_ff;
-        let k = mc.n_expert_used;
-        let gpu = m.devices[dev].gpu();
         let plan = &m.layers[b].experts;
         // §11f: with `BRECCIA_PF_EXPERT_DEVICE` a resident block's experts stream to
         // the expert device too: the RX's streamed GEMM beats the MI50's arena GEMM
@@ -2989,25 +3050,6 @@ impl<'m> Session<'m> {
             .filter(|&x| {
                 streamed && x != dev && x < m.devices.len() && self.venues[x].pf.is_some()
             });
-        // Each expert's blob, in the 16-bit words the GEMM's base push constant
-        // takes (the arena holds all 512 experts back to back).
-        let words = |ty: breccia_kernels::QuantType, rows: usize, cols: usize| -> u32 {
-            let bytes = rows * cols.div_ceil(ty.block_elems()) * ty.block_bytes();
-            assert!(
-                bytes.is_multiple_of(2),
-                "an expert blob must be a whole u16 word count"
-            );
-            (bytes / 2) as u32
-        };
-        let (wgate, wup, wdown) = (
-            words(gate_ty, n_ff, n_embd),
-            words(up_ty, n_ff, n_embd),
-            words(down_ty, n_embd, n_ff),
-        );
-        let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
-        let disp_before = self.dispatches;
-        let overlap = self.pf[dev][PF_OVERLAP];
-
         // The chunk-level shared expert needs a multi-user GEMM for all three roles.
         let shared_chunk = self.pf[dev][PF_SHCHUNK] && {
             let moe = &m.layers[b].moe;
@@ -3028,84 +3070,151 @@ impl<'m> Session<'m> {
                 pipes.gemm(moe.router.key.ty).is_some()
                     && pipes.gemm(moe.shexp_gate.key.ty).is_some()
             };
-
-        // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
-        self.ensure_batch(dev)?;
-        // The block's mixer for the whole chunk at once: every token's attn-mixed
-        // row into `pf.mixed`, one T-token forward into `pf.out`; the per-token
-        // prelude below recomputes HC_READ(attn) (its inject partials feed
-        // HC_WRITE) and copies its `pf.out` row in place of the mixer.
-        if hc_chunk {
-            self.record_hc_chunk(b, dev, t, pos0)?;
-        } else {
-            if self.mixer_chunked(b, dev) {
-                self.record_mixer_chunk(b, dev, t, pos0, false)?;
-                self.mixer_from_chunk = Some(pos0);
-            }
-            self.shared_deferred = shared_chunk;
-            for i in 0..t {
-                self.swap_r_in(dev, i);
-                let prelude = self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace);
-                if let Err(e) = prelude {
-                    self.shared_deferred = false;
-                    self.mixer_from_chunk = None;
-                    return Err(e);
-                }
-                {
-                    let v = &self.venues[dev];
-                    let pf = v.pf.as_ref().expect("the merged prefill scratch");
-                    let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-                    let kb = (k * 4) as u64;
-                    let nb = (n_embd * 4) as u64;
-                    let inject = (
-                        &v.inject_slots[i],
-                        0,
-                        &ws.inject,
-                        0,
-                        ((mc.hc * v.hc.inject_chunks() * 4) as u64).min(ws.inject.size),
-                    );
-                    // Six copies, one region array (and one barrier) per token. The
-                    // ffn `HC_WRITE` moves to pass 2, so this token's inject partials
-                    // (the last region) have to survive the rest of the chunk.
-                    let mut regions = vec![
-                        (&pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb),
-                        (&pf.w, i as u64 * kb, &v.router_w, 0, kb),
-                        (&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb),
-                        (&pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4),
-                        inject,
-                    ];
-                    if !shared_chunk {
-                        regions.push((&pf.shared, i as u64 * nb, &v.sh, 0, nb));
-                    }
-                    batch_cmd::record_copies(gpu, &regions)?;
-                }
-                self.swap_r_in(dev, i);
-                if batch_cmd::recorded() >= MERGED_BATCH_CAP {
-                    if overlap {
-                        self.reopen_batch(dev)?;
-                    } else {
-                        self.flush()?;
-                        self.ensure_batch(dev)?;
-                    }
-                }
-            }
-            self.shared_deferred = false;
-            self.mixer_from_chunk = None;
+        MergedPlan {
+            pe,
+            gate_ty,
+            up_ty,
+            down_ty,
+            streamed,
+            xdev,
+            shared_chunk,
+            hc_chunk,
         }
+    }
+
+    fn prefill_block_merged(
+        &mut self,
+        b: usize,
+        t: usize,
+        pos0: usize,
+        pe: Option<&'m crate::model::PlacedExperts>,
+    ) -> Result<()> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let dev = m.device_of(b);
+        let n_embd = mc.n_embd;
+        let n_ff = mc.n_ff;
+        let k = mc.n_expert_used;
+        let gpu = m.devices[dev].gpu();
+        let MergedPlan {
+            pe,
+            gate_ty,
+            up_ty,
+            down_ty,
+            streamed,
+            xdev,
+            shared_chunk,
+            hc_chunk,
+        } = self.merged_plan(b, dev, pe);
+        let micro = self.micro.is_some();
+        // Each expert's blob, in the 16-bit words the GEMM's base push constant
+        // takes (the arena holds all 512 experts back to back).
+        let words = |ty: breccia_kernels::QuantType, rows: usize, cols: usize| -> u32 {
+            let bytes = rows * cols.div_ceil(ty.block_elems()) * ty.block_bytes();
+            assert!(
+                bytes.is_multiple_of(2),
+                "an expert blob must be a whole u16 word count"
+            );
+            (bytes / 2) as u32
+        };
+        let (wgate, wup, wdown) = (
+            words(gate_ty, n_ff, n_embd),
+            words(up_ty, n_ff, n_embd),
+            words(down_ty, n_embd, n_ff),
+        );
+        let mut no_trace: Option<&mut Vec<LayerTrace>> = None;
+        let disp_before = self.dispatches;
+        let overlap = self.pf[dev][PF_OVERLAP];
+
         // With an expert device the chunk shared expert waits until the routed
         // GEMMs are submitted there, so this card runs it under them (§12 #10).
-        // `BRECCIA_PF_SHARED_UNDER=0` keeps it here.
-        let defer_shared = shared_chunk
+        // `BRECCIA_PF_SHARED_UNDER=0` keeps it here. A micro-batch half records it
+        // with its dense chain instead (`BRECCIA_PF_MICRO`).
+        let defer_shared = !micro
+            && shared_chunk
             && xdev.is_some()
             && std::env::var("BRECCIA_PF_SHARED_UNDER").as_deref() != Ok("0");
-        if shared_chunk && !defer_shared {
-            self.record_shared_chunk(b, dev, t)?;
+        let bound_t0 = std::time::Instant::now();
+
+        // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
+        if !micro {
+            self.ensure_batch(dev)?;
+            // The block's mixer for the whole chunk at once: every token's attn-mixed
+            // row into `pf.mixed`, one T-token forward into `pf.out`; the per-token
+            // prelude below recomputes HC_READ(attn) (its inject partials feed
+            // HC_WRITE) and copies its `pf.out` row in place of the mixer.
+            if hc_chunk {
+                self.record_hc_chunk(b, dev, t, pos0)?;
+            } else {
+                if self.mixer_chunked(b, dev) {
+                    self.record_mixer_chunk(b, dev, t, pos0, false)?;
+                    self.mixer_from_chunk = Some(pos0);
+                }
+                self.shared_deferred = shared_chunk;
+                for i in 0..t {
+                    self.swap_r_in(dev, i);
+                    let prelude = self.record_dense_prelude(b, dev, pos0 + i, &mut no_trace);
+                    if let Err(e) = prelude {
+                        self.shared_deferred = false;
+                        self.mixer_from_chunk = None;
+                        return Err(e);
+                    }
+                    {
+                        let v = &self.venues[dev];
+                        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                        let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                        let kb = (k * 4) as u64;
+                        let nb = (n_embd * 4) as u64;
+                        let inject = (
+                            &v.inject_slots[i],
+                            0,
+                            &ws.inject,
+                            0,
+                            ((mc.hc * v.hc.inject_chunks() * 4) as u64).min(ws.inject.size),
+                        );
+                        // Six copies, one region array (and one barrier) per token. The
+                        // ffn `HC_WRITE` moves to pass 2, so this token's inject partials
+                        // (the last region) have to survive the rest of the chunk.
+                        let mut regions = vec![
+                            (&pf.ids.buf, i as u64 * kb, &v.router_ids, 0, kb),
+                            (&pf.w, i as u64 * kb, &v.router_w, 0, kb),
+                            (&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb),
+                            (&pf.gate, i as u64 * 4, &v.sh_gate_logit, 0, 4),
+                            inject,
+                        ];
+                        if !shared_chunk {
+                            regions.push((&pf.shared, i as u64 * nb, &v.sh, 0, nb));
+                        }
+                        batch_cmd::record_copies(gpu, &regions)?;
+                    }
+                    self.swap_r_in(dev, i);
+                    if batch_cmd::recorded() >= MERGED_BATCH_CAP {
+                        if overlap {
+                            self.reopen_batch(dev)?;
+                        } else {
+                            self.flush()?;
+                            self.ensure_batch(dev)?;
+                        }
+                    }
+                }
+                self.shared_deferred = false;
+                self.mixer_from_chunk = None;
+            }
+            if shared_chunk && !defer_shared {
+                self.record_shared_chunk(b, dev, t)?;
+            }
+            batch_cmd::record_barrier_to_host(gpu)?;
+            self.submit_batch()?;
+            self.flush()?;
         }
-        batch_cmd::record_barrier_to_host(gpu)?;
-        self.submit_batch()?;
-        self.flush()?;
 
         // ---- the bucket list: per distinct expert, its users -----------------
+        // A micro-batch tick starts with both cards idle: the previous half-step's
+        // MoE result goes up to the block card before anything else is shipped
+        // (the imported path's host region is shared with the ship below).
+        if micro {
+            self.micro_up_write(dev)?;
+        }
         let bucket_t0 = std::time::Instant::now();
         let mut raw = vec![0u8; t * k * 4];
         self.venues[dev]
@@ -3239,6 +3348,9 @@ impl<'m> Session<'m> {
             self.record_shared_chunk(b, dev, t)?;
             batch_cmd::record_barrier_to_host(gpu)?;
             self.reopen_batch(edev)?;
+        }
+        if micro {
+            self.micro_launch(edev, bound_t0)?;
         }
 
         // ---- the expert GEMMs: three per (distinct expert, group of <= 8) -----
@@ -3427,6 +3539,8 @@ impl<'m> Session<'m> {
         }
         if let Some(x) = xdev {
             // The MoE result back into the block device's `pf.out` (pass 2 reads it).
+            // A micro-batch tick only reads it off the helper: the block card is busy
+            // and takes it at the next tick boundary (`micro_up_write`).
             self.submit_batch()?;
             self.flush()?;
             let t0 = std::time::Instant::now();
@@ -3436,68 +3550,82 @@ impl<'m> Session<'m> {
                 let imp = self.ship_imp.as_ref().expect("ship_ready");
                 let n = (t * n_embd * 4) as u64;
                 ship_p[2] = crate::xfer::copy_fenced(egpu, &[(&xpf.out, imp.get(x), 0, 0, n)])?;
-                ship_p[3] = crate::xfer::copy_fenced(gpu, &[(imp.get(dev), &pf.out, 0, 0, n)])?;
+                if micro {
+                    self.micro_up = Some(MicroUp::Imported(n));
+                } else {
+                    ship_p[3] = crate::xfer::copy_fenced(gpu, &[(imp.get(dev), &pf.out, 0, 0, n)])?;
+                }
             } else {
                 let bytes = self.stagings[x].read_batch(egpu, &[(&xpf.out, 0, t * n_embd * 4)])?;
                 ship_p[2] = t0.elapsed().as_secs_f64();
-                ship_p[3] = self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
+                if micro {
+                    self.micro_up = bytes.into_iter().next().map(MicroUp::Bytes);
+                } else {
+                    ship_p[3] = self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
+                }
             }
             ship_s += t0.elapsed().as_secs_f64();
-            self.ensure_batch(dev)?;
+            if !micro {
+                self.ensure_batch(dev)?;
+            }
         }
-        {
-            let v = &self.venues[dev];
-            let pf = v.pf.as_ref().expect("the merged prefill scratch");
-            let rows: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
-                .map(|i| {
-                    (
-                        &v.moe_out[i].buf,
-                        0u64,
-                        &pf.out,
-                        (i * n_embd * 4) as u64,
-                        (n_embd * 4) as u64,
-                    )
-                })
-                .collect();
-            batch_cmd::record_copies(gpu, &rows)?;
-            self.dev_up[dev] += (t * n_embd * 4) as u64;
+        if !micro {
+            {
+                let v = &self.venues[dev];
+                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let rows: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
+                    .map(|i| {
+                        (
+                            &v.moe_out[i].buf,
+                            0u64,
+                            &pf.out,
+                            (i * n_embd * 4) as u64,
+                            (n_embd * 4) as u64,
+                        )
+                    })
+                    .collect();
+                batch_cmd::record_copies(gpu, &rows)?;
+                self.dev_up[dev] += (t * n_embd * 4) as u64;
+            }
         }
         self.submit_batch()?;
         self.flush()?;
         let fanin_s = t_fan.elapsed().as_secs_f64();
 
         // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
-        self.timers.mark(HC_WRITE_F);
-        self.ensure_batch(dev)?;
-        if hc_chunk {
-            // One T-token HC_WRITE (the ffn inject partials are still in the chunk
-            // workspace), then the residual back into the per-token slots.
-            let v = &self.venues[dev];
-            let rc = v.r_chunk.as_ref().expect("checked above");
-            let ws = self
-                .hc_chunk_ws[dev]
-                .iter()
-                .find(|w| w.tokens == t)
-                .expect("made in pass 1");
-            let pf = v.pf.as_ref().expect("the merged prefill scratch");
-            v.hc.write(ws, rc, &pf.out, rc)?;
-            let hb = (mc.hc_dim() * 4) as u64;
-            let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
-                .map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb))
-                .collect();
-            batch_cmd::record_copies(gpu, &scatter)?;
+        if !micro {
+            self.timers.mark(HC_WRITE_F);
+            self.ensure_batch(dev)?;
+            if hc_chunk {
+                // One T-token HC_WRITE (the ffn inject partials are still in the chunk
+                // workspace), then the residual back into the per-token slots.
+                let v = &self.venues[dev];
+                let rc = v.r_chunk.as_ref().expect("checked above");
+                let ws = self
+                    .hc_chunk_ws[dev]
+                    .iter()
+                    .find(|w| w.tokens == t)
+                    .expect("made in pass 1");
+                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                v.hc.write(ws, rc, &pf.out, rc)?;
+                let hb = (mc.hc_dim() * 4) as u64;
+                let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
+                    .map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb))
+                    .collect();
+                batch_cmd::record_copies(gpu, &scatter)?;
+            }
+            for i in (0..t).filter(|_| !hc_chunk) {
+                self.swap_r_in(dev, i);
+                self.swap_inject_in(dev, i);
+                let v = &self.venues[dev];
+                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                v.hc.write(ws, &v.r, &v.moe_out[i].buf, &v.r)?;
+                self.swap_inject_in(dev, i);
+                self.swap_r_in(dev, i);
+            }
+            self.submit_batch()?;
+            self.flush()?;
         }
-        for i in (0..t).filter(|_| !hc_chunk) {
-            self.swap_r_in(dev, i);
-            self.swap_inject_in(dev, i);
-            let v = &self.venues[dev];
-            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-            v.hc.write(ws, &v.r, &v.moe_out[i].buf, &v.r)?;
-            self.swap_inject_in(dev, i);
-            self.swap_r_in(dev, i);
-        }
-        self.submit_batch()?;
-        self.flush()?;
 
         // ---- the counters (§8v): per chunk, per block ------------------------
         let dispatches = self.dispatches - disp_before;
@@ -3536,6 +3664,305 @@ impl<'m> Session<'m> {
                 sf * 1e3,
                 sw * 1e3,
                 bucket_s * 1e3
+            );
+        }
+        Ok(())
+    }
+
+    // ---- BRECCIA_PF_MICRO=2: the two-micro-batch pipeline ---------------------------
+    //
+    // Half-steps n = 2b + h (block b, token half h). A(n) is the block card's pass 1
+    // (dense chain, router, chunk shared expert), X(n) the helper's routed experts and
+    // fan-in, B(n) the block card's ffn HC_WRITE. One tick runs X(n) on the helper
+    // while the block card runs B(n-1) then A(n+1) as one submitted segment:
+    //   A(b+1,h) needs B(b,h)      -> same segment, in order;
+    //   A(b,1)   needs A(b,0)'s KV -> an earlier tick (every tick ends with both cards idle).
+    // Both cards are idle at every tick boundary, so `pf.*`, the expert stream slots
+    // and the QSA/GDN chunk workspaces each have one producer and one consumer at a
+    // time; only `r_chunk` and the hc workspaces (which live from A(n) to B(n)) are
+    // doubled, and `r_slots` is windowed per half. Host-staged copies only.
+
+    /// Swap half `h`'s residual chunk, hc workspaces and `r_slots` / token window
+    /// into place (`enter`) or back out. Always call it a second time with `false`.
+    fn micro_ctx(&mut self, dev: usize, h: usize, th: usize, enter: bool) -> Result<()> {
+        if enter && self.micro_rc[h].is_none() {
+            let gpu = self.model.devices[dev].gpu();
+            let bytes = self.venues[dev].r_chunk.as_ref().map_or(0, |b| b.size) / 2;
+            self.micro_rc[h] = Some(
+                breccia_kernels::gemv::alloc(gpu, bytes)
+                    .context("allocating the micro-batch residual chunk")?,
+            );
+        }
+        std::mem::swap(&mut self.venues[dev].r_chunk, &mut self.micro_rc[h]);
+        std::mem::swap(&mut self.hc_chunk_ws[dev], &mut self.micro_hcws[h]);
+        if h == 1 {
+            if enter {
+                self.venues[dev].r_slots.rotate_left(th);
+                self.pf_toks.rotate_left(th);
+            } else {
+                self.venues[dev].r_slots.rotate_right(th);
+                self.pf_toks.rotate_right(th);
+            }
+        }
+        Ok(())
+    }
+
+    /// Record A(n) into the open batch (half context already in place).
+    fn micro_record_a(&mut self, n: usize, th: usize, pos0: usize) -> Result<()> {
+        let (b, h) = (n / 2, n % 2);
+        let dev = self.model.device_of(b);
+        self.record_hc_chunk(b, dev, th, pos0 + h * th)?;
+        self.record_shared_chunk(b, dev, th)
+    }
+
+    /// Record B: the ffn `HC_WRITE` over `pf.out` and the residual back into the
+    /// half's `r_slots` window (the unfused pass 2 of `prefill_block_merged`).
+    fn micro_record_b(&mut self, dev: usize, th: usize) -> Result<()> {
+        let m = self.model;
+        let gpu = m.devices[dev].gpu();
+        let v = &self.venues[dev];
+        let rc = v.r_chunk.as_ref().expect("checked by micro_blocker");
+        let ws = self.hc_chunk_ws[dev]
+            .iter()
+            .find(|w| w.tokens == th)
+            .expect("made by A of the same half");
+        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        v.hc.write(ws, rc, &pf.out, rc)?;
+        let hb = (m.cfg.hc_dim() * 4) as u64;
+        let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..th)
+            .map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb))
+            .collect();
+        batch_cmd::record_copies(gpu, &scatter)
+    }
+
+    /// The previous half-step's MoE result onto the block card's `pf.out` (both cards
+    /// idle, nothing open on the block card).
+    fn micro_up_write(&mut self, dev: usize) -> Result<()> {
+        let m = self.model;
+        let gpu = m.devices[dev].gpu();
+        let Some(up) = self.micro_up.take() else {
+            return Ok(());
+        };
+        let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+        match up {
+            MicroUp::Bytes(b) => {
+                self.stagings[dev].write_regions(gpu, &[(&pf.out, 0, b.as_slice())])?;
+            }
+            MicroUp::Imported(n) => {
+                let imp = self.ship_imp.as_ref().expect("ship_ready");
+                crate::xfer::copy_fenced(gpu, &[(imp.get(dev), &pf.out, 0, 0, n)])?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Submit B(n-1) then A(n+1) on the block card without waiting, park the segment
+    /// in the tick, and scope waits to the helper until the tick ends.
+    fn micro_launch(&mut self, edev: usize, bound_t0: std::time::Instant) -> Result<()> {
+        let t0 = std::time::Instant::now();
+        let (n, th, pos0) = {
+            let tk = self.micro.as_mut().expect("a micro tick");
+            tk.bound_s = bound_t0.elapsed().as_secs_f64();
+            (tk.n, tk.th, tk.pos0)
+        };
+        let m = self.model;
+        let steps = 2 * m.cfg.n_layers;
+        let dev = m.device_of(0);
+        // B(n-1) and A(n+1) are the same half.
+        let h = (n + 1) % 2;
+        let (have_b, have_a) = (n >= 1, n + 1 < steps);
+        if have_b || have_a {
+            self.micro_ctx(dev, h, th, true)?;
+            let r = self.micro_launch_inner(n, dev, th, pos0, have_b, have_a);
+            self.micro_ctx(dev, h, th, false)?;
+            r?;
+        }
+        let seg = self.pending_seg.take();
+        self.pending_dev = None;
+        self.wait_scope = Some(edev);
+        let tk = self.micro.as_mut().expect("a micro tick");
+        tk.seg = seg;
+        tk.launch_s = t0.elapsed().as_secs_f64();
+        tk.launch_end = std::time::Instant::now();
+        Ok(())
+    }
+
+    fn micro_launch_inner(
+        &mut self,
+        n: usize,
+        dev: usize,
+        th: usize,
+        pos0: usize,
+        have_b: bool,
+        have_a: bool,
+    ) -> Result<()> {
+        let m = self.model;
+        let gpu = m.devices[dev].gpu();
+        self.ensure_batch(dev)?;
+        if have_b {
+            self.micro_record_b(dev, th)?;
+        }
+        if have_a {
+            let b_a = (n + 1) / 2;
+            if m.cfg.is_ple_layer(b_a) {
+                // PLE is a host round trip over this half's residuals: drain the card
+                // (the helper has not started this tick's experts yet), run it, go on.
+                self.submit_batch()?;
+                self.flush()?;
+                self.ple_chunk(b_a, th)?;
+                self.ensure_batch(dev)?;
+            }
+            self.micro_record_a(n + 1, th, pos0)?;
+        }
+        batch_cmd::record_barrier_to_host(gpu)?;
+        self.submit_batch()
+    }
+
+    /// Why `BRECCIA_PF_MICRO=2` cannot run this chunk (`None`: it can).
+    fn micro_blocker(&self, t: usize, pos0: usize) -> Option<String> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let dev = m.device_of(0);
+        if !self.prefill_merged {
+            return Some("--prefill-merged is off".into());
+        }
+        if t % 2 != 0 || (t / 2) % 4 != 0 || t < 8 || pos0 % 4 != 0 {
+            return Some(format!("chunk t={t} pos0={pos0} does not split into two multiples of 4"));
+        }
+        if self.venues[dev].r_chunk.is_none() || self.venues[dev].pf.is_none() {
+            return Some("no chunk residual / merged scratch".into());
+        }
+        if (0..mc.n_layers).any(|b| m.device_of(b) != dev) {
+            return Some("the blocks span more than one card".into());
+        }
+        if mc.is_ple_layer(0) {
+            return Some("block 0 is a PLE layer".into());
+        }
+        if (0..mc.n_layers).any(|b| mc.is_ple_layer(b))
+            && (self.venues[dev].ple_emb_chunk.is_none()
+                || std::env::var_os("BRECCIA_NO_PLE_BATCH").is_some())
+        {
+            return Some("PLE layers without the batched PLE phase".into());
+        }
+        for b in 0..mc.n_layers {
+            let p = self.merged_plan(b, dev, m.placed.get(&b));
+            let Some(x) = p.xdev else {
+                return Some(format!("block {b} has no expert device (BRECCIA_PF_EXPERT_DEVICE)"));
+            };
+            if !(p.streamed && p.shared_chunk && p.hc_chunk) {
+                return Some(format!("block {b} lacks the streamed / chunked paths"));
+            }
+            let ready = |d: usize| {
+                [p.gate_ty, p.up_ty, p.down_ty]
+                    .iter()
+                    .all(|ty| self.venues[d].pipes.gemm(*ty).is_some())
+            };
+            if !ready(dev) || !ready(x) {
+                return Some(format!("block {b}: a role type has no multi-user GEMM"));
+            }
+        }
+        None
+    }
+
+    /// The block loop of [`Session::prefill`] as a two-half software pipeline.
+    fn prefill_micro(&mut self, t: usize, pos0: usize) -> Result<()> {
+        let r = self.prefill_micro_run(t, pos0);
+        self.wait_scope = None;
+        self.micro_up = None;
+        if let Some(tk) = self.micro.take() {
+            if let Some(seg) = tk.seg {
+                self.pending_seg = Some(seg);
+                self.pending_dev = Some(self.model.device_of(0));
+            }
+            let _ = self.flush();
+        }
+        r
+    }
+
+    fn prefill_micro_run(&mut self, t: usize, pos0: usize) -> Result<()> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let dev = m.device_of(0);
+        let gpu = m.devices[dev].gpu();
+        let th = t / 2;
+        let steps = 2 * mc.n_layers;
+        let trace = std::env::var_os("BRECCIA_TRACE_MERGED").is_some();
+
+        // Prologue: A(0), alone.
+        self.timers.mark(HC_READ_A);
+        self.micro_ctx(dev, 0, th, true)?;
+        let r = (|| {
+            self.ensure_batch(dev)?;
+            self.micro_record_a(0, th, pos0)?;
+            batch_cmd::record_barrier_to_host(gpu)?;
+            self.submit_batch()?;
+            self.flush()
+        })();
+        self.micro_ctx(dev, 0, th, false)?;
+        r?;
+
+        let (mut boundary, mut launch, mut rx, mut wait) = (0f64, 0f64, 0f64, 0f64);
+        for n in 0..steps {
+            let (b, h) = (n / 2, n % 2);
+            self.micro = Some(MicroTick {
+                n,
+                th,
+                pos0,
+                seg: None,
+                start: std::time::Instant::now(),
+                launch_end: std::time::Instant::now(),
+                bound_s: 0.0,
+                launch_s: 0.0,
+            });
+            self.prefill_block_merged(b, th, pos0 + h * th, m.placed.get(&b))?;
+            let rx_end = std::time::Instant::now();
+            let tk = self.micro.take().expect("a micro tick");
+            self.wait_scope = None;
+            self.pending_seg = tk.seg;
+            self.pending_dev = tk.seg.map(|_| dev);
+            let t_w = std::time::Instant::now();
+            self.flush()?;
+            // Host blocked on the block card after the helper finished: the helper idled.
+            let w = t_w.elapsed().as_secs_f64();
+            let rx_s = rx_end.duration_since(tk.launch_end).as_secs_f64();
+            if trace {
+                eprintln!(
+                    "micro n={n:>2} blk {b:>2} half {h} boundary={:.2} ms (both idle) launch={:.2} ms \
+                     rx={:.2} ms mi50_wait={:.2} ms (rx idle) tick={:.2} ms",
+                    tk.bound_s * 1e3,
+                    tk.launch_s * 1e3,
+                    rx_s * 1e3,
+                    w * 1e3,
+                    tk.start.elapsed().as_secs_f64() * 1e3,
+                );
+            }
+            boundary += tk.bound_s;
+            launch += tk.launch_s;
+            rx += rx_s;
+            wait += w;
+        }
+
+        // Epilogue: the last half's MoE result, then B(2L-1), alone.
+        self.micro_up_write(dev)?;
+        self.micro_ctx(dev, 1, th, true)?;
+        let r = (|| {
+            self.ensure_batch(dev)?;
+            self.micro_record_b(dev, th)?;
+            self.submit_batch()?;
+            self.flush()
+        })();
+        self.micro_ctx(dev, 1, th, false)?;
+        r?;
+        if trace {
+            // Exact MI50 busy time needs GPU timestamps (BRECCIA_GPU_TIME); here: the
+            // card idles at least the boundaries, and the helper idles `mi50_wait`.
+            eprintln!(
+                "micro total t={t} ticks={steps}: mi50 idle >= boundary {:.1} ms | launch {:.1} ms | \
+                 rx {:.1} ms | rx idle (mi50_wait) {:.1} ms",
+                boundary * 1e3,
+                launch * 1e3,
+                rx * 1e3,
+                wait * 1e3,
             );
         }
         Ok(())
@@ -4925,6 +5352,15 @@ impl Drop for Session<'_> {
                 self.venues[dev].hc.release(m.devices[dev].gpu(), ws);
             }
         }
+        let d0 = m.device_of(0);
+        for list in self.micro_hcws.iter_mut() {
+            for ws in list.drain(..) {
+                self.venues[d0].hc.release(m.devices[d0].gpu(), ws);
+            }
+        }
+        for rc in self.micro_rc.iter().flatten() {
+            m.devices[d0].gpu().destroy_buf(rc);
+        }
         for (b, ws) in self.qsa_ws.iter_mut().enumerate() {
             if let Some(ws) = ws.take() {
                 let dev = m.device_of(b);
@@ -5111,6 +5547,13 @@ fn pf_group_users() -> usize {
             .filter(|&n: &usize| n > 0)
             .unwrap_or(1024)
     })
+}
+
+/// `BRECCIA_PF_MICRO=2`: split each prefill chunk into two micro-batches and pipeline
+/// them across the block card and the expert helper (default off; only `2` enables).
+fn pf_micro() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_MICRO").as_deref() == Ok("2"))
 }
 
 /// The merged-prefill optimisation flags, in [`Session::pf`] order.
