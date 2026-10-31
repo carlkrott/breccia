@@ -2830,7 +2830,9 @@ impl<'m> Session<'m> {
                 slices.up.len() as u64,
                 slices.down.len() as u64,
             );
-            m.imported_experts.as_ref().and_then(|arena| {
+            // A VRAM-placed block has no blobs (`BRECCIA_PF_EXPERT_ALL`): the mmap.
+            let vram = m.placed.get(&b).is_some_and(|pe| !pe.host_imported);
+            m.imported_experts.as_ref().filter(|_| !vram).and_then(|arena| {
                 // Blob order skips VRAM-resident blocks: the ordinal is b minus
                 // every VRAM-placed block below it (host-imported ones keep blobs).
                 let streamed_before =
@@ -2903,6 +2905,38 @@ impl<'m> Session<'m> {
     /// it replaces (§8v, measured for every `m`), the SwiGLU is elementwise, and the
     /// fan-in is bit-identical to `MoeCombine` in router order — so the generated
     /// tokens must match the token-by-token path exactly.
+    /// The shared expert for the whole chunk: one dispatch per role, `t` users
+    /// over `pf.mixed`; the down GEMM writes `pf.shared` in the fan-in's layout.
+    fn record_shared_chunk(&mut self, b: usize, dev: usize, t: usize) -> Result<()> {
+        self.timers.mark(SHARED);
+        let m = self.model;
+        let (mc, gpu) = (&m.cfg, m.devices[dev].gpu());
+        let n_embd = mc.n_embd;
+        let moe = &m.layers[b].moe;
+        let v = &self.venues[dev];
+        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let n_sh = mc.n_ff_shared;
+        let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked above");
+        match moe.gate_up.as_ref().filter(|w| g(w).has_pair()) {
+            // One dispatch for gate + up + SwiGLU (§11l item 4), bit-identical.
+            Some(gu) => {
+                batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_GATE);
+                g(gu).run_pair(&gu.buf, &pf.mixed, &pf.sh_a, n_sh, n_embd, t)?;
+            }
+            None => {
+                batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_GATE);
+                g(&moe.gate).run(&moe.gate.buf, &pf.mixed, &pf.sh_g, n_sh, n_embd, t)?;
+                batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_UP);
+                g(&moe.up).run(&moe.up.buf, &pf.mixed, &pf.sh_u, n_sh, n_embd, t)?;
+                batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_SWIGLU);
+                v.swiglu.run(&pf.sh_g, &pf.sh_u, &pf.sh_a, t * n_sh)?;
+            }
+        }
+        batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_DOWN);
+        g(&moe.down).run(&moe.down.buf, &pf.sh_a, &pf.shared, n_embd, n_sh, t)?;
+        Ok(())
+    }
+
     fn prefill_block_merged(
         &mut self,
         b: usize,
@@ -2918,6 +2952,20 @@ impl<'m> Session<'m> {
         let k = mc.n_expert_used;
         let gpu = m.devices[dev].gpu();
         let plan = &m.layers[b].experts;
+        // §11f: with `BRECCIA_PF_EXPERT_DEVICE` a resident block's experts stream to
+        // the expert device too: the RX's streamed GEMM beats the MI50's arena GEMM
+        // ~2.5x (KL 1.6e-5 vs the arena, top-1 same). Only when the arena holds the
+        // file types; `BRECCIA_PF_EXPERT_ALL=0` keeps them on the arena.
+        let to_x = std::env::var("BRECCIA_PF_EXPERT_DEVICE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .is_some_and(|x| x != dev && x < m.devices.len() && self.venues[x].pf.is_some());
+        let pe = pe.filter(|p| {
+            !to_x
+                || std::env::var("BRECCIA_PF_EXPERT_ALL").as_deref() == Ok("0")
+                || (p.gate.key.ty, p.up.key.ty, p.down.key.ty)
+                    != (plan.gate.ty, plan.up.ty, plan.down.ty)
+        });
         let (gate_ty, up_ty, down_ty) = match pe {
             Some(pe) => (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty),
             None => (plan.gate.ty, plan.up.ty, plan.down.ty),
@@ -2926,6 +2974,16 @@ impl<'m> Session<'m> {
         // copied once per chunk out of the mmap into a host-visible slot and then
         // to the device, and the multi-user GEMM runs on them with base 0.
         let streamed = pe.is_none();
+        // §11f dual-card prototype: `BRECCIA_PF_EXPERT_DEVICE=<ordinal>` runs a
+        // streamed block's expert GEMMs and fan-in on that device instead (the RX
+        // streams experts over x16, the MI50 over x4). Host-staged both ways: the
+        // fan-in's inputs go out, `pf.out` comes back — no GPU-to-GPU copy.
+        let xdev = std::env::var("BRECCIA_PF_EXPERT_DEVICE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&x| {
+                streamed && x != dev && x < m.devices.len() && self.venues[x].pf.is_some()
+            });
         // Each expert's blob, in the 16-bit words the GEMM's base push constant
         // takes (the arena holds all 512 experts back to back).
         let words = |ty: breccia_kernels::QuantType, rows: usize, cols: usize| -> u32 {
@@ -3029,32 +3087,14 @@ impl<'m> Session<'m> {
             self.shared_deferred = false;
             self.mixer_from_chunk = None;
         }
-        // The shared expert for the whole chunk: one dispatch per role, `t` users
-        // over `pf.mixed`; the down GEMM writes `pf.shared` in the fan-in's layout.
-        if shared_chunk {
-            self.timers.mark(SHARED);
-            let moe = &m.layers[b].moe;
-            let v = &self.venues[dev];
-            let pf = v.pf.as_ref().expect("the merged prefill scratch");
-            let n_sh = mc.n_ff_shared;
-            let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked above");
-            match moe.gate_up.as_ref().filter(|w| g(w).has_pair()) {
-                // One dispatch for gate + up + SwiGLU (§11l item 4), bit-identical.
-                Some(gu) => {
-                    batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_GATE);
-                    g(gu).run_pair(&gu.buf, &pf.mixed, &pf.sh_a, n_sh, n_embd, t)?;
-                }
-                None => {
-                    batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_GATE);
-                    g(&moe.gate).run(&moe.gate.buf, &pf.mixed, &pf.sh_g, n_sh, n_embd, t)?;
-                    batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_UP);
-                    g(&moe.up).run(&moe.up.buf, &pf.mixed, &pf.sh_u, n_sh, n_embd, t)?;
-                    batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_SWIGLU);
-                    v.swiglu.run(&pf.sh_g, &pf.sh_u, &pf.sh_a, t * n_sh)?;
-                }
-            }
-            batch_cmd::probe::enter(gpu, batch_cmd::probe::SH_DOWN);
-            g(&moe.down).run(&moe.down.buf, &pf.sh_a, &pf.shared, n_embd, n_sh, t)?;
+        // With an expert device the chunk shared expert waits until the routed
+        // GEMMs are submitted there, so this card runs it under them (§12 #10).
+        // `BRECCIA_PF_SHARED_UNDER=0` keeps it here.
+        let defer_shared = shared_chunk
+            && xdev.is_some()
+            && std::env::var("BRECCIA_PF_SHARED_UNDER").as_deref() != Ok("0");
+        if shared_chunk && !defer_shared {
+            self.record_shared_chunk(b, dev, t)?;
         }
         batch_cmd::record_barrier_to_host(gpu)?;
         self.submit_batch()?;
@@ -3121,16 +3161,6 @@ impl<'m> Session<'m> {
             .slots
             .write(&slot_bytes)?;
 
-        // §11f dual-card prototype: `BRECCIA_PF_EXPERT_DEVICE=<ordinal>` runs a
-        // streamed block's expert GEMMs and fan-in on that device instead (the RX
-        // streams experts over x16, the MI50 over x4). Host-staged both ways: the
-        // fan-in's inputs go out, `pf.out` comes back — no GPU-to-GPU copy.
-        let xdev = std::env::var("BRECCIA_PF_EXPERT_DEVICE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&x| {
-                streamed && x != dev && x < m.devices.len() && self.venues[x].pf.is_some()
-            });
         let mut ship_s = 0.0f64;
         let mut ship_p = [0.0f64; 4];
         let ship_imp = xdev.is_some_and(|x| self.ship_ready(dev, x));
@@ -3143,13 +3173,17 @@ impl<'m> Session<'m> {
             let imp = self.ship_imp.as_ref().expect("ship_ready");
             let (hd, hx) = (imp.get(dev), imp.get(x));
             let (mut down, mut up, mut at) = (Vec::new(), Vec::new(), 0u64);
-            for ((src, dst), n) in [&pf.mixed, &pf.w, &pf.shared, &pf.gate]
+            for (i, ((src, dst), n)) in [&pf.mixed, &pf.w, &pf.shared, &pf.gate]
                 .into_iter()
                 .zip([&xpf.mixed, &xpf.w, &xpf.shared, &xpf.gate])
                 .zip(lens)
+                .enumerate()
             {
-                down.push((src, hd, 0, at, n));
-                up.push((hx, dst, at, 0, n));
+                // A deferred `pf.shared` goes after the routed GEMMs, same offset.
+                if !(defer_shared && i == 2) {
+                    down.push((src, hd, 0, at, n));
+                    up.push((hx, dst, at, 0, n));
+                }
                 at += n;
             }
             ship_p[0] = crate::xfer::copy_fenced(gpu, &down)?;
@@ -3160,19 +3194,25 @@ impl<'m> Session<'m> {
             let t0 = std::time::Instant::now();
             let nb = n_embd * 4;
             let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
-            let items: [(&Buf, u64, usize); 4] = [
-                (&pf.mixed, 0, t * nb),
-                (&pf.w, 0, t * k * 4),
-                (&pf.shared, 0, t * nb),
-                (&pf.gate, 0, t * 4),
-            ];
+            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            let pairs: Vec<(&Buf, usize, &Buf)> = [
+                (&pf.mixed, t * nb, &xpf.mixed),
+                (&pf.w, t * k * 4, &xpf.w),
+                (&pf.shared, t * nb, &xpf.shared),
+                (&pf.gate, t * 4, &xpf.gate),
+            ]
+            .into_iter()
+            .enumerate()
+            .filter(|&(i, _)| !(defer_shared && i == 2))
+            .map(|(_, p)| p)
+            .collect();
+            let items: Vec<(&Buf, u64, usize)> = pairs.iter().map(|&(s, n, _)| (s, 0, n)).collect();
             let bytes = self.stagings[dev].read_batch(gpu, &items)?;
             ship_p[0] = t0.elapsed().as_secs_f64();
-            let xpf = self.venues[x].pf.as_ref().expect("checked above");
-            let regions: Vec<(&Buf, u64, &[u8])> = [&xpf.mixed, &xpf.w, &xpf.shared, &xpf.gate]
-                .into_iter()
+            let regions: Vec<(&Buf, u64, &[u8])> = pairs
+                .iter()
                 .zip(bytes.iter())
-                .map(|(buf, d)| (buf, 0, d.as_slice()))
+                .map(|(&(_, _, buf), d)| (buf, 0, d.as_slice()))
                 .collect();
             ship_p[1] = self.stagings[x].write_regions(m.devices[x].gpu(), &regions)?;
             xpf.slots.write(&slot_bytes)?;
@@ -3184,6 +3224,15 @@ impl<'m> Session<'m> {
             None => (dev, gpu),
         };
         let overlap = self.pf[edev][PF_OVERLAP];
+
+        if defer_shared {
+            // Submitted without a wait; the expert device's batch opens at once.
+            // Every later flush waits for it, before `pf.shared` is shipped.
+            self.ensure_batch(dev)?;
+            self.record_shared_chunk(b, dev, t)?;
+            batch_cmd::record_barrier_to_host(gpu)?;
+            self.reopen_batch(edev)?;
+        }
 
         // ---- the expert GEMMs: three per (distinct expert, group of <= 8) -----
         self.timers.mark(EXPERTS);
@@ -3308,6 +3357,23 @@ impl<'m> Session<'m> {
         self.submit_batch()?;
         self.flush()?;
         let gemm_s = t_gemm.elapsed().as_secs_f64();
+        if let Some(x) = xdev.filter(|_| defer_shared) {
+            let t0 = std::time::Instant::now();
+            let n = (t * n_embd * 4) as u64;
+            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            if ship_imp {
+                // The offset the ship above left for it: after `mixed` and `w`.
+                let at = n + (t * k * 4) as u64;
+                let imp = self.ship_imp.as_ref().expect("ship_ready");
+                ship_p[0] += crate::xfer::copy_fenced(gpu, &[(&pf.shared, imp.get(dev), 0, at, n)])?;
+                ship_p[1] += crate::xfer::copy_fenced(m.devices[x].gpu(), &[(imp.get(x), &xpf.shared, at, 0, n)])?;
+            } else {
+                let bytes = self.stagings[dev].read_batch(gpu, &[(&pf.shared, 0, n as usize)])?;
+                ship_p[1] += self.stagings[x].write_regions(m.devices[x].gpu(), &[(&xpf.shared, 0, bytes[0].as_slice())])?;
+            }
+            ship_s += t0.elapsed().as_secs_f64();
+        }
 
         // ---- the fan-in: one dispatch, then the chunk's MoE result per token --
         self.ensure_batch(edev)?;
