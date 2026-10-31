@@ -2268,8 +2268,8 @@ fn mtp_spec_bench(
             println!("mtp-spec  arm {arm} rep {rep}: {sb}");
             println!("mtp-spec  arm {arm} rep {rep}: plain nll/tok {:.4}", sa.nll / sa.tokens.max(1) as f64);
             if rep == 0 {
-                println!("mtp-ids plain {:?}", &a[prompt.len()..]);
-                println!("mtp-ids {arm} {:?}", &b[prompt.len()..]);
+                println!("mtp-ids plain {:?}", &a);
+                println!("mtp-ids {arm} {:?}", &b);
             }
         }
     }

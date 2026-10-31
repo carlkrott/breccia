@@ -2222,12 +2222,48 @@ impl<'m> Session<'m> {
     ) -> Result<Vec<f32>> {
         let mut trace = debug;
         self.begin_token(tok, pos)?;
+        if let Some((dir, _)) = hc_capture() {
+            use std::io::Write;
+            std::fs::create_dir_all(dir)?;
+            std::fs::OpenOptions::new().create(true).append(true).open(format!("{dir}/tokens.u32"))?.write_all(&tok.to_le_bytes())?;
+        }
         let n = self.model.cfg.n_layers;
         for b in 0..n {
             let digests = self.submit_block(b, &mut trace)?;
             self.finish_block(b, digests, &mut trace, false)?;
+            if let Some((dir, blocks)) = hc_capture() {
+                if blocks.contains(&b) {
+                    self.capture_hc(dir, b)?;
+                }
+            }
         }
         self.end_token()
+    }
+
+    /// `BRECCIA_DUMP_HC=<dir>` (drafter acceptance lab): after block `b` of every
+    /// single-token forward, append the mean of the residual's `hc` streams (f32,
+    /// `n_embd`) to `<dir>/b<b>.f32`, the feature DFlash/DSpark drafters read.
+    /// Blocks from `BRECCIA_DUMP_HC_BLOCKS` (comma list). Lab only: it stalls every block.
+    fn capture_hc(&mut self, dir: &str, b: usize) -> Result<()> {
+        use std::io::Write;
+        let (dev, mc) = (self.model.device_of(b), &self.model.cfg);
+        let (hc, d) = (mc.hc, mc.n_embd);
+        self.flush()?;
+        let raw = self.stagings[dev]
+            .read_batch(self.model.devices[dev].gpu(), &[(&self.venues[dev].r, 0, hc * d * 4)])?;
+        let r = f32_from_bytes(&raw[0]);
+        let mut out = Vec::with_capacity(d * 4);
+        for i in 0..d {
+            let m = (0..hc).map(|s| r[s * d + i]).sum::<f32>() / hc as f32;
+            out.extend_from_slice(&m.to_le_bytes());
+        }
+        std::fs::create_dir_all(dir)?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(format!("{dir}/b{b:02}.f32"))?
+            .write_all(&out)?;
+        Ok(())
     }
 
     /// Embed the token into the residual stack and start the per-token timers.
@@ -6736,4 +6772,19 @@ mod tests {
             super::Session::imported_role_slices(&arena, 4, 0, EXPERTS, EXPERTS, EXPERTS).is_err()
         );
     }
+}
+
+/// `BRECCIA_DUMP_HC` + `BRECCIA_DUMP_HC_BLOCKS`, read once (see `capture_hc`).
+fn hc_capture() -> Option<&'static (String, Vec<usize>)> {
+    static C: std::sync::OnceLock<Option<(String, Vec<usize>)>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let dir = std::env::var("BRECCIA_DUMP_HC").ok()?;
+        let blocks = std::env::var("BRECCIA_DUMP_HC_BLOCKS")
+            .unwrap_or_else(|_| "0,5,11,15,22,25,33,35,44,45".into())
+            .split(',')
+            .filter_map(|x| x.trim().parse().ok())
+            .collect();
+        Some((dir, blocks))
+    })
+    .as_ref()
 }
