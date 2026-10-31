@@ -86,10 +86,11 @@ fn env_tile(subgroup: u32, ty: QuantType) -> Option<Tile> {
 const TILES: [Tile; 3] = [(4, 4), (8, 4), (8, 8)];
 const TILE_FALLBACK: Tile = (8, 4);
 
-/// Measured-faster tiled build per GPU family and type; `None` = keep the GEMV-shaped
-/// builds (nothing measured faster yet).
+/// Measured-faster tiled build (m = 1024, attn_gate / hc_ffn_up, `tests/gemm_many.rs`
+/// `tiled_gemm_matches_plain`): 4x4 beat or matched 8x4 / 8x8 on RDNA2 (wave32) and
+/// Vega20 (wave64) for every type measured, at 0.4x-0.5x the previous best's time.
 fn tile_default(_ty: QuantType, _subgroup: u32) -> Option<Tile> {
-    None
+    Some((4, 4))
 }
 
 /// Users below which the tiled build is not used (tiles would be mostly padding).
