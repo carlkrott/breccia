@@ -1667,6 +1667,10 @@ pub struct HcMixer<'g> {
     /// Inject partials per token the **fused** path writes (`n_embd / per`), and
     /// the number `HcWrite` must sum. Unused when `up_gated` is `None`.
     fused_chunks: usize,
+    /// `n_embd / 16` when the opt-in `up` GEMM + gated-mean epilogue is built
+    /// (`BRECCIA_FUSE_HC=1`, [`HcMixer::tile_fused`]), else 0: the inject partials
+    /// per token that path writes at `T >= 64`.
+    tile_chunks: usize,
     /// Bound as the gated-mean's inject weight when the mixer has no `inject`
     /// (every declared binding must be bound).
     no_weight: Buf,
@@ -1703,6 +1707,28 @@ impl<'g> HcMixer<'g> {
         hc_lr: usize,
         with_inject: bool,
         fuse_gated: bool,
+    ) -> Result<Self> {
+        let fuse_hc = std::env::var("BRECCIA_FUSE_HC").is_ok_and(|v| v.trim() == "1");
+        Self::with_fusion_hc(gpu, ty, n_embd, hc, hc_lr, with_inject, fuse_gated, fuse_hc)
+    }
+
+    /// [`HcMixer::with_fusion`] with the opt-in **`up` GEMM + gated-mean epilogue**
+    /// chosen explicitly (`BRECCIA_FUSE_HC=1` is the env form; the conformance suite
+    /// builds both arms in one process). At `T >= 64`, with the default 4x4 tile, a
+    /// BF16 mixer with `inject`, `hc == 4` and `n_embd % 16 == 0`, `read` then runs
+    /// one dispatch (probe `hc-up-gated`) instead of `up` + `gated`; every other
+    /// shape and `fuse_hc == false` keep the existing path unchanged. `ws.gate` is
+    /// not written on the fused path (only the `hc.gate` debug tap reads it).
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_fusion_hc(
+        gpu: &'g Gpu,
+        ty: QuantType,
+        n_embd: usize,
+        hc: usize,
+        hc_lr: usize,
+        with_inject: bool,
+        fuse_gated: bool,
+        fuse_hc: bool,
     ) -> Result<Self> {
         if n_embd == 0 || hc == 0 || hc_lr == 0 {
             return Err(anyhow!("hc mixer needs n_embd, hc, hc_lr > 0"));
@@ -1779,6 +1805,14 @@ impl<'g> HcMixer<'g> {
         } else {
             None
         };
+        let mut gemm = gemm;
+        let mut tile_chunks = 0;
+        if fuse_hc && with_inject && ty == QuantType::Bf16 && hc == 4 && n_embd.is_multiple_of(16) {
+            if let Some(g) = gemm.as_mut() {
+                g.enable_hc_tile_gated()?;
+                tile_chunks = n_embd / 16;
+            }
+        }
         let no_weight = empty_buf(gpu, "hc inject weight")?;
         Ok(HcMixer {
             n_embd,
@@ -1796,6 +1830,7 @@ impl<'g> HcMixer<'g> {
             fused_act,
             up_gated,
             fused_chunks,
+            tile_chunks,
             no_weight,
         })
     }
@@ -1840,6 +1875,12 @@ impl<'g> HcMixer<'g> {
         }
     }
 
+    /// `true` when `read` at `tokens` tokens runs the `up` GEMM + gated-mean epilogue
+    /// (`BRECCIA_FUSE_HC=1`): built, and the plain `up` GEMM would be the default 4x4 tile.
+    pub fn tile_fused(&self, tokens: usize) -> bool {
+        self.tile_chunks > 0 && self.gemm.as_ref().is_some_and(|g| g.hc_tile_gated_for(tokens))
+    }
+
     /// The chunk count of the **separate** gated-mean kernel (the bench paths that
     /// run it explicitly need this, not the fused count).
     pub fn gated_chunks(&self) -> usize {
@@ -1881,7 +1922,11 @@ impl<'g> HcMixer<'g> {
         }
         let hc_dim = self.hc * self.n_embd;
         let blobs = vec![0u32; tokens];
-        let chunks = self.inject_chunks();
+        let chunks = if self.tile_fused(tokens) {
+            self.inject_chunks().max(self.tile_chunks)
+        } else {
+            self.inject_chunks()
+        };
         let splits = self.down_splits();
         let maps = [
             self.down.map_for_blobs(&blobs, crate::XLayout::PerExpert),
@@ -2005,6 +2050,14 @@ impl<'g> HcMixer<'g> {
                 .run(&ws.lo_raw, &ws.lo, self.hc_lr * t, self.hc as f32)?;
         }
         let winj = w.inject.unwrap_or(&self.no_weight);
+        if self.tile_fused(t) {
+            if let Some(g) = &self.gemm {
+                crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_UP_GATED);
+                return g.run_up_gated(
+                    w.up, &ws.lo, &ws.gate, &ws.xn, winj, &ws.inject, &ws.mixed, self.n_embd, self.hc_lr, t,
+                );
+            }
+        }
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::HC_UP);
         match &self.up_gated {
             // **Fused** (§8az): one dispatch for `up`, the gated mean, `gate` and
@@ -2144,11 +2197,13 @@ impl<'g> HcMixer<'g> {
     }
 
     /// The inject partial count [`HcMixer::read`] wrote for `tokens` tokens: the
-    /// fused `up`+gated kernel only runs at `t = 1`, so `t > 1` has the separate
-    /// gated-mean layout even when fusion is compiled.
+    /// fused `up`+gated GEMV only runs at `t = 1`, so `t > 1` has the separate
+    /// gated-mean layout, except for the opt-in [`HcMixer::tile_fused`] shape.
     pub fn read_chunks(&self, tokens: usize) -> usize {
         if tokens == 1 {
             self.inject_chunks()
+        } else if self.tile_fused(tokens) {
+            self.tile_chunks
         } else {
             self.gated_chunks()
         }

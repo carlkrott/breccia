@@ -601,6 +601,82 @@ fn hc_gated_fusion_matches_the_separate_path() {
     );
 }
 
+/// The opt-in `up` GEMM + gated-mean epilogue (`BRECCIA_FUSE_HC=1`, `T >= 64`) must
+/// give the same `mixed` bit for bit and the same `inject` / `write` result to
+/// rounding as the separate `up` + `gated` dispatches. `T` values off a multiple of
+/// 64 exercise the dead-user lanes of the last tile row. `gate` is not written on
+/// the fused path, so it is not compared.
+#[test]
+fn hc_tile_gated_fusion_matches_the_separate_path() {
+    let fx = need_gpu!("hc");
+    let gpu = fx.dev.gpu();
+    let (n_embd, hc, hc_lr) = (2560usize, 4usize, 320usize);
+    let hc_dim = hc * n_embd;
+    let bf16 = |v: &[f32]| -> Vec<u8> {
+        v.iter()
+            .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    };
+    let gamma = normalish(0x1111, hc_dim)
+        .into_iter()
+        .map(|v| v.abs() + 0.5)
+        .collect::<Vec<f32>>();
+    let gbuf = ops::upload_f32(gpu, &gamma).expect("gamma");
+    let dbuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x2222, hc_lr * hc_dim)))
+        .expect("down");
+    let ubuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x3333, hc_dim * hc_lr)))
+        .expect("up");
+    let ibuf = breccia_kernels::gemv::upload(gpu, &bf16(&normalish(0x4444, hc * hc_dim)))
+        .expect("inject");
+    let w = HcWeights {
+        norm: &gbuf,
+        down: &dbuf,
+        up: &ubuf,
+        inject: Some(&ibuf),
+    };
+    let sep = HcMixer::with_fusion_hc(gpu, QuantType::Bf16, n_embd, hc, hc_lr, true, true, false)
+        .expect("separate mixer");
+    let tiled = HcMixer::with_fusion_hc(gpu, QuantType::Bf16, n_embd, hc, hc_lr, true, true, true)
+        .expect("tile-fused mixer");
+
+    for tokens in [64usize, 100, 130] {
+        assert!(!sep.tile_fused(tokens), "T={tokens}: flag off must not fuse");
+        assert!(tiled.tile_fused(tokens), "T={tokens}: flag on must fuse");
+        assert_eq!(sep.read_chunks(tokens), n_embd / 256);
+        assert_eq!(tiled.read_chunks(tokens), n_embd / 16);
+        let rbuf = ops::upload_f32(gpu, &normalish(0x5555, hc_dim * tokens)).expect("r");
+        let bbuf = ops::upload_f32(gpu, &normalish(0x6666, n_embd * tokens)).expect("block");
+        let mut got = Vec::new();
+        for m in [&sep, &tiled] {
+            let obuf =
+                breccia_kernels::gemv::alloc(gpu, (hc_dim * tokens * 4) as u64).expect("out");
+            let ws = m.workspace(gpu, tokens).expect("workspace");
+            m.read(&ws, &rbuf, &w).expect("read");
+            let mixed = ops::download_f32(gpu, &ws.mixed, n_embd * tokens).expect("mixed");
+            let inject = m.inject_values(gpu, &ws).expect("inject");
+            m.write(&ws, &rbuf, &bbuf, &obuf).expect("write");
+            let out = ops::download_f32(gpu, &obuf, hc_dim * tokens).expect("out");
+            m.release(gpu, ws);
+            gpu.destroy_buf(&obuf);
+            got.push((mixed, inject, out));
+        }
+        let mixed_diff = (0..n_embd * tokens)
+            .filter(|&i| got[0].0[i].to_bits() != got[1].0[i].to_bits())
+            .count();
+        assert_eq!(mixed_diff, 0, "T={tokens}: mixed must be bit-identical");
+        let inj_rel = max_rel(&got[1].1, &as_f64(&got[0].1));
+        let out_rel = max_rel(&got[1].2, &as_f64(&got[0].2));
+        println!("hc tile-gated T={tokens}: inject {inj_rel:.2e} write {out_rel:.2e}");
+        assert!(inj_rel <= 1e-5, "T={tokens}: inject max rel {inj_rel:e}");
+        assert!(out_rel <= 1e-5, "T={tokens}: write max rel {out_rel:e}");
+        gpu.destroy_buf(&rbuf);
+        gpu.destroy_buf(&bbuf);
+    }
+    for b in [&gbuf, &dbuf, &ubuf, &ibuf] {
+        gpu.destroy_buf(b);
+    }
+}
+
 /// A fused BF16 mixer at `T > 1` runs the separate gated-mean layout (the fusion
 /// is `T = 1` only), so `write` must sum that layout's partial count: a T-token
 /// read + write must match T single-token runs (the batched prefill HC chain).

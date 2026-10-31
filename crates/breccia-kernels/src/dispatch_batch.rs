@@ -492,6 +492,9 @@ pub mod probe {
     pub const HC_REDUCE: u8 = 34;
     pub const HC_UP: u8 = 35;
     pub const HC_GATED: u8 = 36;
+    /// The `up` GEMM with the gated mean + inject partials as its epilogue
+    /// (`BRECCIA_FUSE_HC=1`); replaces `HC_UP` + `HC_GATED` for that read.
+    pub const HC_UP_GATED: u8 = 37;
     pub const GDN_Z: u8 = 29;
     pub const GDN_BETA: u8 = 30;
     pub const GDN_ALPHA: u8 = 31;
@@ -535,7 +538,7 @@ pub mod probe {
         "hc-reduce",
         "hc-up",
         "hc-gated",
-        "",
+        "hc-up-gated",
         "",
         "",
     ];
