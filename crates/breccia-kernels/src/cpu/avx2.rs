@@ -33,7 +33,6 @@
 use std::arch::x86_64::*;
 
 use crate::quant::QuantType;
-use crate::reference::f16_to_f32;
 use crate::tables::{
     IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL,
 };
@@ -165,6 +164,13 @@ static IQ3S_F32: [[f32; 4]; 512] = {
 #[inline]
 fn u16le(b: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([b[off], b[off + 1]])
+}
+
+/// fp16 -> fp32 via F16C: exact, bit-identical to `f16_to_f32` for every non-NaN input.
+#[inline]
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) fn f16c(h: u16) -> f32 {
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(i32::from(h))))
 }
 
 #[inline]
@@ -339,7 +345,7 @@ unsafe fn iq2_xxs(row: &[u8], x: &[f32]) -> f32 {
         let mut a1 = _mm256_setzero_ps();
         let mut i = 0usize;
         for blk in row.chunks_exact(66) {
-            let d = f16_to_f32(u16le(blk, 0));
+            let d = f16c(u16le(blk, 0));
             for ib in 0..8 {
                 let q0 = u32le(blk, 2 + 8 * ib);
                 let q1 = u32le(blk, 6 + 8 * ib);
@@ -375,7 +381,7 @@ unsafe fn iq2_xs(row: &[u8], x: &[f32]) -> f32 {
         let mut a1 = _mm256_setzero_ps();
         let mut i = 0usize;
         for blk in row.chunks_exact(74) {
-            let d = f16_to_f32(u16le(blk, 0));
+            let d = f16c(u16le(blk, 0));
             for ib in 0..8 {
                 let sc = blk[66 + ib];
                 let s0 = _mm256_set1_ps(d * (0.5 + f32::from(sc & 0xf)) * 0.25);
@@ -411,7 +417,7 @@ unsafe fn iq2_s(row: &[u8], x: &[f32]) -> f32 {
         let mut a1 = _mm256_setzero_ps();
         let mut i = 0usize;
         for blk in row.chunks_exact(82) {
-            let d = f16_to_f32(u16le(blk, 0));
+            let d = f16c(u16le(blk, 0));
             for ib in 0..8 {
                 let h = usize::from(blk[66 + ib]);
                 let sc = blk[74 + ib];
@@ -450,7 +456,7 @@ unsafe fn iq3_xxs(row: &[u8], x: &[f32]) -> f32 {
         let mut a1 = _mm256_setzero_ps();
         let mut i = 0usize;
         for blk in row.chunks_exact(98) {
-            let d = f16_to_f32(u16le(blk, 0));
+            let d = f16c(u16le(blk, 0));
             for ib in 0..8 {
                 let q1 = u32le(blk, 66 + 4 * ib);
                 let dbr = d * (0.5 + ((q1 >> 28) as u8) as f32) * 0.5;
@@ -484,7 +490,7 @@ unsafe fn iq3_s(row: &[u8], x: &[f32]) -> f32 {
         let mut a1 = _mm256_setzero_ps();
         let mut i = 0usize;
         for blk in row.chunks_exact(110) {
-            let d = f16_to_f32(u16le(blk, 0));
+            let d = f16c(u16le(blk, 0));
             for ib in 0..8 {
                 let qhb = usize::from(blk[66 + ib]);
                 // `scales` is 4 bytes at 106: the nibble for unit `ib` lives at
@@ -547,7 +553,7 @@ unsafe fn iq4_nl(row: &[u8], x: &[f32]) -> f32 {
         let mask = _mm_set1_epi8(0x0f);
         let mut i = 0usize;
         for blk in row.chunks_exact(18) {
-            let d = _mm256_set1_ps(f16_to_f32(u16le(blk, 0)));
+            let d = _mm256_set1_ps(f16c(u16le(blk, 0)));
             let qs = _mm_loadu_si128(blk[2..18].as_ptr() as *const __m128i);
             let lo = _mm_and_si128(qs, mask);
             let hi = _mm_and_si128(_mm_srli_epi16(qs, 4), mask);
@@ -569,7 +575,7 @@ unsafe fn iq4_xs(row: &[u8], x: &[f32]) -> f32 {
         let mask = _mm_set1_epi8(0x0f);
         let mut i = 0usize;
         for blk in row.chunks_exact(136) {
-            let d = f16_to_f32(u16le(blk, 0));
+            let d = f16c(u16le(blk, 0));
             let sh = u16le(blk, 2);
             for ib in 0..8usize {
                 let sl = blk[4 + ib / 2];
@@ -613,7 +619,7 @@ pub unsafe fn iq4_nl_many(row: &[u8], xs: &[*const f32], out: *mut f32) {
         let mask = _mm_set1_epi8(0x0f);
         let mut i = 0usize;
         for blk in row.chunks_exact(18) {
-            let d = _mm256_set1_ps(f16_to_f32(u16le(blk, 0)));
+            let d = _mm256_set1_ps(f16c(u16le(blk, 0)));
             let qs = _mm_loadu_si128(blk[2..18].as_ptr() as *const __m128i);
             let lo = _mm_shuffle_epi8(table, _mm_and_si128(qs, mask));
             let hi = _mm_shuffle_epi8(table, _mm_and_si128(_mm_srli_epi16(qs, 4), mask));
@@ -663,7 +669,7 @@ pub unsafe fn q2_0_many(row: &[u8], xs: &[*const f32], out: *mut f32) {
         let three = _mm256_set1_epi32(3);
         let mut i = 0usize;
         for blk in row.chunks_exact(18) {
-            let dv = _mm256_set1_ps(f16_to_f32(u16le(blk, 0)));
+            let dv = _mm256_set1_ps(f16c(u16le(blk, 0)));
             for u in 0..8usize {
                 let wv = _mm256_set1_epi32(u16le(blk, 2 + 2 * u) as i32);
                 let q = _mm256_and_si256(_mm256_srlv_epi32(wv, shifts), three);
@@ -717,8 +723,8 @@ unsafe fn q4_k(row: &[u8], x: &[f32]) -> f32 {
         let nib = _mm256_set1_epi32(0x0f);
         let mut i = 0usize;
         for blk in row.chunks_exact(144) {
-            let d = f16_to_f32(u16le(blk, 0));
-            let dmin = f16_to_f32(u16le(blk, 2));
+            let d = f16c(u16le(blk, 0));
+            let dmin = f16c(u16le(blk, 2));
             for g in 0..4usize {
                 let (s1, m1) = scale_min_k4(blk, 2 * g);
                 let (s2, m2) = scale_min_k4(blk, 2 * g + 1);
@@ -756,8 +762,8 @@ unsafe fn q5_k(row: &[u8], x: &[f32]) -> f32 {
         let nib = _mm256_set1_epi32(0x0f);
         let mut i = 0usize;
         for blk in row.chunks_exact(176) {
-            let d = f16_to_f32(u16le(blk, 0));
-            let dmin = f16_to_f32(u16le(blk, 2));
+            let d = f16c(u16le(blk, 0));
+            let dmin = f16c(u16le(blk, 2));
             for g in 0..4usize {
                 let (s1, m1) = scale_min_k4(blk, 2 * g);
                 let (s2, m2) = scale_min_k4(blk, 2 * g + 1);
@@ -814,7 +820,7 @@ unsafe fn q6_k(row: &[u8], x: &[f32]) -> f32 {
         let three = _mm256_set1_epi32(3);
         let mut i = 0usize;
         for blk in row.chunks_exact(210) {
-            let d = f16_to_f32(u16le(blk, 208));
+            let d = f16c(u16le(blk, 208));
             for g in 0..2usize {
                 for q in 0..4usize {
                     let ql_off = g * 64 + if q % 2 == 0 { 0 } else { 32 };
@@ -874,7 +880,7 @@ unsafe fn q2_0(row: &[u8], x: &[f32]) -> f32 {
         let three = _mm256_set1_epi32(3);
         let mut i = 0usize;
         for blk in row.chunks_exact(18) {
-            let dv = _mm256_set1_ps(f16_to_f32(u16le(blk, 0)));
+            let dv = _mm256_set1_ps(f16c(u16le(blk, 0)));
             for u in 0..8usize {
                 let wv = _mm256_set1_epi32(u16le(blk, 2 + 2 * u) as i32);
                 let q = _mm256_and_si256(_mm256_srlv_epi32(wv, shifts), three);
@@ -963,6 +969,20 @@ unsafe fn f32_row(row: &[u8], x: &[f32]) -> f32 {
 mod tests {
     use super::*;
     use crate::cpu::scalar;
+
+    #[test]
+    fn f16c_matches_the_software_conversion() {
+        if !super::super::avx2_available() {
+            return;
+        }
+        for h in 0..=u16::MAX {
+            let (a, b) = (unsafe { f16c(h) }, crate::reference::f16_to_f32(h));
+            assert!(
+                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                "{h:#06x}: {a} vs {b}"
+            );
+        }
+    }
 
     /// Every AVX2 kernel must agree with the fused scalar port element by
     /// element. A `1` at position `j` turns the dot into "weight `j`", so this
