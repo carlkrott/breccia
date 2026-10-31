@@ -2271,6 +2271,11 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             std::env::set_var(k, "1");
         }
     }
+    // §12.13: the micro-batch pipeline lost on streams-2 (the RX serves its own lane
+    // too: 6.11 / 6.58 s vs 6.53 / 6.54 s), so multi-stream keeps it off unless set.
+    if std::env::var_os("BRECCIA_PF_MICRO").is_none() {
+        std::env::set_var("BRECCIA_PF_MICRO", "0");
+    }
     if prompt.len() + a.gen + 1 > a.ctx {
         anyhow::bail!(
             "prompt {} + gen {} + 1 exceeds --ctx {}",
