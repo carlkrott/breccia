@@ -424,6 +424,9 @@ pub struct Venue<'m> {
     pub ple_idx: Option<Buf>,
     pub ple_key_slots: Vec<Buf>,
     pub ple_value_slots: Vec<Buf>,
+    /// `BRECCIA_PLE_GEMM` (default on): the chunk's compacted embeddings `[t, n_embd]` and the
+    /// key / value projections as one GEMM output each (`[t, hc_dim]`, `[t, n_embd]`).
+    pub ple_gemm: Option<(Buf, Buf, Buf)>,
     pub logits: Option<Buf>,
     /// Device-resident MoE scratch (`--gpu-experts`): `[k, n_ff]` gate/up/act,
     /// `[k, n_embd]` down, and the two row maps the device fills in.
@@ -958,6 +961,15 @@ impl<'m> Session<'m> {
                 } else {
                     (None, None, None, Vec::new(), Vec::new())
                 };
+            let ple_gemm = if ple_gemm_on() && chunk > 0 && !mc.ple.layers.is_empty() {
+                Some((
+                    alloc(chunk as u64 * n * 4, "the PLE GEMM input")?,
+                    alloc((chunk * mc.hc_dim() * 4) as u64, "the PLE key GEMM output")?,
+                    alloc(chunk as u64 * n * 4, "the PLE value GEMM output")?,
+                ))
+            } else {
+                None
+            };
             let moe_map = breccia_kernels::MoeMap::new(gpu)?;
             let moe_combine = breccia_kernels::MoeCombine::new(gpu)?;
             let moe_fanin = breccia_kernels::MoeFanIn::new(gpu)?;
@@ -1046,6 +1058,7 @@ impl<'m> Session<'m> {
                 ple_idx,
                 ple_key_slots,
                 ple_value_slots,
+                ple_gemm,
                 logits,
                 moe_gate,
                 moe_up,
@@ -5063,6 +5076,11 @@ impl<'m> Session<'m> {
         self.ensure_batch(dev)?;
         {
             let v = &self.venues[dev];
+            let gemm_ok = v
+                .pipes
+                .gemm(raw.key.key.ty)
+                .zip(v.pipes.gemm(raw.value.key.ty))
+                .filter(|(a, b)| a.padded_cols(n_embd) == n_embd && b.padded_cols(n_embd) == n_embd);
             let emb_chunk = v
                 .ple_emb_chunk
                 .as_ref()
@@ -5090,21 +5108,33 @@ impl<'m> Session<'m> {
             // `ple.padded_cols()`: token `i`'s rows are `i*n_head .. (i+1)*n_head`.
             v.emb_ple.run(packed_buf, idx, emb_chunk, t * n_head)?;
             let view = (n_head * v.emb_ple.padded_cols() * 4) as u64;
-            for i in 0..t {
-                batch_cmd::record_copy(
-                    gpu,
-                    &v.ple_emb,
-                    0,
-                    emb_chunk,
-                    i as u64 * view,
-                    (n_embd * 4) as u64,
-                )?;
-                v.pipes
-                    .get(&raw.key.key)?
-                    .run(&raw.key.buf, &v.ple_emb, &key_slots[i])?;
-                v.pipes
-                    .get(&raw.value.key)?
-                    .run(&raw.value.buf, &v.ple_emb, &value_slots[i])?;
+            match (&v.ple_gemm, gemm_ok) {
+                (Some((x, kout, vout)), Some(gk)) => {
+                    // Compact the t embeddings, then one GEMM per projection.
+                    for i in 0..t {
+                        batch_cmd::record_copy(gpu, x, (i * n_embd * 4) as u64, emb_chunk, i as u64 * view, (n_embd * 4) as u64)?;
+                    }
+                    gk.0.run(&raw.key.buf, x, kout, hc_dim, n_embd, t)?;
+                    gk.1.run(&raw.value.buf, x, vout, n_embd, n_embd, t)?;
+                }
+                _ => {
+                    for i in 0..t {
+                        batch_cmd::record_copy(
+                            gpu,
+                            &v.ple_emb,
+                            0,
+                            emb_chunk,
+                            i as u64 * view,
+                            (n_embd * 4) as u64,
+                        )?;
+                        v.pipes
+                            .get(&raw.key.key)?
+                            .run(&raw.key.buf, &v.ple_emb, &key_slots[i])?;
+                        v.pipes
+                            .get(&raw.value.key)?
+                            .run(&raw.value.buf, &v.ple_emb, &value_slots[i])?;
+                    }
+                }
             }
         }
         self.submit_batch()?;
@@ -5117,10 +5147,21 @@ impl<'m> Session<'m> {
         let parts = {
             let v = &self.venues[dev];
             let mut items: Vec<(&Buf, u64, usize)> = Vec::with_capacity(3 * t);
+            let gemm = v.ple_gemm.as_ref().filter(|_| {
+                v.pipes.gemm(raw.key.key.ty).is_some() && v.pipes.gemm(raw.value.key.ty).is_some()
+            });
             for i in 0..t {
                 items.push((&v.r_slots[i], 0, hc_dim * 4));
-                items.push((&v.ple_key_slots[i], 0, hc_dim * 4));
-                items.push((&v.ple_value_slots[i], 0, n_embd * 4));
+                match gemm {
+                    Some((_, k, val)) => {
+                        items.push((k, (i * hc_dim * 4) as u64, hc_dim * 4));
+                        items.push((val, (i * n_embd * 4) as u64, n_embd * 4));
+                    }
+                    None => {
+                        items.push((&v.ple_key_slots[i], 0, hc_dim * 4));
+                        items.push((&v.ple_value_slots[i], 0, n_embd * 4));
+                    }
+                }
             }
             self.stagings[dev].read_batch(gpu, &items)?
         };
@@ -5396,6 +5437,11 @@ impl Drop for Session<'_> {
             {
                 gpu.destroy_buf(b);
             }
+            if let Some((x, k, val)) = &v.ple_gemm {
+                for b in [x, k, val] {
+                    gpu.destroy_buf(b);
+                }
+            }
             for mb in &v.moe_out {
                 mb.release(gpu);
             }
@@ -5654,6 +5700,14 @@ fn pf_group_users() -> usize {
 /// `BRECCIA_PF_MICRO=2`: split each prefill chunk into two micro-batches and pipeline
 /// them across the block card and the expert helper (default on since §12.13: plx
 /// +34 %, logits == flag-off chunk/2; unset or `2` enables, anything else disables).
+/// `BRECCIA_PLE_GEMM` (default on, `0` = off): the chunk's PLE key / value projections run as one tiled GEMM
+/// each instead of `t` mat-vecs. Same dot products, different reduction order (parity gate,
+/// not byte-identity).
+fn ple_gemm_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PLE_GEMM").as_deref() != Ok("0"))
+}
+
 /// `BRECCIA_PF_MICRO_OVL`: overlap the tick boundary's transfers (bucketing under the
 /// block card's readback, the MoE result's copy-in submitted behind the launch).
 fn micro_ovl() -> bool {
