@@ -135,7 +135,7 @@ pub fn plan_text(profile: &HwProfile, expert_pin_bytes: Option<u64>) -> String {
             )),
             DeviceRole::StaticResident => out.push_str(&format!(
                 "  [{}] {} → static-resident: weights stay on the card; NO PCIe streaming lane \
-                 (measured {} with {} overlap — Gate A: gen3-class host link, transfers serialize). \
+                 (measured {} with {} overlap on its x4 host link). \
                  Bandwidth-bound decode only.\n",
                 e.identity.index,
                 short_name(&e.identity.name),
