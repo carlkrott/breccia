@@ -3457,7 +3457,8 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             if let breccia_engine::ArenaSpec::Auto(_) = arena {
                 // The MTP draft (~1 GiB) and spec slots are allocated after the arena;
                 // without room they spill to host memory (draft 1.2 -> 16.5 ms/step).
-                // shortcut: fixed margin, size it from the draft + slot bytes if spec ships.
+                // shortcut: fixed margin keyed on the bench env vars; a real spec mode must key on
+                // spec being enabled and size it from the draft + slot bytes.
                 let spec = ["BRECCIA_MTP_SPEC_BENCH", "BRECCIA_MTP_DRAFT_BENCH", "BRECCIA_SPEC_VERIFY_BENCH"]
                     .iter()
                     .any(|k| std::env::var_os(k).is_some());

@@ -67,8 +67,9 @@ pub const MAX_K: usize = 5;
 
 /// Depth chooser. `cost(k) = verify(k+1) + draft(k)` in ms, `tokens(k) = 1 + sum_j
 /// prod_{i<=j} p_i`; picks the best tokens/ms and probes one deeper every 16 picks.
-/// Priors are UNVERIFIED seeds (verify ms from the 1k mixed-prompt table, k=4/5
-/// extrapolated); every number is replaced by an EMA of what this run measures.
+/// Priors measured 10-31 on the RX (split 50%, spec margin): verify T=2..6 = 88/104/118/
+/// 142/159 ms + ~4 ms/draft step, plain 47 ms; every number is replaced by an EMA of
+/// what this run measures.
 struct Gate {
     num: [f64; MAX_K],
     den: [f64; MAX_K],
@@ -83,7 +84,7 @@ impl Gate {
         Gate {
             num: [1.2; MAX_K],
             den: [2.0; MAX_K],
-            round_ms: [52.0, 118.0, 142.0, 172.0, 210.0, 250.0],
+            round_ms: [47.0, 92.0, 112.0, 130.0, 158.0, 179.0],
             seen: [false; MAX_K + 1],
             picks: 0,
         }
