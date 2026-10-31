@@ -189,7 +189,7 @@ impl ModelConfig {
         let ngram = u64_kv(md, &prefix, "ple.ngram_size")?;
         let hpn = u64_kv(md, &prefix, "ple.heads_per_ngram")?;
 
-        let cfg = ModelConfig {
+        let mut cfg = ModelConfig {
             arch: arch.clone(),
             n_layers: u64_kv(md, &prefix, "block_count")?,
             n_embd: u64_kv(md, &prefix, "embedding_length")?,
@@ -236,6 +236,10 @@ impl ModelConfig {
             vocab,
             n_ctx_max: u64_kv(md, &prefix, "context_length")?,
         };
+        // §12 approximate methods: BRECCIA_EXPERTS_USED=k routes to top-k below the file value; router and arena read k from here.
+        if let Some(k) = std::env::var("BRECCIA_EXPERTS_USED").ok().and_then(|v| v.parse::<usize>().ok()) {
+            cfg.n_expert_used = k.clamp(1, cfg.n_expert_used);
+        }
         cfg.validate()?;
         Ok(cfg)
     }
