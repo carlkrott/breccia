@@ -37,7 +37,7 @@ use breccia_vk::ctx::Buf;
 use breccia_kernels::batch_cmd;
 use breccia_kernels::cpu::{self, lane_stats_on, ExpertPool, LaneStats};
 use breccia_kernels::ops::{
-    f32_from_bytes, f32_to_bytes, EmbGather, HcMixer, HcWeights, HcWorkspace, Router, SwiGlu,
+    f32_from_bytes, f32_to_bytes, Add, EmbGather, HcMixer, HcWeights, HcWorkspace, Router, SwiGlu,
 };
 use breccia_kernels::{
     Gdn, GdnProjections, GdnState, GdnTap, GdnWeights, GdnWorkspace, Proj, Qsa, QsaProjections,
@@ -310,6 +310,10 @@ pub struct PfChunk {
     g_bytes: u64,
     u_bytes: u64,
     d_bytes: u64,
+    /// `BRECCIA_PF_SPLIT_HOST`: `[8, n_embd]` mixed + `[8, k]` weights copied down
+    /// in pass 1 for the host lane (system memory, read in bulk), and the host
+    /// partial sum `[8 rows | 1 zero row]` the GPU adds after the fan-in.
+    split: Option<(Mailbox, Mailbox)>,
 }
 
 /// In-flight streamed experts per submit (see [`PfChunk::stream`]).
@@ -355,6 +359,10 @@ impl PfChunk {
         self.ids.release(gpu);
         self.slots.release(gpu);
         self.stream.release(gpu);
+        if let Some((a, b)) = &self.split {
+            a.release(gpu);
+            b.release(gpu);
+        }
         for b in [
             &self.w,
             &self.mixed,
@@ -394,6 +402,8 @@ pub struct Venue<'m> {
     pub qsa: Option<Qsa<'m>>,
     pub router: Router<'m>,
     pub swiglu: SwiGlu<'m>,
+    /// `out = a + b`: adds the host partial of `BRECCIA_PF_SPLIT_HOST` after the fan-in.
+    pub add: Add<'m>,
     pub emb: EmbGather<'m>,
     pub emb_ple: EmbGather<'m>,
     /// The residual stack `[hc, n_embd]`.
@@ -839,6 +849,7 @@ impl<'m> Session<'m> {
             };
             let router = Router::new(gpu, mc.n_expert, mc.n_expert_used)?;
             let swiglu = SwiGlu::new(gpu)?;
+            let add = Add::new(gpu)?;
             let emb = EmbGather::new(gpu, emb_ty, mc.n_embd)?;
             let emb_ple = EmbGather::new(gpu, ple_ty, mc.ple.dim)?;
             // Big enough for the largest single readback: on the head device the
@@ -1043,6 +1054,16 @@ impl<'m> Session<'m> {
                 let align = |v: usize| (v as u64 + 255) & !255;
                 let (gb, ub, db) = (align(g_max), align(u_max), align(d_max));
                 let slot_stride = gb + ub + db;
+                let split = if pf_split_host().is_some() {
+                    let hp = Mailbox::new(gpu, (SPLIT_T_MAX as u64 + 1) * nb)?;
+                    hp.write(&vec![0u8; (SPLIT_T_MAX + 1) * nb as usize])?;
+                    Some((
+                        Mailbox::new_cached(gpu, SPLIT_T_MAX as u64 * (nb + k as u64 * 4))?,
+                        hp,
+                    ))
+                } else {
+                    None
+                };
                 Some(PfChunk {
                     ids: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
                     w: alloc(chunk as u64 * k as u64 * 4, "prefill router weights")?,
@@ -1071,6 +1092,7 @@ impl<'m> Session<'m> {
                     g_bytes: gb,
                     u_bytes: ub,
                     d_bytes: db,
+                    split,
                 })
             } else {
                 None
@@ -1085,6 +1107,7 @@ impl<'m> Session<'m> {
                 qsa,
                 router,
                 swiglu,
+                add,
                 emb,
                 emb_ple,
                 r,
@@ -3672,6 +3695,16 @@ impl<'m> Session<'m> {
             && xdev.is_some()
             && std::env::var("BRECCIA_PF_SHARED_UNDER").as_deref() != Ok("0");
         let bound_t0 = std::time::Instant::now();
+        // `BRECCIA_PF_SPLIT_HOST`: needs the plain streamed path (no helper card, no
+        // micro-batches), a small chunk and a spare scratch row for the zero slot.
+        let split_on = pf_split_host().is_some()
+            && streamed
+            && xdev.is_none()
+            && !micro
+            && t <= SPLIT_T_MAX
+            && self.venues[dev].pf.as_ref().is_some_and(|pf| {
+                pf.split.is_some() && pf.scratch.size >= ((t * k + 1) * n_embd * 4) as u64
+            });
 
         // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
         if !micro {
@@ -3740,6 +3773,18 @@ impl<'m> Session<'m> {
             }
             if shared_chunk && !defer_shared {
                 self.record_shared_chunk(b, dev, t)?;
+            }
+            if split_on {
+                let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+                let hx = &pf.split.as_ref().expect("split scratch").0;
+                let nb = (n_embd * 4) as u64;
+                batch_cmd::record_copies(
+                    gpu,
+                    &[
+                        (&hx.buf, 0, &pf.mixed, 0, t as u64 * nb),
+                        (&hx.buf, t as u64 * nb, &pf.w, 0, (t * k * 4) as u64),
+                    ],
+                )?;
             }
             batch_cmd::record_barrier_to_host(gpu)?;
             self.submit_batch()?;
@@ -3816,6 +3861,64 @@ impl<'m> Session<'m> {
                 u = g_end;
             }
             at = end;
+        }
+        // The host's share: the last `n` distinct experts (expert-id order). Their
+        // pairs point at the scratch's zero row, so the fan-in adds nothing for them
+        // and the host partial lands after it.
+        let mut host_set: Vec<usize> = Vec::new();
+        let mut host_job = None;
+        let mut host_t0 = std::time::Instant::now();
+        if split_on && distinct > 1 {
+            let (n, pct) = pf_split_host().expect("split_on");
+            let n = if pct { (distinct * n).div_ceil(100) } else { n };
+            let n = n.min(distinct - 1);
+            host_set = pairs
+                .iter()
+                .map(|p| p.0)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .rev()
+                .take(n)
+                .collect();
+            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+            let (hx, _) = pf.split.as_ref().expect("split scratch");
+            let mut hbuf = vec![0u8; t * (n_embd + k) * 4];
+            hx.read(&mut hbuf)?;
+            let hf = f32_from_bytes(&hbuf);
+            let (x, w) = (hf[..t * n_embd].to_vec(), &hf[t * n_embd..]);
+            let mut routes: Vec<(Vec<usize>, Vec<f32>)> = vec![(Vec::new(), Vec::new()); t];
+            for &(e, ti, j) in &pairs {
+                if host_set.contains(&e) {
+                    slots[ti * k + j] = (t * k) as u32;
+                }
+            }
+            // Router order inside a token, as the lane expects.
+            for ti in 0..t {
+                for j in 0..k {
+                    let o = (ti * k + j) * 4;
+                    let e = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
+                    if host_set.contains(&e) {
+                        routes[ti].0.push(e);
+                        routes[ti].1.push(w[ti * k + j]);
+                    }
+                }
+            }
+            let plan = m.layers[b].experts;
+            let pool = std::sync::Arc::clone(&self.pool);
+            host_t0 = std::time::Instant::now();
+            host_job = Some(std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                let rs: Vec<cpu::ChunkRoute<'_>> = routes
+                    .iter()
+                    .map(|(i, w)| cpu::ChunkRoute { ids: i, weights: w })
+                    .collect();
+                let mut out = vec![0f32; t * n_embd];
+                let bytes = pool
+                    .lock()
+                    .expect("the expert pool's lock")
+                    .moe_topk_chunk(&plan, &rs, &x, &mut out)?;
+                Ok::<_, anyhow::Error>((out, bytes, t0.elapsed().as_secs_f64()))
+            }));
         }
         let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
         self.venues[dev]
@@ -3910,6 +4013,9 @@ impl<'m> Session<'m> {
         let mut prev_expert: Option<usize> = None;
         let mut stream_prev: Option<breccia_kernels::batch_cmd::Segment> = None;
         for (e, base, users) in groups.iter() {
+            if host_set.contains(e) {
+                continue;
+            }
             let mu = users.len();
             // First group of a new distinct expert: stream it (once per chunk).
             let new_expert = Some(*e) != prev_expert;
@@ -4071,6 +4177,14 @@ impl<'m> Session<'m> {
         // ---- the fan-in: one dispatch, then the chunk's MoE result per token --
         self.ensure_batch(edev)?;
         let t_fan = std::time::Instant::now();
+        if !host_set.is_empty() {
+            // The zero row the host experts' pairs point at (a block may have left
+            // anything in it).
+            let pf = self.venues[edev].pf.as_ref().expect("the merged prefill scratch");
+            let hp = &pf.split.as_ref().expect("split scratch").1;
+            let nb = (n_embd * 4) as u64;
+            batch_cmd::record_copy(egpu, &pf.scratch, (t * k) as u64 * nb, &hp.buf, SPLIT_T_MAX as u64 * nb, nb)?;
+        }
         {
             let v = &self.venues[edev];
             let pf = v.pf.as_ref().expect("the merged prefill scratch");
@@ -4085,6 +4199,26 @@ impl<'m> Session<'m> {
                 k,
                 n_embd,
             )?;
+        }
+        let mut host_wait_s = 0.0f64;
+        let mut host_s = 0.0f64;
+        if let Some(job) = host_job.take() {
+            let tw = std::time::Instant::now();
+            let (part, bytes, busy) = job
+                .join()
+                .map_err(|_| anyhow!("the host split thread panicked on block {b}"))??;
+            host_wait_s = tw.elapsed().as_secs_f64();
+            host_s = busy;
+            self.expert_bytes += bytes as u64;
+            let v = &self.venues[dev];
+            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            let hp = &pf.split.as_ref().expect("split scratch").1;
+            hp.write(&f32_to_bytes(&part))?;
+            self.ensure_batch(dev)?;
+            let v = &self.venues[dev];
+            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            let hp = &pf.split.as_ref().expect("split scratch").1;
+            v.add.run(&pf.out, &hp.buf, &pf.out, t * n_embd, 1.0)?;
         }
         if let Some(x) = xdev {
             // The MoE result back into the block device's `pf.out` (pass 2 reads it).
@@ -4182,6 +4316,17 @@ impl<'m> Session<'m> {
             self.flush()?;
         }
 
+        if !host_set.is_empty() && std::env::var_os("BRECCIA_TRACE_MERGED").is_some() {
+            eprintln!(
+                "split blk {b:>2} t={t} host={}/{distinct} experts: host lane {:.2} ms (since spawn {:.2} ms), \
+                 join wait {:.2} ms, stream fill(cum) {:.1} ms",
+                host_set.len(),
+                host_s * 1e3,
+                host_t0.elapsed().as_secs_f64() * 1e3,
+                host_wait_s * 1e3,
+                self.pf_stream_fill_s * 1e3
+            );
+        }
         // ---- the counters (§8v): per chunk, per block ------------------------
         let dispatches = self.dispatches - disp_before;
         let expert_bytes = m.layers[b].experts.expert_bytes() as u64;
@@ -6202,6 +6347,25 @@ pub fn prefill_plan(len: usize, target: usize) -> Vec<usize> {
 fn routed_pair() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("BRECCIA_PF_ROUTED_PAIR").as_deref() != Ok("0"))
+}
+
+/// Largest chunk the `BRECCIA_PF_SPLIT_HOST` host partial handles.
+const SPLIT_T_MAX: usize = 8;
+
+/// `BRECCIA_PF_SPLIT_HOST=n` (or `n%`): on a streamed block of a chunk of at most
+/// [`SPLIT_T_MAX`] tokens, the last `n` (or that percentage of the) distinct experts in
+/// expert-id order run on the host pool concurrently with the GPU stream loop; their
+/// weighted sum is added to the fan-in output. Default off. `(count, is_percent)`.
+fn pf_split_host() -> Option<(usize, bool)> {
+    static N: std::sync::OnceLock<Option<(usize, bool)>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let v = std::env::var("BRECCIA_PF_SPLIT_HOST").ok()?;
+        let (num, pct) = match v.strip_suffix('%') {
+            Some(n) => (n, true),
+            None => (v.as_str(), false),
+        };
+        num.parse::<usize>().ok().filter(|&n| n > 0).map(|n| (n, pct))
+    })
 }
 
 /// `BRECCIA_PF_GROUP_USERS`: users per merged-prefill expert group (default 1024,
