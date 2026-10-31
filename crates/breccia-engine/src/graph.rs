@@ -2469,7 +2469,8 @@ impl<'m> Session<'m> {
         self.timers.mark(PLE);
 
         let micro_blocked = if pf_micro() { self.micro_blocker(t, pos0) } else { Some(String::new()) };
-        if let Some(why) = micro_blocked.as_ref().filter(|w| !w.is_empty()) {
+        // Only say why when asked for explicitly: default-on falls back silently.
+        if let Some(why) = micro_blocked.as_ref().filter(|w| !w.is_empty() && std::env::var_os("BRECCIA_PF_MICRO").is_some()) {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("breccia: BRECCIA_PF_MICRO=2 off for this prefill: {why}");
@@ -5550,10 +5551,11 @@ fn pf_group_users() -> usize {
 }
 
 /// `BRECCIA_PF_MICRO=2`: split each prefill chunk into two micro-batches and pipeline
-/// them across the block card and the expert helper (default off; only `2` enables).
+/// them across the block card and the expert helper (default on since §12.13: plx
+/// +34 %, logits == flag-off chunk/2; unset or `2` enables, anything else disables).
 fn pf_micro() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BRECCIA_PF_MICRO").as_deref() == Ok("2"))
+    *ON.get_or_init(|| matches!(std::env::var("BRECCIA_PF_MICRO").as_deref(), Err(_) | Ok("2")))
 }
 
 /// The merged-prefill optimisation flags, in [`Session::pf`] order.
