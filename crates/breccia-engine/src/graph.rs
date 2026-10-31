@@ -115,6 +115,8 @@ const GPU_PROBE_BATCHES: usize = 256;
 /// batches so short that the submissions dominate.
 const MERGED_BATCH_CAP: u32 = 6000;
 
+type ShipCopy<'a> = (&'a Buf, &'a Buf, u64, u64, u64);
+
 /// `BRECCIA_PF_MICRO=2` tick state (see [`Session::prefill_micro`]): one half-step of
 /// the two-micro-batch pipeline while its expert half runs on the helper card.
 struct MicroTick {
@@ -642,6 +644,11 @@ pub struct Session<'m> {
     /// [`Session::micro_launch`]).
     micro: Option<MicroTick>,
     micro_up: Option<MicroUp>,
+    /// `BRECCIA_PF_MICRO_OVL`: the previous half's MoE result copy onto the block card, in
+    /// flight on its one-shot buffer until the next readback / PLE / tick end.
+    micro_upw: Option<crate::xfer::PendingCopy>,
+    /// Where the MoE result sits in the ship import (past the ship regions) when overlapped.
+    ship_res_off: u64,
     /// Per micro-batch half: its residual chunk and its hc workspaces, swapped into
     /// `r_chunk` / `hc_chunk_ws` while that half's dense steps are recorded.
     micro_rc: [Option<Buf>; 2],
@@ -1168,6 +1175,8 @@ impl<'m> Session<'m> {
             hc_chunk_ws: (0..model.devices.len()).map(|_| Vec::new()).collect(),
             micro: None,
             micro_up: None,
+            micro_upw: None,
+            ship_res_off: 0,
             micro_rc: [None, None],
             micro_hcws: [Vec::new(), Vec::new()],
             wait_scope: None,
@@ -1384,6 +1393,33 @@ impl<'m> Session<'m> {
     /// Whether the dual-card ship `dev` -> `x` goes through the shared host import.
     /// Made on first use, sized for the largest merged-prefill scratch of either
     /// card; any failure logs once and leaves the staged path on.
+    /// The imported-memory ship of a chunk's helper inputs as `(src, dst, src off, dst
+    /// off, bytes)` lists: block card -> host (`down`) and host -> helper (`up`).
+    fn ship_lists(&self, dev: usize, x: usize, t: usize, k: usize, defer_shared: bool) -> (Vec<ShipCopy<'_>>, Vec<ShipCopy<'_>>) {
+        let n_embd = self.model.cfg.n_embd;
+        let nb = (n_embd * 4) as u64;
+        let lens = [t as u64 * nb, (t * k * 4) as u64, t as u64 * nb, (t * 4) as u64];
+        let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
+        let xpf = self.venues[x].pf.as_ref().expect("checked above");
+        let imp = self.ship_imp.as_ref().expect("ship_ready");
+        let (hd, hx) = (imp.get(dev), imp.get(x));
+        let (mut down, mut up, mut at) = (Vec::new(), Vec::new(), 0u64);
+        for (i, ((src, dst), n)) in [&pf.mixed, &pf.w, &pf.shared, &pf.gate]
+            .into_iter()
+            .zip([&xpf.mixed, &xpf.w, &xpf.shared, &xpf.gate])
+            .zip(lens)
+            .enumerate()
+        {
+            // A deferred `pf.shared` goes after the routed GEMMs, same offset.
+            if !(defer_shared && i == 2) {
+                down.push((src, hd, 0, at, n));
+                up.push((hx, dst, at, 0, n));
+            }
+            at += n;
+        }
+        (down, up)
+    }
+
     fn ship_ready(&mut self, dev: usize, x: usize) -> bool {
         if self.ship_imp_off {
             return false;
@@ -1391,12 +1427,15 @@ impl<'m> Session<'m> {
         let m = self.model;
         let r = (|| -> Result<()> {
             if self.ship_imp.is_none() {
-                let cap = [dev, x]
+                let ship = [dev, x]
                     .iter()
                     .filter_map(|&d| self.venues[d].pf.as_ref())
                     .map(|pf| (pf.mixed.size + pf.w.size + pf.shared.size + pf.gate.size).max(pf.out.size))
                     .max()
                     .unwrap_or(0);
+                // The overlapped micro-batch tick keeps the MoE result past the ship regions.
+                self.ship_res_off = ship.div_ceil(4096) * 4096;
+                let cap = self.ship_res_off + ship;
                 self.ship_imp = Some(crate::xfer::ShipImport::new(cap, m.devices.len())?);
             }
             let imp = self.ship_imp.as_mut().expect("just made");
@@ -3213,8 +3252,16 @@ impl<'m> Session<'m> {
         // A micro-batch tick starts with both cards idle: the previous half-step's
         // MoE result goes up to the block card before anything else is shipped
         // (the imported path's host region is shared with the ship below).
-        if micro {
+        if micro && !micro_ovl() {
             self.micro_up_write(dev)?;
+        }
+        // Overlapped tick: the helper's inputs start their way off the block card now
+        // and the host buckets while the DMA runs.
+        let ship_imp = xdev.is_some_and(|x| self.ship_ready(dev, x));
+        let mut down_pending = None;
+        if let (true, Some(x)) = (micro && micro_ovl() && ship_imp, xdev) {
+            let (down, _) = self.ship_lists(dev, x, t, k, defer_shared);
+            down_pending = Some(crate::xfer::copy_submit(gpu, &down)?);
         }
         let bucket_t0 = std::time::Instant::now();
         let mut raw = vec![0u8; t * k * 4];
@@ -3280,30 +3327,14 @@ impl<'m> Session<'m> {
 
         let mut ship_s = 0.0f64;
         let mut ship_p = [0.0f64; 4];
-        let ship_imp = xdev.is_some_and(|x| self.ship_ready(dev, x));
         if let Some(x) = xdev.filter(|_| ship_imp) {
             let t0 = std::time::Instant::now();
-            let nb = (n_embd * 4) as u64;
-            let lens = [t as u64 * nb, (t * k * 4) as u64, t as u64 * nb, (t * 4) as u64];
-            let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
-            let imp = self.ship_imp.as_ref().expect("ship_ready");
-            let (hd, hx) = (imp.get(dev), imp.get(x));
-            let (mut down, mut up, mut at) = (Vec::new(), Vec::new(), 0u64);
-            for (i, ((src, dst), n)) in [&pf.mixed, &pf.w, &pf.shared, &pf.gate]
-                .into_iter()
-                .zip([&xpf.mixed, &xpf.w, &xpf.shared, &xpf.gate])
-                .zip(lens)
-                .enumerate()
-            {
-                // A deferred `pf.shared` goes after the routed GEMMs, same offset.
-                if !(defer_shared && i == 2) {
-                    down.push((src, hd, 0, at, n));
-                    up.push((hx, dst, at, 0, n));
-                }
-                at += n;
-            }
-            ship_p[0] = crate::xfer::copy_fenced(gpu, &down)?;
+            let (down, up) = self.ship_lists(dev, x, t, k, defer_shared);
+            ship_p[0] = match down_pending.take() {
+                Some(p) => p.wait(gpu)?,
+                None => crate::xfer::copy_fenced(gpu, &down)?,
+            };
             ship_p[1] = crate::xfer::copy_fenced(m.devices[x].gpu(), &up)?;
             xpf.slots.write(&slot_bytes)?;
             ship_s += t0.elapsed().as_secs_f64();
@@ -3544,13 +3575,16 @@ impl<'m> Session<'m> {
             // and takes it at the next tick boundary (`micro_up_write`).
             self.submit_batch()?;
             self.flush()?;
+            // The previous result's copy onto the block card reads the same import range.
+            self.micro_upw_wait()?;
             let t0 = std::time::Instant::now();
             let xpf = self.venues[x].pf.as_ref().expect("checked above");
             let pf = self.venues[dev].pf.as_ref().expect("the merged prefill scratch");
             if ship_imp {
                 let imp = self.ship_imp.as_ref().expect("ship_ready");
                 let n = (t * n_embd * 4) as u64;
-                ship_p[2] = crate::xfer::copy_fenced(egpu, &[(&xpf.out, imp.get(x), 0, 0, n)])?;
+                let ro = if micro && micro_ovl() { self.ship_res_off } else { 0 };
+                ship_p[2] = crate::xfer::copy_fenced(egpu, &[(&xpf.out, imp.get(x), 0, ro, n)])?;
                 if micro {
                     self.micro_up = Some(MicroUp::Imported(n));
                 } else {
@@ -3736,6 +3770,15 @@ impl<'m> Session<'m> {
         batch_cmd::record_copies(gpu, &scatter)
     }
 
+    /// Wait for the in-flight [`Session::micro_up_write`] copy, if any.
+    fn micro_upw_wait(&mut self) -> Result<()> {
+        if let Some(p) = self.micro_upw.take() {
+            let gpu = self.model.devices[self.model.device_of(0)].gpu();
+            p.wait(gpu)?;
+        }
+        Ok(())
+    }
+
     /// The previous half-step's MoE result onto the block card's `pf.out` (both cards
     /// idle, nothing open on the block card).
     fn micro_up_write(&mut self, dev: usize) -> Result<()> {
@@ -3751,7 +3794,13 @@ impl<'m> Session<'m> {
             }
             MicroUp::Imported(n) => {
                 let imp = self.ship_imp.as_ref().expect("ship_ready");
-                crate::xfer::copy_fenced(gpu, &[(imp.get(dev), &pf.out, 0, 0, n)])?;
+                if micro_ovl() {
+                    // Submitted without a wait: queue order puts it ahead of B(n-1).
+                    let p = crate::xfer::copy_submit(gpu, &[(imp.get(dev), &pf.out, self.ship_res_off, 0, n)])?;
+                    self.micro_upw = Some(p);
+                } else {
+                    crate::xfer::copy_fenced(gpu, &[(imp.get(dev), &pf.out, 0, 0, n)])?;
+                }
             }
         }
         Ok(())
@@ -3772,6 +3821,9 @@ impl<'m> Session<'m> {
         // B(n-1) and A(n+1) are the same half.
         let h = (n + 1) % 2;
         let (have_b, have_a) = (n >= 1, n + 1 < steps);
+        if micro_ovl() {
+            self.micro_up_write(dev)?;
+        }
         if have_b || have_a {
             self.micro_ctx(dev, h, th, true)?;
             let r = self.micro_launch_inner(n, dev, th, pos0, have_b, have_a);
@@ -3810,6 +3862,7 @@ impl<'m> Session<'m> {
                 // (the helper has not started this tick's experts yet), run it, go on.
                 self.submit_batch()?;
                 self.flush()?;
+                self.micro_upw_wait()?;
                 self.ple_chunk(b_a, th)?;
                 self.ensure_batch(dev)?;
             }
@@ -3870,6 +3923,7 @@ impl<'m> Session<'m> {
         let r = self.prefill_micro_run(t, pos0);
         self.wait_scope = None;
         self.micro_up = None;
+        let _ = self.micro_upw_wait();
         if let Some(tk) = self.micro.take() {
             if let Some(seg) = tk.seg {
                 self.pending_seg = Some(seg);
@@ -3953,6 +4007,7 @@ impl<'m> Session<'m> {
             self.flush()
         })();
         self.micro_ctx(dev, 1, th, false)?;
+        self.micro_upw_wait()?;
         r?;
         if trace {
             // Exact MI50 busy time needs GPU timestamps (BRECCIA_GPU_TIME); here: the
@@ -5553,6 +5608,13 @@ fn pf_group_users() -> usize {
 /// `BRECCIA_PF_MICRO=2`: split each prefill chunk into two micro-batches and pipeline
 /// them across the block card and the expert helper (default on since §12.13: plx
 /// +34 %, logits == flag-off chunk/2; unset or `2` enables, anything else disables).
+/// `BRECCIA_PF_MICRO_OVL`: overlap the tick boundary's transfers (bucketing under the
+/// block card's readback, the MoE result's copy-in submitted behind the launch).
+fn micro_ovl() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_MICRO_OVL").as_deref() != Ok("0"))
+}
+
 fn pf_micro() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| matches!(std::env::var("BRECCIA_PF_MICRO").as_deref(), Err(_) | Ok("2")))
