@@ -545,6 +545,22 @@ impl<'g> GemmMany<'g> {
         cols: usize,
         users: usize,
     ) -> Result<()> {
+        self.run_pair_at(w, x, out, rows, cols, users, 0)
+    }
+
+    /// [`GemmMany::run_pair`] with the gate rows starting `base_words` (u16 words)
+    /// into `w`; the up rows follow the gate rows exactly (no padding between).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_pair_at(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        base_words: u32,
+    ) -> Result<()> {
         if users == 0 {
             return Err(anyhow!("users must be at least 1"));
         }
@@ -552,7 +568,7 @@ impl<'g> GemmMany<'g> {
             .pair
             .as_ref()
             .ok_or_else(|| anyhow!("no gate+up GEMM shader for {}", self.ty))?;
-        let pc = self.pc(rows, cols, users, 0);
+        let pc = self.pc(rows, cols, users, base_words);
         self.dispatch(kernel, &[w, x, out, &self.tables], &pc, rows, users)
     }
 
