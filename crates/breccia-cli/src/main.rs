@@ -2243,18 +2243,19 @@ fn mtp_spec_bench(
     chunk: usize,
     arms: &str,
 ) -> Result<()> {
-    use breccia_engine::mtp_spec::{generate, Policy};
+    use breccia_engine::mtp_spec::{generate, parse_arm, Accept, Policy, MAX_K};
     let env_n = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
     let (gen, reps) = (env_n("BRECCIA_MTP_GEN", 64), env_n("BRECCIA_MTP_REPS", 2));
     let dir = std::env::var("BRECCIA_MTP_DIR").unwrap_or_else(|_| "/srv/strata-data/mtp/rt".into());
-    sess.spec_enable(4).context("spec_enable(4)")?;
+    sess.spec_enable(MAX_K + 1).context("spec_enable")?;
     let mut d = breccia_engine::mtp_draft::MtpDraft::open(model, 0, &dir, prompt.len() + gen + 16)?;
     println!("mtp-spec  draft {} MiB device, prompt {} gen {gen} reps {reps}", d.bytes >> 20, prompt.len());
     for arm in arms.split(',') {
-        let pol = Policy::parse(arm).with_context(|| format!("BRECCIA_MTP_SPEC_BENCH arm {arm:?}"))?;
+        let (pol, mut acc) = parse_arm(arm).with_context(|| format!("BRECCIA_MTP_SPEC_BENCH arm {arm:?}"))?;
+        acc.special_from = model.cfg.ple.eos; // token_type.json: ids < 248044 are all normal, >= are control/special
         for rep in 0..reps {
-            let (a, sa) = generate(sess, None, prompt, chunk, gen, Policy::Plain)?;
-            let (b, sb) = generate(sess, Some(&mut d), prompt, chunk, gen, pol)?;
+            let (a, sa) = generate(sess, None, prompt, chunk, gen, Policy::Plain, Accept::default())?;
+            let (b, sb) = generate(sess, Some(&mut d), prompt, chunk, gen, pol, acc)?;
             let (ta, tb) = (a.len() as f64 / sa.decode_s, b.len() as f64 / sb.decode_s);
             println!(
                 "mtp-spec  arm {arm} rep {rep}: plain {ta:.2} tok/s | spec {tb:.2} tok/s ({:.3}x) | greedy {} ({} tokens)",
@@ -2265,6 +2266,11 @@ fn mtp_spec_bench(
                 b.len()
             );
             println!("mtp-spec  arm {arm} rep {rep}: {sb}");
+            println!("mtp-spec  arm {arm} rep {rep}: plain nll/tok {:.4}", sa.nll / sa.tokens.max(1) as f64);
+            if rep == 0 {
+                println!("mtp-ids plain {:?}", &a[prompt.len()..]);
+                println!("mtp-ids {arm} {:?}", &b[prompt.len()..]);
+            }
         }
     }
     Ok(())
@@ -3449,8 +3455,19 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                 .map_err(anyhow::Error::msg)
                 .with_context(|| format!("parsing --gpu-experts {list:?}"))?;
             if let breccia_engine::ArenaSpec::Auto(_) = arena {
+                // The MTP draft (~1 GiB) and spec slots are allocated after the arena;
+                // without room they spill to host memory (draft 1.2 -> 16.5 ms/step).
+                // shortcut: fixed margin, size it from the draft + slot bytes if spec ships.
+                let spec = ["BRECCIA_MTP_SPEC_BENCH", "BRECCIA_MTP_DRAFT_BENCH", "BRECCIA_SPEC_VERIFY_BENCH"]
+                    .iter()
+                    .any(|k| std::env::var_os(k).is_some());
+                let margin: u64 = if spec {
+                    std::env::var("BRECCIA_SPEC_MARGIN_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(2048) // draft ~1 GiB + 6 spec slots ~0.7 GiB
+                } else {
+                    0
+                };
                 arena = breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
-                    display_reserve: a.arena_display_reserve_mib << 20,
+                    display_reserve: (a.arena_display_reserve_mib + margin) << 20,
                     headroom: a.arena_headroom_mib << 20,
                 }
                 .with_prefill_chunk(a.prefill_chunk, a.ctx));
@@ -3520,8 +3537,8 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {
-        if !(2..=5).contains(&t) {
-            anyhow::bail!("BRECCIA_SPEC_VERIFY_BENCH={t}: T must be 2..=5");
+        if !(2..=6).contains(&t) {
+            anyhow::bail!("BRECCIA_SPEC_VERIFY_BENCH={t}: T must be 2..=6 (never 8)");
         }
         spec_verify_bench(&mut sess, &l2, prompt.len(), t).context("the spec-verify bench")?;
     }

@@ -201,6 +201,8 @@ pub struct MtpDraft<'g> {
     pub cells: usize,
     /// Device bytes held by this draft (for the VRAM report).
     pub bytes: u64,
+    /// The last step's top-1 softmax probability over the draft vocab.
+    pub last_p: f32,
 }
 
 fn fbuf(gpu: &Gpu, floats: usize) -> Result<Buf> {
@@ -416,6 +418,7 @@ impl<'g> MtpDraft<'g> {
             len: 0,
             cells,
             bytes: 0,
+            last_p: 0.0,
         };
         let mut me = me;
         me.bytes = bytes + act_bytes + me.qsa_state.bytes() + me.hc_ws.bytes() + me.fin_ws.bytes();
@@ -610,6 +613,8 @@ impl<'g> MtpDraft<'g> {
                 best = i;
             }
         }
+        let top = logits[best];
+        self.last_p = 1.0 / logits.iter().map(|&v| (v - top).exp()).sum::<f32>();
         let t4 = std::time::Instant::now();
         self.len = self.len.max(pos + 1);
         let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;

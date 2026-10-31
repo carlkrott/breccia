@@ -1,7 +1,8 @@
 //! Greedy generation with MTP speculative decoding: the draft proposes `k` tokens,
 //! one `Session::verify` of `k + 1` rows checks them, `rollback_to` drops the
 //! rejected tail. Output is the trunk's own greedy argmax (verify decides); the
-//! draft only changes how many trunk passes it takes. `k <= 3`, so T <= 4 (never 8).
+//! draft only changes how many trunk passes it takes (unless `Accept::relax`).
+//! `k <= 5`, so T <= 6 (never 8).
 //!
 //! Draft cell `c` holds `(R_c, tok_{c+1})` and predicts `tok_{c+2}`; `R_c` is the
 //! trunk's final residual stack after token `c`. Cells beyond the confirmed
@@ -17,10 +18,39 @@ use crate::mtp_draft::MtpDraft;
 pub enum Policy {
     /// Plain greedy decode, no draft (the control arm).
     Plain,
-    /// Fixed depth `k` in 1..=3.
+    /// Fixed depth `k` in 1..=MAX_K.
     Fixed(usize),
-    /// Adaptive depth in 0..=3.
+    /// Adaptive depth in 0..=MAX_K.
     Gate,
+}
+
+/// Acceptance and draft-stop knobs; the default (both 0) is exact greedy.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub struct Accept {
+    /// Relaxed ("lazy") accept: keep draft `d` when the trunk gives it
+    /// `p(d) >= relax`, not only when `d` is the trunk argmax. 0 = exact.
+    /// Under greedy any `relax >= 0.5` is exact (p >= 0.5 implies argmax).
+    pub relax: f32,
+    /// Stop drafting once the draft's own top-1 probability falls below this. 0 = off.
+    pub min_p: f32,
+    /// Ids at or above this are special (EOS and up) and only accepted exactly.
+    pub special_from: u32,
+}
+
+/// Parse a bench arm `K[:rP][:mQ]`, e.g. `3`, `5:r0.2`, `gate:r0.3:m0.4`.
+pub fn parse_arm(s: &str) -> Option<(Policy, Accept)> {
+    let mut it = s.split(':');
+    let pol = Policy::parse(it.next()?)?;
+    let mut acc = Accept { special_from: u32::MAX, ..Accept::default() };
+    for part in it {
+        let v: f32 = part.get(1..)?.parse().ok().filter(|v: &f32| (0.0..=1.0).contains(v))?;
+        match part.as_bytes()[0] {
+            b'r' => acc.relax = v,
+            b'm' => acc.min_p = v,
+            _ => return None,
+        }
+    }
+    Some((pol, acc))
 }
 
 impl Policy {
@@ -28,17 +58,17 @@ impl Policy {
         match s {
             "plain" => Some(Self::Plain),
             "gate" => Some(Self::Gate),
-            k => k.parse::<usize>().ok().filter(|k| (1..=3).contains(k)).map(Self::Fixed),
+            k => k.parse::<usize>().ok().filter(|k| (1..=MAX_K).contains(k)).map(Self::Fixed),
         }
     }
 }
 
-const MAX_K: usize = 3;
+pub const MAX_K: usize = 5;
 
 /// Depth chooser. `cost(k) = verify(k+1) + draft(k)` in ms, `tokens(k) = 1 + sum_j
 /// prod_{i<=j} p_i`; picks the best tokens/ms and probes one deeper every 16 picks.
-/// Priors are UNVERIFIED seeds (verify ms from the 1k mixed-prompt table); every
-/// number is replaced by an EMA of what this run measures.
+/// Priors are UNVERIFIED seeds (verify ms from the 1k mixed-prompt table, k=4/5
+/// extrapolated); every number is replaced by an EMA of what this run measures.
 struct Gate {
     num: [f64; MAX_K],
     den: [f64; MAX_K],
@@ -53,7 +83,7 @@ impl Gate {
         Gate {
             num: [1.2; MAX_K],
             den: [2.0; MAX_K],
-            round_ms: [52.0, 118.0, 142.0, 172.0],
+            round_ms: [52.0, 118.0, 142.0, 172.0, 210.0, 250.0],
             seen: [false; MAX_K + 1],
             picks: 0,
         }
@@ -101,6 +131,12 @@ pub struct SpecStats {
     pub offered: [u64; MAX_K],
     pub accepted: [u64; MAX_K],
     pub tokens: u64,
+    /// Draft steps actually run (min-p can stop a round early).
+    pub drafted: u64,
+    /// Accepted drafts that were not the trunk argmax (relaxed accepts).
+    pub relaxed: u64,
+    /// Sum of `-ln p_trunk(token)` over the emitted tokens.
+    pub nll: f64,
     pub prefill_s: f64,
     /// Draft catch-up over the prompt (not in `decode_s`).
     pub prompt_catchup_s: f64,
@@ -123,7 +159,11 @@ impl std::fmt::Display for SpecStats {
         }
         write!(
             f,
-            " | decode {:.3} s (draft {:.3} verify {:.3}) prefill {:.2} s prompt-catchup {:.2} s",
+            " | drafted {} ({:.2} ms/step) relaxed {} nll/tok {:.4} | decode {:.3} s (draft {:.3} verify {:.3}) prefill {:.2} s prompt-catchup {:.2} s",
+            self.drafted,
+            self.draft_s * 1e3 / self.drafted.max(1) as f64,
+            self.relaxed,
+            self.nll / self.tokens.max(1) as f64,
             self.decode_s, self.draft_s, self.verify_s, self.prefill_s, self.prompt_catchup_s
         )
     }
@@ -139,9 +179,16 @@ fn argmax(v: &[f32]) -> u32 {
     b as u32
 }
 
+/// `ln softmax(v)[id]`.
+fn log_p(v: &[f32], id: u32) -> f64 {
+    let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let z: f64 = v.iter().map(|&x| ((x - m) as f64).exp()).sum();
+    (v[id as usize] - m) as f64 - z.ln()
+}
+
 /// Greedy-generate `n_gen` tokens after `prompt` (the first comes from the
 /// prefill logits). `draft` is required unless `policy` is `Plain`.
-/// Needs `sess.spec_enable(4)` for any policy but `Plain`.
+/// Needs `sess.spec_enable(k + 1)` for any policy but `Plain`.
 pub fn generate(
     sess: &mut Session<'_>,
     mut draft: Option<&mut MtpDraft<'_>>,
@@ -149,6 +196,7 @@ pub fn generate(
     chunk: usize,
     n_gen: usize,
     policy: Policy,
+    acc: Accept,
 ) -> Result<(Vec<u32>, SpecStats)> {
     if policy != Policy::Plain && draft.is_none() {
         bail!("{policy:?} needs a draft");
@@ -176,6 +224,7 @@ pub fn generate(
 
     let mut toks: Vec<u32> = prompt.to_vec();
     toks.push(argmax(&logits));
+    st.nll -= log_p(&logits, toks[toks.len() - 1]);
     let mut cells_done = 0usize; // draft cells [0, cells_done) are built from true R
 
     // Catch the draft up over the prompt before the decode clock starts.
@@ -221,6 +270,7 @@ pub fn generate(
                 r_store.push(sess.final_r_decode()?);
             }
             toks.push(argmax(&l));
+            st.nll -= log_p(&l, toks[toks.len() - 1]);
             st.rounds[0] += 1;
             st.tokens += 1;
             gate.observe(0, 0, tr.elapsed().as_secs_f64() * 1e3);
@@ -237,7 +287,12 @@ pub fn generate(
             let (t, _) = d.step_ex(tok, n - 1 + j, j > 0)?;
             drafts.push(t);
             tok = t;
+            if d.last_p < acc.min_p {
+                break; // the next draft is conditioned on an unlikely one
+            }
         }
+        let k = drafts.len();
+        st.drafted += k as u64;
         st.draft_s += td.elapsed().as_secs_f64();
         let tv = std::time::Instant::now();
         let mut vt = vec![cur];
@@ -245,10 +300,22 @@ pub fn generate(
         let rows = sess.verify(&vt, n)?;
         let rs = sess.final_r_slots(k + 1)?;
         let mut a = 0;
-        while a < k && argmax(&rows[a]) == drafts[a] {
+        while a < k {
+            let d = drafts[a];
+            if argmax(&rows[a]) != d {
+                let lp = if acc.relax > 0.0 && d < acc.special_from { log_p(&rows[a], d) } else { f64::NEG_INFINITY };
+                if lp.exp() < acc.relax as f64 || acc.relax == 0.0 {
+                    break;
+                }
+                st.relaxed += 1;
+                st.nll -= lp;
+            } else {
+                st.nll -= log_p(&rows[a], d);
+            }
             a += 1;
         }
         let bonus = argmax(&rows[a]);
+        st.nll -= log_p(&rows[a], bonus);
         sess.rollback_to(a)?;
         st.verify_s += tv.elapsed().as_secs_f64();
         // R_{n..=n+a} are true; cell n-1 is built (the step above).
@@ -280,8 +347,20 @@ mod tests {
         assert_eq!(Policy::parse("plain"), Some(Policy::Plain));
         assert_eq!(Policy::parse("gate"), Some(Policy::Gate));
         assert_eq!(Policy::parse("2"), Some(Policy::Fixed(2)));
-        assert_eq!(Policy::parse("4"), None); // never T=8
+        assert_eq!(Policy::parse("5"), Some(Policy::Fixed(5)));
+        assert_eq!(Policy::parse("6"), None); // T <= 6, never 8
         assert_eq!(Policy::parse("0"), None);
+        let (p, a) = parse_arm("5:r0.2:m0.4").unwrap();
+        assert_eq!((p, a.relax, a.min_p), (Policy::Fixed(5), 0.2, 0.4));
+        assert_eq!(parse_arm("3").unwrap().1.relax, 0.0);
+        assert!(parse_arm("3:x0.1").is_none() && parse_arm("3:r2").is_none() && parse_arm("8").is_none());
+    }
+
+    #[test]
+    fn log_p_is_log_softmax() {
+        let v = [0.0f32, (3.0f32).ln()];
+        assert!((log_p(&v, 1).exp() - 0.75).abs() < 1e-6);
+        assert!((log_p(&v, 0).exp() - 0.25).abs() < 1e-6);
     }
 
     #[test]
