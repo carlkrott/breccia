@@ -411,6 +411,10 @@ enum BenchKind {
 }
 fn main() {
     let cli = Cli::parse();
+    // §12 defaults: cached host staging (§11f) everywhere. Set before any thread starts.
+    if std::env::var_os("BRECCIA_STAGING_CACHED").is_none() {
+        std::env::set_var("BRECCIA_STAGING_CACHED", "1");
+    }
     if let Err(e) = run(cli) {
         eprintln!("breccia: {e:#}");
         std::process::exit(1);
@@ -2260,6 +2264,13 @@ fn multi_arena_specs(
 
 fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     let n_streams = a.streams;
+    // §12 defaults for multi-stream: concurrent prompt passes (§11j) and the first
+    // card as routed-expert helper (§11j item 2, §12.4). Env set to anything wins.
+    for k in ["BRECCIA_MULTI_PREFILL_CONCURRENT", "BRECCIA_PF_EXPERT_DEVICE"] {
+        if std::env::var_os(k).is_none() {
+            std::env::set_var(k, "1");
+        }
+    }
     if prompt.len() + a.gen + 1 > a.ctx {
         anyhow::bail!(
             "prompt {} + gen {} + 1 exceeds --ctx {}",
