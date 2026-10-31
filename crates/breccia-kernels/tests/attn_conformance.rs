@@ -1442,3 +1442,45 @@ fn qsa_v_q8_0_matches_the_reference_and_the_f16_path() {
          rel / {max_abs:.2e} abs; pool {bytes_f16} -> {bytes_q8} B",
     );
 }
+
+/// Top-k with heavy score ties and dead blocks, several tokens per call (the
+/// decode/verify shape the rank kernel serves): ids, order and count match the
+/// reference's "descending score, ties to the lower block, own block appended".
+#[test]
+fn qsa_topk_ties_and_dead_blocks_match_the_reference() {
+    let fx = need_gpu!("qsa");
+    let gpu = fx.dev.gpu();
+    let qsa = Qsa::new(gpu, 8192).expect("qsa");
+    let tokens = 3usize;
+    for cells in [2062usize, 4200] {
+        let ws = qsa.workspace(gpu, tokens, cells).expect("ws");
+        let n_blocks = ws.n_blocks;
+        let pos0 = cells - tokens;
+        // Scores from {0,1,2} (ties everywhere), every 7th block dead.
+        let mut s = 0x9E37_79B9u64;
+        let mut gpu_sc = vec![0f32; tokens * n_blocks];
+        let mut cpu_sc = vec![0f64; tokens * n_blocks];
+        for i in 0..tokens * n_blocks {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let dead = (i % n_blocks) % 7 == 3;
+            gpu_sc[i] = if dead { -1.0e30 } else { ((s >> 33) % 3) as f32 };
+            cpu_sc[i] = if dead { f64::NEG_INFINITY } else { gpu_sc[i] as f64 };
+        }
+        breccia_kernels::gemv::upload_into(gpu, &ws.idx_scores, &breccia_kernels::ops::f32_to_bytes(&gpu_sc))
+            .expect("scores");
+        qsa.topk(&ws, pos0).expect("topk");
+        let ids = breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).expect("ids");
+        let counts = breccia_kernels::ops::download_u32(gpu, &ws.counts, tokens).expect("counts");
+        for t in 0..tokens {
+            let want = qsa::cpu::topk_blocks(
+                &cpu_sc[t * n_blocks..][..n_blocks],
+                qsa::IDX_TOPK_BLOCKS,
+                Some((pos0 + t) / qsa::IDX_BLOCK),
+            );
+            let c = counts[t] as usize;
+            assert_eq!(c, want.len(), "cells={cells} t={t}: count");
+            assert_eq!(&ids[t * ws.max_ids..][..c], &want[..], "cells={cells} t={t}: ids/order");
+        }
+        qsa.release(gpu, ws);
+    }
+}

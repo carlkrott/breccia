@@ -1,0 +1,149 @@
+#version 450
+//
+// Split-K build of `qsa_attn_apply.comp` for small T (decode, speculative verify).
+//
+// The per-head kernel runs `T * 24` workgroups that each walk every selected
+// slot serially (a dependent P -> IDS -> page table -> V chain per slot): at
+// decode 24 workgroups on an 80-CU card, ~0.5 ms per layer at ctx 1k and ~1 ms
+// at 4k. Here workgroup (row, chunk) walks only `chunk_blocks` ids and writes its
+// partial sum to `PART[row][chunk][d]`; `qsa_attn_apply_reduce.comp` sums the
+// chunks in order and applies the gate. Same terms, the summation is chunked
+// (not bit-equal to the serial kernel).
+//
+// Original contract of the per-head kernel:
+// QSA attention output: `o[head][token][d] = sigmoid(gate) * sum_slot p[slot] * v(cell)[d]`
+//
+// (`docs/specs/qwen4exp-architecture.md` §4.3 steps 5-7: dense attention over the
+// selected cells, `A = A * sigmoid(gate)` **before** `attn_output`, where `gate`
+// is the second half of the `attn_q` projection; `LC/src/models/qwen4exp.cpp:1003-1009`.)
+//
+// Consumption of the score matrix is row-major over the same `slots` layout
+// `qsa_attn_scores.comp` wrote and `ops_softmax` normalised, so probabilities
+// arrive already masked to exact zeros (exp(-1e30 - max) == 0 in f32).
+//
+// # Layout
+//
+// One invocation per (token, head, d) — `T * 24 * 256` invocations, `d` fastest —
+// so consecutive lanes read consecutive f16 values of a cell (coalesced) and the
+// same probability (broadcast). The gate is read straight out of the `attn_q`
+// projection output at its interleaved offset (`head*512 + 256 + d`), so the
+// 24x256xT gate values are never copied.
+//
+// `out` is `[T, n_head, head_dim]` head-major, which is exactly the `attn_output`
+// GEMV's (`[6144 -> 2560]`) activation layout.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Probs { float P[]; }; // [n_head*T, slots]
+layout(std430, binding = 1) readonly buffer VPool { uint VP[]; }; // paged f16 pairs
+layout(std430, binding = 2) readonly buffer PageTable { uint PT[]; };
+layout(std430, binding = 3) readonly buffer Ids { uint IDS[]; }; // [T, max_blocks]
+layout(std430, binding = 4) readonly buffer Counts { uint CNT[]; }; // [T]
+layout(std430, binding = 5) readonly buffer QFull { float QF[]; }; // [T, n_head*512]
+layout(std430, binding = 6) writeonly buffer Part { float O[]; }; // [T*n_head, chunks, head_dim]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_head;
+    uint head_dim;
+    uint slots;
+    uint id_stride;
+    int pos0;
+    uint page_cells;
+    uint n_kv_head;
+} pc;
+
+// `qsa::SPLIT_CHUNK_BLOCKS` (push constants are full at 8 words).
+#define CHUNK_BLOCKS 16u
+
+#define WG_X_MAX 65535u
+
+#include "f16_storage.glsl"
+#include "ops_math.glsl"
+
+#ifdef BRECCIA_KV_Q8V
+// `BRECCIA_KV_Q8V`: V is q8_0 (`docs/phase-4/01-forward-pass.md` §8bg) and is
+// dequantised **in registers inside the accumulate loop** — `v = i8 * scale` added
+// straight into `acc`. There is deliberately no dequantise-the-cache-to-f16 pass
+// anywhere: that is the exllamav2 shape, it writes and re-reads what it just
+// quantised, and it makes the quantised path *slower* than f16 even though it reads
+// fewer bytes (research 11, MLC).
+//
+// Byte cost per (cell, 32-element block): 8 words of i8 that four neighbouring
+// lanes share plus one broadcast scale word = 36 B for 32 elements, against 64 B
+// for f16 — the 0.5625x the capacity arithmetic assumes, and it survives only
+// because the four int8 in a word are consumed by consecutive lanes and the scale
+// by all 32.
+//
+// `qsa::sizes::Q8_BLOCK_ELEMS` / `Q8_BLOCK_WORDS` pin these constants.
+#define Q8_BLOCK_ELEMS 32u
+#define Q8_BLOCK_WORDS 9u
+
+// One q8_0 element of the paged V cache: `elem` is the element index inside a row,
+// `row` the row's index in the pool.
+float load_v_q8(uint row, uint elem, uint blocks) {
+    uint at = (row * blocks + (elem / Q8_BLOCK_ELEMS)) * Q8_BLOCK_WORDS;
+    float scale = uintBitsToFloat(VP[at]);
+    // Signed 8-bit extract: sign-extending is exactly the i8 decode.
+    int q = bitfieldExtract(int(VP[at + 1u + ((elem % Q8_BLOCK_ELEMS) >> 2u)]),
+                            int((elem % 4u) * 8u), 8);
+    return float(q) * scale;
+}
+#else
+// One f16 element of the paged cache (`elem` is the element index inside a row).
+float load_half(uint elem) {
+    return breccia_load_f16(VP[elem >> 1], elem);
+}
+#endif
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint chunks = (pc.id_stride + CHUNK_BLOCKS - 1u) / CHUNK_BLOCKS;
+    uint chunk = wg % chunks;
+    uint row = wg / chunks; // t * n_head + h
+    if (row >= pc.tokens * pc.n_head) {
+        return; // whole workgroup
+    }
+    uint d = gl_LocalInvocationID.x; // head_dim == 256 == local size
+    uint h = row % pc.n_head;
+    uint t = row / pc.n_head;
+
+    uint count = CNT[t];
+    int pos = pc.pos0 + int(t);
+    uint kvh = h * pc.n_kv_head / pc.n_head;
+
+#ifdef BRECCIA_KV_Q8V
+    uint blocks = pc.head_dim / Q8_BLOCK_ELEMS;
+#endif
+
+    float acc = 0.0;
+    uint r_end = min(count, (chunk + 1u) * CHUNK_BLOCKS);
+    for (uint r = chunk * CHUNK_BLOCKS; r < r_end; ++r) {
+        uint block = IDS[t * pc.id_stride + r];
+        for (uint k = 0u; k < 4u; ++k) {
+            uint p_slot = r * 4u + k;
+            if (p_slot >= pc.slots) {
+                break;
+            }
+            float p = P[row * pc.slots + p_slot];
+            if (p == 0.0) {
+                continue;
+            }
+            int cell = int(block) * 4 + int(k);
+            if (cell > pos) {
+                continue;
+            }
+            uint page = PT[uint(cell) / pc.page_cells];
+            uint in_page = uint(cell) % pc.page_cells;
+#ifdef BRECCIA_KV_Q8V
+            uint vrow = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
+            acc += p * load_v_q8(vrow, d, blocks);
+#else
+            uint base = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
+                        in_page * pc.head_dim;
+            acc += p * load_half(base + d);
+#endif
+        }
+    }
+    O[(row * chunks + chunk) * pc.head_dim + d] = acc;
+}

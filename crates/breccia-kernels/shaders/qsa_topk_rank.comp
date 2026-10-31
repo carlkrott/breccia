@@ -1,0 +1,108 @@
+#version 450
+//
+// QSA top-k block selection for decode-sized calls: same output as qsa_topk.comp
+// (descending score, ties to the lower block, own block appended if missed) but
+// every block computes its own rank in parallel instead of 512 serial argmax passes
+// in one workgroup.
+//
+//   rank(b) = #{c : s_c > s_b  or  (s_c == s_b and c < b)}
+//
+// is the position the serial loop emits b at, so a visible block with rank < want
+// writes ids[rank] = b. O(n_blocks^2) compares per token: the host gates this to
+// small token counts and bounded n_blocks.
+//
+// phase 0: one invocation per (token, block): rank + scatter.
+// phase 1: one workgroup per token: visible count, own block's rank, count + append.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Scores { float SC[]; }; // [T, n_blocks]
+layout(std430, binding = 1) buffer Ids { uint IDS[]; };             // [T, max_ids]
+layout(std430, binding = 2) writeonly buffer Counts { uint CNT[]; }; // [T]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_blocks;
+    uint topk_blocks;
+    uint max_ids;
+    int pos0;
+    uint phase;
+} pc;
+
+#define WG_X_MAX 65535u
+#define DEAD (-1.0e29)
+
+shared float s_s[256];
+shared uint s_a[256];
+shared uint s_b[256];
+
+// Does block c (score sc) come before block b (score sb) in the emitted order?
+bool before(float sc, uint c, float sb, uint b) {
+    return sc > sb || (sc == sb && c < b);
+}
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint want = min(pc.n_blocks, pc.topk_blocks);
+
+    if (pc.phase == 0u) {
+        uint per = (pc.n_blocks + 255u) / 256u;
+        uint t = wg / per;
+        if (t >= pc.tokens) {
+            return; // whole workgroup leaves together
+        }
+        uint base = t * pc.n_blocks;
+        uint b = (wg % per) * 256u + tid;
+        float sb = b < pc.n_blocks ? SC[base + b] : DEAD;
+        uint rank = 0u;
+        for (uint c0 = 0u; c0 < pc.n_blocks; c0 += 256u) {
+            uint c = c0 + tid;
+            s_s[tid] = c < pc.n_blocks ? SC[base + c] : DEAD;
+            barrier();
+            uint m = min(256u, pc.n_blocks - c0);
+            for (uint j = 0u; j < m; ++j) {
+                rank += before(s_s[j], c0 + j, sb, b) ? 1u : 0u;
+            }
+            barrier();
+        }
+        if (b < pc.n_blocks && sb > DEAD && rank < want) {
+            IDS[t * pc.max_ids + rank] = b;
+        }
+        return;
+    }
+
+    uint t = wg;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint base = t * pc.n_blocks;
+    uint own = uint(pc.pos0 + int(t)) / 4u;
+    float so = own < pc.n_blocks ? SC[base + own] : DEAD;
+    uint vis = 0u;
+    uint orank = 0u;
+    for (uint c = tid; c < pc.n_blocks; c += 256u) {
+        float sc = SC[base + c];
+        vis += sc > DEAD ? 1u : 0u;
+        orank += before(sc, c, so, own) ? 1u : 0u;
+    }
+    s_a[tid] = vis;
+    s_b[tid] = orank;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_a[tid] += s_a[tid + off];
+            s_b[tid] += s_b[tid + off];
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        uint count = min(want, s_a[0]);
+        bool present = own < pc.n_blocks && so > DEAD && s_b[0] < want;
+        if (!present && count < pc.max_ids) {
+            IDS[t * pc.max_ids + count] = own;
+            count += 1u;
+        }
+        CNT[t] = count;
+    }
+}

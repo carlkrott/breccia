@@ -1,0 +1,42 @@
+#version 450
+//
+// Second pass of `qsa_attn_apply_split.comp`: `O[t][h][d] = sigmoid(gate) *
+// sum_c PART[t*n_head+h][c][d]`, chunks summed in ascending order (deterministic).
+// The gate is read in place from the `attn_q` projection output, as in
+// `qsa_attn_apply.comp`.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Part { float PART[]; }; // [T*n_head, chunks, head_dim]
+layout(std430, binding = 1) readonly buffer QFull { float QF[]; }; // [T, n_head*512]
+layout(std430, binding = 2) writeonly buffer Out { float O[]; }; // [T, n_head, head_dim]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_head;
+    uint head_dim;
+    uint chunks;
+} pc;
+
+#define WG_X_MAX 65535u
+
+#include "ops_math.glsl"
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint unit = wg * 256u + gl_LocalInvocationID.x;
+    if (unit >= pc.tokens * pc.n_head * pc.head_dim) {
+        return;
+    }
+    uint d = unit % pc.head_dim;
+    uint row = unit / pc.head_dim; // t * n_head + h
+    uint h = row % pc.n_head;
+    uint t = row / pc.n_head;
+    float acc = 0.0;
+    for (uint c = 0u; c < pc.chunks; ++c) {
+        acc += PART[(row * pc.chunks + c) * pc.head_dim + d];
+    }
+    uint gate_at = t * (pc.n_head * 2u * pc.head_dim) + h * (2u * pc.head_dim) +
+                   pc.head_dim + d;
+    O[unit] = acc * breccia_sigmoid(QF[gate_at]);
+}

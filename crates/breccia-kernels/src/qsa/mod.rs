@@ -118,6 +118,30 @@ fn gqa_scores(tokens: usize) -> bool {
         && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_GQA_SCORES").map_or(true, |v| v != "0"))
 }
 
+/// Ids (4 slots each) per split-apply workgroup: ctx 1k -> 17 chunks, 4k -> 33.
+/// `CHUNK_BLOCKS` in `qsa_attn_apply_split.comp` must match.
+const SPLIT_CHUNK_BLOCKS: usize = 16;
+
+/// Calls below `GQA_MIN_TOKENS` rows (decode, speculative verify) apply with the
+/// split-K pair (`qsa_attn_apply_split.comp` + `_reduce`) instead of the per-head
+/// kernel's `T * 24` serial workgroups. `BRECCIA_QSA_APPLY_SPLIT=0` opts out.
+fn split_apply(tokens: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    tokens < GQA_MIN_TOKENS
+        && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_APPLY_SPLIT").map_or(true, |v| v != "0"))
+}
+
+/// Calls below `GQA_MIN_TOKENS` rows with at most `RANK_TOPK_MAX_BLOCKS` blocks
+/// select with `qsa_topk_rank.comp` (a rank per block, same ids and order as the
+/// serial `qsa_topk.comp`). `BRECCIA_QSA_TOPK_RANK=0` opts out.
+const RANK_TOPK_MAX_BLOCKS: usize = 16384; // O(n^2) compares per token: 64k ctx
+fn rank_topk(tokens: usize, n_blocks: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    tokens < GQA_MIN_TOKENS
+        && n_blocks <= RANK_TOPK_MAX_BLOCKS
+        && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_TOPK_RANK").map_or(true, |v| v != "0"))
+}
+
 /// Calls of `1..GQA_MIN_TOKENS` rows (decode, speculative verify) score with
 /// `qsa_attn_scores_small.comp`: a thread per slot, K read once per kv head. Decode at
 /// ctx 1k: 70 -> 52-60 ms/token, same 32 tokens as the per-head kernel (not bit-equal).
@@ -510,6 +534,9 @@ pub struct QsaWorkspace {
     pub attn: Buf,
     /// `[T, 24, 256]` gated attention output (the `attn_output` GEMV's input).
     pub attn_out: Buf,
+    /// `[24*T, chunks, 256]` split-apply partial sums (one word unless
+    /// [`split_apply`] holds for this `T`).
+    pub attn_part: Buf,
     pub n_blocks: usize,
     pub slots: usize,
     pub max_ids: usize,
@@ -529,6 +556,7 @@ impl QsaWorkspace {
             &self.counts,
             &self.attn,
             &self.attn_out,
+            &self.attn_part,
         ]
         .iter()
         .map(|b| b.size)
@@ -575,6 +603,7 @@ pub struct Qsa<'g> {
     idx_pool: Pipe<'g>,
     idx_score: Pipe<'g>,
     topk: Pipe<'g>,
+    topk_rank: Pipe<'g>,
     attn_scores: Pipe<'g>,
     attn_scores_gqa: Pipe<'g>,
     attn_scores_small: Pipe<'g>,
@@ -585,6 +614,11 @@ pub struct Qsa<'g> {
     /// 12 heads that share it (`qsa_attn_apply_gqa.comp`, plan §12 item 3).
     attn_apply_gqa: Pipe<'g>,
     attn_apply_gqa_q8: Pipe<'g>,
+    /// Decode/verify apply, split over slot chunks (`qsa_attn_apply_split.comp`)
+    /// and summed by `qsa_attn_apply_reduce.comp`.
+    attn_apply_split: Pipe<'g>,
+    attn_apply_split_q8: Pipe<'g>,
+    attn_apply_reduce: Pipe<'g>,
     softmax: Softmax<'g>,
     rope_hd: Rope<'g>,
     rope_idx: Rope<'g>,
@@ -641,6 +675,12 @@ impl<'g> Qsa<'g> {
             3,
             "qsa indexer top-k",
         )?;
+        let topk_rank = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_topk_rank.spv")),
+            3,
+            "qsa indexer top-k (rank)",
+        )?;
         let attn_scores = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_scores.spv")),
@@ -683,6 +723,24 @@ impl<'g> Qsa<'g> {
             7,
             "qsa attention apply (kv-head groups, q8_0 V)",
         )?;
+        let attn_apply_split = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_split.spv")),
+            7,
+            "qsa attention apply (split)",
+        )?;
+        let attn_apply_split_q8 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_split_q8v.spv")),
+            7,
+            "qsa attention apply (split, q8_0 V)",
+        )?;
+        let attn_apply_reduce = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_reduce.spv")),
+            3,
+            "qsa attention apply (split reduce)",
+        )?;
         let softmax = Softmax::new(gpu)?;
         let rope_hd = Rope::new(gpu, MODEL_HEAD_DIM, MODEL_N_ROT, max_pos)?;
         let rope_idx = Rope::new(gpu, IDX_DIM, MODEL_N_ROT, max_pos)?;
@@ -698,6 +756,7 @@ impl<'g> Qsa<'g> {
             idx_pool,
             idx_score,
             topk,
+            topk_rank,
             attn_scores,
             attn_scores_gqa,
             attn_scores_small,
@@ -705,6 +764,9 @@ impl<'g> Qsa<'g> {
             attn_apply_q8,
             attn_apply_gqa,
             attn_apply_gqa_q8,
+            attn_apply_split,
+            attn_apply_split_q8,
+            attn_apply_reduce,
             softmax,
             rope_hd,
             rope_idx,
@@ -748,11 +810,17 @@ impl<'g> Qsa<'g> {
             tokens,
             MODEL_N_HEAD * tokens * slots,
             tokens * ATTN_OUT_DIM,
+            // A prefill chunk workspace is reused by speculative verify at T < 16 rows.
+            if split_apply(1) {
+                tokens.min(GQA_MIN_TOKENS - 1) * ATTN_OUT_DIM * max_ids.div_ceil(SPLIT_CHUNK_BLOCKS)
+            } else {
+                1
+            },
         ];
         assert_eq!(
             sizes.len(),
-            11,
-            "QsaWorkspace has eleven fields; the positional slot list must match it"
+            12,
+            "QsaWorkspace has twelve fields; the positional slot list must match it"
         );
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         for (i, n) in sizes.iter().enumerate() {
@@ -767,7 +835,7 @@ impl<'g> Qsa<'g> {
             }
         }
         let mut it = bufs.into_iter();
-        let mut take = || it.next().expect("eleven qsa buffers were allocated");
+        let mut take = || it.next().expect("twelve qsa buffers were allocated");
         Ok(QsaWorkspace {
             tokens,
             q_full: take(),
@@ -781,6 +849,7 @@ impl<'g> Qsa<'g> {
             counts: take(),
             attn: take(),
             attn_out: take(),
+            attn_part: take(),
             n_blocks,
             slots,
             max_ids,
@@ -800,6 +869,7 @@ impl<'g> Qsa<'g> {
             &ws.counts,
             &ws.attn,
             &ws.attn_out,
+            &ws.attn_part,
         ] {
             gpu.destroy_buf(b);
         }
@@ -1038,6 +1108,21 @@ impl<'g> Qsa<'g> {
             .u(ws.max_ids as u32)
             .i(pos0 as i32)
             .u(0); // dense off: a word Pc does not push is undefined in the shader
+        if rank_topk(ws.tokens, ws.n_blocks) {
+            // Same words; word 5 is `phase` in qsa_topk_rank.comp (0 rank, 1 finalize).
+            let bufs = [&ws.idx_scores, &ws.ids, &ws.counts];
+            let (gx, gy) = grid_for(ws.tokens * ws.n_blocks.div_ceil(256), 1);
+            self.topk_rank.run(&bufs, &pc, (gx, gy, 1))?;
+            let pc1 = Pc::new()
+                .u(ws.tokens as u32)
+                .u(ws.n_blocks as u32)
+                .u(IDX_TOPK_BLOCKS as u32)
+                .u(ws.max_ids as u32)
+                .i(pos0 as i32)
+                .u(1);
+            let (gx, gy) = grid_for(ws.tokens, 1);
+            return self.topk_rank.run(&bufs, &pc1, (gx, gy, 1));
+        }
         let (gx, gy) = grid_for(ws.tokens, 1);
         self.topk
             .run(&[&ws.idx_scores, &ws.ids, &ws.counts], &pc, (gx, gy, 1))
@@ -1107,6 +1192,38 @@ impl<'g> Qsa<'g> {
             .i(pos0 as i32)
             .u(PAGE_CELLS as u32)
             .u(MODEL_N_KV_HEAD as u32);
+        if split_apply(ws.tokens) {
+            let chunks = ws.max_ids.div_ceil(SPLIT_CHUNK_BLOCKS);
+            let pipe = match state.v_layout {
+                VLayout::F16 => &self.attn_apply_split,
+                VLayout::Q8_0 => &self.attn_apply_split_q8,
+            };
+            let (gx, gy) = grid_for(ws.tokens * MODEL_N_HEAD * chunks, 1);
+            pipe.run(
+                &[
+                    &ws.attn,
+                    &state.v_pool,
+                    &state.page_table,
+                    &ws.ids,
+                    &ws.counts,
+                    &ws.q_full,
+                    &ws.attn_part,
+                ],
+                &pc,
+                (gx, gy, 1),
+            )?;
+            let rpc = Pc::new()
+                .u(ws.tokens as u32)
+                .u(MODEL_N_HEAD as u32)
+                .u(MODEL_HEAD_DIM as u32)
+                .u(chunks as u32);
+            let (gx, gy) = grid_for(ws.tokens * ATTN_OUT_DIM, 256);
+            return self.attn_apply_reduce.run(
+                &[&ws.attn_part, &ws.q_full, &ws.attn_out],
+                &rpc,
+                (gx, gy, 1),
+            );
+        }
         let gqa = gqa_apply(ws.tokens);
         let (gx, gy) = if gqa {
             grid_for(ws.tokens * MODEL_N_KV_HEAD, 1)
