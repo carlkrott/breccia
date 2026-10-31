@@ -2328,6 +2328,13 @@ fn spec_verify_bench(
     // Plain greedy: g[i + 1] follows g[i]; d[i] is the logits after feeding g[i].
     let mut g = vec![argmax(first) as u32];
     let (mut dec_ms, mut d) = (Vec::new(), Vec::new());
+    // `BRECCIA_GPU_TIME=1`: per-stage GPU us for one decode step vs one verify.
+    let stage_us = |s: &breccia_engine::Session<'_>, n: usize| {
+        let f = s.forwards.max(1) as f64 / n as f64;
+        s.gpu_time_table()
+            .map(|rows| rows.into_iter().map(|r| (r.stage, r.total_us * f)).collect::<Vec<_>>())
+    };
+    sess.reset_counters()?;
     for i in 0..N {
         let t0 = std::time::Instant::now();
         let l = sess.token(g[i], p + i, None)?;
@@ -2338,6 +2345,7 @@ fn spec_verify_bench(
         }
     }
     let decode_ms = median(&mut dec_ms);
+    let dec_tab = stage_us(sess, N);
 
     let (mut ver_ms, mut rows) = (Vec::new(), Vec::new());
     for rep in 0..=REPS {
@@ -2346,9 +2354,26 @@ fn spec_verify_bench(
         rows = sess.verify(&g[..t], p)?;
         if rep > 0 {
             ver_ms.push(t0.elapsed().as_secs_f64() * 1e3);
+        } else {
+            sess.reset_counters()?;
         }
     }
     let verify_ms = median(&mut ver_ms);
+    if let (Some(dt), Some(vt)) = (dec_tab, stage_us(sess, REPS)) {
+        println!("spec-verify gpu us per call: stage decode verify(T={t})");
+        let (mut sd, mut sv) = (0.0, 0.0);
+        for (name, v) in &vt {
+            let dv = dt.iter().find(|(n, _)| n == name).map_or(0.0, |x| x.1);
+            println!("  {name:<14} {dv:>9.1} {v:>9.1}");
+            sd += dv;
+            sv += v;
+        }
+        for (name, dv) in dt.iter().filter(|(n, _)| !vt.iter().any(|(m, _)| m == n)) {
+            println!("  {name:<14} {dv:>9.1} {:>9.1}", 0.0);
+            sd += dv;
+        }
+        println!("  {:<14} {sd:>9.1} {sv:>9.1}  (wall {:.0} / {:.0} us)", "sum", decode_ms * 1e3, verify_ms * 1e3);
+    }
     let top1 = (0..t).filter(|&i| argmax(&rows[i]) as u32 == g[i + 1]).count();
     let max_diff = (0..t)
         .flat_map(|i| rows[i].iter().zip(&d[i]).map(|(a, b)| (a - b).abs()))
