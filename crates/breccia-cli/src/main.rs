@@ -3247,6 +3247,63 @@ fn prefill_only(
     Ok(())
 }
 
+/// `BRECCIA_SPEC_PROBE=t1,t2,..`: what verifying `t` rows costs at a decode position
+/// (spec-decode phase 1). After the measured generation, replays its true greedy tokens:
+/// `BRECCIA_SPEC_PROBE_G` (64) decode steps, then for each `t` `BRECCIA_SPEC_PROBE_W` (6)
+/// consecutive `t`-row `Session::prefill` windows (the all-accepted verify shape, real
+/// routing), each followed by 4 timed decode steps for a same-position baseline.
+/// Timing only: GDN state is advanced, nothing is rolled back.
+fn spec_probe(
+    a: &TokenArgs,
+    sess: &mut breccia_engine::Session<'_>,
+    prompt: &[u32],
+    gen: &[u32],
+    spec: &str,
+) -> Result<()> {
+    let env_n = |k: &str, d: usize| {
+        std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    };
+    let (g0, w) = (env_n("BRECCIA_SPEC_PROBE_G", 64), env_n("BRECCIA_SPEC_PROBE_W", 6));
+    let ts: Vec<usize> = spec.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    let need = g0 + 4 + ts.iter().map(|t| w * t + 4).sum::<usize>() + 1;
+    anyhow::ensure!(gen.len() >= need, "spec probe needs --gen >= {need}, have {}", gen.len());
+    feed_prompt(sess, prompt, a.prefill_chunk)?;
+    let (mut pos, mut i) = (prompt.len(), 0usize);
+    let mut decode = |sess: &mut breccia_engine::Session<'_>, n: usize, pos: &mut usize, i: &mut usize| -> Result<f64> {
+        let t0 = std::time::Instant::now();
+        for _ in 0..n {
+            sess.token(gen[*i], *pos, None)?;
+            *i += 1;
+            *pos += 1;
+        }
+        Ok(t0.elapsed().as_secs_f64() * 1e3 / n as f64)
+    };
+    decode(sess, g0, &mut pos, &mut i)?;
+    let base = decode(sess, 4, &mut pos, &mut i)?;
+    println!("spec-probe  decode at pos {pos}: {base:.2} ms/step");
+    for &t in &ts {
+        let mut ms = Vec::new();
+        for _ in 0..w {
+            let t0 = std::time::Instant::now();
+            sess.prefill(&gen[i..i + t], pos)?;
+            ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            i += t;
+            pos += t;
+        }
+        let dec = decode(sess, 4, &mut pos, &mut i)?;
+        let warm = &ms[1..];
+        println!(
+            "spec-probe  t={t} rows: windows ms {:?} · mean(excl. first) {:.2} ms = {:.2} x decode · \
+             {:.2} ms/row · decode after {dec:.2} ms/step",
+            ms.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>(),
+            warm.iter().sum::<f64>() / warm.len().max(1) as f64,
+            warm.iter().sum::<f64>() / warm.len().max(1) as f64 / base,
+            warm.iter().sum::<f64>() / warm.len().max(1) as f64 / t as f64,
+        );
+    }
+    Ok(())
+}
+
 fn bench_token(a: TokenArgs) -> Result<()> {
     let prompt = parse_prompt_ids(&a)?;
     let glob = a
@@ -3457,6 +3514,10 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         runs.push(row);
     }
 
+    if let Some(spec) = std::env::var_os("BRECCIA_SPEC_PROBE") {
+        let gen = runs.first().map(|r| r.generated.clone()).unwrap_or_default();
+        spec_probe(&a, &mut sess, &prompt, &gen, &spec.to_string_lossy())?;
+    }
     let runs_n = runs.len().max(1) as f64;
     for v in stages_acc.iter_mut() {
         *v /= runs_n;
