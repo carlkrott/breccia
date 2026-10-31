@@ -2910,9 +2910,18 @@ impl<'m> Session<'m> {
         let raw = {
             let sp = self.spec.as_ref().expect("replay needs spec_enable");
             let out = sp.head_logits.as_ref().expect("replay allocates the head output");
-            let items: Vec<(&Buf, u64, usize)> =
-                (0..t).map(|i| (out, (i * mc.vocab * 4) as u64, mc.vocab * 4)).collect();
-            self.stagings[0].read_batch(gpu, &items)?
+            // As many rows per readback as the staging buffer holds (a small
+            // `--prefill-chunk` sizes it for one or two rows).
+            let per = ((self.stagings[0].capacity() as usize) / (mc.vocab * 4)).max(1);
+            let mut raw = Vec::with_capacity(t);
+            for rows in (0..t).collect::<Vec<_>>().chunks(per) {
+                let items: Vec<(&Buf, u64, usize)> = rows
+                    .iter()
+                    .map(|&i| (out, (i * mc.vocab * 4) as u64, mc.vocab * 4))
+                    .collect();
+                raw.extend(self.stagings[0].read_batch(gpu, &items)?);
+            }
+            raw
         };
         self.timers.stop();
         self.forwards += t;
