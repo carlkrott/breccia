@@ -1708,7 +1708,8 @@ impl<'g> HcMixer<'g> {
         with_inject: bool,
         fuse_gated: bool,
     ) -> Result<Self> {
-        let fuse_hc = std::env::var("BRECCIA_FUSE_HC").is_ok_and(|v| v.trim() == "1");
+        // Default on since 2026-10-31 (plx +1.3 %, greedy tokens identical); `BRECCIA_FUSE_HC=0` opts out.
+        let fuse_hc = !std::env::var("BRECCIA_FUSE_HC").is_ok_and(|v| v.trim() == "0");
         Self::with_fusion_hc(gpu, ty, n_embd, hc, hc_lr, with_inject, fuse_gated, fuse_hc)
     }
 
