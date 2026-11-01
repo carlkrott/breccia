@@ -509,6 +509,9 @@ pub struct Gpu {
     /// both are 0 when `VK_EXT_subgroup_size_control` is absent.
     pub min_subgroup_size: u32,
     pub max_subgroup_size: u32,
+    /// PCI address, so per-device overrides (`BRECCIA_SUBGROUP=03:00.0=32`) can
+    /// name a card instead of an ordinal.
+    pub pci_address: String,
 
     pub queue_c: vk::Queue,
     pub family_c: u32,
@@ -972,7 +975,7 @@ impl Gpu {
             enabled_exts.join(", ")
         );
         println!(
-            "      {} compute units ({}), wave{}",
+            "      {} compute units ({}), wave{}{}",
             match dev.feats.compute_units {
                 0 => "unknown".to_string(),
                 n => n.to_string(),
@@ -982,7 +985,11 @@ impl Gpu {
             } else {
                 "VK_AMD_shader_core_properties2"
             },
-            dev.subgroup_size
+            dev.subgroup_size,
+            match std::env::var("BRECCIA_SUBGROUP") {
+                Ok(v) => format!(" [BRECCIA_SUBGROUP={v}]"),
+                Err(_) => String::new(),
+            }
         );
 
         // Load vkQueueSubmit2 by its core name (see the field's docs).
@@ -1050,6 +1057,7 @@ impl Gpu {
             feats: dev.feats,
             min_subgroup_size: dev.min_subgroup_size,
             max_subgroup_size: dev.max_subgroup_size,
+            pci_address: dev.pci_address.clone(),
             queue_c,
             family_c: fam_c,
             queue_x,
@@ -1306,9 +1314,24 @@ impl Gpu {
     /// else in the engine ever asks for a different one, so this is the only way to
     /// run a pipeline at wave32 and measure it.
     pub fn forced_subgroup(&self) -> Option<u32> {
-        static ON: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| {
-            let n: u32 = std::env::var("BRECCIA_SUBGROUP").ok()?.parse().ok()?;
+        // Per-device form: `BRECCIA_SUBGROUP=0000:03:00.0=32,0000:0e:00.0=64`
+        // (or `03:00.0=32`). A bare number applies to every device. Per-device is
+        // the form that matters here: the calibration sweep found wave32 up to
+        // 2.3x on the RX's prefill GEMMs and *nothing* on the MI50, which is
+        // wave64-native, so a global override would trade one for the other.
+        let raw = std::env::var("BRECCIA_SUBGROUP").ok()?;
+        let n: u32 = match raw.split(',').find_map(|e| {
+            let (k, v) = e.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() || !self.pci_address.contains(k) {
+                return None;
+            }
+            v.trim().parse::<u32>().ok()
+        }) {
+            Some(n) => n,
+            None => raw.trim().parse::<u32>().ok()?,
+        };
+        let n = {
             if !self.feats.subgroup_size_control {
                 eprintln!(
                     "BRECCIA_SUBGROUP={n}: device has no VK_EXT_subgroup_size_control; ignored"
@@ -1326,8 +1349,9 @@ impl Gpu {
                 );
                 return None;
             }
-            Some(n)
-        })
+            n
+        };
+        Some(n)
     }
 
     pub fn kernel(&self, spv: &[u8], n_storage: u32) -> R<Kernel> {
