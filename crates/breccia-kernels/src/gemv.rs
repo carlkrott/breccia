@@ -499,8 +499,26 @@ impl<'g> Gemv<'g> {
     }
 
     /// Split factor for this shape (see [`Gemv::recommended_splits_for`]).
+    ///
+    /// The compute-unit count is a **hardware fact**, not a constant: core Vulkan
+    /// has no way to ask for it, so this used to pass 60 (the MI50's count) on both
+    /// cards. `VK_AMD_shader_core_properties2` reports the real number (80 on the
+    /// RX 6950 XT), which moves the "is the device already full?" threshold and can
+    /// therefore change the split. `BRECCIA_CU_AWARE_SPLITS=1` opts into the
+    /// measured count; the default keeps the historical 60 so decode numerics do not
+    /// shift under a change that has not been A/B'd yet.
     pub fn recommended_splits(&self) -> u32 {
-        self.recommended_splits_for(60)
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| std::env::var("BRECCIA_CU_AWARE_SPLITS").as_deref() == Ok("1"));
+        let cus = if on {
+            match self.gpu.feats.compute_units {
+                0 => 60,
+                n => n,
+            }
+        } else {
+            60
+        };
+        self.recommended_splits_for(cus)
     }
 
     /// Split heuristic: split only when row-parallelism alone leaves the device

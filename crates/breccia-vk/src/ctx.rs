@@ -42,6 +42,12 @@ pub struct Feats {
     pub host_query_reset: bool,
     /// Needed by the fp16 kernel's float16_t storage buffer (Vulkan 1.1 core feature).
     pub storage_buffer16_bit_access: bool,
+    /// `VK_AMD_shader_core_properties2::activeComputeUnitCount`, or 0 when the
+    /// extension is absent. This is the only Vulkan query that reports **how many
+    /// compute units the card actually has** (80 on the RX 6950 XT, 60 on the
+    /// MI50); core Vulkan has no such limit, which is why the kernel heuristics
+    /// used to hard-code 60. See `Gpu::cus`.
+    pub compute_units: u32,
 }
 
 pub struct Dev {
@@ -75,6 +81,15 @@ pub struct Dev {
 }
 
 impl Dev {
+    /// Compute units the driver reports, or `fallback` when the AMD extension that
+    /// exposes the count is absent (non-AMD drivers, or a loader that filtered it).
+    pub fn cus(&self, fallback: u32) -> u32 {
+        match self.feats.compute_units {
+            0 => fallback,
+            n => n,
+        }
+    }
+
     pub fn has_ext(&self, name: &str) -> bool {
         self.exts.iter().any(|e| e == name)
     }
@@ -165,6 +180,13 @@ impl Host {
             if has_pci_bus_info {
                 p2 = p2.push_next(&mut pci);
             }
+            let mut core = vk::PhysicalDeviceShaderCoreProperties2AMD::default();
+            if ext_names
+                .iter()
+                .any(|e| e == "VK_AMD_shader_core_properties2")
+            {
+                p2 = p2.push_next(&mut core);
+            }
             unsafe { self.instance.get_physical_device_properties2(pdev, &mut p2) };
 
             // Feature query (chained structs are filled by the driver when supported).
@@ -203,6 +225,7 @@ impl Host {
                 cooperative_matrix: fcoop.cooperative_matrix != 0,
                 host_query_reset: f12.host_query_reset != 0,
                 storage_buffer16_bit_access: f11.storage_buffer16_bit_access != 0,
+                compute_units: core.active_compute_unit_count,
             };
 
             let families = unsafe {
@@ -932,6 +955,19 @@ impl Gpu {
             dev.name,
             xfer_mode.as_str(),
             enabled_exts.join(", ")
+        );
+        println!(
+            "      {} compute units ({}), wave{}",
+            match dev.feats.compute_units {
+                0 => "unknown".to_string(),
+                n => n.to_string(),
+            },
+            if dev.feats.compute_units == 0 {
+                "VK_AMD_shader_core_properties2 absent"
+            } else {
+                "VK_AMD_shader_core_properties2"
+            },
+            dev.subgroup_size
         );
 
         // Load vkQueueSubmit2 by its core name (see the field's docs).
