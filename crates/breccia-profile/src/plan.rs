@@ -380,6 +380,7 @@ mod tests {
             timestamp: crate::schema::iso8601(0),
             timestamp_unix_s: 0,
             quick: false,
+            cpu_lane: None,
             devices: vec![
                 entry(
                     1,

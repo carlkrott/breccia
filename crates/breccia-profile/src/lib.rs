@@ -183,6 +183,7 @@ pub fn build_profile(
         devices,
         host,
         notes: all_notes,
+        cpu_lane: None,
     }
 }
 

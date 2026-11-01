@@ -28,6 +28,24 @@ pub struct HwProfile {
     pub devices: Vec<DeviceEntry>,
     pub host: HostInfo,
     pub notes: Vec<String>,
+    /// `breccia profile --cpu-lane N`: the measured host expert-lane pick. Optional
+    /// and additive (older readers ignore it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_lane: Option<CpuLaneVerdict>,
+}
+
+/// The host expert lane's measured setup. Only `threads` is applied (when
+/// `--threads` is absent); the kernel and pinning picks are the engine defaults
+/// (AVX2 f32, unpinned), with `BRECCIA_CPU_INT8` / `BRECCIA_CPU_PIN` as opt-ins.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct CpuLaneVerdict {
+    pub threads: usize,
+    /// `HostInfo::cpu_model` + `cpu_threads` it was measured on (stale otherwise).
+    pub cpu_model: String,
+    pub cpu_threads: u32,
+    pub timestamp: String,
+    /// The evidence (A/B, KL) behind the pick.
+    pub reason: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -245,6 +263,7 @@ mod tests {
             timestamp: iso8601(1_761_464_400),
             timestamp_unix_s: 1_761_464_400,
             quick: false,
+            cpu_lane: None,
             devices: vec![DeviceEntry {
                 identity: DeviceIdentity {
                     backend: BackendKind::Vulkan,

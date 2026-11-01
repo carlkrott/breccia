@@ -73,6 +73,13 @@ enum Command {
         /// PCI address(es) for `--prefill` (default: every discrete GPU in the profile)
         #[arg(long, value_name = "PCI")]
         devices: Vec<String>,
+        /// Record the measured host expert-lane thread count in the existing profile;
+        /// engine commands use it when `--threads` is absent
+        #[arg(long, value_name = "THREADS")]
+        cpu_lane: Option<usize>,
+        /// The evidence behind `--cpu-lane` (A/B numbers, KL), stored with it
+        #[arg(long, value_name = "TEXT", default_value = "")]
+        cpu_lane_reason: String,
     },
     /// Phase 2: OpenAI-compatible agent server (parsing surface present now)
     Serve {
@@ -441,6 +448,8 @@ fn run(cli: Cli) -> Result<()> {
             prefill,
             model,
             devices,
+            cpu_lane,
+            cpu_lane_reason,
         } => profile(ProfileArgs {
             reprofile,
             quick,
@@ -450,6 +459,8 @@ fn run(cli: Cli) -> Result<()> {
             prefill,
             model,
             devices,
+            cpu_lane,
+            cpu_lane_reason,
         }),
         Command::Serve { dry_run_plan, args } => serve(dry_run_plan, args),
         Command::Bench { kind: None } => {
@@ -705,6 +716,8 @@ struct ProfileArgs {
     prefill: bool,
     model: String,
     devices: Vec<String>,
+    cpu_lane: Option<usize>,
+    cpu_lane_reason: String,
 }
 
 fn profile(a: ProfileArgs) -> Result<()> {
@@ -712,6 +725,31 @@ fn profile(a: ProfileArgs) -> Result<()> {
         .json
         .clone()
         .unwrap_or_else(breccia_profile::default_profile_path);
+    if let Some(threads) = a.cpu_lane {
+        let mut prof = breccia_profile::load_profile(&path)?.with_context(|| {
+            format!(
+                "no hardware profile at {} (run `breccia profile`)",
+                path.display()
+            )
+        })?;
+        prof.cpu_lane = Some(breccia_profile::schema::CpuLaneVerdict {
+            threads,
+            cpu_model: prof.host.cpu_model.clone(),
+            cpu_threads: prof.host.cpu_threads,
+            timestamp: breccia_profile::schema::iso8601(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            ),
+            reason: a.cpu_lane_reason.clone(),
+        });
+        breccia_profile::save_profile(&prof, &path)?;
+        println!(
+            "cpu lane: {threads} expert threads recorded in {}",
+            path.display()
+        );
+        return Ok(());
+    }
 
     // Cheap identity pass first: decides the cached fast path (and answers
     // --print-fingerprint) without running any benchmark.
@@ -753,6 +791,7 @@ fn profile(a: ProfileArgs) -> Result<()> {
     // A recalibration keeps each GPU's prefill verdict; its own staleness check
     // (driver + shader hash) decides whether it still applies.
     if let Ok(Some(old)) = breccia_profile::load_profile(&path) {
+        profile.cpu_lane = old.cpu_lane.filter(|v| cpu_lane_fresh(v, &profile.host));
         for e in &mut profile.devices {
             e.prefill = old
                 .devices
@@ -788,6 +827,33 @@ fn profile(a: ProfileArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A `cpu_lane` pick holds only on the CPU it was measured on.
+fn cpu_lane_fresh(
+    v: &breccia_profile::schema::CpuLaneVerdict,
+    host: &breccia_profile::schema::HostInfo,
+) -> bool {
+    lane_matches(v, &host.cpu_model, host.cpu_threads)
+}
+
+fn lane_matches(
+    v: &breccia_profile::schema::CpuLaneVerdict,
+    cpu_model: &str,
+    cpu_threads: u32,
+) -> bool {
+    v.threads > 0 && v.cpu_model == cpu_model && v.cpu_threads == cpu_threads
+}
+
+/// Expert-lane threads: `--threads`, else the profile's fresh `cpu_lane` pick,
+/// else 0 (the engine's `default_threads`).
+fn session_threads(flag: Option<usize>) -> usize {
+    flag.or_else(|| {
+        let p = breccia_profile::load_profile(&breccia_profile::default_profile_path()).ok()??;
+        let v = p.cpu_lane.as_ref()?;
+        cpu_lane_fresh(v, &p.host).then_some(v.threads)
+    })
+    .unwrap_or(0)
 }
 
 fn same_pci(a: &str, b: &str) -> bool {
@@ -1592,6 +1658,25 @@ fn busy_per_step(measured: bool, busy_s: f64, steps: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_lane_pick_only_on_its_cpu() {
+        let v = breccia_profile::schema::CpuLaneVerdict {
+            threads: 30,
+            cpu_model: "Ryzen".into(),
+            cpu_threads: 32,
+            ..Default::default()
+        };
+        assert!(lane_matches(&v, "Ryzen", 32));
+        assert!(!lane_matches(&v, "Ryzen", 16));
+        assert!(!lane_matches(&v, "Xeon", 32));
+        assert!(!lane_matches(
+            &breccia_profile::schema::CpuLaneVerdict { threads: 0, ..v },
+            "Ryzen",
+            32
+        ));
+        assert_eq!(session_threads(Some(8)), 8); // --threads never reads the profile
+    }
 
     #[test]
     fn profile_parity_blocks_on_top1_only() {
@@ -2733,7 +2818,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
     let refs: Vec<&breccia_engine::Model> = owner.iter().map(|&o| &models[rank(o)]).collect();
     let cfg = breccia_engine::SessionCfg {
         ctx_capacity: a.ctx,
-        threads: a.threads.unwrap_or(0),
+        threads: session_threads(a.threads),
         timers: a.timers,
         batching: a.batching,
         inbatch_read: a.inbatch_read,
@@ -3096,7 +3181,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
     let refs: Vec<&breccia_engine::Model> = models.iter().collect();
     let cfg = breccia_engine::SessionCfg {
         ctx_capacity: 512,
-        threads: a.threads.unwrap_or(0),
+        threads: session_threads(a.threads),
         timers: true,
         batching: true,
         inbatch_read: a.inbatch_read,
@@ -3665,7 +3750,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
 
     let cfg = breccia_engine::SessionCfg {
         ctx_capacity: a.ctx,
-        threads: a.threads.unwrap_or(0),
+        threads: session_threads(a.threads),
         timers: a.timers,
         batching: a.batching,
         inbatch_read: a.inbatch_read,
