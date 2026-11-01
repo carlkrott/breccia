@@ -26,6 +26,15 @@ use crate::mtp_spec::{argmax, log_p, Accept, SpecStats, MAX_K};
 /// Default look-back window, in tokens (llama.cpp `ngram-simple` uses 3).
 pub const DEFAULT_N: usize = 3;
 
+/// Visible-cell count above which the QSA indexer stops using its dense path
+/// (`IDX_TOPK_BLOCKS * IDX_BLOCK` = 512 blocks of 4 cells, `breccia-kernels`
+/// `qsa/mod.rs`). Below it every block is selected and a T-row verify matches
+/// decode to ~1e-4 at any depth; above it the top-512 selection runs and, as
+/// measured, verify at T >= 4 disagrees with decode by ~2.1 logits and T = 3
+/// still drifts over ~20 greedy tokens (audit B12). Past this point the drafter
+/// caps its depth at one draft; the gate still decides whether to draft at all.
+pub const IDX_DENSE_CELLS: usize = 2048;
+
 /// The suffix index over one token stream.
 ///
 /// `map` is keyed on the last [`NgramDrafter::n`] tokens packed into a `u128`
@@ -226,7 +235,13 @@ pub fn generate(
         let n = toks.len() - 1; // toks[n] is the next token to feed
         let cur = toks[n];
         let td = std::time::Instant::now();
-        let drafts = nd.draft(&toks[..=n], k);
+        // Past the QSA indexer's dense gate a multi-row verify is not token-exact
+        // (B12): T=2 survived 128 greedy tokens at 4k, T=3 did not (divergence at
+        // 20), and T>=4 disagrees with decode by ~2.1 logits. So cap the depth at
+        // one draft there rather than emit a token plain decode would not; the
+        // gate then stops drafting entirely, because T=2 does not pay on its own.
+        let depth = if n + 1 > IDX_DENSE_CELLS { k.min(1) } else { k };
+        let drafts = nd.draft(&toks[..=n], depth);
         let draft_s = td.elapsed().as_secs_f64();
         let offer = if gated {
             gate.want(!drafts.is_empty())
