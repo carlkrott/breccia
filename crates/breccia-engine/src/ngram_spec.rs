@@ -33,7 +33,9 @@ pub const DEFAULT_N: usize = 3;
 /// measured, verify at T >= 4 disagrees with decode by ~2.1 logits and T = 3
 /// still drifts over ~20 greedy tokens (audit B12). Past this point the drafter
 /// caps its depth at one draft; the gate still decides whether to draft at all.
-pub const IDX_DENSE_CELLS: usize = 2048;
+pub fn dense_cell_limit() -> usize {
+    breccia_kernels::qsa::dense_cell_limit()
+}
 
 /// The suffix index over one token stream.
 ///
@@ -240,7 +242,11 @@ pub fn generate(
         // 20), and T>=4 disagrees with decode by ~2.1 logits. So cap the depth at
         // one draft there rather than emit a token plain decode would not; the
         // gate then stops drafting entirely, because T=2 does not pay on its own.
-        let depth = if n + 1 > IDX_DENSE_CELLS { k.min(1) } else { k };
+        let depth = if n + 1 > dense_cell_limit() {
+            k.min(1)
+        } else {
+            k
+        };
         let drafts = nd.draft(&toks[..=n], depth);
         let draft_s = td.elapsed().as_secs_f64();
         let offer = if gated {

@@ -83,6 +83,31 @@ pub const IDX_BLOCK: usize = 4;
 pub const IDX_TOP_K: usize = 2048;
 /// Whole blocks the budget buys (`2048 / 4`).
 pub const IDX_TOPK_BLOCKS: usize = IDX_TOP_K / IDX_BLOCK;
+
+/// The selection budget in blocks, at runtime: `BRECCIA_IDX_TOP_K` takes a **cell**
+/// count (default [`IDX_TOP_K`] = 2048, i.e. 512 blocks of 4 cells) and is rounded
+/// down to whole [`IDX_BLOCK`] blocks, minimum one block. Smaller is faster and
+/// approximate: it is the width of both attention passes and the number of KV cells
+/// read per token, so it is the main long-context quality/speed dial. Read once per
+/// process (the workspace size, the push constants and the engine's exactness cap
+/// all have to agree).
+pub fn idx_topk_blocks() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let cells = std::env::var("BRECCIA_IDX_TOP_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(IDX_TOP_K);
+        (cells / IDX_BLOCK).max(1)
+    })
+}
+
+/// The cell count the selection budget implies ([`idx_topk_blocks`] x [`IDX_BLOCK`]).
+/// Above this many visible cells the indexer's top-k runs; below it every block is
+/// selected and the layer is dense causal attention.
+pub fn dense_cell_limit() -> usize {
+    idx_topk_blocks() * IDX_BLOCK
+}
 /// The spec's selection width, `min(n_kv, idx_top_k + idx_block - 1)`.
 pub const SELECT_WIDTH: usize = IDX_TOP_K + IDX_BLOCK - 1;
 /// Cells per KV page (this module's choice, spec §7 / `docs/phase-3/05` §7).
@@ -131,10 +156,50 @@ fn split_apply(tokens: usize) -> bool {
         && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_APPLY_SPLIT").map_or(true, |v| v != "0"))
 }
 
+/// Which top-k selection kernel to run (see [`Qsa::topk_with`]).
+///
+/// `Rank` counts each block's rank in one parallel pass — O(n_blocks^2) compares
+/// per row, which wins at 1k-4k (0.76 ms vs the serial kernel's 6.30 ms at 4k) but
+/// costs 268 M compares per row at a 64k cache. `Serial` is k block-wide argmax
+/// passes — O(k * n_blocks) with a sequential dependency of `k` (up to 512) passes.
+/// `Auto` picks `Rank` below [`RANK_TOPK_MAX_BLOCKS`] and `Serial` above; both are
+/// measured, and `BRECCIA_QSA_TOPK=serial|rank` forces one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopkPath {
+    Auto,
+    Serial,
+    Rank,
+}
+
+impl TopkPath {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(TopkPath::Auto),
+            "serial" => Some(TopkPath::Serial),
+            "rank" => Some(TopkPath::Rank),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TopkPath::Auto => "auto",
+            TopkPath::Serial => "serial",
+            TopkPath::Rank => "rank",
+        }
+    }
+}
+
 /// Calls below `GQA_MIN_TOKENS` rows with at most `RANK_TOPK_MAX_BLOCKS` blocks
 /// select with `qsa_topk_rank.comp` (a rank per block, same ids and order as the
 /// serial `qsa_topk.comp`). `BRECCIA_QSA_TOPK_RANK=0` opts out.
-const RANK_TOPK_MAX_BLOCKS: usize = 16384; // O(n^2) compares per token: 64k ctx
+/// Measured crossover (RX 6950 XT, `qsa_topk_paths_by_context`, one dispatch per
+/// call, 1 row): rank 0.15 / 0.31 / 0.97 ms at 1050 / 4097 / 16385 blocks against
+/// serial 0.60 / 1.25 / 3.63 ms — rank is 4x ahead and its O(n^2) only overtakes
+/// the serial kernel's O(k*n) at ~61k blocks (244k cells), so the cap sits at the
+/// full 262144-token cache rather than at 16k blocks, where it used to force the
+/// slower kernel for every context past 64k tokens.
+const RANK_TOPK_MAX_BLOCKS: usize = 65536;
 fn rank_topk(tokens: usize, n_blocks: usize) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     tokens < GQA_MIN_TOKENS
@@ -540,6 +605,9 @@ pub struct QsaWorkspace {
     pub n_blocks: usize,
     pub slots: usize,
     pub max_ids: usize,
+    /// Selection budget in blocks for this workspace ([`idx_topk_blocks`]); it sizes
+    /// `max_ids` and goes into every top-k push constant.
+    pub topk_blocks: usize,
 }
 
 impl QsaWorkspace {
@@ -796,7 +864,8 @@ impl<'g> Qsa<'g> {
             return Err(anyhow!("qsa workspace needs tokens >= 1"));
         }
         let n_blocks = n_kv_after / IDX_BLOCK;
-        let max_ids = n_blocks.min(IDX_TOPK_BLOCKS) + 1;
+        let topk_blocks = idx_topk_blocks();
+        let max_ids = n_blocks.min(topk_blocks) + 1;
         let slots = 4 * max_ids;
         let sizes = [
             tokens * QGATE_DIM,
@@ -853,6 +922,7 @@ impl<'g> Qsa<'g> {
             n_blocks,
             slots,
             max_ids,
+            topk_blocks,
         })
     }
 
@@ -1106,15 +1176,31 @@ impl<'g> Qsa<'g> {
     /// it (see `qsa_topk.comp` for why it is per token and never duplicated).
     ///
     /// `pos0` is the sequence position of the first token of the call.
+    /// Which selection kernel [`Qsa::topk`] uses. `Auto` is the measured choice;
+    /// the others exist for A/B and for contexts where the auto rule is wrong.
     pub fn topk(&self, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        let path = match std::env::var("BRECCIA_QSA_TOPK")
+            .ok()
+            .as_deref()
+            .and_then(TopkPath::parse)
+        {
+            Some(p) if p != TopkPath::Auto => p,
+            _ if rank_topk(ws.tokens, ws.n_blocks) => TopkPath::Rank,
+            _ => TopkPath::Serial,
+        };
+        self.topk_with(ws, pos0, path)
+    }
+
+    /// [`Qsa::topk`] on a named path (tests and A/B).
+    pub fn topk_with(&self, ws: &QsaWorkspace, pos0: usize, path: TopkPath) -> Result<()> {
         let pc = Pc::new()
             .u(ws.tokens as u32)
             .u(ws.n_blocks as u32)
-            .u(IDX_TOPK_BLOCKS as u32)
+            .u(ws.topk_blocks as u32)
             .u(ws.max_ids as u32)
             .i(pos0 as i32)
             .u(0); // dense off: a word Pc does not push is undefined in the shader
-        if rank_topk(ws.tokens, ws.n_blocks) {
+        if path == TopkPath::Rank {
             // Same words; word 5 is `phase` in qsa_topk_rank.comp (0 rank, 1 finalize).
             let bufs = [&ws.idx_scores, &ws.ids, &ws.counts];
             let (gx, gy) = grid_for(ws.tokens * ws.n_blocks.div_ceil(256), 1);
@@ -1122,7 +1208,7 @@ impl<'g> Qsa<'g> {
             let pc1 = Pc::new()
                 .u(ws.tokens as u32)
                 .u(ws.n_blocks as u32)
-                .u(IDX_TOPK_BLOCKS as u32)
+                .u(ws.topk_blocks as u32)
                 .u(ws.max_ids as u32)
                 .i(pos0 as i32)
                 .u(1);
@@ -1140,7 +1226,7 @@ impl<'g> Qsa<'g> {
         let pc = Pc::new()
             .u(ws.tokens as u32)
             .u(ws.n_blocks as u32)
-            .u(IDX_TOPK_BLOCKS as u32)
+            .u(ws.topk_blocks as u32)
             .u(ws.max_ids as u32)
             .i(pos0 as i32)
             .u(1);
@@ -1295,7 +1381,7 @@ impl<'g> Qsa<'g> {
         self.idx_pool(state, ws, w.idx_k_norm, pos0)?;
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::QSA_AUX);
         self.idx_tail(state, ws, pos0)?;
-        if ws.n_blocks <= IDX_TOPK_BLOCKS && idx_skip() {
+        if ws.n_blocks <= ws.topk_blocks && idx_skip() {
             self.topk_dense(ws, pos0)?;
         } else {
             self.idx_score(state, ws, pos0)?;
@@ -1555,7 +1641,7 @@ impl Qsa<'_> {
         let pc_tk = Pc::new()
             .u(t as u32)
             .u(ws.n_blocks as u32)
-            .u(IDX_TOPK_BLOCKS as u32)
+            .u(ws.topk_blocks as u32)
             .u(ws.max_ids as u32)
             .i(pos0 as i32);
         let (tgx2, tgy2) = grid_for(t, 1);

@@ -857,7 +857,7 @@ fn qsa_dense_skip_selects_the_scored_set() {
     // cells (own block not yet pooled), 2nd 1k chunk reaching exactly 512 blocks.
     for (tokens, pos0) in [(1024usize, 0usize), (1, 1055), (1, 1058), (1024, 1024)] {
         let ws = qsa.workspace(gpu, tokens, pos0 + tokens).expect("ws");
-        assert!(ws.n_blocks <= qsa::IDX_TOPK_BLOCKS);
+        assert!(ws.n_blocks <= ws.topk_blocks);
         let q = normalish(0xF1 ^ pos0 as u64, tokens * qsa::IDX_N_HEAD * qsa::IDX_DIM);
         breccia_kernels::gemv::upload_into(gpu, &ws.idx_q, &breccia_kernels::ops::f32_to_bytes(&q))
             .expect("idx q");
@@ -1497,7 +1497,7 @@ fn qsa_topk_ties_and_dead_blocks_match_the_reference() {
         for t in 0..tokens {
             let want = qsa::cpu::topk_blocks(
                 &cpu_sc[t * n_blocks..][..n_blocks],
-                qsa::IDX_TOPK_BLOCKS,
+                ws.topk_blocks,
                 Some((pos0 + t) / qsa::IDX_BLOCK),
             );
             let c = counts[t] as usize;
@@ -1508,6 +1508,108 @@ fn qsa_topk_ties_and_dead_blocks_match_the_reference() {
                 "cells={cells} t={t}: ids/order"
             );
         }
+        qsa.release(gpu, ws);
+    }
+}
+
+/// Cost of the two top-k selection kernels against context length, and that they
+/// match the CPU reference. This is the measurement that decides the long-context
+/// selection path: `Rank` is O(n_blocks^2) per row, `Serial` is O(k * n_blocks)
+/// with `k` sequential passes, so the crossover moves with the cache length.
+///
+/// The serial kernel **destroys** the score buffer (`SC[b] = MASK_DEAD` per pick),
+/// so the scores are re-uploaded before every timed call and every path.
+///
+/// `BRECCIA_OP=topk` selects it (one dispatch per timing sample).
+#[test]
+fn qsa_topk_paths_by_context() {
+    let fx = need_gpu!("topk");
+    let gpu = fx.dev.gpu();
+    let qsa = Qsa::new(gpu, 8192).expect("qsa");
+    println!("topk path cost (ms per call, best of 3, one dispatch each)");
+    println!("  cells  tokens   nblocks   serial     rank   parity");
+    for (cells, tokens) in [
+        (4200usize, 1usize),
+        (16388, 1),
+        (65540, 1),
+        (4200, 4),
+        (16388, 4),
+        // the prefill shapes: the serial kernel's k sequential passes make it
+        // latency-bound here, which is the 64k-prefill cliff
+        (16388, 1024),
+        (65540, 1024),
+    ] {
+        let ws = qsa.workspace(gpu, tokens, cells).expect("ws");
+        let n_blocks = ws.n_blocks;
+        let pos0 = cells - tokens;
+        let mut s = 0x9E37_79B9u64 ^ (cells as u64);
+        let mut gpu_sc = vec![0f32; tokens * n_blocks];
+        for i in 0..tokens * n_blocks {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            gpu_sc[i] = ((s >> 33) % 1000) as f32 / 1000.0;
+        }
+        let bytes = breccia_kernels::ops::f32_to_bytes(&gpu_sc);
+        let upload = || {
+            breccia_kernels::gemv::upload_into(gpu, &ws.idx_scores, &bytes).expect("scores");
+        };
+
+        let mut best = [f64::INFINITY; 2];
+        let mut agree = 0usize;
+        for (ax, path) in [(0usize, qsa::TopkPath::Serial), (1, qsa::TopkPath::Rank)] {
+            upload();
+            qsa.topk_with(&ws, pos0, path).expect("warm");
+            for _ in 0..3 {
+                upload();
+                let t = std::time::Instant::now();
+                qsa.topk_with(&ws, pos0, path).expect("timed");
+                best[ax] = best[ax].min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            upload();
+            qsa.topk_with(&ws, pos0, path).expect("check");
+            let ids =
+                breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).expect("ids");
+            let counts = breccia_kernels::ops::download_u32(gpu, &ws.counts, tokens).expect("cnt");
+            let mut ok = 0usize;
+            let check_rows = tokens.min(8);
+            for t in 0..check_rows {
+                let cpu: Vec<f64> = gpu_sc[t * n_blocks..][..n_blocks]
+                    .iter()
+                    .map(|&v| v as f64)
+                    .collect();
+                let want =
+                    qsa::cpu::topk_blocks(&cpu, ws.topk_blocks, Some((pos0 + t) / qsa::IDX_BLOCK));
+                let c = counts[t] as usize;
+                let got = &ids[t * ws.max_ids..][..c];
+                if got == &want[..] {
+                    ok += 1;
+                } else if ax == 0 {
+                    let at = got.iter().zip(&want).position(|(a, b)| a != b);
+                    println!(
+                        "    serial t={t}: MISMATCH count {c} vs {} at {at:?}",
+                        want.len()
+                    );
+                }
+            }
+            if ax == 1 {
+                // cross-path: the serial and rank selections must be identical
+                let ids2 =
+                    breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).unwrap();
+                let cnt2 = breccia_kernels::ops::download_u32(gpu, &ws.counts, tokens).unwrap();
+                if ids != ids2 || counts != cnt2 {
+                    println!("    tokens={tokens}: the two paths disagree");
+                }
+            }
+            agree += ok;
+        }
+        println!(
+            "  {cells:>6} {tokens:>7} {:>9} {serial:>8.2} {rank:>7.2}   {agree}/{n}",
+            n_blocks,
+            serial = best[0],
+            rank = best[1],
+            n = tokens * 2
+        );
         qsa.release(gpu, ws);
     }
 }
