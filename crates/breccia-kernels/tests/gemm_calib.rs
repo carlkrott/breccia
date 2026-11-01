@@ -105,7 +105,7 @@ fn gemm_calibration() {
             // that some i-quant paths do not expect, and the timing does not depend
             // on the values (the cost is the same weight decode either way).
             let zero_w = vec![0u8; wbytes as usize];
-            let zero_x = vec![0u8; (MS[MS.len() - 1] * cols * 4) as usize];
+            let zero_x = vec![0u8; MS[MS.len() - 1] * cols * 4];
             eprintln!("  alloc ok w={wbytes}");
             breccia_kernels::gemv::upload_into(&gpu, &w, &zero_w).expect("zero w");
             breccia_kernels::gemv::upload_into(&gpu, &x, &zero_x).expect("zero x");
