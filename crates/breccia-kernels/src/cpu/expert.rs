@@ -284,7 +284,8 @@ pub fn expert_ffn(
 /// Shard counts come from [`choose_shards`], which picks the smallest split that
 /// keeps the predicted makespan within 15 % of perfect packing, so a 4-thread run
 /// still sends whole-role jobs (40 messages/token-block) while a 16-thread run
-/// splits into thirds.
+/// splits into thirds; it then raises the split to about [`CLAIMS_PER_WORKER`]
+/// shards per worker (cap [`MAX_GRAIN_SHARDS`]) so dynamic claiming can balance.
 ///
 /// # Determinism
 ///
@@ -447,6 +448,10 @@ const MIN_SHARD_ROWS: usize = 16;
 const MAX_SHARDS: usize = 4;
 /// Accept a split whose predicted makespan is within this factor of perfect.
 const PACK_TOLERANCE: f64 = 1.15;
+/// Shards per worker the split aims for so dynamic claiming can even out skew.
+const CLAIMS_PER_WORKER: usize = 3;
+/// Cap on the claim-grain split (message count grows with it).
+const MAX_GRAIN_SHARDS: usize = 12;
 
 /// Smallest row split (1..=[`MAX_SHARDS`]) that packs `tasks` jobs onto
 /// `threads` workers within [`PACK_TOLERANCE`] of perfect.
@@ -466,7 +471,11 @@ fn choose_shards(tasks: usize, threads: usize, rows: usize) -> usize {
             break;
         }
     }
-    best
+    // Dynamic claiming balances better with a few claims per worker: top-8 decode at
+    // 30 t went 4 -> 12 shards, lane wall median 7.86 -> 6.57 ms/token, exact (ABBA, 2026-11-01).
+    let grain = (CLAIMS_PER_WORKER * threads).div_ceil(tasks.max(1));
+    let cap = MAX_GRAIN_SHARDS.min((rows / MIN_SHARD_ROWS).max(1));
+    best.max(grain.min(cap))
 }
 
 impl ExpertPool {
@@ -1107,6 +1116,23 @@ pub fn moe_topk_sequential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn choose_shards_grain_targets_decode_only() {
+        if pool_shards().is_some() {
+            return; // env override bypasses the rule
+        }
+        // decode on 30 workers: top-8 -> 12 shards per role (was 4), top-10 -> 9 (was 3)
+        assert_eq!(choose_shards(8, 30, 640), 12);
+        assert_eq!(choose_shards(10, 30, 640), 9);
+        assert_eq!(choose_shards(10, 30, 2560), 9);
+        // prefill-sized task counts keep the packing choice (grain <= 1)
+        assert_eq!(choose_shards(400, 30, 640), 1);
+        // few threads: unchanged packing result
+        assert_eq!(choose_shards(10, 4, 640), 2);
+        // row floor still caps the split
+        assert_eq!(choose_shards(1, 30, 64), 4);
+    }
 
     #[test]
     fn silu_matches_the_reference_definition() {
