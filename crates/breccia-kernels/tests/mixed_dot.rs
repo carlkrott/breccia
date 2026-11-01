@@ -130,23 +130,18 @@ fn emit(kind: &str) -> String {
 
     // body: one op per accumulator
     s.push_str("%body = OpLabel\n");
-    let mut cur: Vec<String> = (0..ACC).map(|a| format!("%acc{a}")).collect();
-    let mut n = 0usize;
     for a in 0..ACC {
-        let new = format!("%b{n}");
-        n += 1;
+        let new = format!("%b{a}");
+        let src = format!("%acc{a}");
         if dot {
             s.push_str(&format!(
-                "{new} = OpFDot2MixAcc32VALVE %f32 %va %vb {}\n",
-                cur[a]
+                "{new} = OpFDot2MixAcc32VALVE %f32 %va %vb {src}\n"
             ));
         } else {
             s.push_str(&format!(
-                "{new} = OpExtInst %f32 %glsl Fma {} %mul %f2\n",
-                cur[a]
+                "{new} = OpExtInst %f32 %glsl Fma {src} %mul %f2\n"
             ));
         }
-        cur[a] = new;
     }
     s.push_str("OpBranch %continue\n");
 
@@ -158,7 +153,7 @@ fn emit(kind: &str) -> String {
 
     // merge: reduce and store
     s.push_str("%merge = OpLabel\n");
-    let mut acc = format!("%acc0");
+    let mut acc = "%acc0".to_string();
     for a in 1..ACC {
         s.push_str(&format!("%m{a} = OpFAdd %f32 {acc} %acc{a}\n"));
         acc = format!("%m{a}");

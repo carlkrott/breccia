@@ -1544,11 +1544,11 @@ fn qsa_topk_paths_by_context() {
         let pos0 = cells - tokens;
         let mut s = 0x9E37_79B9u64 ^ (cells as u64);
         let mut gpu_sc = vec![0f32; tokens * n_blocks];
-        for i in 0..tokens * n_blocks {
+        for v in gpu_sc.iter_mut() {
             s = s
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            gpu_sc[i] = ((s >> 33) % 1000) as f32 / 1000.0;
+            *v = ((s >> 33) % 1000) as f32 / 1000.0;
         }
         let bytes = breccia_kernels::ops::f32_to_bytes(&gpu_sc);
         let upload = || {
