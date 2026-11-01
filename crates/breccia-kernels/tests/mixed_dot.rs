@@ -29,12 +29,18 @@
 //! - A missing `OpDecorate %S Block` on the SSBO struct makes RADV **segfault**
 //!   instead of reporting VUID-StandaloneSpirv-OpTypeRuntimeArray-04680.
 //!
-//! What is NOT valid yet: the timing. The accumulator chains are affine
-//! (`acc = fma(mul, c, acc)` repeated), so LLVM strength-reduces them and the
-//! measured time does not scale with `BRECCIA_MIXED_DOT_OPS` (8 -> 256 ops is
-//! 0.037 -> 0.038 ms). The fix is a non-affine operand — e.g. feed each step's
-//! f16 pair from the previous accumulator, or load it from memory per step — and
-//! then re-check that time scales linearly in OPS before believing any ratio.
+//! What is NOT valid yet: the timing. Progress so far, all measured:
+//! - A chain seeded at 0 with `va = h(acc)` is a **fixed point** (h(0) = 0): the
+//!   compiler proves the whole body is 0 and deletes it (read-back was all zeros).
+//!   Seeded from a runtime value the body does run (read-back is finite/inf).
+//! - Even then the timing does not scale: 4.3e9 counted instructions complete in
+//!   0.070 ms — ~61 G fma/s-equivalent, several times the card's fp32 peak — so
+//!   the straight-line unrolled body is still being partly eliminated (or the
+//!   instruction count is wrong because the dot step is 3 instructions, not 1).
+//! The fix is a **runtime-bounded loop** (`OpLoopMerge` with the trip count from a
+//! push constant) instead of an unrolled chain: neither the driver nor LLVM can
+//! unroll or fold what it cannot see the bound of. Only after the time scales
+//! linearly in that trip count is any ratio meaningful.
 
 use std::process::Command;
 
@@ -56,6 +62,7 @@ fn emit(kind: &str) -> String {
     let mut s = String::from("OpCapability Shader\n");
     if dot {
         s.push_str("OpCapability DotProductFloat16AccFloat32VALVE\n");
+        s.push_str("OpCapability Float16\n");
         s.push_str("OpExtension \"SPV_VALVE_mixed_float_dot_product\"\n");
     } else {
         s.push_str("%glsl = OpExtInstImport \"GLSL.std.450\"\n");
@@ -70,7 +77,9 @@ fn emit(kind: &str) -> String {
     s.push_str("OpDecorate %gid BuiltIn GlobalInvocationId\n");
     s.push_str("%void = OpTypeVoid\n%fn = OpTypeFunction %void\n%f32 = OpTypeFloat 32\n");
     s.push_str("%u32 = OpTypeInt 32 0\n%v3u32 = OpTypeVector %u32 3\n");
-    s.push_str("%u32_0 = OpConstant %u32 0\n%f0 = OpConstant %f32 0.0\n");
+    s.push_str(
+        "%u32_0 = OpConstant %u32 0\n%u32_1 = OpConstant %u32 1\n%f0 = OpConstant %f32 0.0\n",
+    );
     s.push_str("%f1 = OpConstant %f32 1.0009765625\n%f2 = OpConstant %f32 1.001953125\n");
     s.push_str("%arr = OpTypeRuntimeArray %f32\n%S = OpTypeStruct %arr\n");
     s.push_str("%ptr = OpTypePointer StorageBuffer %S\n");
@@ -87,14 +96,15 @@ fn emit(kind: &str) -> String {
     s.push_str("%g = OpLoad %v3u32 %gid\n%gx = OpCompositeExtract %u32 %g 0\n");
     // Operands derived from the invocation id: with constants the whole chain
     // folds away at compile time (measured: 1e9 "instructions" in 0.04 ms).
-    s.push_str("%fx = OpConvertUToF %f32 %gx\n%mul = OpFMul %f32 %fx %f1\n");
+    s.push_str("%gx1 = OpIAdd %u32 %gx %u32_1\n");
+    s.push_str("%fx = OpConvertUToF %f32 %gx1\n%mul = OpFMul %f32 %fx %f1\n");
     if dot {
         s.push_str("%hx = OpFConvert %half %fx\n");
         s.push_str("%va = OpCompositeConstruct %v2half %hx %hx\n");
     }
     let mut cur: Vec<String> = (0..ACC)
         .map(|a| {
-            s.push_str(&format!("%init{a} = OpCopyObject %f32 %f0\n"));
+            s.push_str(&format!("%init{a} = OpFAdd %f32 %fx %f0\n"));
             format!("%init{a}")
         })
         .collect();
@@ -104,13 +114,17 @@ fn emit(kind: &str) -> String {
             let new = format!("%d{n}");
             n += 1;
             if dot {
+                let hv = format!("%hv{n}");
+                let vv = format!("%vv{n}");
+                s.push_str(&format!("{hv} = OpFConvert %half {}\n", cur[a]));
+                s.push_str(&format!("{vv} = OpCompositeConstruct %v2half {hv} {hv}\n"));
                 s.push_str(&format!(
-                    "{new} = OpFDot2MixAcc32VALVE %f32 %va %vb {}\n",
+                    "{new} = OpFDot2MixAcc32VALVE %f32 {vv} %vb {}\n",
                     cur[a]
                 ));
             } else {
                 s.push_str(&format!(
-                    "{new} = OpExtInst %f32 %glsl Fma %mul %f2 {}\n",
+                    "{new} = OpExtInst %f32 %glsl Fma {} %mul %f2\n",
                     cur[a]
                 ));
             }
@@ -207,6 +221,11 @@ fn mixed_float_dot_vs_f32_fma() {
             eprintln!("mixed-dot: {name} dispatch ok in {t:.4} s");
             best = best.min(t);
         }
+        // read back: proves the body ran (a flat timing alone cannot tell an
+        // optimised-away body from a mis-measured dispatch)
+        let _ = gpu.bind_kernel(&k, &[out.buf]);
+        let vals = breccia_kernels::ops::download_f32(gpu, &out, 4).expect("readback");
+        eprintln!("mixed-dot: {name} first outputs {vals:?}");
         let instr = (WORKGROUPS as f64) * (GROUP as f64) * (ops() * ACC) as f64;
         times.push((name, best, instr / best / 1e9));
         println!(
