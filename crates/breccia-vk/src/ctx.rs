@@ -505,6 +505,10 @@ pub struct Gpu {
     pub mem: vk::PhysicalDeviceMemoryProperties,
     pub timestamp_period_ns: f64,
     pub feats: Feats,
+    /// Pipeline subgroup bounds the device advertises (`min`/`maxSubgroupSize`);
+    /// both are 0 when `VK_EXT_subgroup_size_control` is absent.
+    pub min_subgroup_size: u32,
+    pub max_subgroup_size: u32,
 
     pub queue_c: vk::Queue,
     pub family_c: u32,
@@ -850,6 +854,17 @@ impl Gpu {
         if robustness2 {
             enabled_exts.push("VK_EXT_robustness2".to_string());
         }
+        // `VK_VALVE_shader_mixed_float_dot_product`: packed f16 dots into an f32
+        // accumulator (`OpFDot2MixAcc32VALVE`). Enabling it is what makes that
+        // capability legal in a module — a module that uses it without the device
+        // extension enabled is undefined behaviour (measured: SIGSEGV on the RX).
+        // No shipped shader uses it yet: glslang cannot emit it (see the Vulkan
+        // adoption audit), so it is exposed for the hand-assembled probe and for
+        // any future post-pass.
+        let mixed_float_dot = dev.has_ext("VK_VALVE_shader_mixed_float_dot_product");
+        if mixed_float_dot {
+            enabled_exts.push("VK_VALVE_shader_mixed_float_dot_product".to_string());
+        }
         // `VK_EXT_memory_budget` (the adaptive arena's sizing source): the driver
         // reports, per heap, what this process may still allocate. Cheap to enable
         // and advertised by RADV on both cards here; without it the arena falls
@@ -1033,6 +1048,8 @@ impl Gpu {
             mem: dev.mem,
             timestamp_period_ns: dev.timestamp_period_ns as f64,
             feats: dev.feats,
+            min_subgroup_size: dev.min_subgroup_size,
+            max_subgroup_size: dev.max_subgroup_size,
             queue_c,
             family_c: fam_c,
             queue_x,
@@ -1280,7 +1297,50 @@ impl Gpu {
 
     // --- kernels -------------------------------------------------------------
 
+    /// Pipeline subgroup width to force, or `None` for the device's natural width.
+    ///
+    /// `BRECCIA_SUBGROUP=32|64` pins it when the device advertises
+    /// `VK_EXT_subgroup_size_control` and the value is inside
+    /// `[minSubgroupSize, maxSubgroupSize]`. Both cards here report 64 as their
+    /// natural width — the RX 6950 XT's hardware native width is 32 — and nothing
+    /// else in the engine ever asks for a different one, so this is the only way to
+    /// run a pipeline at wave32 and measure it.
+    pub fn forced_subgroup(&self) -> Option<u32> {
+        static ON: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            let n: u32 = std::env::var("BRECCIA_SUBGROUP").ok()?.parse().ok()?;
+            if !self.feats.subgroup_size_control {
+                eprintln!(
+                    "BRECCIA_SUBGROUP={n}: device has no VK_EXT_subgroup_size_control; ignored"
+                );
+                return None;
+            }
+            if n != 32 && n != 64 && n != 128 {
+                eprintln!("BRECCIA_SUBGROUP={n}: not a power-of-two subgroup width; ignored");
+                return None;
+            }
+            if n < self.min_subgroup_size || n > self.max_subgroup_size {
+                eprintln!(
+                    "BRECCIA_SUBGROUP={n}: outside this device's {}..={}; ignored",
+                    self.min_subgroup_size, self.max_subgroup_size
+                );
+                return None;
+            }
+            Some(n)
+        })
+    }
+
     pub fn kernel(&self, spv: &[u8], n_storage: u32) -> R<Kernel> {
+        self.kernel_with_subgroup(spv, n_storage, self.forced_subgroup())
+    }
+
+    /// [`Gpu::kernel`] with an explicit required subgroup width (`None` = natural).
+    pub fn kernel_with_subgroup(
+        &self,
+        spv: &[u8],
+        n_storage: u32,
+        required_subgroup: Option<u32>,
+    ) -> R<Kernel> {
         unsafe {
             let words: Vec<u32> = spv
                 .chunks_exact(4)
@@ -1336,6 +1396,16 @@ impl Gpu {
                 .stage(vk::ShaderStageFlags::COMPUTE)
                 .module(module)
                 .name(c"main");
+            // Forcing the width has to be declared on the stage, and the feature is
+            // enabled at device creation (`en_f13.subgroup_size_control`).
+            let mut req = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default();
+            let stage = match required_subgroup {
+                Some(n) if self.feats.subgroup_size_control => {
+                    req.required_subgroup_size = n;
+                    stage.push_next(&mut req)
+                }
+                _ => stage,
+            };
             let cpci = vk::ComputePipelineCreateInfo::default()
                 .stage(stage)
                 .layout(layout);
