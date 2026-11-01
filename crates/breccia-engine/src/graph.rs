@@ -100,6 +100,15 @@ fn defer_placed_waits() -> bool {
     *ON.get_or_init(|| std::env::var_os("BRECCIA_NO_DEFER_PLACED").is_none())
 }
 
+/// `BRECCIA_SUBMIT_DEPTH2=1`: when the next block opens a batch on the device whose
+/// deferred segment is still running, keep that segment in flight (wait only the one
+/// before it) instead of draining the device, so the host records block b+1 while
+/// block b executes. Same-queue order is the dependency, as for the deferral itself.
+fn submit_depth2() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_SUBMIT_DEPTH2").is_some_and(|v| v == "1"))
+}
+
 /// Live sessions on this process, so the last one to drop can release the shared
 /// dispatch ring's pools.
 static LIVE_SESSIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -640,6 +649,9 @@ pub struct Session<'m> {
     /// block executes while stream B's expert lane runs (§8o).
     pending_seg: Option<breccia_kernels::batch_cmd::Segment>,
     pending_dev: Option<usize>,
+    /// `BRECCIA_SUBMIT_DEPTH2`: the segment before `pending_seg`, still in flight on
+    /// the same device (waited before the next one is kept, so at most two).
+    prev_seg: Option<(breccia_kernels::batch_cmd::Segment, usize)>,
     /// Position of the token being processed (QSA's rope/selection input).
     pos: usize,
     /// The token id being processed (the PLE hash needs it).
@@ -1238,6 +1250,7 @@ impl<'m> Session<'m> {
             pending_batch: None,
             pending_seg: None,
             pending_dev: None,
+            prev_seg: None,
             pos: 0,
             cur_tok: 0,
             lane_s: 0.0,
@@ -1401,6 +1414,21 @@ impl<'m> Session<'m> {
         };
         if let Some(v) = self.dev_wait_s.first_mut() {
             *v += wait;
+        }
+        // `wait_all` drained it.
+        self.prev_seg = None;
+        Ok(())
+    }
+
+    /// Wait for the depth-2 segment, if one is kept.
+    fn wait_prev_seg(&mut self) -> Result<()> {
+        if let Some((seg, d)) = self.prev_seg.take() {
+            let wait = {
+                let gpus = self.device_gpus();
+                batch_cmd::wait(&gpus, seg)
+                    .map_err(|e| anyhow!("waiting for the previous block segment: {e}"))?
+            };
+            self.dev_wait_s[d] += wait;
         }
         Ok(())
     }
@@ -1571,7 +1599,17 @@ impl<'m> Session<'m> {
                 return Ok(());
             }
         }
-        self.flush()?;
+        if self.pending_batch.is_none()
+            && self.pending_dev == Some(dev)
+            && self.pending_seg.is_some()
+            && submit_depth2()
+        {
+            self.wait_prev_seg()?;
+            self.prev_seg = self.pending_seg.take().map(|s| (s, dev));
+            self.pending_dev = None;
+        } else {
+            self.flush()?;
+        }
         batch_cmd::begin(self.model.devices[dev].gpu())
             .map_err(|e| anyhow!("opening a dispatch batch on device {dev}: {e}"))?;
         self.timers.open_batch();
@@ -4997,6 +5035,8 @@ impl<'m> Session<'m> {
                     .map_err(|e| anyhow!("waiting for block {b}'s segment: {e}"))?
             };
             self.dev_wait_s[d] += wait;
+            // Same queue, so already signalled: collect it before the host reads back.
+            self.wait_prev_seg()?;
         }
 
         // ---- a block whose experts are resident: nothing left to do ---------
