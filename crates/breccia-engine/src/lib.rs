@@ -52,6 +52,7 @@ pub mod model;
 pub mod mtp_draft;
 pub mod mtp_spec;
 pub mod multi;
+pub mod ngram_spec;
 pub mod placement;
 pub mod ple;
 pub mod report;

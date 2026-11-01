@@ -193,7 +193,7 @@ impl std::fmt::Display for SpecStats {
     }
 }
 
-fn argmax(v: &[f32]) -> u32 {
+pub(crate) fn argmax(v: &[f32]) -> u32 {
     let mut b = 0;
     for (i, &x) in v.iter().enumerate() {
         if x > v[b] {
@@ -204,7 +204,7 @@ fn argmax(v: &[f32]) -> u32 {
 }
 
 /// `ln softmax(v)[id]`.
-fn log_p(v: &[f32], id: u32) -> f64 {
+pub(crate) fn log_p(v: &[f32], id: u32) -> f64 {
     let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let z: f64 = v.iter().map(|&x| ((x - m) as f64).exp()).sum();
     (v[id as usize] - m) as f64 - z.ln()

@@ -2437,6 +2437,75 @@ fn mtp_spec_bench(
     Ok(())
 }
 
+/// `BRECCIA_NGRAM_SPEC_BENCH=1,3,5`: for each draft depth, ABAB against plain
+/// greedy decode with a **weight-free n-gram (prompt-lookup) draft**. No MTP
+/// weights and no second model are needed; `BRECCIA_MTP_GEN`/`_REPS` set the
+/// length and repetitions. Greedy output must be token-identical (exact verify).
+fn ngram_spec_bench(
+    sess: &mut breccia_engine::Session<'_>,
+    prompt: &[u32],
+    chunk: usize,
+    arms: &str,
+) -> Result<()> {
+    use breccia_engine::mtp_spec::{generate, Accept, Policy};
+    use breccia_engine::ngram_spec::{generate as generate_ngram, DEFAULT_N};
+    let env_n = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (gen, reps) = (env_n("BRECCIA_MTP_GEN", 64), env_n("BRECCIA_MTP_REPS", 2));
+    let n = env_n("BRECCIA_NGRAM_N", DEFAULT_N);
+    println!(
+        "ngram-spec  window {n} · prompt {} gen {gen} reps {reps}",
+        prompt.len()
+    );
+    for arm in arms.split(',') {
+        let k: usize = arm
+            .trim()
+            .parse()
+            .with_context(|| format!("BRECCIA_NGRAM_SPEC_BENCH arm {arm:?} (depth 1..=5)"))?;
+        let acc = Accept {
+            special_from: sess.model.cfg.ple.eos,
+            ..Accept::default()
+        };
+        for rep in 0..reps {
+            let (a, sa) = generate(
+                sess,
+                None,
+                prompt,
+                chunk,
+                gen,
+                Policy::Plain,
+                Accept::default(),
+            )?;
+            let (b, sb) = generate_ngram(sess, prompt, chunk, gen, k, n, acc)?;
+            let (ta, tb) = (a.len() as f64 / sa.decode_s, b.len() as f64 / sb.decode_s);
+            println!(
+                "ngram-spec  k {k} rep {rep}: plain {ta:.2} tok/s | spec {tb:.2} tok/s ({:.3}x) | greedy {} ({} tokens)",
+                tb / ta,
+                if a == b {
+                    "IDENTICAL".to_string()
+                } else {
+                    format!("DIFFER at {:?}", a.iter().zip(&b).position(|(x, y)| x != y))
+                },
+                b.len()
+            );
+            println!("ngram-spec  k {k} rep {rep}: {sb}");
+            println!(
+                "ngram-spec  k {k} rep {rep}: plain nll/tok {:.4}",
+                sa.nll / sa.tokens.max(1) as f64
+            );
+            if rep == 0 {
+                println!("ngram-ids plain {:?}", &a);
+                println!("ngram-ids {k} {:?}", &b);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `BRECCIA_MTP_DRAFT_BENCH=N`: time N draft steps (synthetic R, real MTP
 /// weights, zeroed draft KV) on device 0. `BRECCIA_MTP_DIR` overrides the weights dir.
 fn mtp_draft_bench(
@@ -3799,6 +3868,10 @@ fn bench_token(a: TokenArgs) -> Result<()> {
     if let Ok(arms) = std::env::var("BRECCIA_MTP_SPEC_BENCH") {
         mtp_spec_bench(&model, &mut sess, &prompt, a.prefill_chunk, &arms)
             .context("the MTP spec bench")?;
+    }
+    if let Ok(arms) = std::env::var("BRECCIA_NGRAM_SPEC_BENCH") {
+        ngram_spec_bench(&mut sess, &prompt, a.prefill_chunk, &arms)
+            .context("the n-gram spec bench")?;
     }
     let s1 = breccia_engine::LogitSummary::of_top(&l1, a.top_logits.max(10));
     let s2 = breccia_engine::LogitSummary::of(&l2);
