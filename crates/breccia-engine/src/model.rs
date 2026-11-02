@@ -704,13 +704,104 @@ impl Model {
                 per * e.n_experts as u64
             })
             .collect();
-        let candidates: Vec<ArenaBlock> = (0..cfg.n_layers)
+        // **Measured placement** (`breccia profile --tiers`): assign each block to
+        // the tier with the best measured expert-FFN rate per byte, so the RX, the
+        // MI50 and the host pool each get the work they are fastest at. Falls back
+        // to the layer placement when the table is absent or was measured by a
+        // different build (same staleness rule as the tile table).
+        let manual: Vec<ArenaBlock> = (0..cfg.n_layers)
             .map(|b| ArenaBlock {
                 block: b,
                 device: placement.device_of(b),
                 bytes: arena_sizes[b],
             })
             .collect();
+        let tier_place: Option<Vec<Option<usize>>> = (|| {
+            let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+                .ok()
+                .flatten()?;
+            let v = prof.tiers.as_ref()?;
+            if v.spirv_hash != breccia_kernels::SPIRV_HASH {
+                return None;
+            }
+            let tiers: Vec<breccia_profile::schema::TierRate> = v
+                .tiers
+                .iter()
+                .filter(|t| {
+                    t.kind != "device"
+                        || devices
+                            .iter()
+                            .any(|d| d.info.pci_address.eq_ignore_ascii_case(&t.id))
+                })
+                .cloned()
+                .collect();
+            if !tiers.iter().any(|t| t.kind == "device") {
+                return None;
+            }
+            // The engine asks a tier for the merged-prefill group size, ~chunk*k/n_expert.
+            let users = ((1024 * cfg.n_expert_used) / cfg.n_expert.max(1)).max(1) as u32;
+            let demands: Vec<breccia_profile::placement::BlockDemand> = arena_sizes
+                .iter()
+                .map(|&b| breccia_profile::placement::BlockDemand {
+                    bytes: b,
+                    users_per_call: users,
+                    weight: 1.0,
+                })
+                .collect();
+            let choice = breccia_profile::placement::place_blocks(&demands, &tiers);
+            if opts.verbose {
+                let mut per = vec![0usize; devices.len()];
+                let mut host = 0usize;
+                for c in &choice {
+                    match c.and_then(|ti| {
+                        let t = &tiers[ti];
+                        (t.kind != "host")
+                            .then(|| {
+                                devices
+                                    .iter()
+                                    .position(|d| d.info.pci_address.eq_ignore_ascii_case(&t.id))
+                            })
+                            .flatten()
+                    }) {
+                        Some(d) => per[d] += 1,
+                        None => host += 1,
+                    }
+                }
+                eprintln!(
+                    "breccia: tiers: measured placement at users={users} -> {} device blocks {:?}, {host} on the host",
+                    per.iter().sum::<usize>(),
+                    per
+                );
+            }
+            Some(
+                choice
+                    .into_iter()
+                    .map(|c| {
+                        c.and_then(|ti| {
+                            let t = &tiers[ti];
+                            if t.kind == "host" {
+                                return None;
+                            }
+                            devices
+                                .iter()
+                                .position(|d| d.info.pci_address.eq_ignore_ascii_case(&t.id))
+                        })
+                    })
+                    .collect(),
+            )
+        })();
+        let candidates: Vec<ArenaBlock> = match &tier_place {
+            Some(v) => (0..cfg.n_layers)
+                .filter_map(|b| {
+                    v[b].map(|dev| ArenaBlock {
+                        block: b,
+                        device: dev,
+                        bytes: arena_sizes[b],
+                    })
+                })
+                .collect(),
+            None => manual.clone(),
+        };
         let (arena_choice, arena_report) = match &opts.arena {
             ArenaSpec::Off => (arena::ArenaChoice::default(), None),
             ArenaSpec::List(list) => {
@@ -722,7 +813,7 @@ impl Model {
                     if blocks.iter().any(|x: &ArenaBlock| x.block == b) {
                         continue;
                     }
-                    blocks.push(candidates[b]);
+                    blocks.push(manual[b]);
                 }
                 blocks.sort_by_key(|x| x.block);
                 (
