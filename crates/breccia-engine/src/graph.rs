@@ -3808,6 +3808,25 @@ impl<'m> Session<'m> {
         }
     }
 
+    /// Submit the block's dense batch and **wait for its router ids**: the per-block
+    /// fence (item 4). Extracted unchanged so the depth-2 pipeline can later submit
+    /// block `b`'s dense pass and wait for block `b-1`'s ids at this same seam.
+    /// `BRECCIA_PF_STALL=1` prints the wait per block.
+    fn pf_readback(&mut self, gpu: &breccia_vk::ctx::Gpu, b: usize, t: usize) -> Result<()> {
+        batch_cmd::record_barrier_to_host(gpu)?;
+        let t_rb = std::time::Instant::now();
+        self.submit_batch()?;
+        self.flush()?;
+        if std::env::var_os("BRECCIA_PF_STALL").is_some() {
+            eprintln!(
+                "pf-stall blk {:>2} t={t:>4}: {:.3} ms",
+                b,
+                t_rb.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        Ok(())
+    }
+
     fn prefill_block_merged(
         &mut self,
         b: usize,
@@ -3957,19 +3976,7 @@ impl<'m> Session<'m> {
                     ],
                 )?;
             }
-            batch_cmd::record_barrier_to_host(gpu)?;
-            // Item 4's cost: this wait is the per-block fence the depth-2 pipeline
-            // would remove. `BRECCIA_PF_STALL=1` prints it per block.
-            let t_rb = std::time::Instant::now();
-            self.submit_batch()?;
-            self.flush()?;
-            if std::env::var_os("BRECCIA_PF_STALL").is_some() {
-                eprintln!(
-                    "pf-stall blk {:>2} t={t:>4}: {:.3} ms",
-                    b,
-                    t_rb.elapsed().as_secs_f64() * 1e3
-                );
-            }
+            self.pf_readback(gpu, b, t)?;
         }
 
         // ---- the bucket list: per distinct expert, its users -----------------
