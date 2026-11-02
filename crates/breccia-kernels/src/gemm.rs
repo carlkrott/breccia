@@ -101,6 +101,38 @@ fn tile_default(_ty: QuantType, _subgroup: u32) -> Option<Tile> {
     Some((4, 4))
 }
 
+/// `BRECCIA_GEMM_TILE` set: the caller wants exactly that tile, no measured rule.
+fn tile_forced() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("BRECCIA_GEMM_TILE").is_ok())
+}
+
+/// The tile for a concrete dispatch, measured (`gemm_calib` `gemm_tile_sweep`,
+/// RX, `out/gemm-tiles-rx.csv`): the 4x4 build is right for wide shapes and large
+/// batches, and the **4x2** build (half the user tile, twice the workgroups) wins
+/// by 1.4-8.2x when the row count is small enough that `rows/64` leaves the tiled
+/// grid starved. Numbers behind the rule:
+///
+/// | rows | users | 4x2 vs 4x4 |
+/// |---|---|---|
+/// | 640 (gate) | 64-256 | 1.37-3.08x (IQ3_S), 4.2-8.2x (BF16) |
+/// | 640 | 512-1024 | 4x4 better (0.4-0.8x for 4x2) |
+/// | 2560 (down) | 64 | 1.16-1.35x |
+/// | 2560 | >= 96 | 4x4 better |
+fn tile_for(ty: QuantType, rows: usize, users: usize) -> Option<Tile> {
+    // A narrow row count means only rows/64 workgroups per user tile, so the
+    // smaller user tile is what fills the GPU.
+    let narrow = rows <= 1024;
+    if narrow && (users <= 256 || ty == QuantType::Bf16) {
+        return Some((4, 2));
+    }
+    // Tiny batches starve every tile; the narrow one starves least.
+    if users <= 96 {
+        return Some((4, 2));
+    }
+    Some((4, 4))
+}
+
 /// Users below which the tiled build is not used (tiles would be mostly padding).
 const TILE_MIN_USERS: usize = 64;
 
@@ -448,8 +480,16 @@ impl<'g> GemmMany<'g> {
     }
 
     /// The tiled pipeline `run_at` would use for `rows x users`, if any.
-    fn tiled(&self, users: usize) -> Option<(&breccia_vk::ctx::Kernel, Tile)> {
-        let t = self.want_tile.filter(|_| users >= TILE_MIN_USERS)?;
+    fn tiled(&self, rows: usize, users: usize) -> Option<(&breccia_vk::ctx::Kernel, Tile)> {
+        if users < TILE_MIN_USERS {
+            return None;
+        }
+        let t = if tile_forced() {
+            self.want_tile
+        } else {
+            tile_for(self.ty, rows, users)
+        }
+        .or(self.want_tile)?;
         self.tiles
             .iter()
             .find(|(c, _)| *c == t)
@@ -605,7 +645,7 @@ impl<'g> GemmMany<'g> {
         if users == 0 {
             return Err(anyhow!("users must be at least 1"));
         }
-        if let Some((kernel, t)) = self.tiled(users) {
+        if let Some((kernel, t)) = self.tiled(rows, users) {
             let pc = self.pc(rows, cols, users, base_words);
             return self.dispatch_grid(
                 kernel,
@@ -809,7 +849,7 @@ impl<'g> GemmMany<'g> {
         users: usize,
         target_s: f64,
     ) -> Result<GemvTiming> {
-        if let Some((_, t)) = self.tiled(users) {
+        if let Some((_, t)) = self.tiled(rows, users) {
             return self.run_timed_tiled(t, w, x, out, rows, cols, users, target_s);
         }
         let (kernel, v) = self.plain(rows, users);

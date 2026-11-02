@@ -244,3 +244,99 @@ fn gemm_variant_sweep() {
         }
     }
 }
+
+/// Tile sweep: which of the four tiled builds wins for each (shape, users) cell.
+/// This is the matrix `tile_default()` should be a function of — today it returns
+/// (4,4) for every type and shape, and the measured optimum moves with both.
+///
+/// `BRECCIA_CALIB_TILES=1` selects it.
+#[test]
+fn gemm_tile_sweep() {
+    if std::env::var("BRECCIA_CALIB_TILES").is_err() {
+        eprintln!("gemm_tiles: SKIPPED — set BRECCIA_CALIB_TILES=1");
+        return;
+    }
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("gemm_tiles: SKIPPED — set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let host = Host::new().expect("host");
+    let devs = host.devices().expect("devices");
+    let idx = devs
+        .iter()
+        .position(|d| d.pci_address == selector.trim() || d.index.to_string() == selector.trim())
+        .unwrap_or(0);
+    let gpu = Gpu::create(&host, &devs[idx], 1).expect("device");
+    println!("# tiles device {selector}");
+    println!("type,rows,shape,users,tile,us");
+
+    const TLI: [breccia_kernels::gemm::Tile; 4] = [(4, 2), (4, 4), (8, 4), (8, 8)];
+    let users_list = [64usize, 96, 128, 192, 256, 512, 1024];
+    // One quantised type and BF16: the tile optimum is a launch-geometry property,
+    // and these two cover the fastest and slowest inner loops.
+    for ty in [QuantType::Iq3S, QuantType::Bf16] {
+        eprintln!("tiles: type {} ...", ty.name());
+        for (rows, cols, shape) in SHAPES {
+            let mut gemm = match GemmMany::new(&gpu, ty) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("tiles: {} new failed: {e}", ty.name());
+                    continue;
+                }
+            };
+            let wbytes = gemm.weight_bytes(rows, cols);
+            let max_users = users_list[users_list.len() - 1];
+            let (Ok(w), Ok(x), Ok(out)) = (
+                alloc(&gpu, wbytes),
+                alloc(&gpu, (max_users * cols * 4) as u64),
+                alloc(&gpu, (max_users * rows * 4) as u64),
+            ) else {
+                continue;
+            };
+            breccia_kernels::gemv::upload_into(&gpu, &w, &vec![0u8; wbytes as usize]).expect("w");
+            breccia_kernels::gemv::upload_into(&gpu, &x, &vec![0u8; max_users * cols * 4])
+                .expect("x");
+            for users in users_list {
+                for t in TLI {
+                    // Public path: `run_at` picks the tiled build for users >= 64,
+                    // which is exactly what production does.
+                    gemm.set_tile(Some(t));
+                    let mut best = f64::INFINITY;
+                    for pass in 0..4 {
+                        let t0 = std::time::Instant::now();
+                        if gemm.run_at(&w, &x, &out, rows, cols, users, 0).is_err() {
+                            break;
+                        }
+                        let dt = t0.elapsed().as_secs_f64() * 1e6;
+                        if pass > 0 {
+                            best = best.min(dt);
+                        }
+                    }
+                    println!(
+                        "{},{},{},{},{}x{},{:.1}",
+                        ty.name(),
+                        rows,
+                        shape,
+                        users,
+                        t.0,
+                        t.1,
+                        best
+                    );
+                    eprintln!(
+                        "  {:>6} {:<5} users={:<5} tile {}x{} {:8.1} us",
+                        ty.name(),
+                        shape,
+                        users,
+                        t.0,
+                        t.1,
+                        best
+                    );
+                }
+            }
+            gemm.set_tile(None);
+            gpu.destroy_buf(&w);
+            gpu.destroy_buf(&x);
+            gpu.destroy_buf(&out);
+        }
+    }
+}
