@@ -3879,6 +3879,17 @@ impl<'m> Session<'m> {
     /// fence (item 4). Extracted unchanged so the depth-2 pipeline can later submit
     /// block `b`'s dense pass and wait for block `b-1`'s ids at this same seam.
     /// `BRECCIA_PF_STALL=1` prints the wait per block.
+    /// `BRECCIA_PF_PHASES=1`: one line per (block, phase), printed as each phase ends so
+    /// a run that later times out still shows where the time went.
+    fn pf_mark(b: usize, phase: &str, t: &std::time::Instant) {
+        if std::env::var_os("BRECCIA_PF_PHASES").is_some() {
+            eprintln!(
+                "pf-phase blk {b:>2} {phase:<8} {:8.1} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
+        }
+    }
+
     fn pf_readback(&mut self, gpu: &breccia_vk::ctx::Gpu, b: usize, t: usize) -> Result<()> {
         batch_cmd::record_barrier_to_host(gpu)?;
         let t_rb = std::time::Instant::now();
@@ -3933,6 +3944,7 @@ impl<'m> Session<'m> {
                 .pf_active
                 .store(active, std::sync::atomic::Ordering::Relaxed);
         }
+        let mut pf_tp = std::time::Instant::now();
         let micro = self.micro.is_some();
         // Each expert's blob, in the 16-bit words the GEMM's base push constant
         // takes (the arena holds all 512 experts back to back).
@@ -4057,7 +4069,11 @@ impl<'m> Session<'m> {
                     ],
                 )?;
             }
+            Self::pf_mark(b, "dense", &pf_tp);
+            pf_tp = std::time::Instant::now();
             self.pf_readback(gpu, b, t)?;
+            Self::pf_mark(b, "readback", &pf_tp);
+            pf_tp = std::time::Instant::now();
         }
 
         // ---- the bucket list: per distinct expert, its users -----------------
@@ -4226,6 +4242,8 @@ impl<'m> Session<'m> {
         let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
         self.venues[dev].pf_at(b).slots.write(&slot_bytes)?;
         let bucket_s = bucket_t0.elapsed().as_secs_f64();
+        Self::pf_mark(b, "bucket", &pf_tp);
+        pf_tp = std::time::Instant::now();
 
         let mut ship_s = 0.0f64;
         let mut ship_p = [0.0f64; 4];
@@ -4601,6 +4619,7 @@ impl<'m> Session<'m> {
         self.submit_batch()?;
         self.flush()?;
         let fanin_s = t_fan.elapsed().as_secs_f64();
+        Self::pf_mark(b, "moe", &pf_tp);
 
         // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
         if !micro {
