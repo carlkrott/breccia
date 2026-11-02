@@ -404,6 +404,19 @@ impl Venue<'_> {
     /// The prefill scratch set for `block`: the second one on odd blocks when the
     /// depth-2 pipeline is enabled, otherwise the single set.
     fn pf_at(&self, block: usize) -> &PfChunk {
+        // Audit switch: `BRECCIA_PF_SET=1` makes every access use the second set
+        // (isolates "alternation breaks cross-block reuse" from "a writer still
+        // targets set 0"). `=0` forces the first set.
+        match std::env::var("BRECCIA_PF_SET").as_deref() {
+            Ok("1") => {
+                return self
+                    .pf2
+                    .as_ref()
+                    .expect("BRECCIA_PF_SET=1 needs BRECCIA_PF_DEPTH=1")
+            }
+            Ok("0") => return self.pf.as_ref().expect("the merged prefill scratch"),
+            _ => {}
+        }
         let second = pf_depth() && block % 2 == 1;
         if second {
             self.pf2.as_ref()
@@ -6668,11 +6681,8 @@ const SPLIT_T_MAX: usize = 8;
 /// The flag stays off until every access is `pf_at(block)`; then it can become the
 /// depth-2 pipeline's backing store. `BRECCIA_PF_DEPTH=1` is deliberately ignored.
 fn pf_depth() -> bool {
-    // Off: alternation still measures KL 1.08 with every merged-pass access and the
-    // dense helpers on `pf_at(b)`, so a consumer outside that set (router logits /
-    // observe / ship) reads set 0 during prefill. The default single set is
-    // bit-identical; enabling this stays unsafe until that consumer is found.
-    false
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BRECCIA_PF_DEPTH").is_some())
 }
 
 fn pf_split_tiers() -> bool {
