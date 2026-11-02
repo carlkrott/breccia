@@ -305,6 +305,10 @@ enum BenchKind {
     },
     /// Phase 4: the forward-pass graph — one token, then greedy generation
     Token {
+        /// Store the QSA attention **V** cache as q8_0 instead of f16. K stays f16
+        /// either way. Same choice as `BRECCIA_KV_Q8V=1`.
+        #[arg(long, default_value_t = false)]
+        kv_q8v: bool,
         /// Tokens to generate after the prompt (greedy, temperature 0)
         #[arg(long, default_value_t = 32)]
         gen: usize,
@@ -630,6 +634,7 @@ fn run(cli: Cli) -> Result<()> {
         Command::Bench {
             kind:
                 Some(BenchKind::Token {
+                    kv_q8v,
                     gen,
                     prompt_ids,
                     prompt_ids_file,
@@ -660,6 +665,10 @@ fn run(cli: Cli) -> Result<()> {
                     page_hint_trim,
                 }),
         } => {
+            // Before any `QsaState` exists: the layout is latched on first use.
+            if kv_q8v {
+                breccia_kernels::qsa::VLayout::set_current(breccia_kernels::qsa::VLayout::Q8_0);
+            }
             let (prefill_chunk, prefill_chunks) =
                 resolve_prefill_chunks(prefill_chunk, prefill_merged, &devices, ctx);
             bench_token(TokenArgs {

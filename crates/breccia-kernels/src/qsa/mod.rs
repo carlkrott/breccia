@@ -242,7 +242,24 @@ pub enum VLayout {
     Q8_0,
 }
 
+/// Process-wide V layout: the launch flag's value, else the env default. One
+/// static (not one per function) so `set_current` and `current` agree.
+static V_LAYOUT: std::sync::OnceLock<VLayout> = std::sync::OnceLock::new();
+
 impl VLayout {
+    /// The launch flag's choice, when set ([`VLayout::set_current`]); otherwise the
+    /// env default. The flag exists so a serving config can name the layout instead
+    /// of depending on the environment the process happens to inherit.
+    pub fn current() -> Self {
+        *V_LAYOUT.get_or_init(Self::from_env)
+    }
+
+    /// Set the layout for this process (first call wins; a later call is a no-op).
+    /// Must run before the first `QsaState` is built — the layout sizes the cache.
+    pub fn set_current(v: VLayout) {
+        let _ = V_LAYOUT.set(v);
+    }
+
     /// `BRECCIA_KV_Q8V=1|true|on|yes` selects [`VLayout::Q8_0`]; anything else (and
     /// unset) keeps the f16 reference path.
     pub fn from_env() -> Self {
@@ -363,7 +380,7 @@ impl QsaState {
     /// Allocate for `capacity_cells` cells (rounded up to whole pages) and a rope
     /// table of `max_pos` positions, with the V layout from `BRECCIA_KV_Q8V`.
     pub fn new(gpu: &Gpu, capacity_cells: usize, max_pos: usize) -> Result<Self> {
-        Self::with_layout(gpu, capacity_cells, max_pos, VLayout::from_env())
+        Self::with_layout(gpu, capacity_cells, max_pos, VLayout::current())
     }
 
     /// [`QsaState::new`] with the V layout given explicitly (the conformance test
