@@ -186,3 +186,81 @@ mod tests {
         assert_eq!(place_blocks(&[block(1, 1)], &tiers), vec![None]);
     }
 }
+
+/// Split **one block's** experts across tiers so the tiers finish together.
+///
+/// Each expert's cost on tier `t` is `rows_e / rate_t` (seconds); assigning experts
+/// largest-first to the tier with the smallest projected completion time is the
+/// classic LPT list schedule, and it is within one expert of the optimum makespan.
+/// `None` means "no tier takes it" (the caller puts it on the host), and with a
+/// single usable tier everything goes there.
+///
+/// This is the per-expert half of item 3: whole-block placement answers *where a
+/// block lives*, this answers *how a block's experts are divided* inside it.
+pub fn split_experts(rows_per_expert: &[u32], rates: &[f64]) -> Vec<Option<usize>> {
+    let mut out = vec![None; rows_per_expert.len()];
+    if rates.is_empty() || rates.iter().all(|&r| r <= 0.0) {
+        return out;
+    }
+    let mut load = vec![0.0f64; rates.len()];
+    let mut order: Vec<usize> = (0..rows_per_expert.len()).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(rows_per_expert[i]));
+    for i in order {
+        let rows = rows_per_expert[i].max(1) as f64;
+        let mut best: Option<(usize, f64)> = None;
+        for (t, &r) in rates.iter().enumerate() {
+            if r <= 0.0 {
+                continue;
+            }
+            let finish = load[t] + rows / r;
+            if best.is_none_or(|(_, b)| finish < b) {
+                best = Some((t, finish));
+            }
+        }
+        if let Some((t, _)) = best {
+            load[t] += rows / rates[t];
+            out[i] = Some(t);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    #[test]
+    fn equal_tiers_get_equal_work() {
+        let p = split_experts(&[32, 32, 32, 32], &[1.0, 1.0]);
+        let a = p.iter().filter(|x| **x == Some(0)).count();
+        assert_eq!(a, 2, "{p:?}");
+    }
+
+    #[test]
+    fn the_faster_tier_takes_more_experts() {
+        // 2x the rate: LPT gives it 3 of 4 equal experts (makespan 1.5 vs 2.0).
+        let p = split_experts(&[10, 10, 10, 10], &[2.0, 1.0]);
+        let fast = p.iter().filter(|x| **x == Some(0)).count();
+        assert_eq!(fast, 3, "{p:?}");
+    }
+
+    #[test]
+    fn a_block_s_own_work_is_balanced_not_split_by_count() {
+        // One huge expert and three small ones across equal tiers: the huge one
+        // takes a tier of its own, the small ones share the other.
+        let p = split_experts(&[100, 5, 5, 5], &[1.0, 1.0]);
+        assert_eq!(p[0], Some(0), "{p:?}");
+        assert!(p[1..].iter().all(|x| *x == Some(1)), "{p:?}");
+    }
+
+    #[test]
+    fn no_usable_tier_means_host() {
+        assert_eq!(split_experts(&[1, 2], &[0.0, 0.0]), vec![None, None]);
+        assert_eq!(split_experts(&[1, 2], &[]), vec![None, None]);
+    }
+
+    #[test]
+    fn one_tier_takes_everything() {
+        assert_eq!(split_experts(&[5, 6], &[1.0]), vec![Some(0), Some(0)]);
+    }
+}
