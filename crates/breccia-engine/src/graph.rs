@@ -3740,7 +3740,7 @@ impl<'m> Session<'m> {
         let n_embd = mc.n_embd;
         let moe = &m.layers[b].moe;
         let v = &self.venues[dev];
-        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let pf = v.pf_at(b);
         let n_sh = mc.n_ff_shared;
         let g = |w: &crate::model::W| v.pipes.gemm(w.key.ty).expect("checked above");
         match moe.gate_up.as_ref().filter(|w| g(w).has_pair()) {
@@ -4029,12 +4029,7 @@ impl<'m> Session<'m> {
         }
         let bucket_t0 = std::time::Instant::now();
         let mut raw = vec![0u8; t * k * 4];
-        self.venues[dev]
-            .pf
-            .as_ref()
-            .expect("the merged prefill scratch")
-            .ids
-            .read(&mut raw)?;
+        self.venues[dev].pf_at(b).ids.read(&mut raw)?;
         let mut pairs: Vec<(usize, usize, usize)> = Vec::with_capacity(t * k);
         for i in 0..t {
             for j in 0..k {
@@ -4168,12 +4163,7 @@ impl<'m> Session<'m> {
             }));
         }
         let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
-        self.venues[dev]
-            .pf
-            .as_ref()
-            .expect("the merged prefill scratch")
-            .slots
-            .write(&slot_bytes)?;
+        self.venues[dev].pf_at(b).slots.write(&slot_bytes)?;
         let bucket_s = bucket_t0.elapsed().as_secs_f64();
 
         let mut ship_s = 0.0f64;
@@ -6678,9 +6668,12 @@ const SPLIT_T_MAX: usize = 8;
 /// The flag stays off until every access is `pf_at(block)`; then it can become the
 /// depth-2 pipeline's backing store. `BRECCIA_PF_DEPTH=1` is deliberately ignored.
 fn pf_depth() -> bool {
-    // Still not safe: the merged pass's helpers (`record_shared_chunk`, the fan-in)
-    // read `venue.pf` without the block, so alternation is inconsistent (measured KL
-    // 1.08). The flag is ignored until `pf_at(block)` is threaded through them.
+    // Off. Alternation per *block* is the wrong granularity: `pf` carries values
+    // across the dense/moe phases and into the next block (shared expert, `out`), so
+    // switching sets by `block % 2` is inconsistent even when every access in the
+    // merged pass reads `pf_at(b)` (measured KL 1.08, unchanged by converting the
+    // remaining sites). The depth-2 pipeline must split the phases and give each
+    // **phase** its own set, not each block.
     false
 }
 
