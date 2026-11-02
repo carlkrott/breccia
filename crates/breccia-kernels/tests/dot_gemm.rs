@@ -133,7 +133,7 @@ fn dot_gemm_vs_the_tiled_bf16_build() {
         "shape", "users", "dot us", "bf16 us"
     );
     for (rows, cols, shape) in [(640usize, 2560usize, "gate"), (2560, 640, "down")] {
-        let mut gemm = GemmMany::new(&gpu, QuantType::Bf16).expect("bf16 gemm");
+        let gemm = GemmMany::new(&gpu, QuantType::Bf16).expect("bf16 gemm");
         for users in [128usize, 1024] {
             let wbytes = gemm.weight_bytes(rows, cols);
             let w = alloc(&gpu, wbytes).expect("w");
