@@ -35,6 +35,8 @@ layout(push_constant) uniform Params {
     int pos0;
     uint page_cells;
     uint n_kv_head;
+
+    uint tok0; // first token of this tile inside the call's buffers
 } pc;
 
 #define WG_X_MAX 65535u
@@ -73,11 +75,12 @@ void main() {
         return; // whole workgroup: no barrier is skipped by part of it
     }
     uint kvh = wg - t * pc.n_kv_head;
+    uint tg = t + pc.tok0;  // global token: ids, counts, position, out
     uint h0 = kvh * GROUP;
     uint d = gl_LocalInvocationID.x;
 
-    uint count = CNT[t];
-    int pos = pc.pos0 + int(t);
+    uint count = CNT[tg];
+    int pos = pc.pos0 + int(tg);
     uint nslots = min(count * 4u, pc.slots);
 
     float acc[GROUP];
@@ -90,7 +93,7 @@ void main() {
         uint s = c0 + d;
         uint base = DEAD;
         if (s < nslots) {
-            int cell = int(IDS[t * pc.id_stride + s / 4u]) * 4 + int(s % 4u);
+            int cell = int(IDS[tg * pc.id_stride + s / 4u]) * 4 + int(s % 4u);
             if (cell <= pos) {
                 uint page = PT[uint(cell) / pc.page_cells];
                 uint in_page = uint(cell) % pc.page_cells;
@@ -126,8 +129,8 @@ void main() {
 
     [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
         uint hh = h0 + h;
-        uint gate_at = t * (pc.n_head * 2u * pc.head_dim) + hh * (2u * pc.head_dim) +
+        uint gate_at = tg * (pc.n_head * 2u * pc.head_dim) + hh * (2u * pc.head_dim) +
                        pc.head_dim + d;
-        O[(t * pc.n_head + hh) * pc.head_dim + d] = acc[h] * breccia_sigmoid(QF[gate_at]);
+        O[(tg * pc.n_head + hh) * pc.head_dim + d] = acc[h] * breccia_sigmoid(QF[gate_at]);
     }
 }

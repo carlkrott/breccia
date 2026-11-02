@@ -117,14 +117,17 @@ pub(crate) fn grid_for(units: usize, per_wg: usize) -> (u32, u32) {
 /// A 32-byte push-constant block builder (every op uses four words or fewer).
 #[derive(Clone, Copy)]
 pub(crate) struct Pc {
-    bytes: [u8; 32],
+    /// Room for 12 words. It was 8; the QSA attention tiling's ninth word (`tok0`)
+    /// was silently dropped by `u()` until this grew (and the pipeline layout's
+    /// range grew with it, `ctx.rs`).
+    bytes: [u8; 48],
     len: usize,
 }
 
 impl Pc {
     pub(crate) fn new() -> Self {
         Pc {
-            bytes: [0u8; 32],
+            bytes: [0u8; 48],
             len: 0,
         }
     }
@@ -133,14 +136,18 @@ impl Pc {
     /// `u` sequence, e.g. the fused HC variant's 8 words).
     pub(crate) fn from_bytes(bytes: &[u8; 32]) -> Self {
         Pc {
-            bytes: *bytes,
+            bytes: {
+                let mut b = [0u8; 48];
+                b[..32].copy_from_slice(bytes);
+                b
+            },
             len: 32,
         }
     }
 
     pub(crate) fn u(mut self, v: u32) -> Self {
         let at = self.len;
-        if at + 4 <= 32 {
+        if at + 4 <= 48 {
             self.bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
             self.len = at + 4;
         }

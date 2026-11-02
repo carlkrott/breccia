@@ -112,6 +112,12 @@ pub fn dense_cell_limit() -> usize {
 pub const SELECT_WIDTH: usize = IDX_TOP_K + IDX_BLOCK - 1;
 /// Cells per KV page (this module's choice, spec §7 / `docs/phase-3/05` §7).
 pub const PAGE_CELLS: usize = 16;
+
+/// Rows of the QSA score matrix held at once. The prefill attention loop walks a
+/// chunk in tiles of this many tokens, so `attn` is `24 x ATTN_TILE x slots`
+/// instead of `24 x T x slots` — 24 KiB/token instead of 192 at an 8k context.
+/// Attention is row-independent, so the tiling is exact.
+pub const ATTN_TILE: usize = 1024;
 /// `attn_q` output width: 24 heads x (256 q + 256 gate).
 pub const QGATE_DIM: usize = MODEL_N_HEAD * 2 * MODEL_HEAD_DIM;
 /// `attn_output` input width: 24 x 256.
@@ -627,6 +633,9 @@ pub struct QsaWorkspace {
     pub ncand: Buf,
     /// `[24*T, slots]` attention scores, softmaxed in place.
     pub attn: Buf,
+    /// Rows of [`QsaWorkspace::attn`] (the attention tile; `tokens` when the call is
+    /// smaller than [`ATTN_TILE`] or not on the GQA path).
+    pub attn_rows: usize,
     /// `[T, 24, 256]` gated attention output (the `attn_output` GEMV's input).
     pub attn_out: Buf,
     /// `[24*T, chunks, 256]` split-apply partial sums (one word unless
@@ -924,6 +933,13 @@ impl<'g> Qsa<'g> {
         let topk_blocks = idx_topk_blocks();
         let max_ids = n_blocks.min(topk_blocks) + 1;
         let slots = 4 * max_ids;
+        // The prefill attention is tiled over rows; a call that does not use both
+        // GQA kernels keeps a full-size score matrix.
+        let attn_rows = if gqa_scores(tokens) && gqa_apply(tokens) {
+            tokens.min(ATTN_TILE)
+        } else {
+            tokens
+        };
         let sizes = [
             tokens * QGATE_DIM,
             tokens * ATTN_OUT_DIM,
@@ -937,7 +953,7 @@ impl<'g> Qsa<'g> {
             tokens,
             tokens * n_blocks.max(1),
             tokens,
-            MODEL_N_HEAD * tokens * slots,
+            MODEL_N_HEAD * attn_rows * slots,
             tokens * ATTN_OUT_DIM,
             // A prefill chunk workspace is reused by speculative verify at T < 16 rows.
             if split_apply(1) {
@@ -980,6 +996,7 @@ impl<'g> Qsa<'g> {
             cand: take(),
             ncand: take(),
             attn: take(),
+            attn_rows,
             attn_out: take(),
             attn_part: take(),
             n_blocks,
@@ -1359,7 +1376,25 @@ impl<'g> Qsa<'g> {
     }
 
     /// Scores over the selected cells, then softmax in place.
+    /// Whole-call attention (one tile). Callers with a chunk larger than
+    /// [`ATTN_TILE`] must use [`Qsa::forward`], which alternates attend and apply per
+    /// tile; this is for decode/small batches and the stage bench.
     pub fn attend(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        debug_assert!(
+            ws.attn_rows == ws.tokens,
+            "attend() on a tiled workspace would leave only the last tile's scores"
+        );
+        self.attend_tile(state, ws, pos0, 0, ws.tokens)
+    }
+
+    fn attend_tile(
+        &self,
+        state: &QsaState,
+        ws: &QsaWorkspace,
+        pos0: usize,
+        row0: usize,
+        tile: usize,
+    ) -> Result<()> {
         let pc = Pc::new()
             .u(ws.tokens as u32)
             .u(MODEL_N_HEAD as u32)
@@ -1369,9 +1404,39 @@ impl<'g> Qsa<'g> {
             .i(pos0 as i32)
             .u(PAGE_CELLS as u32)
             .u(MODEL_N_KV_HEAD as u32);
-        let (pipe, units) = if gqa_scores(ws.tokens) {
-            (&self.attn_scores_gqa, ws.tokens * MODEL_N_KV_HEAD)
-        } else if small_scores(ws.tokens) {
+        if gqa_scores(ws.tokens) {
+            // One tile: `forward` runs attend+apply per tile, because the score
+            // matrix is reused (applying after all tiles would read the last one).
+            {
+                let pct = Pc::new()
+                    .u(tile as u32)
+                    .u(MODEL_N_HEAD as u32)
+                    .u(MODEL_HEAD_DIM as u32)
+                    .u(ws.slots as u32)
+                    .u(ws.max_ids as u32)
+                    .i(pos0 as i32)
+                    .u(PAGE_CELLS as u32)
+                    .u(MODEL_N_KV_HEAD as u32)
+                    .u(row0 as u32);
+                let (gx, gy) = grid_for(tile * MODEL_N_KV_HEAD, 1);
+                self.attn_scores_gqa.run(
+                    &[
+                        &ws.q,
+                        &state.k_pool,
+                        &state.page_table,
+                        &ws.ids,
+                        &ws.counts,
+                        &ws.attn,
+                    ],
+                    &pct,
+                    (gx, gy, 1),
+                )?;
+                self.softmax
+                    .run(&ws.attn, &ws.attn, MODEL_N_HEAD * tile, ws.slots)?;
+            }
+            return Ok(());
+        }
+        let (pipe, units) = if small_scores(ws.tokens) {
             (
                 &self.attn_scores_small,
                 ws.tokens * MODEL_N_KV_HEAD * ws.slots.div_ceil(256),
@@ -1397,7 +1462,23 @@ impl<'g> Qsa<'g> {
     }
 
     /// Probability-weighted V, gated by `sigmoid(gate)` from the `attn_q` half.
+    /// See [`Qsa::attend`]: one tile, for callers whose chunk fits one.
     pub fn apply(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        debug_assert!(
+            ws.attn_rows == ws.tokens,
+            "apply() on a tiled workspace would read only the last tile's scores"
+        );
+        self.apply_tile(state, ws, pos0, 0, ws.tokens)
+    }
+
+    fn apply_tile(
+        &self,
+        state: &QsaState,
+        ws: &QsaWorkspace,
+        pos0: usize,
+        row0: usize,
+        tile: usize,
+    ) -> Result<()> {
         let pc = Pc::new()
             .u(ws.tokens as u32)
             .u(MODEL_N_HEAD as u32)
@@ -1438,6 +1519,39 @@ impl<'g> Qsa<'g> {
                 &rpc,
                 (gx, gy, 1),
             );
+        }
+        if gqa_apply(ws.tokens) {
+            {
+                let pct = Pc::new()
+                    .u(tile as u32)
+                    .u(MODEL_N_HEAD as u32)
+                    .u(MODEL_HEAD_DIM as u32)
+                    .u(ws.slots as u32)
+                    .u(ws.max_ids as u32)
+                    .i(pos0 as i32)
+                    .u(PAGE_CELLS as u32)
+                    .u(MODEL_N_KV_HEAD as u32)
+                    .u(row0 as u32);
+                let pipe = match state.v_layout {
+                    VLayout::F16 => &self.attn_apply_gqa,
+                    VLayout::Q8_0 => &self.attn_apply_gqa_q8,
+                };
+                let (gx, gy) = grid_for(tile * MODEL_N_KV_HEAD, 1);
+                pipe.run(
+                    &[
+                        &ws.attn,
+                        &state.v_pool,
+                        &state.page_table,
+                        &ws.ids,
+                        &ws.counts,
+                        &ws.q_full,
+                        &ws.attn_out,
+                    ],
+                    &pct,
+                    (gx, gy, 1),
+                )?;
+            }
+            return Ok(());
         }
         let gqa = gqa_apply(ws.tokens);
         let (gx, gy) = if gqa {
@@ -1515,8 +1629,16 @@ impl<'g> Qsa<'g> {
             self.topk(ws, pos0)?;
         }
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::ATTN);
-        self.attend(state, ws, pos0)?;
-        self.apply(state, ws, pos0)?;
+        // Attention is row-independent, so the pair is tiled together: `attn` is one
+        // tile deep, and each tile's scores are consumed before the next overwrites
+        // them. A call that is not GQA-sized has `attn_rows == tokens` (one tile).
+        let mut row0 = 0usize;
+        while row0 < t {
+            let tile = (t - row0).min(ws.attn_rows).max(1);
+            self.attend_tile(state, ws, pos0, row0, tile)?;
+            self.apply_tile(state, ws, pos0, row0, tile)?;
+            row0 += tile;
+        }
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::ATTN_OUT);
         proj.out.run(proj.w_out, &ws.attn_out, out, t)?;
         Ok(())

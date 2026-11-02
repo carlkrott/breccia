@@ -1402,16 +1402,15 @@ impl Gpu {
             // room for a fifth word (accumulator selector, per-row weight base)
             // without a second pipeline layout per shader. Every device here
             // reports maxPushConstantsSize >= 128 (Vulkan's guaranteed minimum is
-            // also 128), so 32 costs nothing. Shaders still declare only the
-            // 16-byte prefix they read; a 32-byte range with a 16-byte block at
-            // offset 0 is backwards compatible (`cmd_push_constants` may push a
-            // prefix of the range), and a shader that needs a fifth word can now
-            // declare 20/32 bytes without touching the layout
-            // (docs/phase-3/03-gaps-closed.md).
+            // also 128), so the range costs nothing. Shaders declare only the
+            // prefix they read, and `cmd_push_constants` may push a prefix of the
+            // range. It was 32 bytes (8 words): the QSA attention tiling needs a
+            // ninth word (`tok0`), and a shader block larger than the range reads
+            // undefined constants, so the range is 48 bytes now.
             let pcr = vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 .offset(0)
-                .size(32);
+                .size(48);
             let layouts = [dsl];
             let pcrs = [pcr];
             let plci = vk::PipelineLayoutCreateInfo::default()

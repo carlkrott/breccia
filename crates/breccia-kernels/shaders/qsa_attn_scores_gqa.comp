@@ -33,6 +33,7 @@ layout(push_constant) uniform Params {
     int pos0;
     uint page_cells;
     uint n_kv_head;
+    uint tok0; // first token of this tile inside the call's buffers
 } pc;
 
 #define WG_X_MAX 65535u
@@ -54,28 +55,30 @@ void main() {
         return; // whole workgroup
     }
     uint kvh = wg - t * pc.n_kv_head;
+    uint tg = t + pc.tok0;  // global token: q, ids, counts, position
     uint h0 = kvh * GROUP;
     uint sg_size = gl_SubgroupSize;
     uint sgs = 256u / sg_size;
     uint sg_id = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
     uint n_local = pc.head_dim / sg_size;
-    uint row0 = t * pc.n_head + h0;
+    uint qrow = tg * pc.n_head + h0; // q rows are the call-global token
+    uint srow = t * pc.n_head + h0;  // score rows are tile-local
 
     float q[GROUP][LOCAL_MAX];
     [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
         [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
-            q[h][m] = m < n_local ? Q[(row0 + h) * pc.head_dim + lane + m * sg_size] : 0.0;
+            q[h][m] = m < n_local ? Q[(qrow + h) * pc.head_dim + lane + m * sg_size] : 0.0;
         }
     }
 
-    uint count = CNT[t];
-    int pos = pc.pos0 + int(t);
+    uint count = CNT[tg];
+    int pos = pc.pos0 + int(tg);
     uint live = min(pc.slots, count * 4u);
     uint dead = pc.slots - live;
     for (uint i = gl_LocalInvocationID.x; i < GROUP * dead; i += 256u) {
         uint h = i / dead;
-        SC[(row0 + h) * pc.slots + live + (i - h * dead)] = MASK_DEAD;
+        SC[(srow + h) * pc.slots + live + (i - h * dead)] = MASK_DEAD;
     }
 
     for (uint c0 = 0u; c0 < live; c0 += CHUNK) {
@@ -83,7 +86,7 @@ void main() {
         uint s = c0 + gl_LocalInvocationID.x;
         uint base = DEAD;
         if (s < live) {
-            int cell = int(IDS[t * pc.id_stride + s / 4u]) * 4 + int(s % 4u);
+            int cell = int(IDS[tg * pc.id_stride + s / 4u]) * 4 + int(s % 4u);
             if (cell <= pos) {
                 uint page = PT[uint(cell) / pc.page_cells];
                 uint in_page = uint(cell) % pc.page_cells;
@@ -100,7 +103,7 @@ void main() {
             uint at = c0 + j;
             if (b == DEAD) {
                 if (lane < GROUP) {
-                    SC[(row0 + lane) * pc.slots + at] = MASK_DEAD;
+                    SC[(srow + lane) * pc.slots + at] = MASK_DEAD;
                 }
                 continue;
             }
@@ -122,7 +125,7 @@ void main() {
                     acc += subgroupShuffleXor(acc, off);
                 }
                 if (lane == 0u) {
-                    SC[(row0 + h) * pc.slots + at] = acc * KQ_SCALE;
+                    SC[(srow + h) * pc.slots + at] = acc * KQ_SCALE;
                 }
             }
         }
