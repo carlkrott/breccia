@@ -1805,6 +1805,16 @@ fn measured_candidates(
     arena_sizes: &[u64],
     verbose: bool,
 ) -> Option<Vec<ArenaBlock>> {
+    // **Off by default until the arena device and the execution device are the same
+    // thing.** `placement.device_of(b)` decides where a block's dense weights and
+    // state live and where it runs; this policy only chooses where its experts sit.
+    // Those must agree, and they do not yet: a measured assignment that differs from
+    // the layer placement makes an expert GEMM read an arena on another card (RX
+    // `GCVM_L2_PROTECTION_FAULT` + reset, 2026-11-02 20:12). The real fix is to feed
+    // the measured tiers into `Placement` itself, not just the arena.
+    if std::env::var("BRECCIA_TIER_PLACEMENT").is_err() {
+        return None;
+    }
     let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
         .ok()
         .flatten()?;

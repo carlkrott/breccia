@@ -1067,7 +1067,7 @@ impl<'m> Session<'m> {
                 let align = |v: usize| (v as u64 + 255) & !255;
                 let (gb, ub, db) = (align(g_max), align(u_max), align(d_max));
                 let slot_stride = gb + ub + db;
-                let split = if pf_split_host().is_some() {
+                let split = if pf_split_host().is_some() || pf_split_tiers() {
                     let hp = Mailbox::new(gpu, (SPLIT_T_MAX as u64 + 1) * nb)?;
                     hp.write(&vec![0u8; (SPLIT_T_MAX + 1) * nb as usize])?;
                     Some((
@@ -4057,8 +4057,14 @@ impl<'m> Session<'m> {
                     }
                 }
                 host_set = breccia_profile::placement::host_experts(&rows, dev_rate, host_rate);
-            } else {
-                let (n, pct) = pf_split_host().expect("split_on");
+                if b == 0 {
+                    eprintln!(
+                        "breccia: split-tiers: device {dev_rate:.3e} host {host_rate:.3e} rows/s -> {} of {} experts to the host",
+                        host_set.len(),
+                        rows.len()
+                    );
+                }
+            } else if let Some((n, pct)) = pf_split_host() {
                 let n = if pct { (distinct * n).div_ceil(100) } else { n };
                 let n = n.min(distinct - 1);
                 host_set = pairs
