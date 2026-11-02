@@ -118,6 +118,7 @@ const SHADERS: &[&str] = &[
     "qsa_idx_score",
     "qsa_topk",
     "qsa_topk_rank",
+    "qsa_topk_thr",
     "qsa_attn_scores",
     "qsa_attn_scores_gqa",
     "qsa_attn_scores_small",

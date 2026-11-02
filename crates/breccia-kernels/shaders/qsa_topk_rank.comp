@@ -19,6 +19,7 @@ layout(local_size_x = 256) in;
 layout(std430, binding = 0) readonly buffer Scores { float SC[]; }; // [T, n_blocks]
 layout(std430, binding = 1) buffer Ids { uint IDS[]; };             // [T, max_ids]
 layout(std430, binding = 2) writeonly buffer Counts { uint CNT[]; }; // [T]
+layout(std430, binding = 3) readonly buffer Thr { float THR[]; };   // [T]
 
 layout(push_constant) uniform Params {
     uint tokens;
@@ -35,6 +36,7 @@ layout(push_constant) uniform Params {
 shared float s_s[256];
 shared uint s_a[256];
 shared uint s_b[256];
+
 
 // Does block c (score sc) come before block b (score sb) in the emitted order?
 bool before(float sc, uint c, float sb, uint b) {
@@ -55,14 +57,28 @@ void main() {
         uint base = t * pc.n_blocks;
         uint b = (wg % per) * 256u + tid;
         float sb = b < pc.n_blocks ? SC[base + b] : DEAD;
-        uint rank = 0u;
+        // Two exact prunes, both in `rank`:
+        //  * a block below `THR[t]` (a proven lower bound on the `want`-th score,
+        //    qsa_topk_thr.comp) can never be selected, so it starts past `want`;
+        //  * a survivor stops comparing once its partial rank reaches `want`, since
+        //    rank only grows.
+        // The score row is still swept in 256-wide LDS tiles: every workgroup loads
+        // it cooperatively (coalesced, L2-resident) and only the survivors compare,
+        // which is what keeps this cheap at 16k blocks.
+        bool live = b < pc.n_blocks && sb > DEAD && sb >= THR[t];
+        uint rank = live ? 0u : want;
         for (uint c0 = 0u; c0 < pc.n_blocks; c0 += 256u) {
             uint c = c0 + tid;
             s_s[tid] = c < pc.n_blocks ? SC[base + c] : DEAD;
             barrier();
-            uint m = min(256u, pc.n_blocks - c0);
-            for (uint j = 0u; j < m; ++j) {
-                rank += before(s_s[j], c0 + j, sb, b) ? 1u : 0u;
+            if (live) {
+                uint m = min(256u, pc.n_blocks - c0);
+                for (uint j = 0u; j < m; ++j) {
+                    rank += before(s_s[j], c0 + j, sb, b) ? 1u : 0u;
+                }
+                if (rank >= want) {
+                    live = false;
+                }
             }
             barrier();
         }

@@ -595,6 +595,9 @@ pub struct QsaWorkspace {
     pub ids: Buf,
     /// `[T]` ids per token.
     pub counts: Buf,
+    /// `[T]` proven lower bound on the `topk_blocks`-th score
+    /// (`qsa_topk_thr.comp`): blocks below it skip the rank select.
+    pub thr: Buf,
     /// `[24*T, slots]` attention scores, softmaxed in place.
     pub attn: Buf,
     /// `[T, 24, 256]` gated attention output (the `attn_output` GEMV's input).
@@ -622,6 +625,7 @@ impl QsaWorkspace {
             &self.idx_scores,
             &self.ids,
             &self.counts,
+            &self.thr,
             &self.attn,
             &self.attn_out,
             &self.attn_part,
@@ -672,6 +676,7 @@ pub struct Qsa<'g> {
     idx_score: Pipe<'g>,
     topk: Pipe<'g>,
     topk_rank: Pipe<'g>,
+    topk_thr: Pipe<'g>,
     attn_scores: Pipe<'g>,
     attn_scores_gqa: Pipe<'g>,
     attn_scores_small: Pipe<'g>,
@@ -743,10 +748,16 @@ impl<'g> Qsa<'g> {
             3,
             "qsa indexer top-k",
         )?;
+        let topk_thr = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_topk_thr.spv")),
+            2,
+            "qsa indexer top-k threshold",
+        )?;
         let topk_rank = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_topk_rank.spv")),
-            3,
+            4,
             "qsa indexer top-k (rank)",
         )?;
         let attn_scores = Pipe::new(
@@ -825,6 +836,7 @@ impl<'g> Qsa<'g> {
             idx_score,
             topk,
             topk_rank,
+            topk_thr,
             attn_scores,
             attn_scores_gqa,
             attn_scores_small,
@@ -877,6 +889,7 @@ impl<'g> Qsa<'g> {
             tokens * n_blocks.max(1),
             tokens * max_ids,
             tokens,
+            tokens,
             MODEL_N_HEAD * tokens * slots,
             tokens * ATTN_OUT_DIM,
             // A prefill chunk workspace is reused by speculative verify at T < 16 rows.
@@ -888,8 +901,8 @@ impl<'g> Qsa<'g> {
         ];
         assert_eq!(
             sizes.len(),
-            12,
-            "QsaWorkspace has twelve fields; the positional slot list must match it"
+            13,
+            "QsaWorkspace has thirteen fields; the positional slot list must match it"
         );
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         for (i, n) in sizes.iter().enumerate() {
@@ -904,7 +917,7 @@ impl<'g> Qsa<'g> {
             }
         }
         let mut it = bufs.into_iter();
-        let mut take = || it.next().expect("twelve qsa buffers were allocated");
+        let mut take = || it.next().expect("thirteen qsa buffers were allocated");
         Ok(QsaWorkspace {
             tokens,
             q_full: take(),
@@ -916,6 +929,7 @@ impl<'g> Qsa<'g> {
             idx_scores: take(),
             ids: take(),
             counts: take(),
+            thr: take(),
             attn: take(),
             attn_out: take(),
             attn_part: take(),
@@ -937,6 +951,7 @@ impl<'g> Qsa<'g> {
             &ws.idx_scores,
             &ws.ids,
             &ws.counts,
+            &ws.thr,
             &ws.attn,
             &ws.attn_out,
             &ws.attn_part,
@@ -1191,6 +1206,19 @@ impl<'g> Qsa<'g> {
         self.topk_with(ws, pos0, path)
     }
 
+    /// Compute the rank select's score threshold (`qsa_topk_thr.comp`).
+    fn topk_threshold(&self, ws: &QsaWorkspace) -> Result<()> {
+        let groups = ws.topk_blocks.min(ws.n_blocks).max(1);
+        let pc = Pc::new()
+            .u(ws.tokens as u32)
+            .u(ws.n_blocks as u32)
+            .u(groups as u32)
+            .u(0);
+        let (gx, gy) = grid_for(ws.tokens, 1);
+        self.topk_thr
+            .run_then_barrier(&[&ws.idx_scores, &ws.thr], &pc, (gx, gy, 1))
+    }
+
     /// [`Qsa::topk`] on a named path (tests and A/B).
     pub fn topk_with(&self, ws: &QsaWorkspace, pos0: usize, path: TopkPath) -> Result<()> {
         let pc = Pc::new()
@@ -1201,8 +1229,13 @@ impl<'g> Qsa<'g> {
             .i(pos0 as i32)
             .u(0); // dense off: a word Pc does not push is undefined in the shader
         if path == TopkPath::Rank {
+            // Threshold first: a proven lower bound on the `want`-th score, so the
+            // rank pass only scans the blocks that can actually be selected.
+            if std::env::var("BRECCIA_QSA_TOPK_THR").map_or(true, |v| v != "0") {
+                self.topk_threshold(ws)?;
+            }
             // Same words; word 5 is `phase` in qsa_topk_rank.comp (0 rank, 1 finalize).
-            let bufs = [&ws.idx_scores, &ws.ids, &ws.counts];
+            let bufs = [&ws.idx_scores, &ws.ids, &ws.counts, &ws.thr];
             let (gx, gy) = grid_for(ws.tokens * ws.n_blocks.div_ceil(256), 1);
             self.topk_rank.run(&bufs, &pc, (gx, gy, 1))?;
             let pc1 = Pc::new()
@@ -1384,7 +1417,11 @@ impl<'g> Qsa<'g> {
         if ws.n_blocks <= ws.topk_blocks && idx_skip() {
             self.topk_dense(ws, pos0)?;
         } else {
-            self.idx_score(state, ws, pos0)?;
+            // A/B knob (default on): `BRECCIA_IDX_SCORE=0` skips the scoring pass so
+            // its share of `qsa-aux` can be measured directly.
+            if std::env::var("BRECCIA_IDX_SCORE").map_or(true, |v| v != "0") {
+                self.idx_score(state, ws, pos0)?;
+            }
             self.topk(ws, pos0)?;
         }
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::ATTN);

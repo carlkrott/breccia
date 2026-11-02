@@ -36,7 +36,24 @@ pub fn qsa_cells(
     let kv_rows = MODEL_N_KV_HEAD * MODEL_HEAD_DIM;
     let idx_q_rows = IDX_N_HEAD * IDX_DIM;
     let max_t = tokens.iter().cloned().max().unwrap_or(1);
-    let max_pos = (max_t + 4096).next_power_of_two();
+    // `BRECCIA_QSA_BENCH_CELLS=65536` adds decode cells at that cache position, so the
+    // long-context stage split (idx-score vs topk vs attention) is measurable rather
+    // than inferred from the end-to-end aggregate.
+    let bench_cells: Vec<usize> = std::env::var("BRECCIA_QSA_BENCH_CELLS")
+        .ok()
+        .map(|v| {
+            v.split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect::<Vec<usize>>()
+        })
+        .unwrap_or_default();
+    let cap = bench_cells
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(0)
+        .max(max_t + 4096);
+    let max_pos = cap.next_power_of_two();
 
     let b_w_q = upload(gpu, &bf16_ones(QGATE_DIM * N_EMBD)).context("w_q")?;
     let b_w_k = upload(gpu, &bf16_ones(kv_rows * N_EMBD)).context("w_k")?;
@@ -57,7 +74,7 @@ pub fn qsa_cells(
     let g_out = Gemv::new(gpu, ty, N_EMBD, ATTN_OUT_DIM)?;
 
     let qsa = Qsa::new(gpu, max_pos)?;
-    let state = QsaState::new(gpu, max_t + 4096, max_pos)?;
+    let state = QsaState::new(gpu, cap, max_pos)?;
     let wg = QsaWeights {
         q_norm: &b_q_norm,
         k_norm: &b_k_norm,
@@ -84,6 +101,9 @@ pub fn qsa_cells(
     }
     if tokens.contains(&1) {
         plan.push((1, 2048));
+    }
+    for &c in &bench_cells {
+        plan.push((1, c));
     }
     for &(t, pos0) in &plan {
         let ws = qsa.workspace(gpu, t, pos0 + t)?;

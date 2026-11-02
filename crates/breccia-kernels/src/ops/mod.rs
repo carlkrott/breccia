@@ -214,6 +214,30 @@ impl<'g> Pipe<'g> {
         Ok(())
     }
 
+    /// One dispatch followed by a full device barrier, for a kernel whose output
+    /// the *next* dispatch reads when no batch is open (each `run` is then its own
+    /// submission, and a device write is not visible to a later submission without
+    /// a barrier). Inside a batch the per-resource tracker already does this, so
+    /// the batched path stays on [`Pipe::run`].
+    pub(crate) fn run_then_barrier(
+        &self,
+        bufs: &[&Buf],
+        pc: &Pc,
+        grid: (u32, u32, u32),
+    ) -> Result<()> {
+        if crate::dispatch_batch::is_open() {
+            return self.run(bufs, pc, grid);
+        }
+        self.bind(bufs)?;
+        self.gpu
+            .wall_run(Qc::C, |d, cmd| {
+                record(d, cmd, &self.kernel, pc.as_bytes(), grid);
+                unsafe { Gpu::barrier_all(d, cmd) };
+            })
+            .map_err(|e| anyhow!("{}: {e}", self.what))?;
+        Ok(())
+    }
+
     /// One dispatch repeated for `target_s`, GPU-timestamped. A full barrier
     /// between dispatches keeps the reported number a latency, not a pipelined
     /// average (same protocol as `Gemv::run_timed`).

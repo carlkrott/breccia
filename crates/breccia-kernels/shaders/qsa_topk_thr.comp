@@ -1,0 +1,74 @@
+#version 450
+//
+// QSA indexer top-k — a provable score threshold, so the rank select can skip the
+// blocks that cannot win.
+//
+// `qsa_topk_rank.comp` is O(n_blocks^2) compares: at a 64k-token cache (16384
+// blocks) every block scans the whole score row, which is the dominant cost of a
+// long-context QSA layer. Almost all of that work is wasted on blocks that are
+// nowhere near the top 512.
+//
+// This pass computes
+//
+//   tau = min over g < G of  max_{b : b == g (mod G)} score[b]
+//
+// with `G = min(topk_blocks, n_blocks)`. Each of the G groups contains at least one
+// block scoring >= tau (its own maximum), so there are at least G blocks scoring
+// >= tau, and therefore the G-th largest score is >= tau. A block scoring below
+// tau is *provably* outside the top G, so the rank select may skip it outright.
+// The bound is exact in the sense that matters: no selectable block is ever
+// excluded (ties at tau are kept).
+//
+// Groups are strided (`g, g+G, g+2G, ...`) so that at every step the workgroup's
+// lanes read consecutive floats — the pass is a handful of coalesced sweeps over
+// the score row.
+//
+// One workgroup per token; `G` is 512 in production, so a thread owns `G/256`
+// groups.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Scores { float SC[]; }; // [T, n_blocks]
+layout(std430, binding = 1) writeonly buffer Thr { float THR[]; };  // [T]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_blocks;
+    uint groups;
+    uint pad0;
+} pc;
+
+shared float s_m[256];
+
+void main() {
+    uint t = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = t * pc.n_blocks;
+    uint g_step = pc.groups;
+
+    // Every group contributes its own maximum to the min (a thread may own more
+    // than one group: it takes the min across them, not the max). Threads without a
+    // group contribute +inf, which the min ignores.
+    float m = 1.0e30;
+    for (uint g = tid; g < g_step; g += 256u) {
+        float gm = -1.0e30;
+        for (uint b = g; b < pc.n_blocks; b += g_step) {
+            gm = max(gm, SC[base + b]);
+        }
+        m = min(m, gm);
+    }
+    s_m[tid] = m;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_m[tid] = min(s_m[tid], s_m[tid + off]);
+        }
+        barrier();
+    }
+    if (tid == 0u) {
+        THR[t] = s_m[0];
+    }
+}
