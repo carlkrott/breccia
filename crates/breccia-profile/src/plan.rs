@@ -382,6 +382,7 @@ mod tests {
             timestamp_unix_s: 0,
             quick: false,
             cpu_lane: None,
+            tiers: None,
             devices: vec![
                 entry(
                     1,

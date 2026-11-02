@@ -15,6 +15,7 @@
 
 pub mod backend;
 pub mod fingerprint;
+pub mod placement;
 pub mod plan;
 pub mod role;
 pub mod schema;
@@ -185,6 +186,7 @@ pub fn build_profile(
         host,
         notes: all_notes,
         cpu_lane: None,
+        tiers: None,
     }
 }
 

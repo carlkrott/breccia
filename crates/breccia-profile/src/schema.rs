@@ -32,6 +32,38 @@ pub struct HwProfile {
     /// and additive (older readers ignore it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_lane: Option<CpuLaneVerdict>,
+    /// `breccia profile --tiers`: measured expert-FFN throughput of every compute
+    /// tier (each device and the host pool). Placement uses these rates instead of
+    /// a VRAM-only rule, so it is the same code on one card, three cards or none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tiers: Option<TierVerdict>,
+}
+
+/// One tier's measured expert-FFN rates.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct TierVerdict {
+    pub timestamp: String,
+    /// `breccia_kernels::SPIRV_HASH` of the build that measured it.
+    pub spirv_hash: String,
+    pub tiers: Vec<TierRate>,
+}
+
+/// One compute tier: a device, or the host expert pool.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct TierRate {
+    /// `"device"` or `"host"`.
+    pub kind: String,
+    /// PCI address for a device; the CPU model for the host tier.
+    pub id: String,
+    /// Bytes available for expert blobs (VRAM of the device, or host RAM).
+    pub capacity_bytes: u64,
+    /// Row counts the rate was measured at, ascending.
+    pub users: Vec<u32>,
+    /// Expert-FFN rows/s at each `users` entry (gate+up+SwiGLU+down per row).
+    pub rows_per_s: Vec<f64>,
+    /// Sustained bytes/s reading the weight source.
+    pub weight_bytes_per_s: f64,
+    pub driver_version: String,
 }
 
 /// The host expert lane's measured setup. Only `threads` is applied (when
@@ -297,6 +329,7 @@ mod tests {
             timestamp_unix_s: 1_761_464_400,
             quick: false,
             cpu_lane: None,
+            tiers: None,
             devices: vec![DeviceEntry {
                 identity: DeviceIdentity {
                     backend: BackendKind::Vulkan,
