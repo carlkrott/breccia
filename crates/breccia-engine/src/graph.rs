@@ -1145,7 +1145,11 @@ impl<'m> Session<'m> {
                     })
                 };
                 if pf_depth() {
-                    Some((mk()?, Some(mk()?)))
+                    let second = mk()?;
+                    if std::env::var("BRECCIA_PF_SET").as_deref() == Ok("1") {
+                        zero_pf(gpu, &second)?;
+                    }
+                    Some((mk()?, Some(second)))
                 } else {
                     Some((mk()?, None))
                 }
@@ -3962,7 +3966,7 @@ impl<'m> Session<'m> {
                     self.spec_row_state(b, i, t)?;
                     {
                         let v = &self.venues[dev];
-                        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                        let pf = v.pf_at(b);
                         let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
                         let kb = (k * 4) as u64;
                         let nb = (n_embd * 4) as u64;
@@ -6681,8 +6685,37 @@ const SPLIT_T_MAX: usize = 8;
 /// The flag stays off until every access is `pf_at(block)`; then it can become the
 /// depth-2 pipeline's backing store. `BRECCIA_PF_DEPTH=1` is deliberately ignored.
 fn pf_depth() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("BRECCIA_PF_DEPTH").is_some())
+    // Off. Set-2-only (`PF_SET=1`) is still disjoint from baseline even with the
+    // second set zeroed, so a consumer of set 0 remains; the zero-fill test rules
+    // out stale-memory read-before-write. The default single set is bit-identical.
+    false
+}
+
+/// Zero every buffer of a scratch set (audit: distinguishes a genuine unwritten
+/// field from stale allocator contents, which is what a second allocation exposes).
+fn zero_pf(gpu: &breccia_vk::ctx::Gpu, pf: &PfChunk) -> Result<()> {
+    for b in [
+        &pf.ids.buf,
+        &pf.w,
+        &pf.mixed,
+        &pf.shared,
+        &pf.gate,
+        &pf.slots.buf,
+        &pf.scratch,
+        &pf.x,
+        &pf.gg,
+        &pf.uu,
+        &pf.act,
+        &pf.down,
+        &pf.out,
+        &pf.sh_g,
+        &pf.sh_u,
+        &pf.sh_a,
+        &pf.logits,
+    ] {
+        breccia_kernels::gemv::upload_into(gpu, b, &vec![0u8; b.size as usize])?;
+    }
+    Ok(())
 }
 
 fn pf_split_tiers() -> bool {
