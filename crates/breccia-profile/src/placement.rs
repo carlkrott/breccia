@@ -303,3 +303,78 @@ mod host_experts_tests {
         assert_eq!(host_experts(&[(0, 1), (1, 2)], 0.0, 1.0), vec![0, 1]);
     }
 }
+
+/// Split `blocks` contiguously across devices in proportion to their measured
+/// rates, so both cards are busy for the same wall time (the faster card takes
+/// more blocks). Every device with a rate gets at least one block when there are
+/// enough blocks to go round. Used by `Placement`, which must produce contiguous
+/// runs; the arena follows `device_of(b)` and so cannot disagree with it.
+pub fn rate_counts(rates: &[f64], blocks: usize) -> Vec<usize> {
+    let mut out = vec![0usize; rates.len()];
+    let live: Vec<usize> = (0..rates.len()).filter(|&i| rates[i] > 0.0).collect();
+    if live.is_empty() || blocks == 0 {
+        return out;
+    }
+    let total: f64 = live.iter().map(|&i| rates[i]).sum();
+    let mut assigned = 0usize;
+    for (k, &i) in live.iter().enumerate() {
+        let c = if k + 1 == live.len() {
+            blocks - assigned
+        } else {
+            ((blocks as f64) * rates[i] / total).round() as usize
+        }
+        .min(blocks - assigned);
+        out[i] = c;
+        assigned += c;
+    }
+    // A live device with enough blocks to go round should not idle.
+    if blocks >= live.len() {
+        for &i in &live {
+            if out[i] == 0 {
+                if let Some((j, _)) = (0..out.len())
+                    .filter(|&j| out[j] > 1)
+                    .map(|j| (j, out[j]))
+                    .max_by_key(|&(_, c)| c)
+                {
+                    out[j] -= 1;
+                    out[i] += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod rate_counts_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_follow_the_measured_ratio() {
+        assert_eq!(rate_counts(&[3.0, 1.0], 48), vec![36, 12]);
+        assert_eq!(rate_counts(&[1.0, 1.0], 48), vec![24, 24]);
+    }
+
+    #[test]
+    fn a_zero_rate_device_gets_no_blocks() {
+        assert_eq!(rate_counts(&[2.0, 0.0], 10), vec![10, 0]);
+    }
+
+    #[test]
+    fn a_live_device_is_not_left_idle() {
+        // 99:1 over 4 blocks would round the slow card to 0; it keeps one.
+        let c = rate_counts(&[99.0, 1.0], 4);
+        assert_eq!(c.iter().sum::<usize>(), 4);
+        assert!(c[1] >= 1, "{c:?}");
+    }
+
+    #[test]
+    fn the_total_is_always_the_block_count() {
+        for n in [1usize, 2, 3, 7, 48, 49] {
+            for r in [vec![1.0f64, 1.0], vec![3.0, 1.0], vec![1.0, 2.0, 4.0]] {
+                let c = rate_counts(&r, n);
+                assert_eq!(c.iter().sum::<usize>(), n, "{r:?} x {n} -> {c:?}");
+            }
+        }
+    }
+}

@@ -436,7 +436,23 @@ impl Model {
                     .collect();
                 Placement::explicit(specs, &layer_bytes, tail_bytes, &counts)?
             }
-            None => Placement::balanced(specs, &layer_bytes, tail_bytes),
+            None => {
+                let rates = std::env::var_os("BRECCIA_TIER_PLACEMENT")
+                    .and_then(|_| tier_rates_for_specs(&specs, 16));
+                match rates {
+                    Some(r) => {
+                        let counts = breccia_profile::placement::rate_counts(&r, layer_bytes.len());
+                        if opts.verbose {
+                            eprintln!(
+                                "breccia: tiers: rate-weighted layer split {counts:?} from {:?} rows/s",
+                                r.iter().map(|v| (v / 1e6).round()).collect::<Vec<_>>()
+                            );
+                        }
+                        Placement::explicit(specs, &layer_bytes, tail_bytes, &counts)?
+                    }
+                    None => Placement::balanced(specs, &layer_bytes, tail_bytes),
+                }
+            }
         };
         let mut devices = Vec::with_capacity(placement.devices.len());
         for spec in &placement.devices {
@@ -735,19 +751,11 @@ impl Model {
             }
             ArenaSpec::Auto(aopts) => {
                 let budgets = probe_budgets(&devices, *aopts, opts.verbose)?;
-                // Measured placement (`breccia profile --tiers`), fitted to the
-                // **runtime budget** (free minus display reserve), not the heap: the
-                // policy must see what this process may actually allocate.
-                let cands = measured_candidates(
-                    &manual,
-                    &devices,
-                    &budgets,
-                    &cfg,
-                    &arena_sizes,
-                    opts.verbose,
-                )
-                .unwrap_or_else(|| manual.clone());
-                let choice = arena::select(&cands, &budgets);
+                // The arena follows `placement.device_of(b)`: the measured tier
+                // decision lives in `Placement` (rate-weighted counts), so the arena
+                // device and the execution device cannot disagree. Overriding the
+                // arena separately is what caused the RX page fault + reset.
+                let choice = arena::select(&manual, &budgets);
                 let report = arena_report_of(&choice, &devices);
                 (choice, Some(report))
             }
@@ -1794,102 +1802,36 @@ fn co_tenant_check(devices: &[Device], verbose: bool) -> Result<()> {
 /// counters otherwise. When neither answers, this **fails** rather than guessing a
 /// number — a wrong budget here is an `VK_ERROR_OUT_OF_DEVICE_MEMORY` at best and a
 /// starved display card at worst.
-/// Candidate blocks from the measured tier table, with each tier's capacity set to
-/// its **runtime budget**. `None` when the table is absent, stale, or has no device
-/// row, in which case the caller keeps the layer-placement rule.
-fn measured_candidates(
-    _manual: &[ArenaBlock],
-    devices: &[Device],
-    budgets: &[DeviceBudget],
-    cfg: &ModelConfig,
-    arena_sizes: &[u64],
-    verbose: bool,
-) -> Option<Vec<ArenaBlock>> {
-    // **Off by default until the arena device and the execution device are the same
-    // thing.** `placement.device_of(b)` decides where a block's dense weights and
-    // state live and where it runs; this policy only chooses where its experts sit.
-    // Those must agree, and they do not yet: a measured assignment that differs from
-    // the layer placement makes an expert GEMM read an arena on another card (RX
-    // `GCVM_L2_PROTECTION_FAULT` + reset, 2026-11-02 20:12). The real fix is to feed
-    // the measured tiers into `Placement` itself, not just the arena.
-    if std::env::var("BRECCIA_TIER_PLACEMENT").is_err() {
-        return None;
-    }
-    let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
-        .ok()
-        .flatten()?;
-    let v = prof.tiers.as_ref()?;
-    if v.spirv_hash != breccia_kernels::SPIRV_HASH {
-        return None;
-    }
-    let mut tiers: Vec<breccia_profile::schema::TierRate> = v
-        .tiers
-        .iter()
-        .filter(|t| {
-            t.kind != "device"
-                || devices
-                    .iter()
-                    .any(|d| d.info.pci_address.eq_ignore_ascii_case(&t.id))
-        })
-        .cloned()
-        .collect();
-    if !tiers.iter().any(|t| t.kind == "device") {
-        return None;
-    }
-    // Re-fit each device tier's capacity to the budget this run actually has.
-    for t in tiers.iter_mut().filter(|t| t.kind == "device") {
-        if let Some(d) = devices
-            .iter()
-            .position(|d| d.info.pci_address.eq_ignore_ascii_case(&t.id))
-        {
-            if let Some(b) = budgets.iter().find(|b| b.device == d) {
-                t.capacity_bytes = b.budget();
-            }
-        }
-    }
-    let users = ((1024 * cfg.n_expert_used) / cfg.n_expert.max(1)).max(1) as u32;
-    // No expert-frequency profile exists in this engine yet, so every block weighs
-    // the same; `weight` is the hook a measured table would fill.
-    let demands: Vec<breccia_profile::placement::BlockDemand> = arena_sizes
-        .iter()
-        .map(|&b| breccia_profile::placement::BlockDemand {
-            bytes: b,
-            users_per_call: users,
-            weight: 1.0,
-        })
-        .collect();
-    let choice = breccia_profile::placement::place_blocks(&demands, &tiers);
-    let mut per = vec![0usize; devices.len()];
-    let mut host = 0usize;
-    let mut out = Vec::new();
-    for (b, c) in choice.iter().enumerate() {
-        let dev = c.and_then(|ti| {
-            let t = &tiers[ti];
-            if t.kind == "host" {
+/// Each requested device's measured expert rate (rows/s at `users`), in spec order.
+/// `None` when the table is absent/stale or a device has no row — the caller then
+/// keeps the balanced rule.
+fn tier_rates_for_specs(specs: &[placement::DeviceSpec], users: u32) -> Option<Vec<f64>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<Option<Vec<breccia_profile::schema::TierRate>>> = OnceLock::new();
+    let tiers = T
+        .get_or_init(|| {
+            let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+                .ok()
+                .flatten()?;
+            let v = prof.tiers?;
+            if v.spirv_hash != breccia_kernels::SPIRV_HASH {
                 return None;
             }
-            devices
-                .iter()
-                .position(|d| d.info.pci_address.eq_ignore_ascii_case(&t.id))
-        });
-        match dev {
-            Some(d) => {
-                per[d] += 1;
-                out.push(ArenaBlock {
-                    block: b,
-                    device: d,
-                    bytes: arena_sizes[b],
-                });
-            }
-            None => host += 1,
+            Some(v.tiers)
+        })
+        .as_ref()?;
+    let mut out = Vec::with_capacity(specs.len());
+    for s in specs {
+        let want = s.selector.as_deref().unwrap_or(&s.label);
+        let t = tiers.iter().find(|t| {
+            t.kind == "device"
+                && (t.id.eq_ignore_ascii_case(want) || t.id.eq_ignore_ascii_case(&s.label))
+        })?;
+        let r = breccia_profile::placement::rate_at(t, users);
+        if r <= 0.0 {
+            return None;
         }
-    }
-    if verbose {
-        eprintln!(
-            "breccia: tiers: measured placement at users={users} -> {} device blocks {:?}, {host} on the host",
-            per.iter().sum::<usize>(),
-            per
-        );
+        out.push(r);
     }
     Some(out)
 }
