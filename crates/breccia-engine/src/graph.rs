@@ -3958,8 +3958,18 @@ impl<'m> Session<'m> {
                 )?;
             }
             batch_cmd::record_barrier_to_host(gpu)?;
+            // Item 4's cost: this wait is the per-block fence the depth-2 pipeline
+            // would remove. `BRECCIA_PF_STALL=1` prints it per block.
+            let t_rb = std::time::Instant::now();
             self.submit_batch()?;
             self.flush()?;
+            if std::env::var_os("BRECCIA_PF_STALL").is_some() {
+                eprintln!(
+                    "pf-stall blk {:>2} t={t:>4}: {:.3} ms",
+                    b,
+                    t_rb.elapsed().as_secs_f64() * 1e3
+                );
+            }
         }
 
         // ---- the bucket list: per distinct expert, its users -----------------
