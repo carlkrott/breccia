@@ -2540,7 +2540,7 @@ impl<'m> Session<'m> {
         match (self.mixer_from_chunk, m.layers[b].kind) {
             (Some(pos0), _) => {
                 let v = &self.venues[dev];
-                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let pf = v.pf_at(b);
                 let nb = (mc.n_embd * 4) as u64;
                 let src = (pos - pos0) as u64 * nb;
                 batch_cmd::record_copies(
@@ -5571,7 +5571,7 @@ impl<'m> Session<'m> {
             let v = &self.venues[dev];
             let rc = v.r_chunk.as_ref().expect("checked by the caller");
             let ws = &self.hc_chunk_ws[dev][wi];
-            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            let pf = v.pf_at(b);
             let gather: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
                 .map(|i| (rc, i as u64 * hb, &v.r_slots[i], 0, hb))
                 .collect();
@@ -5584,7 +5584,7 @@ impl<'m> Session<'m> {
         let v = &self.venues[dev];
         let rc = v.r_chunk.as_ref().expect("checked by the caller");
         let ws = &self.hc_chunk_ws[dev][wi];
-        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let pf = v.pf_at(b);
         batch_cmd::probe::enter(gpu, batch_cmd::probe::HC_WRITE);
         v.hc.write(ws, rc, &pf.out, rc)?;
         hc_read_ws(v, ws, &m.layers[b].hc_ffn, rc)?;
@@ -5627,7 +5627,7 @@ impl<'m> Session<'m> {
             self.swap_r_in(dev, i);
             let v = &self.venues[dev];
             let res = hc_read(v, &m.layers[b].hc_attn, &v.r).and_then(|_| {
-                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let pf = v.pf_at(b);
                 let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
                 batch_cmd::record_copies(gpu, &[(&pf.mixed, i as u64 * nb, &ws.mixed, 0, nb)])
             });
@@ -6668,12 +6668,10 @@ const SPLIT_T_MAX: usize = 8;
 /// The flag stays off until every access is `pf_at(block)`; then it can become the
 /// depth-2 pipeline's backing store. `BRECCIA_PF_DEPTH=1` is deliberately ignored.
 fn pf_depth() -> bool {
-    // Off. Alternation per *block* is the wrong granularity: `pf` carries values
-    // across the dense/moe phases and into the next block (shared expert, `out`), so
-    // switching sets by `block % 2` is inconsistent even when every access in the
-    // merged pass reads `pf_at(b)` (measured KL 1.08, unchanged by converting the
-    // remaining sites). The depth-2 pipeline must split the phases and give each
-    // **phase** its own set, not each block.
+    // Off: alternation still measures KL 1.08 with every merged-pass access and the
+    // dense helpers on `pf_at(b)`, so a consumer outside that set (router logits /
+    // observe / ship) reads set 0 during prefill. The default single set is
+    // bit-identical; enabling this stays unsafe until that consumer is found.
     false
 }
 
