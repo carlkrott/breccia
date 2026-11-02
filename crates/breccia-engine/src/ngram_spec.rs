@@ -32,11 +32,8 @@ pub const DEFAULT_N: usize = 3;
 /// decode to ~1e-4 at any depth; above it the top-512 selection runs and, as
 /// measured, verify at T >= 4 disagrees with decode by ~2.1 logits and T = 3
 /// still drifts over ~20 greedy tokens (audit B12). Past this point the drafter
-/// caps its depth at one draft; the gate still decides whether to draft at all.
-pub fn dense_cell_limit() -> usize {
-    breccia_kernels::qsa::dense_cell_limit()
-}
-
+/// caps its depth at one draft — **history**: the fix landed (see
+/// `qsa_idx_score.comp`'s mask), so the cap is gone.
 /// The suffix index over one token stream.
 ///
 /// `map` is keyed on the last [`NgramDrafter::n`] tokens packed into a `u128`
@@ -242,12 +239,11 @@ pub fn generate(
         // 20), and T>=4 disagrees with decode by ~2.1 logits. So cap the depth at
         // one draft there rather than emit a token plain decode would not; the
         // gate then stops drafting entirely, because T=2 does not pay on its own.
-        let depth = if n + 1 > dense_cell_limit() {
-            k.min(1)
-        } else {
-            k
-        };
-        let drafts = nd.draft(&toks[..=n], depth);
+        //
+        // The cap is gone: B12 is fixed (the indexer's score mask now requires the
+        // whole block to be visible), so a verify agrees with decode to ~1e-4
+        // logits at any context length — measured 2.147 -> 1.08e-4 at 4k, T=6.
+        let drafts = nd.draft(&toks[..=n], k);
         let draft_s = td.elapsed().as_secs_f64();
         let offer = if gated {
             gate.want(!drafts.is_empty())

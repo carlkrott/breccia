@@ -57,7 +57,12 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     int pos = pc.pos0 + int(t);
 
-    if (int(b * pc.idx_block) > pos) {
+    // The pooled key of a block averages ALL of its cells, so a query may only use
+    // it when it can see the whole block: masking on the block's first cell let a
+    // block that completes mid-call (speculative verify, T >= 4) be scored with
+    // future cells folded in, which changed the selection versus decode and made
+    // the verify rows disagree by ~2 logits (audit B12). Mask on the last cell.
+    if (int(b * pc.idx_block + pc.idx_block - 1u) > pos) {
         if (tid == 0u) {
             SC[t * pc.n_blocks + b] = MASK_DEAD;
         }
