@@ -4301,7 +4301,7 @@ impl<'m> Session<'m> {
             }
             {
                 let v = &self.venues[edev];
-                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let pf = v.pf_at(b);
                 let pipes = &v.pipes;
                 let gate = pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
                 let up = pipes.gemm(up_ty).expect("the up multi-user GEMM");
@@ -4461,7 +4461,7 @@ impl<'m> Session<'m> {
         }
         {
             let v = &self.venues[edev];
-            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            let pf = v.pf_at(b);
             v.moe_fanin.run(
                 &pf.scratch,
                 &pf.slots.buf,
@@ -4485,12 +4485,12 @@ impl<'m> Session<'m> {
             host_s = busy;
             self.expert_bytes += bytes as u64;
             let v = &self.venues[dev];
-            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            let pf = v.pf_at(b);
             let hp = &pf.split.as_ref().expect("split scratch").1;
             hp.write(&f32_to_bytes(&part))?;
             self.ensure_batch(dev)?;
             let v = &self.venues[dev];
-            let pf = v.pf.as_ref().expect("the merged prefill scratch");
+            let pf = v.pf_at(b);
             let hp = &pf.split.as_ref().expect("split scratch").1;
             v.add.run(&pf.out, &hp.buf, &pf.out, t * n_embd, 1.0)?;
         }
@@ -4543,7 +4543,7 @@ impl<'m> Session<'m> {
         if !micro {
             {
                 let v = &self.venues[dev];
-                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let pf = v.pf_at(b);
                 let rows: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
                     .map(|i| {
                         (
@@ -4576,7 +4576,7 @@ impl<'m> Session<'m> {
                     .iter()
                     .find(|w| w.tokens == t)
                     .expect("made in pass 1");
-                let pf = v.pf.as_ref().expect("the merged prefill scratch");
+                let pf = v.pf_at(b);
                 v.hc.write(ws, rc, &pf.out, rc)?;
                 let hb = (mc.hc_dim() * 4) as u64;
                 let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
@@ -6678,6 +6678,9 @@ const SPLIT_T_MAX: usize = 8;
 /// The flag stays off until every access is `pf_at(block)`; then it can become the
 /// depth-2 pipeline's backing store. `BRECCIA_PF_DEPTH=1` is deliberately ignored.
 fn pf_depth() -> bool {
+    // Still not safe: the merged pass's helpers (`record_shared_chunk`, the fan-in)
+    // read `venue.pf` without the block, so alternation is inconsistent (measured KL
+    // 1.08). The flag is ignored until `pf_at(block)` is threaded through them.
     false
 }
 
