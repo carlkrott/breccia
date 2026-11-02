@@ -94,7 +94,7 @@ pub struct ArenaOpts {
 /// 1366-token chunks at ctx 4200 = 1881 MiB (1.38); flat in ctx, so 1.5 for slack.
 /// shortcut: measured on this model only; derive it from the session's real
 /// allocations once a second model ships.
-pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 1 << 20;
+pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 1 << 19;
 
 impl ArenaOpts {
     /// Both reserves grown by the scratch a `chunk`-token prefill allocates after
