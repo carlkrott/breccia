@@ -297,6 +297,11 @@ pub struct PfChunk {
     down: Buf,
     /// `[T, n_embd]`, the fan-in's output.
     out: Buf,
+    /// The **MoE result** for the chunk, separate from `out` (which is the token
+    /// mixer's output): the fan-in, the host partial, the cross-device ship and the
+    /// ffn HC_WRITE all address this buffer, so `out` is never overwritten by the
+    /// expert path. This is the separation item 4's double buffer needs.
+    moe: Buf,
     /// `[T, n_ff_shared]` gate, up and SwiGLU of the chunk-level shared expert
     /// (`BRECCIA_PF_SHCHUNK`).
     sh_g: Buf,
@@ -1140,6 +1145,7 @@ impl<'m> Session<'m> {
                         act: alloc(users * nfb, "prefill expert act")?,
                         down: alloc(users * nb, "prefill expert down")?,
                         out: alloc(chunk as u64 * nb, "prefill merged out")?,
+                        moe: alloc(chunk as u64 * nb, "prefill merged moe out")?,
                         sh_g: alloc(chunk as u64 * nsb, "prefill chunk shared gate")?,
                         sh_u: alloc(chunk as u64 * nsb, "prefill chunk shared up")?,
                         sh_a: alloc(chunk as u64 * nsb, "prefill chunk shared act")?,
@@ -4489,7 +4495,7 @@ impl<'m> Session<'m> {
                 &pf.w,
                 &pf.shared,
                 &pf.gate,
-                &pf.out,
+                &pf.moe,
                 t,
                 k,
                 n_embd,
@@ -4513,7 +4519,7 @@ impl<'m> Session<'m> {
             let v = &self.venues[dev];
             let pf = v.pf_at(b);
             let hp = &pf.split.as_ref().expect("split scratch").1;
-            v.add.run(&pf.out, &hp.buf, &pf.out, t * n_embd, 1.0)?;
+            v.add.run(&pf.moe, &hp.buf, &pf.moe, t * n_embd, 1.0)?;
         }
         if let Some(x) = xdev {
             // The MoE result back into the block device's `pf.out` (pass 2 reads it).
@@ -4537,20 +4543,20 @@ impl<'m> Session<'m> {
                 } else {
                     0
                 };
-                ship_p[2] = crate::xfer::copy_fenced(egpu, &[(&xpf.out, imp.get(x), 0, ro, n)])?;
+                ship_p[2] = crate::xfer::copy_fenced(egpu, &[(&xpf.moe, imp.get(x), 0, ro, n)])?;
                 if micro {
                     self.micro_up = Some(MicroUp::Imported(n));
                 } else {
-                    ship_p[3] = crate::xfer::copy_fenced(gpu, &[(imp.get(dev), &pf.out, 0, 0, n)])?;
+                    ship_p[3] = crate::xfer::copy_fenced(gpu, &[(imp.get(dev), &pf.moe, 0, 0, n)])?;
                 }
             } else {
-                let bytes = self.stagings[x].read_batch(egpu, &[(&xpf.out, 0, t * n_embd * 4)])?;
+                let bytes = self.stagings[x].read_batch(egpu, &[(&xpf.moe, 0, t * n_embd * 4)])?;
                 ship_p[2] = t0.elapsed().as_secs_f64();
                 if micro {
                     self.micro_up = bytes.into_iter().next().map(MicroUp::Bytes);
                 } else {
                     ship_p[3] = self.stagings[dev]
-                        .write_regions(gpu, &[(&pf.out, 0, bytes[0].as_slice())])?;
+                        .write_regions(gpu, &[(&pf.moe, 0, bytes[0].as_slice())])?;
                 }
             }
             ship_s += t0.elapsed().as_secs_f64();
@@ -4567,7 +4573,7 @@ impl<'m> Session<'m> {
                         (
                             &v.moe_out[i].buf,
                             0u64,
-                            &pf.out,
+                            &pf.moe,
                             (i * n_embd * 4) as u64,
                             (n_embd * 4) as u64,
                         )
@@ -4595,7 +4601,7 @@ impl<'m> Session<'m> {
                     .find(|w| w.tokens == t)
                     .expect("made in pass 1");
                 let pf = v.pf_at(b);
-                v.hc.write(ws, rc, &pf.out, rc)?;
+                v.hc.write(ws, rc, &pf.moe, rc)?;
                 let hb = (mc.hc_dim() * 4) as u64;
                 let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
                     .map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb))
