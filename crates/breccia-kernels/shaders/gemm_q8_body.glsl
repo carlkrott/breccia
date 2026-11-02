@@ -23,7 +23,11 @@ layout(std430, binding = 5) readonly buffer DQVec { uint16_t DQ[]; };  // f16 pe
 #define pc_users pc.splits
 #define ROW_BASE_WORDS pc.base
 #define LANES 32u
+#ifndef ROWS_PER_WG
+// Overridable at build time: the gate/up expert GEMM emits only
+// rows/8 workgroups, i.e. one per CU on an 80-CU card, and is latency-bound.
 #define ROWS_PER_WG 8u
+#endif
 #define WG_X_MAX 65535u
 #define UNITS (QK / 8u)
 #define STEP (UNITS >= LANES ? 1u : (LANES / UNITS))
