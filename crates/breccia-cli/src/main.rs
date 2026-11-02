@@ -319,6 +319,11 @@ enum BenchKind {
         /// A file of whitespace/comma-separated prompt ids
         #[arg(long, value_name = "PATH")]
         prompt_ids_file: Option<PathBuf>,
+        /// Prompt as **text**, tokenized with the model's own tokenizer (no
+        /// `--prompt-ids` needed). `--prompt-ids-file` / `--prompt-ids` win if both
+        /// are given.
+        #[arg(long, value_name = "TEXT")]
+        prompt: Option<String>,
         /// Device plan: comma-separated PCI addresses (`0000:03:00.0,0000:0e:00.0`),
         /// runtime indices, or `default` (first discrete). Repeatable; the
         /// default is one device. **The first run of new code must be
@@ -635,6 +640,7 @@ fn run(cli: Cli) -> Result<()> {
             kind:
                 Some(BenchKind::Token {
                     kv_q8v,
+                    prompt,
                     gen,
                     prompt_ids,
                     prompt_ids_file,
@@ -672,6 +678,7 @@ fn run(cli: Cli) -> Result<()> {
             let (prefill_chunk, prefill_chunks) =
                 resolve_prefill_chunks(prefill_chunk, prefill_merged, &devices, ctx);
             bench_token(TokenArgs {
+                prompt,
                 gen,
                 prompt_ids,
                 prompt_ids_file,
@@ -2404,6 +2411,7 @@ const DEFAULT_MODEL_GLOB: &str = "/srv/strata-data/models/IQ3_XXS/*-0000?-of-000
 
 struct TokenArgs {
     gen: usize,
+    prompt: Option<String>,
     prompt_ids: Option<String>,
     prompt_ids_file: Option<PathBuf>,
     devices: Vec<String>,
@@ -3854,11 +3862,27 @@ fn prefill_only(
 }
 
 fn bench_token(a: TokenArgs) -> Result<()> {
-    let prompt = parse_prompt_ids(&a)?;
     let glob = a
         .gguf
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL_GLOB.to_string());
+    let prompt = match &a.prompt {
+        Some(text) => {
+            let shards = breccia_format::shard::ShardSet::open_glob(&glob)
+                .with_context(|| format!("opening the model shards ({glob})"))?;
+            let tok = breccia_format::tokenizer::Tokenizer::from_shards(&shards)?;
+            let ids = tok.encode(text);
+            println!(
+                "prompt   {} chars -> {} ids (tokenizer {}, {} tokens)",
+                text.chars().count(),
+                ids.len(),
+                tok.pre,
+                tok.vocab_size()
+            );
+            ids
+        }
+        None => parse_prompt_ids(&a)?,
+    };
     if a.streams > 1 {
         return bench_token_multi(&a, &prompt, &glob);
     }

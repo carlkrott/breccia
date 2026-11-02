@@ -53,6 +53,7 @@ pub mod mtp;
 pub mod pack;
 pub mod quant;
 pub mod shard;
+pub mod tokenizer;
 
 #[cfg(test)]
 pub(crate) mod testutil;
