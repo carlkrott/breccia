@@ -1120,7 +1120,10 @@ impl<'m> Session<'m> {
                 let slot_stride = gb + ub + db;
                 // One builder, called once (or twice under `BRECCIA_PF_DEPTH`).
                 let mk = || -> Result<PfChunk> {
-                    let split = if pf_split_host().is_some() || pf_split_tiers() {
+                    let split = if pf_split_host().is_some()
+                        || pf_split_tiers()
+                        || model.placed.len() < mc.n_layers
+                    {
                         // Sized for the largest chunk `prefill_plan` can hand us, not
                         // `SPLIT_T_MAX`: the device/host partition is useful at prefill
                         // scale, not only in the micro-batch path.
@@ -3961,7 +3964,9 @@ impl<'m> Session<'m> {
         let bound_t0 = std::time::Instant::now();
         // `BRECCIA_PF_SPLIT_HOST`: needs the plain streamed path (no helper card, no
         // micro-batches), a small chunk and a spare scratch row for the zero slot.
-        let split_on = (pf_split_host().is_some() || pf_split_tiers())
+        let split_on = (pf_split_host().is_some()
+            || pf_split_tiers()
+            || (pe.is_none() && std::env::var_os("BRECCIA_PF_HOST_COLD").is_some()))
             && streamed
             && xdev.is_none()
             && !micro
@@ -4139,7 +4144,17 @@ impl<'m> Session<'m> {
                     )
                 })
                 .flatten();
-            if let Some((dev_rate, host_rate)) = tp {
+            if pe.is_none() && std::env::var_os("BRECCIA_PF_HOST_COLD").is_some() {
+                // A cold block has no arena: compute it on the host lane instead of
+                // streaming every expert blob over PCIe (item 5). The device loop
+                // skips groups whose expert is in `host_set`, so nothing streams.
+                host_set = pairs
+                    .iter()
+                    .map(|p| p.0)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+            } else if let Some((dev_rate, host_rate)) = tp {
                 let mut rows: Vec<(usize, u32)> = Vec::with_capacity(distinct);
                 for &(e, _, _) in &pairs {
                     match rows.last_mut() {
