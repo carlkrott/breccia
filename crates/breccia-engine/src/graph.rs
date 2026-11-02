@@ -401,6 +401,18 @@ impl PfChunk {
 
 /// Everything one device owns during a session.
 impl Venue<'_> {
+    /// The scratch set the current operation uses (`pf_active`), for call sites that
+    /// do not have a block index.
+    fn pf(&self) -> &PfChunk {
+        let second = self.pf_active.load(std::sync::atomic::Ordering::Relaxed) == 1;
+        if second {
+            self.pf2.as_ref()
+        } else {
+            self.pf.as_ref()
+        }
+        .expect("the merged prefill scratch")
+    }
+
     /// The prefill scratch set for `block`: the second one on odd blocks when the
     /// depth-2 pipeline is enabled, otherwise the single set.
     fn pf_at(&self, block: usize) -> &PfChunk {
@@ -494,6 +506,10 @@ pub struct Venue<'m> {
     /// Second prefill scratch set, allocated only under `BRECCIA_PF_DEPTH=1`, so the
     /// depth-2 pipeline can run `dense(b+1)` while `moe(b)` reads the other set.
     pub pf2: Option<PfChunk>,
+    /// Which set the **current** merged-prefill block uses (0 or 1). `pf()` reads it,
+    /// so every access — direct, inline or in a helper that only has the venue —
+    /// resolves to the same set without threading a block index.
+    pub pf_active: std::sync::atomic::AtomicUsize,
     /// Chunked-prefill scratch: the chunk's gathered residual, one residual slice
     /// per token (the dense chain runs per token, unchanged) and one host-visible
     /// MoE mailbox per token (`docs/phase-4` §8s).
@@ -1205,6 +1221,7 @@ impl<'m> Session<'m> {
                 moe_fanin,
                 pf,
                 pf2,
+                pf_active: std::sync::atomic::AtomicUsize::new(0),
                 r_chunk,
                 r_slots,
                 inject_slots,
@@ -1578,11 +1595,8 @@ impl<'m> Session<'m> {
             t as u64 * nb,
             (t * 4) as u64,
         ];
-        let pf = self.venues[dev]
-            .pf
-            .as_ref()
-            .expect("the merged prefill scratch");
-        let xpf = self.venues[x].pf.as_ref().expect("checked above");
+        let pf = self.venues[dev].pf();
+        let xpf = self.venues[x].pf();
         let imp = self.ship_imp.as_ref().expect("ship_ready");
         let (hd, hx) = (imp.get(dev), imp.get(x));
         let (mut down, mut up, mut at) = (Vec::new(), Vec::new(), 0u64);
@@ -3696,10 +3710,7 @@ impl<'m> Session<'m> {
                 })
         };
         let total = {
-            let pf = self.venues[dev]
-                .pf
-                .as_ref()
-                .expect("the merged prefill scratch");
+            let pf = self.venues[dev].pf();
             let off = slot as u64 * pf.slot_stride;
             let (g, u, d) = (pf.g_bytes, pf.u_bytes, pf.d_bytes);
             if (slices.gate.len() as u64) > g
@@ -3898,6 +3909,21 @@ impl<'m> Session<'m> {
             shared_chunk,
             hc_chunk,
         } = self.merged_plan(b, dev, pe);
+        // Resolve the scratch set once for this block; `Venue::pf()` then answers
+        // every access (direct, inline, or in a helper with only the venue).
+        let active = match std::env::var("BRECCIA_PF_SET").as_deref() {
+            Ok("1") => 1usize,
+            Ok("0") => 0usize,
+            _ => usize::from(pf_depth() && b % 2 == 1),
+        };
+        self.venues[dev]
+            .pf_active
+            .store(active, std::sync::atomic::Ordering::Relaxed);
+        if let Some(x) = xdev {
+            self.venues[x]
+                .pf_active
+                .store(active, std::sync::atomic::Ordering::Relaxed);
+        }
         let micro = self.micro.is_some();
         // Each expert's blob, in the 16-bit words the GEMM's base push constant
         // takes (the arena holds all 512 experts back to back).
@@ -4009,10 +4035,7 @@ impl<'m> Session<'m> {
                 self.record_shared_chunk(b, dev, t)?;
             }
             if split_on {
-                let pf = self.venues[dev]
-                    .pf
-                    .as_ref()
-                    .expect("the merged prefill scratch");
+                let pf = self.venues[dev].pf();
                 let hx = &pf.split.as_ref().expect("split scratch").0;
                 let nb = (n_embd * 4) as u64;
                 batch_cmd::record_copies(
@@ -4187,7 +4210,7 @@ impl<'m> Session<'m> {
         let mut ship_p = [0.0f64; 4];
         if let Some(x) = xdev.filter(|_| ship_imp) {
             let t0 = std::time::Instant::now();
-            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            let xpf = self.venues[x].pf();
             let (down, up) = self.ship_lists(dev, x, t, k, defer_shared || sdefer);
             ship_p[0] = match down_pending.take() {
                 Some(p) => p.wait(gpu)?,
@@ -4199,11 +4222,8 @@ impl<'m> Session<'m> {
         } else if let Some(x) = xdev {
             let t0 = std::time::Instant::now();
             let nb = n_embd * 4;
-            let pf = self.venues[dev]
-                .pf
-                .as_ref()
-                .expect("the merged prefill scratch");
-            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            let pf = self.venues[dev].pf();
+            let xpf = self.venues[x].pf();
             let pairs: Vec<(&Buf, usize, &Buf)> = [
                 (&pf.mixed, t * nb, &xpf.mixed),
                 (&pf.w, t * k * 4, &xpf.w),
@@ -4407,11 +4427,8 @@ impl<'m> Session<'m> {
         if let Some(x) = xdev.filter(|_| defer_shared) {
             let t0 = std::time::Instant::now();
             let n = (t * n_embd * 4) as u64;
-            let pf = self.venues[dev]
-                .pf
-                .as_ref()
-                .expect("the merged prefill scratch");
-            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            let pf = self.venues[dev].pf();
+            let xpf = self.venues[x].pf();
             if ship_imp {
                 // The offset the ship above left for it: after `mixed` and `w`.
                 let at = n + (t * k * 4) as u64;
@@ -4437,7 +4454,7 @@ impl<'m> Session<'m> {
             self.micro_upw_wait()?;
             let n = (t * n_embd * 4) as u64;
             let at = n + (t * k * 4) as u64;
-            let xpf = self.venues[x].pf.as_ref().expect("checked above");
+            let xpf = self.venues[x].pf();
             let imp = self.ship_imp.as_ref().expect("ship_ready");
             sh_pending = Some(crate::xfer::copy_submit(
                 egpu,
@@ -4451,10 +4468,7 @@ impl<'m> Session<'m> {
         if !host_set.is_empty() {
             // The zero row the host experts' pairs point at (a block may have left
             // anything in it).
-            let pf = self.venues[edev]
-                .pf
-                .as_ref()
-                .expect("the merged prefill scratch");
+            let pf = self.venues[edev].pf();
             let hp = &pf.split.as_ref().expect("split scratch").1;
             let nb = (n_embd * 4) as u64;
             batch_cmd::record_copy(
@@ -4513,11 +4527,8 @@ impl<'m> Session<'m> {
             // The previous result's copy onto the block card reads the same import range.
             self.micro_upw_wait()?;
             let t0 = std::time::Instant::now();
-            let xpf = self.venues[x].pf.as_ref().expect("checked above");
-            let pf = self.venues[dev]
-                .pf
-                .as_ref()
-                .expect("the merged prefill scratch");
+            let xpf = self.venues[x].pf();
+            let pf = self.venues[dev].pf();
             if ship_imp {
                 let imp = self.ship_imp.as_ref().expect("ship_ready");
                 let n = (t * n_embd * 4) as u64;
@@ -4714,7 +4725,7 @@ impl<'m> Session<'m> {
             .iter()
             .find(|w| w.tokens == th)
             .expect("made by A of the same half");
-        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let pf = v.pf();
         v.hc.write(ws, rc, &pf.out, rc)?;
         let hb = (m.cfg.hc_dim() * 4) as u64;
         let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..th)
@@ -4746,10 +4757,7 @@ impl<'m> Session<'m> {
         if sh.is_none() && up.is_none() {
             return Ok(());
         }
-        let pf = self.venues[dev]
-            .pf
-            .as_ref()
-            .expect("the merged prefill scratch");
+        let pf = self.venues[dev].pf();
         let mut cps: Vec<ShipCopy<'_>> = Vec::new();
         match up {
             Some(MicroUp::Bytes(b)) => {
@@ -5730,7 +5738,7 @@ impl<'m> Session<'m> {
             out: many(&qw.out)?,
             w_out: &qw.out.buf,
         };
-        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let pf = v.pf();
         let ws = self.qsa_chunk_ws[dev].as_ref().expect("made above");
         qsa.forward(state, ws, &weights, &proj, &pf.mixed, &pf.out, pos0)?;
         let tap = self
@@ -5803,7 +5811,7 @@ impl<'m> Session<'m> {
         let state = self.gdn_state[b]
             .as_ref()
             .ok_or_else(|| anyhow!("block {b} has no GDN state"))?;
-        let pf = v.pf.as_ref().expect("the merged prefill scratch");
+        let pf = v.pf();
         let ws = self.gdn_chunk_ws[dev].as_ref().expect("made above");
         let tap = self
             .spec
@@ -6685,9 +6693,10 @@ const SPLIT_T_MAX: usize = 8;
 /// The flag stays off until every access is `pf_at(block)`; then it can become the
 /// depth-2 pipeline's backing store. `BRECCIA_PF_DEPTH=1` is deliberately ignored.
 fn pf_depth() -> bool {
-    // Off. Set-2-only (`PF_SET=1`) is still disjoint from baseline even with the
-    // second set zeroed, so a consumer of set 0 remains; the zero-fill test rules
-    // out stale-memory read-before-write. The default single set is bit-identical.
+    // Off. With `pf_active` every merged-pass access resolves through `Venue::pf()`
+    // (17 sites) and set-2-only is *still* disjoint from baseline, so the difference
+    // is not the set of the merged pass's accesses: something outside it reads set 0
+    // between blocks, or a buffer is aliased. Default single set is bit-identical.
     false
 }
 
