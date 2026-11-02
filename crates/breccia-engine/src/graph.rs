@@ -400,6 +400,20 @@ impl PfChunk {
 }
 
 /// Everything one device owns during a session.
+impl Venue<'_> {
+    /// The prefill scratch set for `block`: the second one on odd blocks when the
+    /// depth-2 pipeline is enabled, otherwise the single set.
+    fn pf_at(&self, block: usize) -> &PfChunk {
+        let second = pf_depth() && block % 2 == 1;
+        if second {
+            self.pf2.as_ref()
+        } else {
+            self.pf.as_ref()
+        }
+        .expect("the merged prefill scratch")
+    }
+}
+
 pub struct Venue<'m> {
     pub pipes: PipelineSet<'m>,
     pub hc: HcMixer<'m>,
@@ -464,6 +478,9 @@ pub struct Venue<'m> {
     /// The merged prefill pass's chunk scratch on this device (`Some` only when
     /// `--prefill-merged` is on).
     pub pf: Option<PfChunk>,
+    /// Second prefill scratch set, allocated only under `BRECCIA_PF_DEPTH=1`, so the
+    /// depth-2 pipeline can run `dense(b+1)` while `moe(b)` reads the other set.
+    pub pf2: Option<PfChunk>,
     /// Chunked-prefill scratch: the chunk's gathered residual, one residual slice
     /// per token (the dense chain runs per token, unchanged) and one host-visible
     /// MoE mailbox per token (`docs/phase-4` §8s).
@@ -1067,52 +1084,64 @@ impl<'m> Session<'m> {
                 let align = |v: usize| (v as u64 + 255) & !255;
                 let (gb, ub, db) = (align(g_max), align(u_max), align(d_max));
                 let slot_stride = gb + ub + db;
-                let split = if pf_split_host().is_some() || pf_split_tiers() {
-                    // Sized for the largest chunk `prefill_plan` can hand us, not
-                    // `SPLIT_T_MAX`: the device/host partition is useful at prefill
-                    // scale, not only in the micro-batch path.
-                    let srows = prefill_cap(chunk) as u64;
-                    let hp = Mailbox::new(gpu, (srows + 1) * nb)?;
-                    hp.write(&vec![0u8; ((srows + 1) * nb) as usize])?;
-                    Some((Mailbox::new_cached(gpu, srows * (nb + k as u64 * 4))?, hp))
-                } else {
-                    None
+                // One builder, called once (or twice under `BRECCIA_PF_DEPTH`).
+                let mk = || -> Result<PfChunk> {
+                    let split = if pf_split_host().is_some() || pf_split_tiers() {
+                        // Sized for the largest chunk `prefill_plan` can hand us, not
+                        // `SPLIT_T_MAX`: the device/host partition is useful at prefill
+                        // scale, not only in the micro-batch path.
+                        let srows = prefill_cap(chunk) as u64;
+                        let hp = Mailbox::new(gpu, (srows + 1) * nb)?;
+                        hp.write(&vec![0u8; ((srows + 1) * nb) as usize])?;
+                        Some((Mailbox::new_cached(gpu, srows * (nb + k as u64 * 4))?, hp))
+                    } else {
+                        None
+                    };
+                    Ok(PfChunk {
+                        ids: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
+                        w: alloc(chunk as u64 * k as u64 * 4, "prefill router weights")?,
+                        mixed: alloc(chunk as u64 * nb, "prefill chunk mixed")?,
+                        shared: alloc(chunk as u64 * nb, "prefill chunk shared")?,
+                        gate: alloc(chunk as u64 * 4, "prefill chunk shared gate")?,
+                        slots: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
+                        scratch: alloc(chunk as u64 * k as u64 * nb, "prefill merged scratch")?,
+                        x: alloc(users * nb, "prefill expert gather")?,
+                        gg: alloc(users * nfb, "prefill expert gate")?,
+                        uu: alloc(users * nfb, "prefill expert up")?,
+                        act: alloc(users * nfb, "prefill expert act")?,
+                        down: alloc(users * nb, "prefill expert down")?,
+                        out: alloc(chunk as u64 * nb, "prefill merged out")?,
+                        sh_g: alloc(chunk as u64 * nsb, "prefill chunk shared gate")?,
+                        sh_u: alloc(chunk as u64 * nsb, "prefill chunk shared up")?,
+                        sh_a: alloc(chunk as u64 * nsb, "prefill chunk shared act")?,
+                        logits: alloc(
+                            chunk as u64 * mc.n_expert as u64 * 4,
+                            "prefill chunk router logits",
+                        )?,
+                        // Two halves, so the host fills one while the GPU copies the other.
+                        stream: Mailbox::new(gpu, 2 * STREAM_SLOTS as u64 * slot_stride)?,
+                        sf_gate: alloc(gb.max(16), "streamed expert gate")?,
+                        sf_up: alloc(ub.max(16), "streamed expert up")?,
+                        sf_down: alloc(db.max(16), "streamed expert down")?,
+                        sf_gu: alloc((gb + ub).max(16), "streamed expert gate+up")?,
+                        slot_stride,
+                        g_bytes: gb,
+                        u_bytes: ub,
+                        d_bytes: db,
+                        split,
+                    })
                 };
-                Some(PfChunk {
-                    ids: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
-                    w: alloc(chunk as u64 * k as u64 * 4, "prefill router weights")?,
-                    mixed: alloc(chunk as u64 * nb, "prefill chunk mixed")?,
-                    shared: alloc(chunk as u64 * nb, "prefill chunk shared")?,
-                    gate: alloc(chunk as u64 * 4, "prefill chunk shared gate")?,
-                    slots: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
-                    scratch: alloc(chunk as u64 * k as u64 * nb, "prefill merged scratch")?,
-                    x: alloc(users * nb, "prefill expert gather")?,
-                    gg: alloc(users * nfb, "prefill expert gate")?,
-                    uu: alloc(users * nfb, "prefill expert up")?,
-                    act: alloc(users * nfb, "prefill expert act")?,
-                    down: alloc(users * nb, "prefill expert down")?,
-                    out: alloc(chunk as u64 * nb, "prefill merged out")?,
-                    sh_g: alloc(chunk as u64 * nsb, "prefill chunk shared gate")?,
-                    sh_u: alloc(chunk as u64 * nsb, "prefill chunk shared up")?,
-                    sh_a: alloc(chunk as u64 * nsb, "prefill chunk shared act")?,
-                    logits: alloc(
-                        chunk as u64 * mc.n_expert as u64 * 4,
-                        "prefill chunk router logits",
-                    )?,
-                    // Two halves, so the host fills one while the GPU copies the other.
-                    stream: Mailbox::new(gpu, 2 * STREAM_SLOTS as u64 * slot_stride)?,
-                    sf_gate: alloc(gb.max(16), "streamed expert gate")?,
-                    sf_up: alloc(ub.max(16), "streamed expert up")?,
-                    sf_down: alloc(db.max(16), "streamed expert down")?,
-                    sf_gu: alloc((gb + ub).max(16), "streamed expert gate+up")?,
-                    slot_stride,
-                    g_bytes: gb,
-                    u_bytes: ub,
-                    d_bytes: db,
-                    split,
-                })
+                if pf_depth() {
+                    Some((mk()?, Some(mk()?)))
+                } else {
+                    Some((mk()?, None))
+                }
             } else {
                 None
+            };
+            let (pf, pf2) = match pf {
+                Some((a, b)) => (Some(a), b),
+                None => (None, None),
             };
             venues.push(Venue {
                 pipes,
@@ -1158,6 +1187,7 @@ impl<'m> Session<'m> {
                 moe_combine,
                 moe_fanin,
                 pf,
+                pf2,
                 r_chunk,
                 r_slots,
                 inject_slots,
@@ -4096,10 +4126,7 @@ impl<'m> Session<'m> {
                     .take(n)
                     .collect();
             }
-            let pf = self.venues[dev]
-                .pf
-                .as_ref()
-                .expect("the merged prefill scratch");
+            let pf = self.venues[dev].pf_at(b);
             let (hx, _) = pf.split.as_ref().expect("split scratch");
             let mut hbuf = vec![0u8; t * (n_embd + k) * 4];
             hx.read(&mut hbuf)?;
@@ -6644,6 +6671,16 @@ const SPLIT_T_MAX: usize = 8;
 /// weighted sum is added to the fan-in output. Default off. `(count, is_percent)`.
 /// `BRECCIA_PF_SPLIT_TIERS=1`: choose the host's share of a block from the measured
 /// tier rates (`breccia profile --tiers`) instead of a count/percentage.
+/// Item 4's second prefill scratch set. The builder and the `pf_at(block)` accessor
+/// exist, but enabling alternation is **not yet correct**: only the split-path and
+/// bucket sites were switched, and the remaining `venue.pf` reads in the merged pass
+/// still address set 0 (measured: 1k logits KL 0.90 with `BRECCIA_PF_DEPTH=1`).
+/// The flag stays off until every access is `pf_at(block)`; then it can become the
+/// depth-2 pipeline's backing store. `BRECCIA_PF_DEPTH=1` is deliberately ignored.
+fn pf_depth() -> bool {
+    false
+}
+
 fn pf_split_tiers() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
