@@ -63,6 +63,12 @@ pub use batch::{GemvBatch, XLayout};
 
 /// Hash of every compiled SPIR-V module in this build (see `build.rs`).
 pub const SPIRV_HASH: &str = env!("BRECCIA_SPIRV_HASH");
+
+/// The hand-assembled mixed-float-dot module (`shaders/mixed_dot_probe.spvasm`),
+/// built by `build.rs` with `spirv-as` + `spirv-val` exactly like the compiled
+/// shaders. `OpFDot2MixAcc32VALVE` is unreachable from GLSL (glslang cannot emit
+/// it), so a kernel that wants the 1.7x has to come from assembly like this.
+pub const MIXED_DOT_PROBE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mixed_dot_probe.spv"));
 pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
 pub use dispatch_batch as batch_cmd;

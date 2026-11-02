@@ -91,7 +91,7 @@ fn env_tile(subgroup: u32, ty: QuantType) -> Option<Tile> {
     }
 }
 
-const TILES: [Tile; 3] = [(4, 4), (8, 4), (8, 8)];
+const TILES: [Tile; 4] = [(4, 2), (4, 4), (8, 4), (8, 8)];
 const TILE_FALLBACK: Tile = (8, 4);
 
 /// Measured-faster tiled build (m = 1024, attn_gate / hc_ffn_up, `tests/gemm_many.rs`

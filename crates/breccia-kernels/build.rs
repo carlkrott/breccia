@@ -166,7 +166,10 @@ const GEMM_VARIANTS: &[(u32, u32)] = &[(2, 8), (4, 8), (1, 16), (2, 16)];
 
 /// `(RM, RN)` register tiles of the tiled GEMM (`shaders/gemm_tile.glsl`: a
 /// 16*RM x 16*RN output tile per workgroup); keep in step with `TILES` in `src/gemm.rs`.
-const GEMM_TILES: &[(u32, u32)] = &[(4, 4), (8, 4), (8, 8)];
+// (4,2) exists to test whether the row-poor gate/up shape is workgroup-starved:
+// a 64x32 tile gives it 10 x 32 = 320 workgroups instead of 10 x 16 = 160, at the
+// same rows per tile and with no reduction (unlike split-K).
+const GEMM_TILES: &[(u32, u32)] = &[(4, 2), (4, 4), (8, 4), (8, 8)];
 
 fn main() {
     // **Every** shader and include, file by file. `rerun-if-changed=shaders` (the
@@ -196,6 +199,11 @@ fn main() {
     // The hand-written `OpSDot` fallback module (§8bb): assembled and validated with
     // the same discipline as the compiled shaders.
     assemble(&out_dir, "shaders/intdot_probe.spvasm");
+    // The mixed-float-dot proof (§ adoption audit §9): glslang cannot emit
+    // `OpFDot2MixAcc32VALVE`, so the module is hand-written assembly and goes
+    // through the same spirv-as + spirv-val gate as everything else. This is the
+    // integration point a future GEMM body would use.
+    assemble(&out_dir, "shaders/mixed_dot_probe.spvasm");
 
     for name in SHADERS {
         compile(&glslc, &out_dir, name, name, &[]);

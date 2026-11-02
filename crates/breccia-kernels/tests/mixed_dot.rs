@@ -376,3 +376,57 @@ void main() {
         Err(e) => println!("glsl_dot_isa: pipeline REJECTED: {e}"),
     }
 }
+
+/// The **build-time** path: `shaders/mixed_dot_probe.spvasm` is assembled by
+/// `build.rs` (spirv-as + spirv-val) and reaches the engine as
+/// `breccia_kernels::MIXED_DOT_PROBE`. This proves the integration a real GEMM
+/// body would use — no runtime toolchain, no `spirv-as` at test time.
+#[test]
+fn build_time_mixed_dot_module_runs() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("build_time_mixed_dot: SKIPPED — set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let host = breccia_vk::ctx::Host::new().expect("host");
+    let devs = host.devices().expect("devices");
+    let idx = devs
+        .iter()
+        .position(|d| d.pci_address == selector.trim() || d.index.to_string() == selector.trim())
+        .unwrap_or(0);
+    let gpu = breccia_vk::ctx::Gpu::create(&host, &devs[idx], 1).expect("device");
+    let k = gpu
+        .kernel(breccia_kernels::MIXED_DOT_PROBE, 1)
+        .expect("the build-time module must create a pipeline");
+    let out = breccia_kernels::gemv::alloc(&gpu, 64 * 64 * 4).expect("out");
+    gpu.bind_kernel(&k, &[out.buf]).expect("bind");
+    let trips = 64u32.to_le_bytes();
+    let secs = gpu
+        .wall_run(breccia_vk::ctx::Qc::C, |d, cmd| unsafe {
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipe);
+            d.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                k.layout,
+                0,
+                &[k.set],
+                &[],
+            );
+            d.cmd_push_constants(cmd, k.layout, vk::ShaderStageFlags::COMPUTE, 0, &trips);
+            d.cmd_dispatch(cmd, 64, 1, 1);
+        })
+        .expect("dispatch");
+    let vals = breccia_kernels::ops::download_f32(&gpu, &out, 4).expect("readback");
+    println!(
+        "build_time_mixed_dot: {:.4} ms, first outputs {vals:?}",
+        secs * 1e3
+    );
+    assert!(
+        vals.iter().all(|v| v.is_finite()),
+        "the dot kernel produced {vals:?}"
+    );
+    assert!(
+        vals.iter().any(|v| *v != 0.0),
+        "the dot kernel wrote nothing"
+    );
+    gpu.destroy_buf(&out);
+}
