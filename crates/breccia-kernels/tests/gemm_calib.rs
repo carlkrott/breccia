@@ -142,3 +142,105 @@ fn gemm_calibration() {
         }
     }
 }
+
+/// Variant sweep: the blocked builds a type can actually use are (1,8), (2,8),
+/// (4,8), (1,16), (2,16) plus the plain fallback, so the whole tuning space is
+/// small enough to measure exhaustively. Reports the best variant per (type, m)
+/// for the current device and build condition, which is what `tuned()` should
+/// contain instead of its hand-written rows.
+///
+/// `BRECCIA_CALIB_VARIANTS=1` selects it.
+#[test]
+fn gemm_variant_sweep() {
+    if std::env::var("BRECCIA_CALIB_VARIANTS").is_err() {
+        eprintln!("gemm_variants: SKIPPED — set BRECCIA_CALIB_VARIANTS=1");
+        return;
+    }
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("gemm_variants: SKIPPED — set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let host = Host::new().expect("host");
+    let devs = host.devices().expect("devices");
+    let idx = devs
+        .iter()
+        .position(|d| d.pci_address == selector.trim() || d.index.to_string() == selector.trim())
+        .unwrap_or(0);
+    let gpu = Gpu::create(&host, &devs[idx], 1).expect("device");
+    let wg = match gpu.forced_subgroup() {
+        Some(n) => n.to_string(),
+        None => format!("{}", devs[idx].subgroup_size),
+    };
+    println!("# variants device {selector} wg={wg}");
+    println!("type,rows,shape,m,variant,rpl,umax,us");
+
+    const VARIANTS: [(usize, usize); 5] = [(1, 8), (2, 8), (4, 8), (1, 16), (2, 16)];
+    let ms = [8usize, 32, 128, 1024];
+    for (rows, cols, shape) in SHAPES {
+        for ty in TYPES {
+            let Ok(mut gemm) = GemmMany::new(&gpu, ty) else {
+                continue;
+            };
+            let wbytes = gemm.weight_bytes(rows, cols);
+            let (Ok(w), Ok(x), Ok(out)) = (
+                alloc(&gpu, wbytes),
+                alloc(&gpu, (ms[ms.len() - 1] * cols * 4) as u64),
+                alloc(&gpu, (ms[ms.len() - 1] * rows * 4) as u64),
+            ) else {
+                continue;
+            };
+            breccia_kernels::gemv::upload_into(&gpu, &w, &vec![0u8; wbytes as usize]).expect("w");
+            breccia_kernels::gemv::upload_into(&gpu, &x, &vec![0u8; ms[ms.len() - 1] * cols * 4])
+                .expect("x");
+            for m in ms {
+                let mut best = (f64::INFINITY, -1i32, 0usize, 0usize);
+                for (rpl, umax) in VARIANTS {
+                    gemm.set_variant(rpl, umax);
+                    let mut t_best = f64::INFINITY;
+                    for pass in 0..4 {
+                        let t = std::time::Instant::now();
+                        if gemm.run_at(&w, &x, &out, rows, cols, m, 0).is_err() {
+                            break;
+                        }
+                        let dt = t.elapsed().as_secs_f64() * 1e6;
+                        if pass > 0 {
+                            t_best = t_best.min(dt);
+                        }
+                    }
+                    if t_best < best.0 {
+                        // what the dispatcher actually used (may have fallen back)
+                        let v = gemm.variant_for(rows, m);
+                        best = (t_best, 0, v.0, v.1);
+                    }
+                }
+                println!(
+                    "{},{},{},{},{},{},{},{:.1}",
+                    ty.name(),
+                    rows,
+                    shape,
+                    m,
+                    if best.2 == 1 && best.3 == 8 {
+                        "plain"
+                    } else {
+                        "blocked"
+                    },
+                    best.2,
+                    best.3,
+                    best.0
+                );
+                eprintln!(
+                    "  {:>7} {:<5} m={:<5} best {:.1} us  variant ({},{})",
+                    ty.name(),
+                    shape,
+                    m,
+                    best.0,
+                    best.2,
+                    best.3
+                );
+            }
+            gpu.destroy_buf(&w);
+            gpu.destroy_buf(&x);
+            gpu.destroy_buf(&out);
+        }
+    }
+}
