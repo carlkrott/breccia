@@ -1304,44 +1304,36 @@ fn profile_tiers(path: &std::path::Path) -> Result<()> {
             driver_version: format!("{} {}", d.driver_name, d.driver_version),
         });
     }
-    // Host tier: the same trio (gate+up+down) as a scalar f32 GEMV over the real
-    // shapes, one pass per point, scaled by the pool's thread count. This is the
-    // lane's arithmetic (fp32 MACs), not a token benchmark.
+    // Host tier: the **real quantised expert lane** (IQ3_S, mmap weight reads), one
+    // block, top-k as the model routes. The lane processes each (token, expert) pair
+    // independently, so its rows/s is flat across the user counts; it is measured at
+    // one row and repeated, which is the measured shape, not an assumption about
+    // batch scaling (a GPU has a batched GEMM, the lane does not).
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
-    let g_w = vec![0.5f32; g_rows * g_cols];
-    let d_w = vec![0.5f32; d_rows * d_cols];
-    let xin = vec![0.125f32; g_cols.max(d_cols)];
-    let mut out = vec![0f32; g_rows.max(d_rows)];
-    let mut host_s = Vec::new();
-    for &u in &users {
-        let t = std::time::Instant::now();
-        for _ in 0..u {
-            for r in 0..g_rows {
-                let mut a = 0f32;
-                for c in 0..g_cols {
-                    a += g_w[r * g_cols + c] * xin[c];
-                }
-                out[r] = a;
-            }
-            for r in 0..g_rows {
-                let mut a = 0f32;
-                for c in 0..g_cols {
-                    a += g_w[r * g_cols + c] * xin[c];
-                }
-                out[r] = a;
-            }
-            for r in 0..d_rows {
-                let mut a = 0f32;
-                for c in 0..d_cols {
-                    a += d_w[r * d_cols + c] * xin[c];
-                }
-                out[r] = a;
-            }
-        }
-        let secs = t.elapsed().as_secs_f64().max(1e-9);
-        host_s.push(work_per_user * u as f64 * threads as f64 / secs);
-    }
-    println!("  host ({threads} threads): {host_s:?} rows/s (scalar GEMV x threads)");
+    let rep =
+        breccia_kernels::cpu::run_cpu_expert_bench(&breccia_kernels::cpu::CpuExpertBenchOptions {
+            threads: 0,
+            types: vec![breccia_kernels::QuantType::Iq3S],
+            topk: 8,
+            model_glob: breccia_kernels::cpu::DEFAULT_CPU_MODEL_GLOB.to_string(),
+            quick: true,
+            reps: 1,
+            type_experts: 0,
+            layers: 1,
+            json: None,
+        })
+        .context("the host expert-lane calibration")?;
+    let tok = rep.token.first().context("host lane: no token cell")?;
+    let n_ff = rep
+        .per_type
+        .iter()
+        .find(|c| c.ty == breccia_kernels::QuantType::Iq3S)
+        .map_or(640usize, |c| c.rows);
+    let rows_per_s = (tok.topk * n_ff) as f64 / (tok.best_ms / 1000.0).max(1e-9);
+    let host_s = vec![rows_per_s; users.len()];
+    println!(
+        "  host ({threads} threads, IQ3_S lane): {rows_per_s:.3e} rows/s at {users:?} (measured at 1 row)"
+    );
     rates.push(breccia_profile::schema::TierRate {
         kind: "host".into(),
         id: prof.host.cpu_model.clone(),
