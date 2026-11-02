@@ -73,6 +73,11 @@ pub const MIXED_DOT_PROBE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mix
 /// The mixed-float-dot GEMM body ([`gemm::DotGemm`]): f16 weight pairs x f32
 /// activations into an f32 accumulator, one instruction per two MACs.
 pub const MIXED_DOT_GEMM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f16_dot.spv"));
+
+/// The **tiled** mixed-float-dot GEMM (TM=64 rows x TN=8 users per workgroup, X
+/// staged in LDS as f16). Same arithmetic and bindings as [`MIXED_DOT_GEMM`].
+pub const MIXED_DOT_GEMM_TILED: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/gemm_tile_dot_f16.spv"));
 pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
 pub use dispatch_batch as batch_cmd;

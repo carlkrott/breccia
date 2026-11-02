@@ -127,7 +127,8 @@ fn dot_gemm_vs_the_tiled_bf16_build() {
         eprintln!("dot_gemm_speed: SKIPPED — no extension");
         return;
     }
-    let g = DotGemm::new(&gpu).expect("pipeline");
+    let g = DotGemm::new(&gpu).expect("naive pipeline");
+    let gt = DotGemm::new_tiled(&gpu).expect("tiled pipeline");
     println!(
         "dot_gemm: {:>10} {:>6} {:>9} {:>9}",
         "shape", "users", "dot us", "bf16 us"
@@ -142,12 +143,19 @@ fn dot_gemm_vs_the_tiled_bf16_build() {
             upload(&gpu, &vec![0u8; wbytes as usize]).expect("wz");
             upload(&gpu, &vec![0u8; users * cols * 4]).expect("xz");
             let mut t_dot = f64::INFINITY;
+            let mut t_tiled = f64::INFINITY;
             let mut t_bf16 = f64::INFINITY;
             for pass in 0..4 {
                 let t0 = std::time::Instant::now();
                 g.run(&w, &x, &o, rows, cols, users).expect("dot");
                 if pass > 0 {
                     t_dot = t_dot.min(t0.elapsed().as_secs_f64() * 1e6);
+                }
+                let tt = std::time::Instant::now();
+                gt.run_tiled(&w, &x, &o, rows, cols, users)
+                    .expect("tiled dot");
+                if pass > 0 {
+                    t_tiled = t_tiled.min(tt.elapsed().as_secs_f64() * 1e6);
                 }
                 let t1 = std::time::Instant::now();
                 gemm.run_at(&w, &x, &o, rows, cols, users, 0).expect("bf16");
@@ -156,13 +164,99 @@ fn dot_gemm_vs_the_tiled_bf16_build() {
                 }
             }
             println!(
-                "dot_gemm: {:>10} {users:>6} {t_dot:>9.1} {t_bf16:>9.1}  ({:.2}x)",
+                "dot_gemm: {:>10} {users:>6} {t_dot:>9.1} {t_tiled:>9.1} {t_bf16:>9.1}  \
+                 (tiled vs bf16 {:.2}x)",
                 shape,
-                t_bf16 / t_dot
+                t_bf16 / t_tiled
             );
             gpu.destroy_buf(&w);
             gpu.destroy_buf(&x);
             gpu.destroy_buf(&o);
         }
     }
+}
+
+/// The tiled body must agree with the naive one element for element (same
+/// arithmetic, different schedule), and both with the CPU reference.
+#[test]
+fn tiled_dot_gemm_matches_the_naive_body() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("tiled_dot: SKIPPED — set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let Some((_host, gpu)) = open(&selector) else {
+        return;
+    };
+    if !DotGemm::supported(&gpu) {
+        eprintln!("tiled_dot: SKIPPED — no extension");
+        return;
+    }
+    // Deliberately not tile-aligned: rows 67 > 64, users 11 > 8, cols 96 (>BK),
+    // so the clamps are exercised.
+    let envn = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let (rows, cols, users) = (
+        envn("BRECCIA_DOT_ROWS", 67),
+        envn("BRECCIA_DOT_COLS", 96),
+        envn("BRECCIA_DOT_USERS", 11),
+    );
+    let mut seed = 0xdead_beefu32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((seed >> 20) & 0xff) as f32 / 64.0 - 2.0
+    };
+    let wf: Vec<f32> = (0..rows * cols).map(|_| next()).collect();
+    let xf: Vec<f32> = (0..users * cols).map(|_| next()).collect();
+    let mut wbytes = Vec::new();
+    for pair in wf.chunks(2) {
+        let lo = half(pair[0]) as u32;
+        let hi = half(pair[1]) as u32;
+        wbytes.extend_from_slice(&(lo | (hi << 16)).to_le_bytes());
+    }
+    let mut xbytes = Vec::new();
+    for v in &xf {
+        xbytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let w = upload(&gpu, &wbytes).expect("w");
+    let x = upload(&gpu, &xbytes).expect("x");
+    let a = alloc(&gpu, (rows * users * 4) as u64).expect("a");
+    let b = alloc(&gpu, (rows * users * 4) as u64).expect("b");
+    DotGemm::new(&gpu)
+        .expect("naive")
+        .run(&w, &x, &a, rows, cols, users)
+        .expect("naive dispatch");
+    DotGemm::new_tiled(&gpu)
+        .expect("tiled")
+        .run_tiled(&w, &x, &b, rows, cols, users)
+        .expect("tiled dispatch");
+    let va = breccia_kernels::ops::download_f32(&gpu, &a, rows * users).expect("a");
+    let vb = breccia_kernels::ops::download_f32(&gpu, &b, rows * users).expect("b");
+    let worst = va
+        .iter()
+        .zip(&vb)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0f32, f32::max);
+    let mut worst_cpu = 0f32;
+    for u in 0..users {
+        for r in 0..rows {
+            let mut acc = 0f32;
+            for k in 0..cols {
+                acc += to_f32(half(wf[r * cols + k])) * to_f32(half(xf[u * cols + k]));
+            }
+            worst_cpu = worst_cpu.max((vb[u * rows + r] - acc).abs());
+        }
+    }
+    println!(
+        "tiled_dot: {rows}x{cols} x {users} users — tiled vs naive {worst:.3e}, \
+         tiled vs CPU {worst_cpu:.3e}"
+    );
+    assert!(worst < 1e-4 && worst_cpu < 1e-3, "tiled body diverges");
+    gpu.destroy_buf(&w);
+    gpu.destroy_buf(&x);
+    gpu.destroy_buf(&a);
+    gpu.destroy_buf(&b);
 }

@@ -1192,6 +1192,25 @@ impl<'g> DotGemm<'g> {
         gpu.feats.mixed_float_dot
     }
 
+    /// Tile of the tiled body: TM rows per workgroup, TN users (`build.rs` panel).
+    pub const TILE_ROWS: usize = 64;
+    pub const TILE_USERS: usize = 8;
+
+    /// The **tiled** body: X staged in LDS as f16 pairs, one W row per thread
+    /// reused across the workgroup's users. Same arithmetic, same bindings.
+    pub fn new_tiled(gpu: &'g Gpu) -> Result<Self> {
+        if !Self::supported(gpu) {
+            anyhow::bail!(
+                "{} does not advertise VK_VALVE_shader_mixed_float_dot_product",
+                gpu.pci_address
+            );
+        }
+        let kernel = gpu
+            .kernel(crate::MIXED_DOT_GEMM_TILED, 3)
+            .map_err(|e| anyhow!("creating the tiled mixed-dot GEMM pipeline: {e}"))?;
+        Ok(DotGemm { kernel, gpu })
+    }
+
     /// Compile the pipeline. Errors (rather than silently falling back) when the
     /// device cannot run it, so a caller's capability check is not a guess.
     pub fn new(gpu: &'g Gpu) -> Result<Self> {
@@ -1205,6 +1224,30 @@ impl<'g> DotGemm<'g> {
             .kernel(crate::MIXED_DOT_GEMM, 3)
             .map_err(|e| anyhow!("creating the mixed-dot GEMM pipeline: {e}"))?;
         Ok(DotGemm { kernel, gpu })
+    }
+
+    /// [`DotGemm::run`] with the tiled grid (`ceil(rows/64) x ceil(users/8)`).
+    pub fn run_tiled(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        o: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+    ) -> Result<()> {
+        if rows == 0 || cols == 0 || users == 0 {
+            return Ok(());
+        }
+        if !cols.is_multiple_of(2) {
+            anyhow::bail!("mixed-dot GEMM needs an even `cols`, got {cols}");
+        }
+        let grid = (
+            rows.div_ceil(Self::TILE_ROWS).max(1) as u32,
+            users.div_ceil(Self::TILE_USERS).max(1) as u32,
+            1,
+        );
+        self.launch(w, x, o, rows, cols, users, grid)
     }
 
     /// `o[u * rows + r] = sum_k w[r*cols + k] * x[u*cols + k]`, f32 accumulation.
@@ -1225,6 +1268,20 @@ impl<'g> DotGemm<'g> {
         }
         let n = (rows * users) as u64;
         let groups = n.div_ceil(64).max(1) as u32;
+        self.launch(w, x, o, rows, cols, users, (groups, 1, 1))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        o: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        grid: (u32, u32, u32),
+    ) -> Result<()> {
         let pc = crate::ops::Pc::new()
             .u(rows as u32)
             .u(cols as u32)
@@ -1250,7 +1307,7 @@ impl<'g> DotGemm<'g> {
                     0,
                     pc.as_bytes(),
                 );
-                d.cmd_dispatch(cmd, groups, 1, 1);
+                d.cmd_dispatch(cmd, grid.0, grid.1, grid.2);
             })
             .map_err(|e| anyhow!("mixed-dot GEMM dispatch: {e}"))?;
         Ok(())

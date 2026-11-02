@@ -207,6 +207,10 @@ fn main() {
     // The mixed-dot GEMM body itself (`gemm::DotGemm`): quant-agnostic (weights as
     // f16 pairs), capability-gated, selected by calibration.
     assemble(&out_dir, "shaders/gemm_f16_dot.spvasm");
+    // The tiled body: same arithmetic, but X staged in LDS as f16 and each thread's
+    // W row reused across the workgroup's users (audit §24 measured the naive body
+    // at 0.01x of the tiled GLSL build, which is what this fixes).
+    assemble(&out_dir, "shaders/gemm_tile_dot_f16.spvasm");
 
     for name in SHADERS {
         compile(&glslc, &out_dir, name, name, &[]);
