@@ -6693,11 +6693,11 @@ const SPLIT_T_MAX: usize = 8;
 /// The flag stays off until every access is `pf_at(block)`; then it can become the
 /// depth-2 pipeline's backing store. `BRECCIA_PF_DEPTH=1` is deliberately ignored.
 fn pf_depth() -> bool {
-    // Off. With `pf_active` every merged-pass access resolves through `Venue::pf()`
-    // (17 sites) and set-2-only is *still* disjoint from baseline, so the difference
-    // is not the set of the merged pass's accesses: something outside it reads set 0
-    // between blocks, or a buffer is aliased. Default single set is bit-identical.
-    false
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("BRECCIA_PF_DEPTH").is_some()
+            || std::env::var("BRECCIA_PF_SET").as_deref() == Ok("1")
+    })
 }
 
 /// Zero every buffer of a scratch set (audit: distinguishes a genuine unwritten
