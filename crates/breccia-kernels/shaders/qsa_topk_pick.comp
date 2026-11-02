@@ -1,0 +1,87 @@
+#version 450
+//
+// QSA indexer top-k — threshold **and** candidate compaction, in one pass pair.
+//
+// `qsa_topk_rank.comp` ranks every block, which at a 64k cache is three sweeps over
+// 16 384 scores per layer (measured: cost is linear in blocks, not in compares).
+// A block below
+//
+//   tau = min over G disjoint groups of the group maximum
+//
+// is provably outside the top G (each group contributes an element >= tau, so at
+// least G blocks score >= tau, so the G-th largest is >= tau). Compacting the blocks
+// that clear tau turns the rank pass into "rank ~1 271 candidates instead of
+// 16 384", which is where the win is.
+//
+// Groups are strided (`g, g+G, g+2G, ...`) so every sweep is coalesced, and the
+// compaction appends to `CAND` in block order (one atomic per survivor).
+//
+// One workgroup per token. `max_cand` is `n_blocks` (the worst case is every block
+// clearing tau, e.g. an all-tie score row), so the list can never truncate.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Scores { float SC[]; }; // [T, n_blocks]
+layout(std430, binding = 1) buffer Cand { uint CAND[]; };           // [T, max_cand]
+layout(std430, binding = 2) writeonly buffer NCand { uint NC[]; };  // [T]
+layout(std430, binding = 3) writeonly buffer Thr { float THR[]; };  // [T]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_blocks;
+    uint groups;   // min(topk_blocks, n_blocks)
+    uint max_cand; // n_blocks
+} pc;
+
+#define DEAD (-1.0e29)
+
+shared float s_m[256];
+shared uint s_cnt;
+
+void main() {
+    uint t = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = t * pc.n_blocks;
+    uint g_step = pc.groups;
+
+    // Pass 1: tau = min over groups of the group maximum. A thread may own several
+    // groups; it takes the min across them, which is the true min over all groups.
+    float m = 1.0e30;
+    for (uint g = tid; g < g_step; g += 256u) {
+        float gm = -1.0e30;
+        for (uint b = g; b < pc.n_blocks; b += g_step) {
+            gm = max(gm, SC[base + b]);
+        }
+        m = min(m, gm);
+    }
+    s_m[tid] = m;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_m[tid] = min(s_m[tid], s_m[tid + off]);
+        }
+        barrier();
+    }
+    float tau = s_m[0];
+    if (tid == 0u) {
+        THR[t] = tau;
+        s_cnt = 0u;
+    }
+    barrier();
+
+    // Pass 2: compact the survivors in block order.
+    for (uint b = tid; b < pc.n_blocks; b += 256u) {
+        float s = SC[base + b];
+        if (s > DEAD && s >= tau) {
+            uint p = atomicAdd(s_cnt, 1u);
+            CAND[t * pc.max_cand + p] = b;
+        }
+    }
+    barrier();
+    if (tid == 0u) {
+        NC[t] = min(s_cnt, pc.max_cand);
+    }
+}

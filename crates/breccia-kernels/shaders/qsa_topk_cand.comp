@@ -1,0 +1,107 @@
+#version 450
+//
+// QSA indexer top-k — rank the **candidates** only.
+//
+// Input is the list `qsa_topk_pick.comp` produced: every block scoring at least
+// `THR[t]`, in block order. Since every candidate outscores every non-candidate,
+// a candidate's rank among candidates is its rank among all blocks, so the emitted
+// list is identical to ranking the whole row — with far less work.
+//
+// Common case (`nc <= 4096`): the candidate ids are staged in LDS, one thread per
+// candidate compares against all of them (scores come from the score row, which is
+// L2-resident and broadcast across each warp), and the top `want` write their slot.
+//
+// Fallback (`nc > 4096`, e.g. an all-tie score row where every block clears tau):
+// the ids do not fit in LDS, so this workgroup ranks its own 256 blocks of the row
+// against the row in 256-wide LDS tiles, with the threshold and saturation prunes.
+// Same result, slower — and exact either way.
+//
+// Grid: (max(16, ceil(n_blocks/256)), tokens). In the common case chunks past the
+// candidate count return immediately; the fallback uses every chunk.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Scores { float SC[]; }; // [T, n_blocks]
+layout(std430, binding = 1) readonly buffer Cand { uint CAND[]; };  // [T, max_cand]
+layout(std430, binding = 2) readonly buffer NCand { uint NC[]; };   // [T]
+layout(std430, binding = 3) readonly buffer Thr { float THR[]; };   // [T]
+layout(std430, binding = 4) buffer Ids { uint IDS[]; };             // [T, max_ids]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_blocks;
+    uint topk_blocks;
+    uint max_ids;
+    uint max_cand;
+} pc;
+
+#define DEAD (-1.0e29)
+#define MAX_CAND 4096u
+#define WG_X_MAX 65535u
+
+shared uint s_id[MAX_CAND];
+shared float s_s[256];
+
+bool before(float sc, uint c, float sb, uint b) {
+    return sc > sb || (sc == sb && c < b);
+}
+
+void main() {
+    uint t = gl_WorkGroupID.y;
+    uint chunk = gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = t * pc.n_blocks;
+    uint nc = NC[t];
+    uint want = min(pc.topk_blocks, nc);
+
+    if (nc <= MAX_CAND) {
+        if (chunk * 256u >= nc) {
+            return; // this workgroup has no candidates
+        }
+        for (uint j = tid; j < nc; j += 256u) {
+            s_id[j] = CAND[t * pc.max_cand + j];
+        }
+        barrier();
+        uint i = chunk * 256u + tid;
+        if (i < nc) {
+            uint ii = s_id[i];
+            float si = SC[base + ii];
+            uint rank = 0u;
+            for (uint j = 0u; j < nc; ++j) {
+                uint jj = s_id[j];
+                rank += before(SC[base + jj], jj, si, ii) ? 1u : 0u;
+            }
+            if (rank < want) {
+                IDS[t * pc.max_ids + rank] = ii;
+            }
+        }
+        return;
+    }
+
+    // Fallback: rank this chunk's 256 blocks of the row, threshold-pruned.
+    uint b = chunk * 256u + tid;
+    float sb = b < pc.n_blocks ? SC[base + b] : DEAD;
+    bool live = b < pc.n_blocks && sb > DEAD && sb >= THR[t];
+    uint rank = live ? 0u : want;
+    for (uint c0 = 0u; c0 < pc.n_blocks; c0 += 256u) {
+        uint c = c0 + tid;
+        s_s[tid] = c < pc.n_blocks ? SC[base + c] : DEAD;
+        barrier();
+        if (live) {
+            uint m = min(256u, pc.n_blocks - c0);
+            for (uint j = 0u; j < m; ++j) {
+                rank += before(s_s[j], c0 + j, sb, b) ? 1u : 0u;
+            }
+            if (rank >= want) {
+                live = false;
+            }
+        }
+        barrier();
+    }
+    if (b < pc.n_blocks && sb > DEAD && rank < want) {
+        IDS[t * pc.max_ids + rank] = b;
+    }
+}
