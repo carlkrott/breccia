@@ -300,3 +300,79 @@ fn mixed_float_dot_vs_f32_fma() {
     let _ = (fma_ms, dot_ms);
     gpu.destroy_buf(&out);
 }
+
+/// Answer (measured, gfx1030, RADV): **no**. With runtime `f16vec2` operands the
+/// driver emits two `v_fma_mix_f32` (f16 x f16 -> f32, one per half) per dot and a
+/// `v_add_f32` — i.e. fp32 rate, no 2x. With constant operands it folds the whole
+/// thing to a single `v_fmac_f32`. So the 1.7x in `mixed_float_dot_vs_f32_fma`
+/// requires the explicit `OpFDot2MixAcc32VALVE` instruction; a plain GLSL shader
+/// cannot reach it. Porting it into a GEMM therefore means hand-written SPIR-V or
+/// a SPIR-V post-pass, not a shader edit.
+///
+/// Does the driver emit `v_dot2_f32_f16` from ordinary GLSL? Compiles the plain
+/// `f16vec2` dot pattern `acc += float(a.x)*float(b.x) + float(a.y)*float(b.y)`
+/// and creates the pipeline; run with `RADV_DEBUG=asm` and grep the dump for
+/// `v_dot2` to see the ISA. This decides whether the GEMM port can be a shader
+/// change or has to be hand-assembled SPIR-V.
+#[test]
+fn glsl_dot_isa() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("glsl_dot_isa: SKIPPED — set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let src = r#"#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Out { float o[]; };
+layout(std430, binding = 1) readonly buffer In { uint w[]; };
+layout(push_constant) uniform P { uint n; };
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    float fx = float(gid + 1u);
+    // runtime operands: constants let the compiler fold the whole dot away
+    f16vec2 a = unpackFloat2x16(w[gid * 2u]);
+    f16vec2 b = unpackFloat2x16(w[gid * 2u + 1u]);
+    float acc0 = fx, acc1 = fx, acc2 = fx, acc3 = fx;
+    for (uint i = 0u; i < n; ++i) {
+        acc0 += float(a.x) * float(b.x) + float(a.y) * float(b.y);
+        acc1 += float(a.x) * float(b.x) + float(a.y) * float(b.y);
+        acc2 += float(a.x) * float(b.x) + float(a.y) * float(b.y);
+        acc3 += float(a.x) * float(b.x) + float(a.y) * float(b.y);
+    }
+    o[gid] = acc0 + acc1 + acc2 + acc3;
+}
+"#;
+    let dir = std::env::temp_dir().join("breccia-mixed-dot");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let comp = dir.join("isa.comp");
+    let spv = dir.join("isa.spv");
+    std::fs::write(&comp, src).expect("write glsl");
+    let ok = Command::new("glslc")
+        .arg("--target-env=vulkan1.3")
+        .arg("-O")
+        .arg(&comp)
+        .arg("-o")
+        .arg(&spv)
+        .status()
+        .ok()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("glsl_dot_isa: glslc failed");
+        return;
+    }
+    let bytes = std::fs::read(&spv).expect("spv");
+    let host = breccia_vk::ctx::Host::new().expect("host");
+    let devs = host.devices().expect("devices");
+    let idx = devs
+        .iter()
+        .position(|d| d.pci_address == selector.trim() || d.index.to_string() == selector.trim())
+        .unwrap_or(0);
+    let gpu = breccia_vk::ctx::Gpu::create(&host, &devs[idx], 1).expect("device");
+    match gpu.kernel(&bytes, 1) {
+        Ok(_) => {
+            println!("glsl_dot_isa: pipeline created (check the RADV_DEBUG=asm dump for v_dot2)")
+        }
+        Err(e) => println!("glsl_dot_isa: pipeline REJECTED: {e}"),
+    }
+}
