@@ -69,6 +69,10 @@ pub const SPIRV_HASH: &str = env!("BRECCIA_SPIRV_HASH");
 /// shaders. `OpFDot2MixAcc32VALVE` is unreachable from GLSL (glslang cannot emit
 /// it), so a kernel that wants the 1.7x has to come from assembly like this.
 pub const MIXED_DOT_PROBE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mixed_dot_probe.spv"));
+
+/// The mixed-float-dot GEMM body ([`gemm::DotGemm`]): f16 weight pairs x f32
+/// activations into an f32 accumulator, one instruction per two MACs.
+pub const MIXED_DOT_GEMM: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f16_dot.spv"));
 pub use bench::{run_gemv_bench, BatchCell, GemvBenchOptions, GemvReport, Shape};
 pub use device::Device;
 pub use dispatch_batch as batch_cmd;

@@ -1164,3 +1164,95 @@ mod tile_table_tests {
         assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((4, 2)));
     }
 }
+
+/// A mixed-float-dot GEMM: `OpFDot2MixAcc32VALVE` does two f16 MACs into an f32
+/// accumulator per instruction, measured at 1.70x (gfx1030) / 1.78x (gfx906) the
+/// fp32 FMA rate. Unreachable from GLSL, so the body is assembly
+/// (`shaders/gemm_f16_dot.spvasm`, built by `build.rs` with spirv-as + spirv-val).
+///
+/// **Quant-agnostic**: the kernel takes weights as f16 pairs, so any format the
+/// caller can present as f16 (F16 directly, BF16/F32 through a range check, IQ*
+/// through its dequant state) uses the same kernel. **System-agnostic**: it is
+/// refused up front unless the device advertises
+/// `VK_VALVE_shader_mixed_float_dot_product`, and the choice between it and the
+/// tiled builds belongs to calibration (`breccia profile --kernels`), not to a
+/// compile-time switch.
+///
+/// Layout: `w` holds `rows*cols` f16 (two per 32-bit word), `x` is f32 `users*cols`
+/// and `o` f32 `users*rows` at `O[u * rows + r]` — the same output contract as
+/// every other GEMM build. `cols` must be even.
+pub struct DotGemm<'g> {
+    kernel: breccia_vk::ctx::Kernel,
+    gpu: &'g Gpu,
+}
+
+impl<'g> DotGemm<'g> {
+    /// Does this device advertise the extension the kernel needs?
+    pub fn supported(gpu: &Gpu) -> bool {
+        gpu.feats.mixed_float_dot
+    }
+
+    /// Compile the pipeline. Errors (rather than silently falling back) when the
+    /// device cannot run it, so a caller's capability check is not a guess.
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        if !Self::supported(gpu) {
+            anyhow::bail!(
+                "{} does not advertise VK_VALVE_shader_mixed_float_dot_product",
+                gpu.pci_address
+            );
+        }
+        let kernel = gpu
+            .kernel(crate::MIXED_DOT_GEMM, 3)
+            .map_err(|e| anyhow!("creating the mixed-dot GEMM pipeline: {e}"))?;
+        Ok(DotGemm { kernel, gpu })
+    }
+
+    /// `o[u * rows + r] = sum_k w[r*cols + k] * x[u*cols + k]`, f32 accumulation.
+    pub fn run(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        o: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+    ) -> Result<()> {
+        if rows == 0 || cols == 0 || users == 0 {
+            return Ok(());
+        }
+        if !cols.is_multiple_of(2) {
+            anyhow::bail!("mixed-dot GEMM needs an even `cols`, got {cols}");
+        }
+        let n = (rows * users) as u64;
+        let groups = n.div_ceil(64).max(1) as u32;
+        let pc = crate::ops::Pc::new()
+            .u(rows as u32)
+            .u(cols as u32)
+            .u(users as u32);
+        self.gpu
+            .bind_kernel(&self.kernel, &[w.buf, x.buf, o.buf])
+            .map_err(|e| anyhow!("{e}"))?;
+        self.gpu
+            .wall_run(breccia_vk::ctx::Qc::C, |d, cmd| unsafe {
+                d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.kernel.pipe);
+                d.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.kernel.layout,
+                    0,
+                    &[self.kernel.set],
+                    &[],
+                );
+                d.cmd_push_constants(
+                    cmd,
+                    self.kernel.layout,
+                    vk::ShaderStageFlags::COMPUTE,
+                    0,
+                    pc.as_bytes(),
+                );
+                d.cmd_dispatch(cmd, groups, 1, 1);
+            })
+            .map_err(|e| anyhow!("mixed-dot GEMM dispatch: {e}"))?;
+        Ok(())
+    }
+}

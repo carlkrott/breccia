@@ -204,6 +204,9 @@ fn main() {
     // through the same spirv-as + spirv-val gate as everything else. This is the
     // integration point a future GEMM body would use.
     assemble(&out_dir, "shaders/mixed_dot_probe.spvasm");
+    // The mixed-dot GEMM body itself (`gemm::DotGemm`): quant-agnostic (weights as
+    // f16 pairs), capability-gated, selected by calibration.
+    assemble(&out_dir, "shaders/gemm_f16_dot.spvasm");
 
     for name in SHADERS {
         compile(&glslc, &out_dir, name, name, &[]);

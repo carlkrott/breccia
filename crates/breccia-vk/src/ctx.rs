@@ -42,6 +42,9 @@ pub struct Feats {
     pub host_query_reset: bool,
     /// Needed by the fp16 kernel's float16_t storage buffer (Vulkan 1.1 core feature).
     pub storage_buffer16_bit_access: bool,
+    /// `VK_VALVE_shader_mixed_float_dot_product` was advertised (and enabled):
+    /// packed f16 dots into an f32 accumulator are then legal in a module.
+    pub mixed_float_dot: bool,
     /// `VK_AMD_shader_core_properties2::activeComputeUnitCount`, or 0 when the
     /// extension is absent. This is the only Vulkan query that reports **how many
     /// compute units the card actually has** (80 on the RX 6950 XT, 60 on the
@@ -225,6 +228,9 @@ impl Host {
                 cooperative_matrix: fcoop.cooperative_matrix != 0,
                 host_query_reset: f12.host_query_reset != 0,
                 storage_buffer16_bit_access: f11.storage_buffer16_bit_access != 0,
+                mixed_float_dot: ext_names
+                    .iter()
+                    .any(|e| e == "VK_VALVE_shader_mixed_float_dot_product"),
                 compute_units: core.active_compute_unit_count,
             };
 
