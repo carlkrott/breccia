@@ -412,48 +412,78 @@ impl Model {
                 .map(|d| placement::DeviceSpec::parse(d))
                 .collect()
         };
-        let placement = match &opts.blocks {
-            Some(counts) => {
-                if counts.len() != specs.len() {
-                    bail!(
-                        "--split-blocks lists {} devices but {} were requested",
-                        counts.len(),
-                        specs.len()
-                    );
+        let placement =
+            match &opts.blocks {
+                Some(counts) => {
+                    if counts.len() != specs.len() {
+                        bail!(
+                            "--split-blocks lists {} devices but {} were requested",
+                            counts.len(),
+                            specs.len()
+                        );
+                    }
+                    // One `usize::MAX` takes the blocks the others leave (the streams'
+                    // expert helper loads as `[rest, 0]` without knowing the block count).
+                    let named: usize = counts.iter().filter(|&&c| c != usize::MAX).sum();
+                    let counts: Vec<usize> = counts
+                        .iter()
+                        .map(|&c| {
+                            if c == usize::MAX {
+                                layer_bytes.len().saturating_sub(named)
+                            } else {
+                                c
+                            }
+                        })
+                        .collect();
+                    Placement::explicit(specs, &layer_bytes, tail_bytes, &counts)?
                 }
-                // One `usize::MAX` takes the blocks the others leave (the streams'
-                // expert helper loads as `[rest, 0]` without knowing the block count).
-                let named: usize = counts.iter().filter(|&&c| c != usize::MAX).sum();
-                let counts: Vec<usize> = counts
-                    .iter()
-                    .map(|&c| {
-                        if c == usize::MAX {
-                            layer_bytes.len().saturating_sub(named)
-                        } else {
-                            c
-                        }
-                    })
-                    .collect();
-                Placement::explicit(specs, &layer_bytes, tail_bytes, &counts)?
-            }
-            None => {
-                let rates = std::env::var_os("BRECCIA_TIER_PLACEMENT")
-                    .and_then(|_| tier_rates_for_specs(&specs, 16));
-                match rates {
-                    Some(r) => {
-                        let counts = breccia_profile::placement::rate_counts(&r, layer_bytes.len());
-                        if opts.verbose {
-                            eprintln!(
-                                "breccia: tiers: rate-weighted layer split {counts:?} from {:?} rows/s",
+                None => {
+                    let rates = std::env::var_os("BRECCIA_TIER_PLACEMENT")
+                        .and_then(|_| tier_rates_for_specs(&specs, 16));
+                    match rates {
+                        Some(r) => {
+                            let n = layer_bytes.len();
+                            let d = specs.len();
+                            // Expert headroom: a split that puts more dense weights on a
+                            // card leaves less room for that card's resident expert arena.
+                            // Take the measured split only if it does not cost headroom.
+                            let caps = tier_capacities_for_specs(&specs);
+                            let headroom = |counts: &[usize]| -> Option<u64> {
+                                let caps = caps.as_ref()?;
+                                let mut at = 0usize;
+                                let mut min = u64::MAX;
+                                for (i, &c) in counts.iter().enumerate() {
+                                    let mut bytes: u64 =
+                                        layer_bytes[at..(at + c).min(n)].iter().sum();
+                                    if i + 1 == d {
+                                        bytes += tail_bytes;
+                                    }
+                                    at += c;
+                                    min = min.min(caps[i].saturating_sub(bytes));
+                                }
+                                Some(min)
+                            };
+                            let measured = breccia_profile::placement::rate_counts(&r, n);
+                            let balanced: Vec<usize> =
+                                (0..d).map(|i| n / d + usize::from(i < n % d)).collect();
+                            let take = !matches!(
+                                (headroom(&measured), headroom(&balanced)),
+                                (Some(m), Some(b)) if m + (64 << 20) < b
+                            );
+                            let counts = if take { measured } else { balanced };
+                            if opts.verbose {
+                                eprintln!(
+                                "breccia: tiers: {} layer split {counts:?} (rates {:?} M rows/s)",
+                                if take { "rate-weighted" } else { "headroom-guarded" },
                                 r.iter().map(|v| (v / 1e6).round()).collect::<Vec<_>>()
                             );
+                            }
+                            Placement::explicit(specs, &layer_bytes, tail_bytes, &counts)?
                         }
-                        Placement::explicit(specs, &layer_bytes, tail_bytes, &counts)?
+                        None => Placement::balanced(specs, &layer_bytes, tail_bytes),
                     }
-                    None => Placement::balanced(specs, &layer_bytes, tail_bytes),
                 }
-            }
-        };
+            };
         let mut devices = Vec::with_capacity(placement.devices.len());
         for spec in &placement.devices {
             devices.push(
@@ -1805,6 +1835,34 @@ fn co_tenant_check(devices: &[Device], verbose: bool) -> Result<()> {
 /// Each requested device's measured expert rate (rows/s at `users`), in spec order.
 /// `None` when the table is absent/stale or a device has no row — the caller then
 /// keeps the balanced rule.
+/// Each requested device's VRAM capacity from the tier table, in spec order.
+fn tier_capacities_for_specs(specs: &[placement::DeviceSpec]) -> Option<Vec<u64>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<Option<Vec<breccia_profile::schema::TierRate>>> = OnceLock::new();
+    let tiers = T
+        .get_or_init(|| {
+            let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+                .ok()
+                .flatten()?;
+            let v = prof.tiers?;
+            if v.spirv_hash != breccia_kernels::SPIRV_HASH {
+                return None;
+            }
+            Some(v.tiers)
+        })
+        .as_ref()?;
+    let mut out = Vec::with_capacity(specs.len());
+    for s in specs {
+        let want = s.selector.as_deref().unwrap_or(&s.label);
+        let t = tiers.iter().find(|t| {
+            t.kind == "device"
+                && (t.id.eq_ignore_ascii_case(want) || t.id.eq_ignore_ascii_case(&s.label))
+        })?;
+        out.push(t.capacity_bytes);
+    }
+    Some(out)
+}
+
 fn tier_rates_for_specs(specs: &[placement::DeviceSpec], users: u32) -> Option<Vec<f64>> {
     use std::sync::OnceLock;
     static T: OnceLock<Option<Vec<breccia_profile::schema::TierRate>>> = OnceLock::new();
