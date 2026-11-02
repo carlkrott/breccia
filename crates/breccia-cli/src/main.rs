@@ -75,6 +75,11 @@ enum Command {
         /// Re-run after a driver or shader change.
         #[arg(long)]
         kernels: bool,
+        /// `--tiers`: measure each card's expert gate+up+down trio at users
+        /// 1/16/128/1024 and store the rates, so block placement is a knapsack on
+        /// measurement instead of VRAM alone (`breccia_profile::placement`).
+        #[arg(long)]
+        tiers: bool,
         /// Model for `--prefill` (shard glob or path)
         #[arg(long, value_name = "GLOB", default_value = DEFAULT_MODEL_GLOB)]
         model: String,
@@ -485,6 +490,7 @@ fn run(cli: Cli) -> Result<()> {
             print_fingerprint,
             prefill,
             kernels,
+            tiers,
             model,
             devices,
             cpu_lane,
@@ -497,6 +503,7 @@ fn run(cli: Cli) -> Result<()> {
             print_fingerprint,
             prefill,
             kernels,
+            tiers,
             model,
             devices,
             cpu_lane,
@@ -789,6 +796,7 @@ struct ProfileArgs {
     /// winners in the profile (no model needed). This is the install-time step
     /// that makes the kernel geometry follow the hardware.
     kernels: bool,
+    tiers: bool,
     model: String,
     devices: Vec<String>,
     cpu_lane: Option<usize>,
@@ -802,6 +810,12 @@ fn profile(a: ProfileArgs) -> Result<()> {
         .unwrap_or_else(breccia_profile::default_profile_path);
     if a.kernels {
         profile_kernels(&path)?;
+        if !a.prefill && !a.tiers {
+            return Ok(());
+        }
+    }
+    if a.tiers {
+        profile_tiers(&path)?;
         if !a.prefill {
             return Ok(());
         }
@@ -1210,6 +1224,144 @@ fn profile_prefill(path: &std::path::Path, model_glob: &str, devices: &[String])
         breccia_profile::save_profile(&prof, path)?;
         println!("  best chunk {best} stored");
     }
+    Ok(())
+}
+
+/// `breccia profile --tiers`: measure each card's expert gate+up+down trio at the
+/// user counts the engine produces, so `placement::place_blocks` has rates instead
+/// of a VRAM-only rule. The host tier is measured by the CPU pool (below); a card
+/// that cannot be opened is skipped, and a tier row is only written for a card that
+/// appears in the profile.
+fn profile_tiers(path: &std::path::Path) -> Result<()> {
+    use breccia_kernels::QuantType;
+    let mut prof = breccia_profile::load_profile(path)?.with_context(|| {
+        format!(
+            "no hardware profile at {} (run `breccia profile`)",
+            path.display()
+        )
+    })?;
+    let host = breccia_vk::ctx::Host::new()
+        .map_err(|e| anyhow::anyhow!("opening the Vulkan host: {e}"))?;
+    let devs = host
+        .devices()
+        .map_err(|e| anyhow::anyhow!("enumerating devices: {e}"))?;
+    let (g_rows, g_cols) = (640usize, 2560usize); // gate and up
+    let (d_rows, d_cols) = (2560usize, 640usize); // down
+    let trio_bytes = (g_rows * g_cols * 2 * 2 + d_rows * d_cols * 2) as f64;
+    let work_per_user = (g_rows * 2 + d_rows) as f64;
+    let users = [1usize, 16, 128, 1024];
+    let mut rates = Vec::new();
+    for d in &devs {
+        if d.name.contains("Processor") {
+            continue;
+        }
+        let Ok(gpu) = breccia_vk::ctx::Gpu::create(&host, d, 1) else {
+            continue;
+        };
+        let gemm = breccia_kernels::gemm::GemmMany::new(&gpu, QuantType::Bf16)
+            .with_context(|| format!("expert GEMM on {}", d.name))?;
+        let wg = breccia_kernels::gemv::upload(&gpu, &vec![0u8; g_rows * g_cols * 2])?;
+        let wd = breccia_kernels::gemv::upload(&gpu, &vec![0u8; d_rows * d_cols * 2])?;
+        let mut per_s = Vec::new();
+        let mut bytes_s = 0.0;
+        for &u in &users {
+            let xg = breccia_kernels::gemv::alloc(&gpu, (u * g_cols * 4) as u64)?;
+            let og = breccia_kernels::gemv::alloc(&gpu, (u * g_rows * 4) as u64)?;
+            let xd = breccia_kernels::gemv::alloc(&gpu, (u * d_cols * 4) as u64)?;
+            let od = breccia_kernels::gemv::alloc(&gpu, (u * d_rows * 4) as u64)?;
+            let mut best = f64::INFINITY;
+            for pass in 0..4 {
+                let t = std::time::Instant::now();
+                gemm.run(&wg, &xg, &og, g_rows, g_cols, u)?;
+                gemm.run(&wg, &xg, &og, g_rows, g_cols, u)?; // up shares the shape
+                gemm.run(&wd, &xd, &od, d_rows, d_cols, u)?;
+                if pass > 0 {
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+            }
+            if u == 128 {
+                bytes_s = trio_bytes / best;
+            }
+            per_s.push(work_per_user * u as f64 / best);
+            gpu.destroy_buf(&xg);
+            gpu.destroy_buf(&og);
+            gpu.destroy_buf(&xd);
+            gpu.destroy_buf(&od);
+        }
+        gpu.destroy_buf(&wg);
+        gpu.destroy_buf(&wd);
+        println!(
+            "  {} ({}): {:?} rows/s at users {:?}",
+            d.name, d.pci_address, per_s, users
+        );
+        rates.push(breccia_profile::schema::TierRate {
+            kind: "device".into(),
+            id: d.pci_address.clone(),
+            capacity_bytes: gpu.mem_budget().map_or(0, |m| m.heap_bytes),
+            users: users.iter().map(|&u| u as u32).collect(),
+            rows_per_s: per_s,
+            weight_bytes_per_s: bytes_s,
+            driver_version: format!("{} {}", d.driver_name, d.driver_version),
+        });
+    }
+    // Host tier: the same trio (gate+up+down) as a scalar f32 GEMV over the real
+    // shapes, one pass per point, scaled by the pool's thread count. This is the
+    // lane's arithmetic (fp32 MACs), not a token benchmark.
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get());
+    let g_w = vec![0.5f32; g_rows * g_cols];
+    let d_w = vec![0.5f32; d_rows * d_cols];
+    let xin = vec![0.125f32; g_cols.max(d_cols)];
+    let mut out = vec![0f32; g_rows.max(d_rows)];
+    let mut host_s = Vec::new();
+    for &u in &users {
+        let t = std::time::Instant::now();
+        for _ in 0..u {
+            for r in 0..g_rows {
+                let mut a = 0f32;
+                for c in 0..g_cols {
+                    a += g_w[r * g_cols + c] * xin[c];
+                }
+                out[r] = a;
+            }
+            for r in 0..g_rows {
+                let mut a = 0f32;
+                for c in 0..g_cols {
+                    a += g_w[r * g_cols + c] * xin[c];
+                }
+                out[r] = a;
+            }
+            for r in 0..d_rows {
+                let mut a = 0f32;
+                for c in 0..d_cols {
+                    a += d_w[r * d_cols + c] * xin[c];
+                }
+                out[r] = a;
+            }
+        }
+        let secs = t.elapsed().as_secs_f64().max(1e-9);
+        host_s.push(work_per_user * u as f64 * threads as f64 / secs);
+    }
+    println!("  host ({threads} threads): {host_s:?} rows/s (scalar GEMV x threads)");
+    rates.push(breccia_profile::schema::TierRate {
+        kind: "host".into(),
+        id: prof.host.cpu_model.clone(),
+        capacity_bytes: prof.host.mem_total_bytes,
+        users: users.iter().map(|&u| u as u32).collect(),
+        rows_per_s: host_s,
+        weight_bytes_per_s: 0.0,
+        driver_version: String::new(),
+    });
+    prof.tiers = Some(breccia_profile::schema::TierVerdict {
+        timestamp: breccia_profile::schema::iso8601(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        ),
+        spirv_hash: breccia_kernels::SPIRV_HASH.to_string(),
+        tiers: rates,
+    });
+    breccia_profile::save_profile(&prof, path)?;
+    println!("  tier rates stored in {}", path.display());
     Ok(())
 }
 
