@@ -264,3 +264,42 @@ mod split_tests {
         assert_eq!(split_experts(&[5, 6], &[1.0]), vec![Some(0), Some(0)]);
     }
 }
+
+/// Which of one block's experts the **host** should take, from the block device's
+/// and the host's measured rates (the item-3 decision at the call site).
+pub fn host_experts(
+    rows_per_expert: &[(usize, u32)],
+    device_rate: f64,
+    host_rate: f64,
+) -> Vec<usize> {
+    let rows: Vec<u32> = rows_per_expert.iter().map(|x| x.1).collect();
+    let choice = split_experts(&rows, &[device_rate, host_rate]);
+    rows_per_expert
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| choice[*i] == Some(1))
+        .map(|(_, (e, _))| *e)
+        .collect()
+}
+
+#[cfg(test)]
+mod host_experts_tests {
+    use super::*;
+
+    #[test]
+    fn the_slower_host_gets_about_its_share() {
+        // Device twice the host: 1 of 3 equal experts goes to the host (LPT).
+        let h = host_experts(&[(0, 10), (1, 10), (2, 10)], 2.0, 1.0);
+        assert_eq!(h, vec![2], "{h:?}");
+    }
+
+    #[test]
+    fn a_host_with_no_measured_rate_takes_nothing() {
+        assert!(host_experts(&[(0, 10), (1, 99)], 1.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn a_device_with_no_rate_leaves_everything_to_the_host() {
+        assert_eq!(host_experts(&[(0, 1), (1, 2)], 0.0, 1.0), vec![0, 1]);
+    }
+}

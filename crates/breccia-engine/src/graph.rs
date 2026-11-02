@@ -3862,7 +3862,7 @@ impl<'m> Session<'m> {
         let bound_t0 = std::time::Instant::now();
         // `BRECCIA_PF_SPLIT_HOST`: needs the plain streamed path (no helper card, no
         // micro-batches), a small chunk and a spare scratch row for the zero slot.
-        let split_on = pf_split_host().is_some()
+        let split_on = (pf_split_host().is_some() || pf_split_tiers())
             && streamed
             && xdev.is_none()
             && !micro
@@ -4037,17 +4037,39 @@ impl<'m> Session<'m> {
         let mut host_job = None;
         let mut host_t0 = std::time::Instant::now();
         if split_on && distinct > 1 {
-            let (n, pct) = pf_split_host().expect("split_on");
-            let n = if pct { (distinct * n).div_ceil(100) } else { n };
-            let n = n.min(distinct - 1);
-            host_set = pairs
-                .iter()
-                .map(|p| p.0)
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .rev()
-                .take(n)
-                .collect();
+            // Item 3: when the tier table is present, the host's share of *this
+            // block* is the LPT partition by rows x cost(device/host), so the two
+            // sides finish together. `pf_split_host` remains the fallback.
+            let tp = pf_split_tiers()
+                .then(|| {
+                    tier_pair(
+                        &m.devices[dev].info.pci_address,
+                        ((t * k) / distinct.max(1)).max(1) as u32,
+                    )
+                })
+                .flatten();
+            if let Some((dev_rate, host_rate)) = tp {
+                let mut rows: Vec<(usize, u32)> = Vec::with_capacity(distinct);
+                for &(e, _, _) in &pairs {
+                    match rows.last_mut() {
+                        Some((last, count)) if *last == e => *count += 1,
+                        _ => rows.push((e, 1)),
+                    }
+                }
+                host_set = breccia_profile::placement::host_experts(&rows, dev_rate, host_rate);
+            } else {
+                let (n, pct) = pf_split_host().expect("split_on");
+                let n = if pct { (distinct * n).div_ceil(100) } else { n };
+                let n = n.min(distinct - 1);
+                host_set = pairs
+                    .iter()
+                    .map(|p| p.0)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .rev()
+                    .take(n)
+                    .collect();
+            }
             let pf = self.venues[dev]
                 .pf
                 .as_ref()
@@ -6594,6 +6616,41 @@ const SPLIT_T_MAX: usize = 8;
 /// [`SPLIT_T_MAX`] tokens, the last `n` (or that percentage of the) distinct experts in
 /// expert-id order run on the host pool concurrently with the GPU stream loop; their
 /// weighted sum is added to the fan-in output. Default off. `(count, is_percent)`.
+/// `BRECCIA_PF_SPLIT_TIERS=1`: choose the host's share of a block from the measured
+/// tier rates (`breccia profile --tiers`) instead of a count/percentage.
+fn pf_split_tiers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BRECCIA_PF_SPLIT_TIERS").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
+/// `(device rate, host rate)` rows/s at `users` for the card at `pci`, from the
+/// profile's tier table. `None` when the table is absent or stale.
+fn tier_pair(pci: &str, users: u32) -> Option<(f64, f64)> {
+    use std::sync::OnceLock;
+    static T: OnceLock<Option<Vec<breccia_profile::schema::TierRate>>> = OnceLock::new();
+    let tiers = T
+        .get_or_init(|| {
+            let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
+                .ok()
+                .flatten()?;
+            let v = prof.tiers?;
+            if v.spirv_hash != breccia_kernels::SPIRV_HASH {
+                return None;
+            }
+            Some(v.tiers)
+        })
+        .as_ref()?;
+    let dev = tiers
+        .iter()
+        .find(|t| t.kind == "device" && t.id.eq_ignore_ascii_case(pci))?;
+    let host = tiers.iter().find(|t| t.kind == "host")?;
+    let dr = breccia_profile::placement::rate_at(dev, users);
+    let hr = breccia_profile::placement::rate_at(host, users);
+    (dr > 0.0 && hr > 0.0).then_some((dr, hr))
+}
+
 fn pf_split_host() -> Option<(usize, bool)> {
     static N: std::sync::OnceLock<Option<(usize, bool)>> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
