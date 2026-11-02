@@ -447,6 +447,11 @@ pub struct Mailbox {
 }
 
 impl Mailbox {
+    /// Bytes this mailbox was allocated with.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
     pub fn new(gpu: &Gpu, size: u64) -> Result<Self> {
         Self::with_preferred(gpu, size, vk::MemoryPropertyFlags::DEVICE_LOCAL)
     }

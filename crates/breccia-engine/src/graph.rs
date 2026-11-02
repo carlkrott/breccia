@@ -1068,12 +1068,13 @@ impl<'m> Session<'m> {
                 let (gb, ub, db) = (align(g_max), align(u_max), align(d_max));
                 let slot_stride = gb + ub + db;
                 let split = if pf_split_host().is_some() || pf_split_tiers() {
-                    let hp = Mailbox::new(gpu, (SPLIT_T_MAX as u64 + 1) * nb)?;
-                    hp.write(&vec![0u8; (SPLIT_T_MAX + 1) * nb as usize])?;
-                    Some((
-                        Mailbox::new_cached(gpu, SPLIT_T_MAX as u64 * (nb + k as u64 * 4))?,
-                        hp,
-                    ))
+                    // Sized for the largest chunk `prefill_plan` can hand us, not
+                    // `SPLIT_T_MAX`: the device/host partition is useful at prefill
+                    // scale, not only in the micro-batch path.
+                    let srows = prefill_cap(chunk) as u64;
+                    let hp = Mailbox::new(gpu, (srows + 1) * nb)?;
+                    hp.write(&vec![0u8; ((srows + 1) * nb) as usize])?;
+                    Some((Mailbox::new_cached(gpu, srows * (nb + k as u64 * 4))?, hp))
                 } else {
                     None
                 };
@@ -3866,9 +3867,11 @@ impl<'m> Session<'m> {
             && streamed
             && xdev.is_none()
             && !micro
-            && t <= SPLIT_T_MAX
             && self.venues[dev].pf.as_ref().is_some_and(|pf| {
-                pf.split.is_some() && pf.scratch.size >= ((t * k + 1) * n_embd * 4) as u64
+                pf.split
+                    .as_ref()
+                    .is_some_and(|(c, _)| c.size() >= t as u64 * (n_embd as u64 * 4 + k as u64 * 4))
+                    && pf.scratch.size >= ((t * k + 1) * n_embd * 4) as u64
             });
 
         // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
