@@ -47,6 +47,9 @@ pub struct GemmMany<'g> {
     hcgate: Option<breccia_vk::ctx::Kernel>,
     /// Forced users per z slice (1..=USERS_MAX); `None` = [`upz_for`] per dispatch.
     upz: Option<usize>,
+    /// `set_tile(Some(_))` was called: use exactly that tile, bypassing both the
+    /// env override and the measured rule (calibration and A/B rely on this).
+    tile_locked: bool,
     tables: Buf,
 }
 
@@ -107,6 +110,132 @@ fn tile_forced() -> bool {
     *F.get_or_init(|| std::env::var("BRECCIA_GEMM_TILE").is_ok())
 }
 
+/// One calibrated cell: at `(rows, users)` on this device, `tile` measured
+/// `us` microseconds. Written by [`calibrate_tiles`] and installed from
+/// `hw_profile.json` at startup, so the choice follows the hardware instead of a
+/// constant compiled for the developer's card.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct TileCell {
+    /// Quant type name (`IQ3_S`, `BF16`, …): the optimum differs by type, because
+    /// the inner loop's latency does (BF16 wants the small tile at every user count
+    /// on the narrow shape; IQ3_S does not).
+    pub ty: String,
+    pub rows: usize,
+    pub users: usize,
+    /// `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"`.
+    pub tile: String,
+    pub us: f64,
+}
+
+/// Cells installed from the profile (per process). Empty = fall back to
+/// [`tile_for`]'s built-in rule, which was measured on this host.
+fn tile_table() -> &'static std::sync::RwLock<Vec<TileCell>> {
+    static T: std::sync::OnceLock<std::sync::RwLock<Vec<TileCell>>> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::RwLock::new(Vec::new()))
+}
+
+/// Install the calibrated cells (startup, from `hw_profile.json`). Replaces any
+/// previous table; an empty vector restores the built-in rule.
+pub fn set_tile_table(cells: Vec<TileCell>) {
+    if let Ok(mut t) = tile_table().write() {
+        *t = cells;
+    }
+}
+
+fn parse_tile(s: &str) -> Option<Tile> {
+    let (a, b) = s.split_once('x')?;
+    let t: Tile = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+    TILES.contains(&t).then_some(t)
+}
+
+/// Sweep the tiled builds over `cells` for `types` and return the winner per cell.
+///
+/// This is the function an install/startup step calls: it needs no model (the cost
+/// depends on shape and type, not weight values), touches only the device, and
+/// returns rows that go straight into `hw_profile.json` and back through
+/// [`set_tile_table`]. Times are summed across the types swept so one tile serves
+/// every type at that shape; ties go to the larger tile (fewer workgroups, less
+/// LDS churn).
+pub fn calibrate_tiles(
+    gpu: &breccia_vk::ctx::Gpu,
+    cells: &[(usize, usize, usize)],
+    types: &[QuantType],
+) -> Result<Vec<TileCell>> {
+    let mut out = Vec::new();
+    for &(rows, cols, users) in cells {
+        for &ty in types {
+            let Ok(mut gemm) = GemmMany::new(gpu, ty) else {
+                continue;
+            };
+            let wbytes = gemm.weight_bytes(rows, cols);
+            let w = crate::gemv::alloc(gpu, wbytes)?;
+            let x = crate::gemv::alloc(gpu, (users * cols * 4) as u64)?;
+            let o = crate::gemv::alloc(gpu, (users * rows * 4) as u64)?;
+            crate::gemv::upload_into(gpu, &w, &vec![0u8; wbytes as usize])?;
+            crate::gemv::upload_into(gpu, &x, &vec![0u8; users * cols * 4])?;
+            let mut totals = vec![f64::INFINITY; TILES.len()];
+            for (i, t) in TILES.iter().enumerate() {
+                gemm.set_tile(Some(*t));
+                for pass in 0..4 {
+                    let t0 = std::time::Instant::now();
+                    if gemm.run_at(&w, &x, &o, rows, cols, users, 0).is_err() {
+                        break;
+                    }
+                    if pass > 0 {
+                        let dt = t0.elapsed().as_secs_f64() * 1e6;
+                        if dt < totals[i] {
+                            totals[i] = dt;
+                        }
+                    }
+                }
+            }
+            gemm.set_tile(None);
+            gpu.destroy_buf(&w);
+            gpu.destroy_buf(&x);
+            gpu.destroy_buf(&o);
+            // Ties (or holes) resolve to the later, larger tile.
+            let mut best = 0usize;
+            for i in 1..TILES.len() {
+                if totals[i] <= totals[best] {
+                    best = i;
+                }
+            }
+            if !totals[best].is_finite() {
+                continue;
+            }
+            let t = TILES[best];
+            out.push(TileCell {
+                ty: ty.name().to_string(),
+                rows,
+                users,
+                tile: format!("{}x{}", t.0, t.1),
+                us: totals[best],
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The nearest calibrated cell in log-space, so a shape between two samples uses
+/// the closer one. `None` when nothing has been calibrated.
+fn tile_from_table(ty: QuantType, rows: usize, users: usize) -> Option<Tile> {
+    let t = tile_table().read().ok()?;
+    let want = ty.name();
+    let mut near: Option<&TileCell> = None;
+    let lr = (rows.max(1) as f64).ln();
+    let lu = (users.max(1) as f64).ln();
+    for c in t.iter().filter(|c| c.ty == want) {
+        let d = |c: &TileCell| {
+            (lr - (c.rows.max(1) as f64).ln()).powi(2) + (lu - (c.users.max(1) as f64).ln()).powi(2)
+        };
+        near = match near {
+            Some(b) if d(b) <= d(c) => Some(b),
+            _ => Some(c),
+        };
+    }
+    near.and_then(|c| parse_tile(&c.tile))
+}
+
 /// The tile for a concrete dispatch, measured (`gemm_calib` `gemm_tile_sweep`,
 /// RX, `out/gemm-tiles-rx.csv`): the 4x4 build is right for wide shapes and large
 /// batches, and the **4x2** build (half the user tile, twice the workgroups) wins
@@ -120,6 +249,12 @@ fn tile_forced() -> bool {
 /// | 2560 (down) | 64 | 1.16-1.35x |
 /// | 2560 | >= 96 | 4x4 better |
 fn tile_for(ty: QuantType, rows: usize, users: usize) -> Option<Tile> {
+    // A calibrated table (installed from the profile at startup) wins: it is the
+    // only source that travelled with the hardware it was measured on.
+    if let Some(t) = tile_from_table(ty, rows, users) {
+        return Some(t);
+    }
+    // Fallback rule, measured on this host (RX 6950 XT / MI50, 2026-11).
     // A narrow row count means only rows/64 workgroups per user tile, so the
     // smaller user tile is what fills the GPU.
     let narrow = rows <= 1024;
@@ -405,6 +540,7 @@ impl<'g> GemmMany<'g> {
                 (env_rpl().unwrap_or(t.0), env_umax().unwrap_or(t.1))
             }),
             upz: default_upz(),
+            tile_locked: false,
             tables,
         })
     }
@@ -421,6 +557,7 @@ impl<'g> GemmMany<'g> {
     /// Force the tiled build (`None` = the GEMV-shaped builds); A/B and tests.
     pub fn set_tile(&mut self, t: Option<Tile>) {
         self.want_tile = t;
+        self.tile_locked = t.is_some();
     }
 
     /// Build the HC `up` + gated-mean pipeline (BF16 only; default on, `BRECCIA_FUSE_HC=0` opts out).
@@ -484,7 +621,7 @@ impl<'g> GemmMany<'g> {
         if users < TILE_MIN_USERS {
             return None;
         }
-        let t = if tile_forced() {
+        let t = if self.tile_locked || tile_forced() {
             self.want_tile
         } else {
             tile_for(self.ty, rows, users)
@@ -984,5 +1121,46 @@ mod tests {
         // down (2560 rows) and a 1024-token dense chunk keep USERS_MAX.
         assert_eq!(upz_for(2560, 8, super::USERS_MAX), 8);
         assert_eq!(upz_for(640, 1024, super::USERS_MAX), 8);
+    }
+}
+
+#[cfg(test)]
+mod tile_table_tests {
+    use super::*;
+
+    fn cell(ty: &str, rows: usize, users: usize, tile: &str) -> TileCell {
+        TileCell {
+            ty: ty.into(),
+            rows,
+            users,
+            tile: tile.into(),
+            us: 1.0,
+        }
+    }
+
+    /// A calibrated table installed at startup must win over the built-in rule, and
+    /// must be per type: BF16 and IQ3_S legitimately disagree at the same shape.
+    #[test]
+    fn the_installed_table_overrides_the_builtin_rule() {
+        // Built-in rule says 4x2 for a narrow shape at 128 users.
+        assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((4, 2)));
+        set_tile_table(vec![
+            cell("IQ3_S", 640, 128, "8x8"),
+            cell("BF16", 640, 128, "4x4"),
+        ]);
+        assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((8, 8)));
+        assert_eq!(tile_for(QuantType::Bf16, 640, 128), Some((4, 4)));
+        // A type the table does not cover falls back to the rule.
+        assert_eq!(tile_for(QuantType::Q6K, 640, 128), Some((4, 2)));
+        // Nearest cell wins for a shape between samples.
+        set_tile_table(vec![
+            cell("IQ3_S", 640, 64, "4x2"),
+            cell("IQ3_S", 2560, 1024, "8x8"),
+        ]);
+        assert_eq!(tile_for(QuantType::Iq3S, 700, 70), Some((4, 2)));
+        assert_eq!(tile_for(QuantType::Iq3S, 2400, 1000), Some((8, 8)));
+        // An empty table restores the rule.
+        set_tile_table(Vec::new());
+        assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((4, 2)));
     }
 }

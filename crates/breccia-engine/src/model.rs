@@ -1637,7 +1637,7 @@ fn profile_entries(
             None
         })
     });
-    devices
+    let entries: Vec<Option<breccia_profile::schema::DeviceEntry>> = devices
         .iter()
         .map(|d| {
             let want = breccia_vk::pci::normalize_address(&d.info.pci_address);
@@ -1655,7 +1655,34 @@ fn profile_entries(
             }
             entry.cloned()
         })
-        .collect()
+        .collect();
+
+    // Install the calibrated GEMM tile table (startup, from the profile). Only
+    // cells measured by *this* build count: a shader change invalidates them, the
+    // same rule `PrefillVerdict` follows. With no table the kernels fall back to
+    // their built-in rule, so a fresh machine behaves exactly as before.
+    let cells: Vec<breccia_kernels::gemm::TileCell> = entries
+        .iter()
+        .flatten()
+        .filter_map(|e| e.kernel.as_ref())
+        .filter(|k| k.spirv_hash == breccia_kernels::SPIRV_HASH)
+        .flat_map(|k| k.tiles.iter())
+        .map(|t| breccia_kernels::gemm::TileCell {
+            ty: t.ty.clone(),
+            rows: t.rows,
+            users: t.users,
+            tile: t.tile.clone(),
+            us: t.us,
+        })
+        .collect();
+    if verbose && !cells.is_empty() {
+        eprintln!(
+            "breccia: kernels: {} calibrated tile cells from the profile",
+            cells.len()
+        );
+    }
+    breccia_kernels::gemm::set_tile_table(cells);
+    entries
 }
 
 /// The devices of this placement, annotated with what the profile measured.

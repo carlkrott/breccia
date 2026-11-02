@@ -370,6 +370,7 @@ mod tests {
             role_reason: d.reason,
             role_notes: d.notes,
             prefill: None,
+            kernel: None,
         }
     }
 

@@ -63,6 +63,39 @@ pub struct DeviceEntry {
     /// correctly *and* faster. Optional and additive (older readers ignore it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefill: Option<PrefillVerdict>,
+    /// `breccia profile --kernels`: which GEMM tile this card measured fastest at
+    /// each (rows, users) cell. Optional and additive; the engine installs it at
+    /// load so the kernel choice travels with the hardware instead of being
+    /// compiled in for the developer's card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<KernelVerdict>,
+}
+
+/// One card's kernel-geometry calibration.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct KernelVerdict {
+    pub driver_version: String,
+    /// `breccia_kernels::SPIRV_HASH` of the build that measured it: a shader change
+    /// invalidates the table, exactly like `PrefillVerdict`.
+    pub spirv_hash: String,
+    pub timestamp: String,
+    /// One row per measured cell.
+    #[serde(default)]
+    pub tiles: Vec<TileChoice>,
+}
+
+/// The winning tiled build at one (rows, users) cell.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct TileChoice {
+    /// Quant type name; the optimum is type-specific.
+    #[serde(default)]
+    pub ty: String,
+    pub rows: usize,
+    pub users: usize,
+    /// `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"`.
+    pub tile: String,
+    /// Mean microseconds over the types swept at this cell.
+    pub us: f64,
 }
 
 /// One card's merged-prefill discovery result. Stale (and so not trusted) when
@@ -290,6 +323,7 @@ mod tests {
                 role_reason: "test".into(),
                 role_notes: vec!["note".into()],
                 prefill: None,
+                kernel: None,
             }],
             host: HostInfo {
                 hostname: "host".into(),
