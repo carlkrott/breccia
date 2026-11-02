@@ -94,7 +94,7 @@ pub struct ArenaOpts {
 /// 1366-token chunks at ctx 4200 = 1881 MiB (1.38); flat in ctx, so 1.5 for slack.
 /// shortcut: measured on this model only; derive it from the session's real
 /// allocations once a second model ships.
-pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 3 << 19;
+pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 1 << 20;
 
 impl ArenaOpts {
     /// Both reserves grown by the scratch a `chunk`-token prefill allocates after
@@ -349,11 +349,12 @@ mod tests {
     fn prefill_chunk_grows_both_reserves() {
         let o = ArenaOpts::default();
         assert_eq!(o.with_prefill_chunk(0, 4096), o);
+        let per = PREFILL_SCRATCH_PER_TOKEN;
         let c = o.with_prefill_chunk(1024, 4096); // chunks up to 1536 tokens
-        assert_eq!(c.headroom - o.headroom, 2304 << 20);
-        assert_eq!(c.display_reserve - o.display_reserve, 2304 << 20);
+        assert_eq!(c.headroom - o.headroom, 1536 * per);
+        assert_eq!(c.display_reserve - o.display_reserve, 1536 * per);
         let c = o.with_prefill_chunk(2048, 1100); // the ctx caps the chunk
-        assert_eq!(c.headroom - o.headroom, 1650 << 20);
+        assert_eq!(c.headroom - o.headroom, 1100 * per);
     }
 
     use super::*;
