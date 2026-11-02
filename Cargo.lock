@@ -115,6 +115,7 @@ dependencies = [
  "breccia-format",
  "breccia-kernels",
  "breccia-profile",
+ "breccia-server",
  "breccia-vk",
  "clap",
  "serde",

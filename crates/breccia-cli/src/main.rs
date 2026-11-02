@@ -89,8 +89,29 @@ enum Command {
         #[arg(long, value_name = "TEXT", default_value = "")]
         cpu_lane_reason: String,
     },
-    /// Phase 2: OpenAI-compatible agent server (parsing surface present now)
+    /// OpenAI-compatible HTTP server over the in-process engine
     Serve {
+        /// TCP port (binds 127.0.0.1)
+        #[arg(long, default_value_t = 8164)]
+        port: u16,
+        /// Model shard glob
+        #[arg(long, value_name = "GLOB", default_value = DEFAULT_MODEL_GLOB)]
+        gguf: String,
+        /// Device plan (repeatable PCI address / index); empty = the profile's choice
+        #[arg(long, value_name = "PCI")]
+        devices: Vec<String>,
+        /// Context capacity in tokens
+        #[arg(long, default_value_t = 8192)]
+        ctx: usize,
+        /// Expert placement: `auto`, `off`, or a per-stream block list
+        #[arg(long, default_value = "auto")]
+        gpu_experts: String,
+        /// Upper bound on `max_tokens` a request may ask for
+        #[arg(long, default_value_t = 1024)]
+        max_tokens: usize,
+        /// Merged prefill chunk
+        #[arg(long, default_value_t = 1024)]
+        prefill_chunk: usize,
         /// Resolve and print the backend/device/placement plan, launch nothing
         #[arg(long)]
         dry_run_plan: bool,
@@ -481,7 +502,31 @@ fn run(cli: Cli) -> Result<()> {
             cpu_lane,
             cpu_lane_reason,
         }),
-        Command::Serve { dry_run_plan, args } => serve(dry_run_plan, args),
+        Command::Serve {
+            port,
+            gguf,
+            devices,
+            ctx,
+            gpu_experts,
+            max_tokens,
+            prefill_chunk,
+            dry_run_plan,
+            args,
+        } => {
+            if dry_run_plan || !args.is_empty() {
+                serve_plan(dry_run_plan, args)
+            } else {
+                serve_http(ServeArgs {
+                    port,
+                    gguf,
+                    devices,
+                    ctx,
+                    gpu_experts,
+                    max_tokens,
+                    prefill_chunk,
+                })
+            }
+        }
         Command::Bench { kind: None } => {
             println!(
                 "bench: available harnesses\n  \
@@ -1591,7 +1636,7 @@ fn print_transfer_summary(rep: &breccia_vk::TransferReport) {
     }
 }
 
-fn serve(dry_run: bool, args: Vec<String>) -> Result<()> {
+fn serve_plan(dry_run: bool, args: Vec<String>) -> Result<()> {
     if args.is_empty() {
         println!(
             "serve: phase-2 (no arguments given).\n\
@@ -4477,4 +4522,111 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         println!("wrote {}", path.display());
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `breccia serve`: an OpenAI-compatible HTTP surface over one session.
+// ---------------------------------------------------------------------------
+
+struct ServeArgs {
+    port: u16,
+    gguf: String,
+    devices: Vec<String>,
+    ctx: usize,
+    gpu_experts: String,
+    max_tokens: usize,
+    prefill_chunk: usize,
+}
+
+/// The engine, adapted to what the HTTP layer needs.
+struct EngineBackend<'a, 'm> {
+    sess: &'a mut breccia_engine::Session<'m>,
+    tok: breccia_format::tokenizer::Tokenizer,
+    name: String,
+    max_tokens: usize,
+}
+
+impl breccia_server::Backend for EngineBackend<'_, '_> {
+    fn model_name(&self) -> String {
+        self.name.clone()
+    }
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
+        Ok(self.tok.encode(text))
+    }
+    fn decode_text(&self, ids: &[u32]) -> String {
+        self.tok.decode(ids)
+    }
+    fn complete(&mut self, prompt: &[u32], max_tokens: usize) -> Result<Vec<u32>, String> {
+        let n = max_tokens.min(self.max_tokens).max(1);
+        self.sess
+            .generate(prompt, n, None)
+            .map(|g| g.tokens)
+            .map_err(|e| e.to_string())
+    }
+    fn eos(&self) -> Option<u32> {
+        self.tok.eos
+    }
+    fn special(&self, text: &str) -> Option<u32> {
+        self.tok.id(text)
+    }
+}
+
+fn serve_http(a: ServeArgs) -> Result<()> {
+    let arena = if a.gpu_experts == "auto" {
+        breccia_engine::ArenaSpec::Auto(
+            breccia_engine::ArenaOpts {
+                display_reserve: 2560 << 20,
+                ..Default::default()
+            }
+            .with_prefill_chunk(a.prefill_chunk, a.ctx),
+        )
+    } else {
+        breccia_engine::ArenaSpec::parse(&a.gpu_experts).map_err(anyhow::Error::msg)?
+    };
+    let model = breccia_engine::Model::load(
+        &a.gguf,
+        &breccia_engine::LoadOptions {
+            devices: a.devices.clone(),
+            ctx_capacity: a.ctx,
+            head_device: breccia_engine::HeadSpec::Auto,
+            arena,
+            verbose: true,
+            ..Default::default()
+        },
+    )
+    .with_context(|| format!("loading the model ({})", a.gguf))?;
+    print!("{}", model.stats.banner(&model.cfg));
+    let mut sess = breccia_engine::Session::new(
+        &model,
+        &breccia_engine::SessionCfg {
+            ctx_capacity: a.ctx,
+            threads: 0,
+            timers: false,
+            batching: true,
+            inbatch_read: true,
+            prefill_chunk: a.prefill_chunk,
+            prefill_merged: true,
+            probe: false,
+            pool: None,
+        },
+    )?;
+    let shards = breccia_format::shard::ShardSet::open_glob(&a.gguf)
+        .with_context(|| format!("opening the model shards ({})", a.gguf))?;
+    let tok = breccia_format::tokenizer::Tokenizer::from_shards(&shards)?;
+    println!(
+        "tokenizer: {} ({} tokens), bos {:?}, eos {:?}",
+        tok.pre,
+        tok.vocab_size(),
+        tok.bos,
+        tok.eos
+    );
+    let name = "breccia".to_string();
+    let backend = EngineBackend {
+        sess: &mut sess,
+        tok,
+        name,
+        max_tokens: a.max_tokens,
+    };
+    breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
+        .map_err(|e| anyhow::anyhow!("server: {e}"))
 }

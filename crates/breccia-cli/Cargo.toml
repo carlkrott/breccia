@@ -16,6 +16,7 @@ breccia-vk = { path = "../breccia-vk" }
 breccia-kernels = { path = "../breccia-kernels" }
 breccia-engine = { path = "../breccia-engine" }
 breccia-format = { path = "../breccia-format" }
+breccia-server = { path = "../breccia-server" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
