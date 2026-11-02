@@ -334,3 +334,123 @@ fn a_calibrated_dot_cell_routes_run_at_to_the_dot_body() {
     gpu.destroy_buf(&x);
     gpu.destroy_buf(&o);
 }
+
+/// **The prepass**: a BF16 weight matrix declared eligible (`set_dot_weights`) and a
+/// calibrated `dot` cell must run the mixed-dot body on an f16-pair copy of those
+/// weights, and match a CPU reference that does the same BF16 -> f16 conversion.
+/// Values are multiples of 1/64 in [-2, 2), i.e. exact in both formats, so the
+/// reference is the kernel's arithmetic rather than a rounding argument.
+#[test]
+fn a_bf16_matrix_runs_on_the_dot_after_the_f16_prepass() {
+    use breccia_kernels::gemm::{set_tile_table, GemmMany, TileCell};
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("dot_prepass: SKIPPED — set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let Some((_host, gpu)) = open(&selector) else {
+        return;
+    };
+    if !DotGemm::supported(&gpu) {
+        eprintln!("dot_prepass: SKIPPED — no extension");
+        return;
+    }
+    println!(
+        "dot_prepass: {:>10} {:>6} {:>10} {:>10}  ratio",
+        "shape", "users", "dot us", "bf16 us"
+    );
+    for (rows, cols, users, name) in [
+        (640usize, 2560usize, 128usize, "gate"),
+        (640, 2560, 1024, "gate"),
+        (2560, 640, 128, "down"),
+        (2560, 640, 1024, "down"),
+    ] {
+        let mut seed = 0x51ed_2a37u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 20) & 0xff) as f32 / 64.0 - 2.0
+        };
+        let wf: Vec<f32> = (0..rows * cols).map(|_| next()).collect();
+        let xf: Vec<f32> = (0..users * cols).map(|_| next()).collect();
+        // BF16 storage (top 16 bits), which is what the engine uploads.
+        let mut wbytes = Vec::with_capacity(rows * cols * 2);
+        for v in &wf {
+            wbytes.extend_from_slice(&((v.to_bits() >> 16) as u16).to_le_bytes());
+        }
+        let mut xbytes = Vec::with_capacity(users * cols * 4);
+        for v in &xf {
+            xbytes.extend_from_slice(&v.to_le_bytes());
+        }
+        let w = upload(&gpu, &wbytes).expect("w");
+        let x = upload(&gpu, &xbytes).expect("x");
+        let o = alloc(&gpu, (rows * users * 4) as u64).expect("o");
+        let o2 = alloc(&gpu, (rows * users * 4) as u64).expect("o2");
+
+        // Calibration says this cell wants the dot.
+        set_tile_table(vec![TileCell {
+            ty: "BF16".into(),
+            rows,
+            users,
+            tile: "dot".into(),
+            us: 1.0,
+        }]);
+        let mut dot = GemmMany::new(&gpu, QuantType::Bf16).expect("gemm");
+        // The weights are BF16: the prepass converts and caches them.
+        dot.set_dot_bf16(true);
+        let plain = GemmMany::new(&gpu, QuantType::Bf16).expect("plain gemm");
+
+        dot.run_at(&w, &x, &o, rows, cols, users, 0)
+            .expect("dot run");
+        plain
+            .run_at(&w, &x, &o2, rows, cols, users, 0)
+            .expect("bf16 run");
+        let got = breccia_kernels::ops::download_f32(&gpu, &o, rows * users).expect("read");
+        let want = breccia_kernels::ops::download_f32(&gpu, &o2, rows * users).expect("read2");
+
+        let mut worst_cpu = 0f32;
+        let mut worst_bf16 = 0f32;
+        // Sample the first 4 users and 16 rows: the kernel is uniform over both, so
+        // a full O(rows*cols*users) CPU reference would cost seconds for nothing.
+        for u in 0..users.min(4) {
+            for r in 0..rows.min(16) {
+                let mut acc = 0f32;
+                for k in 0..cols {
+                    acc += to_f32(half(wf[r * cols + k])) * to_f32(half(xf[u * cols + k]));
+                }
+                worst_cpu = worst_cpu.max((got[u * rows + r] - acc).abs());
+                worst_bf16 = worst_bf16.max((got[u * rows + r] - want[u * rows + r]).abs());
+            }
+        }
+        // Timing: best of 4 for each path.
+        let mut t_dot = f64::INFINITY;
+        let mut t_bf16 = f64::INFINITY;
+        for pass in 0..5 {
+            let t0 = std::time::Instant::now();
+            dot.run_at(&w, &x, &o, rows, cols, users, 0).expect("dot");
+            if pass > 0 {
+                t_dot = t_dot.min(t0.elapsed().as_secs_f64() * 1e6);
+            }
+            let t1 = std::time::Instant::now();
+            plain
+                .run_at(&w, &x, &o2, rows, cols, users, 0)
+                .expect("bf16");
+            if pass > 0 {
+                t_bf16 = t_bf16.min(t1.elapsed().as_secs_f64() * 1e6);
+            }
+        }
+        println!(
+            "dot_prepass: {name:>10} {users:>6} {t_dot:>10.1} {t_bf16:>10.1}  {:.2}x  \
+             |err vs CPU| {worst_cpu:.2e}, vs BF16 {worst_bf16:.2e}",
+            t_bf16 / t_dot
+        );
+        assert!(worst_cpu < 1e-2, "{name}: dot off CPU by {worst_cpu:.3e}");
+        assert!(
+            worst_bf16 < 5e-2,
+            "{name}: dot vs BF16 path by {worst_bf16:.3e}"
+        );
+        set_tile_table(Vec::new());
+        gpu.destroy_buf(&w);
+        gpu.destroy_buf(&x);
+        gpu.destroy_buf(&o);
+        gpu.destroy_buf(&o2);
+    }
+}

@@ -54,6 +54,14 @@ pub struct GemmMany<'g> {
     /// The caller's declaration that this matrix's weights are f16 pairs (two per
     /// word). Default false: quantised bits must never be read as f16.
     dot_weights: bool,
+    /// The caller's declaration that this matrix's weights are **BF16** and may be
+    /// converted to f16 pairs once ([`GemmMany::set_dot_bf16`]). Kept separate from
+    /// `dot_weights` so an already-f16 buffer is never re-interpreted as BF16.
+    dot_bf16: bool,
+    /// BF16 weight tensors converted to f16 pairs, keyed by source `Buf::id`. The
+    /// conversion is the prepass the dot needs: BF16 and f16 are both 2 bytes, so
+    /// the copy is the same size as the tensor it mirrors, made once on first use.
+    dot_cache: std::sync::Mutex<std::collections::HashMap<u64, Buf>>,
     /// `set_tile(Some(_))` was called: use exactly that tile, bypassing both the
     /// env override and the measured rule (calibration and A/B rely on this).
     tile_locked: bool,
@@ -610,6 +618,8 @@ impl<'g> GemmMany<'g> {
                 None
             },
             dot_weights: false,
+            dot_bf16: false,
+            dot_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             tile_locked: false,
             tables,
         })
@@ -630,6 +640,13 @@ impl<'g> GemmMany<'g> {
     /// the calibration says, so a quantised tensor cannot be misread as f16.
     pub fn set_dot_weights(&mut self, on: bool) {
         self.dot_weights = on;
+    }
+
+    /// Declare that this matrix's weights are **BF16** and may be converted to f16
+    /// pairs on first use (the prepass). Separate from [`GemmMany::set_dot_weights`],
+    /// which promises the buffer is already f16 pairs.
+    pub fn set_dot_bf16(&mut self, on: bool) {
+        self.dot_bf16 = on;
     }
 
     /// Whether the dot body is available and declared usable for this matrix.
@@ -864,12 +881,33 @@ impl<'g> GemmMany<'g> {
         if users == 0 {
             return Err(anyhow!("users must be at least 1"));
         }
-        // Calibrated dot cell + declared f16 weights: run the mixed-dot body.
-        if self.dot_weights {
-            if let (Some(Choice::Dot), Some(dot)) =
-                (choice_from_table(self.ty, rows, users), self.dot.as_ref())
-            {
-                return dot.run_tiled(w, x, out, rows, cols, users);
+        // Calibrated dot cell + declared weights: run the mixed-dot body.
+        // `dot_weights` promises f16 pairs already; `dot_bf16` converts the tensor
+        // once here (the prepass) and caches it by source buffer.
+        if base_words == 0 {
+            let choice = choice_from_table(self.ty, rows, users);
+            if choice != Some(Choice::Dot) && (self.dot_weights || self.dot_bf16) {
+                dot_log_reject(rows, cols, users, choice, self.dot.is_some());
+            }
+            if let (Some(Choice::Dot), Some(dot)) = (choice, self.dot.as_ref()) {
+                if self.dot_weights {
+                    dot_log(rows, cols, users);
+                    return dot.run_tiled(w, x, out, rows, cols, users);
+                }
+                if self.dot_bf16 && self.ty == QuantType::Bf16 {
+                    let mut cache = self.dot_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if let std::collections::hash_map::Entry::Vacant(slot) = cache.entry(w.id) {
+                        // A refused conversion keeps the BF16 path: running on a
+                        // different matrix than the caller passed is not an option.
+                        if let Ok(b) = f16_pairs_from_bf16(self.gpu, w, rows, cols) {
+                            slot.insert(b);
+                        }
+                    }
+                    if let Some(b) = cache.get(&w.id) {
+                        dot_log(rows, cols, users);
+                        return dot.run_tiled(b, x, out, rows, cols, users);
+                    }
+                }
             }
         }
         if let Some((kernel, t)) = self.tiled(rows, users) {
@@ -1452,5 +1490,114 @@ mod dot_selection_tests {
         // A type with no cells falls back to the built-in rule.
         assert_eq!(choice_from_table(QuantType::Q6K, 640, 128), None);
         set_tile_table(Vec::new());
+    }
+}
+
+/// BF16 (`u16` bits, 8-bit exponent) as f32: exact, since f32 holds every BF16.
+fn bf16_to_f32(h: u16) -> f32 {
+    f32::from_bits((h as u32) << 16)
+}
+
+/// f32 -> f16 bits, round-to-nearest-even. `None` when the value does not fit f16
+/// (overflow to inf, NaN), which makes the caller keep the BF16 path instead of
+/// silently running on a different matrix.
+fn f32_to_f16(v: f32) -> Option<u16> {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let man = bits & 0x7f_ffff;
+    if exp == 0xff {
+        return None; // inf / NaN
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return None; // magnitude above f16's 65504
+    }
+    if e <= 0 {
+        // Subnormal f16 (or zero): shift the implicit bit into place.
+        if e < -10 {
+            return Some(sign); // rounds to zero
+        }
+        let m = man | 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = m >> shift;
+        let rem = m & ((1u32 << shift) - 1);
+        let tie = 1u32 << (shift - 1);
+        let up = rem > tie || (rem == tie && (half & 1) == 1);
+        return Some(sign | (half + up as u32) as u16);
+    }
+    let half = ((e as u32) << 10) | (man >> 13);
+    let rem = man & 0x1fff;
+    let up = rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1);
+    let rounded = half + up as u32;
+    if (rounded & 0x7c00) == 0x7c00 {
+        return None; // rounded up into inf
+    }
+    Some(sign | rounded as u16)
+}
+
+/// The prepass: read a BF16 weight matrix off the device, convert it to f16 pairs
+/// (two per 32-bit word, low half first, the layout `gemm_f16_dot.spvasm` reads) and
+/// upload the copy. One-time per tensor; same size as the source.
+fn f16_pairs_from_bf16(gpu: &Gpu, w: &Buf, rows: usize, cols: usize) -> Result<Buf> {
+    if !cols.is_multiple_of(2) {
+        anyhow::bail!("f16 prepass needs an even `cols`, got {cols}");
+    }
+    let n = rows * cols;
+    let bytes =
+        crate::gemv::download(gpu, w, n * 2).map_err(|e| anyhow!("f16 prepass read: {e}"))?;
+    if bytes.len() != n * 2 {
+        anyhow::bail!("f16 prepass read {} of {} bytes", bytes.len(), n * 2);
+    }
+    let mut out = Vec::with_capacity(n * 2);
+    for pair in bytes.chunks_exact(4) {
+        let lo = u16::from_le_bytes([pair[0], pair[1]]);
+        let hi = u16::from_le_bytes([pair[2], pair[3]]);
+        let a = f32_to_f16(bf16_to_f32(lo))
+            .ok_or_else(|| anyhow!("weight does not fit f16 ({})", bf16_to_f32(lo)))?;
+        let b = f32_to_f16(bf16_to_f32(hi))
+            .ok_or_else(|| anyhow!("weight does not fit f16 ({})", bf16_to_f32(hi)))?;
+        let word = (a as u32) | ((b as u32) << 16);
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    crate::gemv::upload(gpu, &out).map_err(|e| anyhow!("f16 prepass upload: {e}"))
+}
+
+/// `BRECCIA_DOT_LOG=1`: name each (shape, users) cell the BF16 prepass hands to the
+/// mixed-dot body, once per process — the evidence that a real model run uses it.
+fn dot_log(rows: usize, cols: usize, users: usize) {
+    if std::env::var("BRECCIA_DOT_LOG").map_or(true, |v| v == "0") {
+        return;
+    }
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, usize)>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((rows, users))
+    {
+        eprintln!("breccia: mixed-dot on BF16 {rows}x{cols} x {users} users");
+    }
+}
+
+/// `BRECCIA_DOT_LOG=1`: once per shape, why a BF16 GEMM eligible for the prepass did
+/// not take the dot (no calibrated cell, or no pipeline). Diagnostic only.
+fn dot_log_reject(rows: usize, cols: usize, users: usize, c: Option<Choice>, have: bool) {
+    if std::env::var("BRECCIA_DOT_LOG").map_or(true, |v| v == "0") {
+        return;
+    }
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(usize, usize)>>> =
+        std::sync::OnceLock::new();
+    let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    if seen
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((rows, users))
+    {
+        eprintln!(
+            "breccia: dot declined {rows}x{cols} x {users} users: cell {:?}, pipeline {have}",
+            c
+        );
     }
 }

@@ -1241,7 +1241,22 @@ impl<'g> PipelineSet<'g> {
                 continue;
             }
             match breccia_kernels::gemm::GemmMany::new(gpu, k.ty) {
-                Ok(g) => {
+                Ok(mut g) => {
+                    // BF16 is f16-presentable in 2 bytes, so the mixed-dot body can
+                    // serve it after a one-time conversion (GemmMany caches the f16
+                    // copy per tensor). The calibrated table still decides *where*;
+                    // this only says the type is eligible.
+                    // `BRECCIA_F16_PREPASS=1` opts in. Default **off**: measured at
+                    // 1k, the dot body converts the f32 activations to f16 too, and
+                    // that moves the distribution (KL 1.3e-1) and the greedy sequence
+                    // (first difference at token 2), i.e. it fails the parity gate even
+                    // though every weight is exact. Faster (1.1-3.0x per GEMM where the
+                    // dot wins) but not yet accuracy-neutral; see gemm.rs.
+                    if k.ty == breccia_kernels::QuantType::Bf16
+                        && std::env::var("BRECCIA_F16_PREPASS").is_ok_and(|v| v == "1")
+                    {
+                        g.set_dot_bf16(true);
+                    }
                     gemm.insert(k.ty, g);
                 }
                 Err(_) if !is_expert_role => {}
