@@ -260,3 +260,77 @@ fn tiled_dot_gemm_matches_the_naive_body() {
     gpu.destroy_buf(&a);
     gpu.destroy_buf(&b);
 }
+
+/// **Selection path**: a calibrated `dot` cell plus a caller that declares f16
+/// weights must make `GemmMany::run_at` dispatch the mixed-dot body — and the
+/// result must match a CPU reference. Without the declaration it must stay on the
+/// tile build, so a quantised tensor can never be read as f16.
+#[test]
+fn a_calibrated_dot_cell_routes_run_at_to_the_dot_body() {
+    use breccia_kernels::gemm::{set_tile_table, GemmMany, TileCell};
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("dot_select: SKIPPED — set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let Some((_host, gpu)) = open(&selector) else {
+        return;
+    };
+    if !DotGemm::supported(&gpu) {
+        eprintln!("dot_select: SKIPPED — no extension");
+        return;
+    }
+    let (rows, cols, users) = (64usize, 64usize, 8usize);
+    let mut seed = 0x5eed_1234u32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        ((seed >> 20) & 0xff) as f32 / 64.0 - 2.0
+    };
+    let wf: Vec<f32> = (0..rows * cols).map(|_| next()).collect();
+    let xf: Vec<f32> = (0..users * cols).map(|_| next()).collect();
+    let mut wbytes = Vec::new();
+    for pair in wf.chunks(2) {
+        let lo = half(pair[0]) as u32;
+        let hi = half(pair[1]) as u32;
+        wbytes.extend_from_slice(&(lo | (hi << 16)).to_le_bytes());
+    }
+    let mut xbytes = Vec::new();
+    for v in &xf {
+        xbytes.extend_from_slice(&v.to_le_bytes());
+    }
+    let w = upload(&gpu, &wbytes).expect("w");
+    let x = upload(&gpu, &xbytes).expect("x");
+    let o = alloc(&gpu, (rows * users * 4) as u64).expect("o");
+
+    // The dot wins at this cell (calibrated), and the caller declares f16 weights.
+    set_tile_table(vec![TileCell {
+        ty: "BF16".into(),
+        rows,
+        users,
+        tile: "dot".into(),
+        us: 1.0,
+    }]);
+    let mut gemm = GemmMany::new(&gpu, QuantType::Bf16).expect("gemm");
+    assert!(!gemm.dot_available(), "not declared yet");
+    gemm.set_dot_weights(true);
+    assert!(gemm.dot_available(), "declared f16 weights");
+    gemm.run_at(&w, &x, &o, rows, cols, users, 0)
+        .expect("run_at");
+    let got = breccia_kernels::ops::download_f32(&gpu, &o, rows * users).expect("readback");
+
+    let mut worst = 0f32;
+    for u in 0..users {
+        for r in 0..rows {
+            let mut acc = 0f32;
+            for k in 0..cols {
+                acc += to_f32(half(wf[r * cols + k])) * to_f32(half(xf[u * cols + k]));
+            }
+            worst = worst.max((got[u * rows + r] - acc).abs());
+        }
+    }
+    println!("dot_select: run_at via the calibrated dot cell, worst |err| {worst:.3e}");
+    assert!(worst < 1e-3, "the routed dot body is wrong: {worst:.3e}");
+    set_tile_table(Vec::new());
+    gpu.destroy_buf(&w);
+    gpu.destroy_buf(&x);
+    gpu.destroy_buf(&o);
+}

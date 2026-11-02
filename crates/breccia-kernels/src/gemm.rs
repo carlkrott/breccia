@@ -47,6 +47,13 @@ pub struct GemmMany<'g> {
     hcgate: Option<breccia_vk::ctx::Kernel>,
     /// Forced users per z slice (1..=USERS_MAX); `None` = [`upz_for`] per dispatch.
     upz: Option<usize>,
+    /// The mixed-float-dot body, when the device advertises the extension. Only
+    /// dispatched when the caller declared its weights to be f16 pairs
+    /// ([`GemmMany::set_dot_weights`]) *and* the calibration chose `dot` here.
+    dot: Option<DotGemm<'g>>,
+    /// The caller's declaration that this matrix's weights are f16 pairs (two per
+    /// word). Default false: quantised bits must never be read as f16.
+    dot_weights: bool,
     /// `set_tile(Some(_))` was called: use exactly that tile, bypassing both the
     /// env override and the measured rule (calibration and A/B rely on this).
     tile_locked: bool,
@@ -189,6 +196,26 @@ pub fn calibrate_tiles(
                     }
                 }
             }
+            // Mixed-dot candidate: same shapes, f16-pair weights. It is measured
+            // whenever the device advertises the extension, so the table can say
+            // "the dot wins here"; the *runtime* additionally requires the caller to
+            // declare f16 weights (`set_dot_weights`), so a quantised tensor can
+            // never be routed to it by a stale verdict.
+            let mut dot_us = f64::INFINITY;
+            if let Ok(dot) = DotGemm::new_tiled(gpu) {
+                for pass in 0..4 {
+                    let t0 = std::time::Instant::now();
+                    if dot.run_tiled(&w, &x, &o, rows, cols, users).is_err() {
+                        break;
+                    }
+                    if pass > 0 {
+                        let dt = t0.elapsed().as_secs_f64() * 1e6;
+                        if dt < dot_us {
+                            dot_us = dt;
+                        }
+                    }
+                }
+            }
             gemm.set_tile(None);
             gpu.destroy_buf(&w);
             gpu.destroy_buf(&x);
@@ -200,20 +227,55 @@ pub fn calibrate_tiles(
                     best = i;
                 }
             }
-            if !totals[best].is_finite() {
+            if !totals[best].is_finite() && !dot_us.is_finite() {
                 continue;
             }
-            let t = TILES[best];
+            let (tile, us) = if dot_us.is_finite() && dot_us < totals[best] * 0.99 {
+                ("dot".to_string(), dot_us)
+            } else {
+                let t = TILES[best];
+                (format!("{}x{}", t.0, t.1), totals[best])
+            };
             out.push(TileCell {
                 ty: ty.name().to_string(),
                 rows,
                 users,
-                tile: format!("{}x{}", t.0, t.1),
-                us: totals[best],
+                tile,
+                us,
             });
         }
     }
     Ok(out)
+}
+
+/// What the calibrated table says to run at a shape: one of the GLSL tiles, or the
+/// mixed-float-dot kernel (`DotGemm`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choice {
+    Tile(Tile),
+    Dot,
+}
+
+/// The nearest calibrated cell in log space, per type, as a [`Choice`].
+fn choice_from_table(ty: QuantType, rows: usize, users: usize) -> Option<Choice> {
+    let t = tile_table().read().ok()?;
+    let want = ty.name();
+    let mut near: Option<&TileCell> = None;
+    let d = |c: &TileCell| {
+        ((rows.max(1) as f64).ln() - (c.rows.max(1) as f64).ln()).powi(2)
+            + ((users.max(1) as f64).ln() - (c.users.max(1) as f64).ln()).powi(2)
+    };
+    for c in t.iter().filter(|c| c.ty == want) {
+        near = match near {
+            Some(b) if d(b) <= d(c) => Some(b),
+            _ => Some(c),
+        };
+    }
+    let c = near?;
+    if c.tile == "dot" {
+        return Some(Choice::Dot);
+    }
+    parse_tile(&c.tile).map(Choice::Tile)
 }
 
 /// The nearest calibrated cell in log-space, so a shape between two samples uses
@@ -224,7 +286,9 @@ fn tile_from_table(ty: QuantType, rows: usize, users: usize) -> Option<Tile> {
     let mut near: Option<&TileCell> = None;
     let lr = (rows.max(1) as f64).ln();
     let lu = (users.max(1) as f64).ln();
-    for c in t.iter().filter(|c| c.ty == want) {
+    // A calibrated `dot` cell is not a tile: skip it so the GLSL path still has a
+    // sensible answer when the caller cannot use the dot.
+    for c in t.iter().filter(|c| c.ty == want && c.tile != "dot") {
         let d = |c: &TileCell| {
             (lr - (c.rows.max(1) as f64).ln()).powi(2) + (lu - (c.users.max(1) as f64).ln()).powi(2)
         };
@@ -540,6 +604,12 @@ impl<'g> GemmMany<'g> {
                 (env_rpl().unwrap_or(t.0), env_umax().unwrap_or(t.1))
             }),
             upz: default_upz(),
+            dot: if DotGemm::supported(gpu) {
+                DotGemm::new_tiled(gpu).ok()
+            } else {
+                None
+            },
+            dot_weights: false,
             tile_locked: false,
             tables,
         })
@@ -555,6 +625,18 @@ impl<'g> GemmMany<'g> {
     }
 
     /// Force the tiled build (`None` = the GEMV-shaped builds); A/B and tests.
+    /// Declare that this matrix's weights are **f16 pairs**, which is what the
+    /// mixed-dot body reads. Without this the dot can never be dispatched, whatever
+    /// the calibration says, so a quantised tensor cannot be misread as f16.
+    pub fn set_dot_weights(&mut self, on: bool) {
+        self.dot_weights = on;
+    }
+
+    /// Whether the dot body is available and declared usable for this matrix.
+    pub fn dot_available(&self) -> bool {
+        self.dot.is_some() && self.dot_weights
+    }
+
     pub fn set_tile(&mut self, t: Option<Tile>) {
         self.want_tile = t;
         self.tile_locked = t.is_some();
@@ -781,6 +863,14 @@ impl<'g> GemmMany<'g> {
     ) -> Result<()> {
         if users == 0 {
             return Err(anyhow!("users must be at least 1"));
+        }
+        // Calibrated dot cell + declared f16 weights: run the mixed-dot body.
+        if self.dot_weights {
+            if let (Some(Choice::Dot), Some(dot)) =
+                (choice_from_table(self.ty, rows, users), self.dot.as_ref())
+            {
+                return dot.run_tiled(w, x, out, rows, cols, users);
+            }
         }
         if let Some((kernel, t)) = self.tiled(rows, users) {
             let pc = self.pc(rows, cols, users, base_words);
@@ -1125,6 +1215,13 @@ mod tests {
 }
 
 #[cfg(test)]
+mod table_lock {
+    /// The calibrated table is process-global, so the tests that install one must
+    /// not run concurrently.
+    pub static L: std::sync::Mutex<()> = std::sync::Mutex::new(());
+}
+
+#[cfg(test)]
 mod tile_table_tests {
     use super::*;
 
@@ -1142,6 +1239,9 @@ mod tile_table_tests {
     /// must be per type: BF16 and IQ3_S legitimately disagree at the same shape.
     #[test]
     fn the_installed_table_overrides_the_builtin_rule() {
+        let _g = super::table_lock::L
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Built-in rule says 4x2 for a narrow shape at 128 users.
         assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((4, 2)));
         set_tile_table(vec![
@@ -1311,5 +1411,46 @@ impl<'g> DotGemm<'g> {
             })
             .map_err(|e| anyhow!("mixed-dot GEMM dispatch: {e}"))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dot_selection_tests {
+    use super::*;
+
+    fn cell(ty: &str, rows: usize, users: usize, tile: &str) -> TileCell {
+        TileCell {
+            ty: ty.into(),
+            rows,
+            users,
+            tile: tile.into(),
+            us: 1.0,
+        }
+    }
+
+    /// A calibrated `dot` cell must be what the dispatcher consults, and it must not
+    /// disturb the tile choice (which skips `dot` cells entirely).
+    #[test]
+    fn a_dot_cell_is_a_choice_and_not_a_tile() {
+        let _g = super::table_lock::L
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_tile_table(vec![
+            cell("IQ3_S", 640, 128, "dot"),
+            cell("IQ3_S", 640, 1024, "4x4"),
+        ]);
+        assert_eq!(
+            choice_from_table(QuantType::Iq3S, 640, 128),
+            Some(Choice::Dot)
+        );
+        assert_eq!(
+            choice_from_table(QuantType::Iq3S, 640, 1024),
+            Some(Choice::Tile((4, 4)))
+        );
+        // `tile_for` ignores the dot cell and answers with the nearest real tile.
+        assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((4, 4)));
+        // A type with no cells falls back to the built-in rule.
+        assert_eq!(choice_from_table(QuantType::Q6K, 640, 128), None);
+        set_tile_table(Vec::new());
     }
 }
