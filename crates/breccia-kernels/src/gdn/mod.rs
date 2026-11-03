@@ -574,6 +574,7 @@ impl<'g> Gdn<'g> {
         self.norm_gate(&ws.step, w.ssm_norm, &ws.z, &ws.normed)?;
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_OUT);
         proj.out.run(proj.w_out, &ws.normed, out, t)?;
+        crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::AFTER_MIXER);
         Ok(())
     }
 

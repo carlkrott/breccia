@@ -271,12 +271,22 @@ fn gemm_tile_sweep() {
     println!("type,rows,shape,users,tile,us");
 
     const TLI: [breccia_kernels::gemm::Tile; 4] = [(4, 2), (4, 4), (8, 4), (8, 8)];
-    let users_list = [64usize, 96, 128, 192, 256, 512, 1024];
+    // `BRECCIA_CALIB_DENSE=1`: the prefill dense projections (ssm_out 6144->2560 and its
+    // transpose) at prefill-chunk user counts instead of the expert shapes.
+    let dense = std::env::var("BRECCIA_CALIB_DENSE").is_ok();
+    let users_list: &[usize] = if dense { &[8000] } else { &[64, 96, 128, 192, 256, 512, 1024] };
+    let shapes: &[(usize, usize, &str)] =
+        if dense { &[(2560, 6144, "ssm_out")] } else { &SHAPES };
     // One quantised type and BF16: the tile optimum is a launch-geometry property,
     // and these two cover the fastest and slowest inner loops.
-    for ty in [QuantType::Iq3S, QuantType::Bf16] {
+    let tys: &[QuantType] = if dense {
+        &[QuantType::Iq3S, QuantType::Iq4Xs, QuantType::Q4K, QuantType::Q5K, QuantType::Q6K, QuantType::Bf16]
+    } else {
+        &[QuantType::Iq3S, QuantType::Bf16]
+    };
+    for &ty in tys {
         eprintln!("tiles: type {} ...", ty.name());
-        for (rows, cols, shape) in SHAPES {
+        for &(rows, cols, shape) in shapes {
             let mut gemm = match GemmMany::new(&gpu, ty) {
                 Ok(g) => g,
                 Err(e) => {
@@ -296,7 +306,7 @@ fn gemm_tile_sweep() {
             breccia_kernels::gemv::upload_into(&gpu, &w, &vec![0u8; wbytes as usize]).expect("w");
             breccia_kernels::gemv::upload_into(&gpu, &x, &vec![0u8; max_users * cols * 4])
                 .expect("x");
-            for users in users_list {
+            for &users in users_list {
                 for t in TLI {
                     // Public path: `run_at` picks the tiled build for users >= 64,
                     // which is exactly what production does.
@@ -323,13 +333,14 @@ fn gemm_tile_sweep() {
                         best
                     );
                     eprintln!(
-                        "  {:>6} {:<5} users={:<5} tile {}x{} {:8.1} us",
+                        "  {:>6} {:<5} users={:<5} tile {}x{} {:8.1} us  {:.2} TFLOP/s",
                         ty.name(),
                         shape,
                         users,
                         t.0,
                         t.1,
-                        best
+                        best,
+                        2.0 * (rows * cols * users) as f64 / best / 1e6
                     );
                 }
             }

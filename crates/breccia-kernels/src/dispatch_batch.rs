@@ -504,6 +504,8 @@ pub mod probe {
     /// The `up` GEMM with the gated mean + inject partials as its epilogue
     /// (default on; `BRECCIA_FUSE_HC=0` opts out); replaces `HC_UP` + `HC_GATED` for that read.
     pub const HC_UP_GATED: u8 = 37;
+    /// Whatever runs after a GDN mixer's out projection until the next stage mark.
+    pub const AFTER_MIXER: u8 = 38;
     pub const GDN_Z: u8 = 29;
     pub const GDN_BETA: u8 = 30;
     pub const GDN_ALPHA: u8 = 31;
@@ -548,7 +550,7 @@ pub mod probe {
         "hc-up",
         "hc-gated",
         "hc-up-gated",
-        "",
+        "after-mixer",
         "",
     ];
 

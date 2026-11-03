@@ -256,6 +256,22 @@ pub fn calibrate_tiles(
     Ok(out)
 }
 
+/// `BRECCIA_GEMM_TRACE=1`: one stderr line per distinct (type, shape, path) a
+/// `GemmMany::run_at` dispatch takes, so a slow stage can be tied to its kernel.
+fn gemm_trace(ty: QuantType, rows: usize, cols: usize, users: usize, path: &str) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("BRECCIA_GEMM_TRACE").is_ok()) {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let key = format!("{} {rows}x{cols} users~{} {path}", ty.name(), users.next_power_of_two());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&key) {
+        eprintln!("gemm-trace: {key}");
+        seen.push(key);
+    }
+}
+
 /// What the calibrated table says to run at a shape: one of the GLSL tiles, or the
 /// mixed-float-dot kernel (`DotGemm`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -911,6 +927,7 @@ impl<'g> GemmMany<'g> {
             }
         }
         if let Some((kernel, t)) = self.tiled(rows, users) {
+            gemm_trace(self.ty, rows, cols, users, &format!("tile {}x{}", t.0, t.1));
             let pc = self.pc(rows, cols, users, base_words);
             return self.dispatch_grid(
                 kernel,
@@ -920,6 +937,7 @@ impl<'g> GemmMany<'g> {
             );
         }
         let (kernel, v) = self.plain(rows, users);
+        gemm_trace(self.ty, rows, cols, users, &format!("plain {v:?}"));
         let pc = self.pc_v(rows, cols, users, base_words, v);
         self.dispatch(kernel, &[w, x, out, &self.tables], &pc, rows / v.0, users)
     }
