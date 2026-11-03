@@ -12,5 +12,25 @@
 #define BLOCK_WORDS 8u
 #define BRECCIA_GEMM_MANY
 #include "blocks.glsl"
-#define DEQUANT_UNIT dequant_bf16_unit
+// Same bytes as `W`, viewed 16 B at a time: one load per 8-element unit instead of
+// eight u16 loads (the scalar form ran the tiled build at 3-6 TFLOP/s vs 13 for IQ3_S).
+// Values are identical, so outputs are bit-identical to `dequant_bf16_unit`.
+layout(std430, binding = 0) readonly buffer WeightQ { uvec4 W4[]; };
+void dequant_bf16_unit_v4(uint off, uint u, out float v[8]) {
+    uint o = off + 8u * u;
+    if ((o & 7u) != 0u) {
+        dequant_bf16_unit(off, u, v);
+        return;
+    }
+    uvec4 q = W4[o >> 3u];
+    v[0] = uintBitsToFloat(q.x << 16);
+    v[1] = uintBitsToFloat(q.x & 0xffff0000u);
+    v[2] = uintBitsToFloat(q.y << 16);
+    v[3] = uintBitsToFloat(q.y & 0xffff0000u);
+    v[4] = uintBitsToFloat(q.z << 16);
+    v[5] = uintBitsToFloat(q.z & 0xffff0000u);
+    v[6] = uintBitsToFloat(q.w << 16);
+    v[7] = uintBitsToFloat(q.w & 0xffff0000u);
+}
+#define DEQUANT_UNIT dequant_bf16_unit_v4
 #include "gemm_body.glsl"
