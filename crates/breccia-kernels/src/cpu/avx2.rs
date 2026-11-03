@@ -692,6 +692,85 @@ pub unsafe fn q2_0_many(row: &[u8], xs: &[*const f32], out: *mut f32) {
     }
 }
 
+/// [`iq4_nl_many`] for `IQ3_XXS`: the grid decode and sign fold happen once per
+/// unit of 8, then every user takes the same alternating `a0`/`a1` FMA as
+/// [`iq3_xxs`], so each dot is bit-identical to the single-user kernel.
+///
+/// # Safety
+/// As [`iq4_nl_many`], with whole 98-byte blocks of 256 values.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn iq3_xxs_many(row: &[u8], xs: &[*const f32], out: *mut f32) {
+    // SAFETY: as `iq3_xxs`; callers pass in-range activation pointers.
+    unsafe {
+        let m = xs.len().min(MANY_MAX);
+        let mut a0 = [_mm256_setzero_ps(); MANY_MAX];
+        let mut a1 = [_mm256_setzero_ps(); MANY_MAX];
+        let mut i = 0usize;
+        for blk in row.chunks_exact(98) {
+            let d = f16c(u16le(blk, 0));
+            for ib in 0..8 {
+                let q1 = u32le(blk, 66 + 4 * ib);
+                let dbr = d * (0.5 + ((q1 >> 28) as u8) as f32) * 0.5;
+                for l in 0..4 {
+                    let base = 2 + 8 * ib + 4 * (l / 2) + ((2 * l) & 3);
+                    let v = signed_grid4_v(
+                        &IQ3XXS_F32[blk[base] as usize],
+                        &IQ3XXS_F32[blk[base + 1] as usize],
+                        dbr,
+                        sign_bits_by_idx((q1 >> (7 * l)) & 127),
+                    );
+                    let acc = if l & 1 == 0 { &mut a0 } else { &mut a1 };
+                    for (j, xp) in xs.iter().take(m).enumerate() {
+                        acc[j] = v_fma(acc[j], v, xp.add(i));
+                    }
+                    i += 8;
+                }
+            }
+        }
+        for (u, (x, y)) in a0.iter().zip(a1.iter()).take(m).enumerate() {
+            *out.add(u) = finish(*x, *y);
+        }
+    }
+}
+
+/// [`iq3_xxs_many`] for `IQ3_S` (same structure as [`iq3_s`]).
+///
+/// # Safety
+/// As [`iq4_nl_many`], with whole 110-byte blocks of 256 values.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub unsafe fn iq3_s_many(row: &[u8], xs: &[*const f32], out: *mut f32) {
+    // SAFETY: as `iq3_s`; callers pass in-range activation pointers.
+    unsafe {
+        let m = xs.len().min(MANY_MAX);
+        let mut a0 = [_mm256_setzero_ps(); MANY_MAX];
+        let mut a1 = [_mm256_setzero_ps(); MANY_MAX];
+        let mut i = 0usize;
+        for blk in row.chunks_exact(110) {
+            let d = f16c(u16le(blk, 0));
+            for ib in 0..8 {
+                let qhb = usize::from(blk[66 + ib]);
+                let sc = blk[106 + 2 * (ib / 4) + (ib / 2) % 2];
+                let sc = if ib % 2 == 0 { sc & 0xf } else { sc >> 4 };
+                let dbr = d * (1.0 + 2.0 * f32::from(sc));
+                for l in 0..4 {
+                    let qb = 2 + 8 * ib + 4 * (l / 2) + ((2 * l) & 3);
+                    let g1 = (blk[qb] as usize) | ((qhb << (8 - 2 * l)) & 256);
+                    let g2 = (blk[qb + 1] as usize) | ((qhb << (7 - 2 * l)) & 256);
+                    let v = signed_grid4(&IQ3S_F32[g1], &IQ3S_F32[g2], dbr, blk[74 + 4 * ib + l]);
+                    let acc = if l & 1 == 0 { &mut a0 } else { &mut a1 };
+                    for (j, xp) in xs.iter().take(m).enumerate() {
+                        acc[j] = v_fma(acc[j], v, xp.add(i));
+                    }
+                    i += 8;
+                }
+            }
+        }
+        for (u, (x, y)) in a0.iter().zip(a1.iter()).take(m).enumerate() {
+            *out.add(u) = finish(*x, *y);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Q4_K / Q5_K
 // ---------------------------------------------------------------------------
@@ -1033,7 +1112,7 @@ mod tests {
         }
         let cols: usize = 2560;
         let rows: usize = 3;
-        for ty in [QuantType::Iq4Nl, QuantType::Q2_0] {
+        for ty in [QuantType::Iq4Nl, QuantType::Q2_0, QuantType::Iq3Xxs, QuantType::Iq3S] {
             let bpr = cols.div_ceil(ty.block_elems());
             let bb = ty.block_bytes();
             let mut packed = vec![0u8; rows * bpr * bb];

@@ -108,6 +108,8 @@ pub fn gemv_into_many(
                     match ty {
                         QuantType::Iq4Nl => avx2::iq4_nl_many(row, &ptrs, tmp.as_mut_ptr()),
                         QuantType::Q2_0 => avx2::q2_0_many(row, &ptrs, tmp.as_mut_ptr()),
+                        QuantType::Iq3Xxs => avx2::iq3_xxs_many(row, &ptrs, tmp.as_mut_ptr()),
+                        QuantType::Iq3S => avx2::iq3_s_many(row, &ptrs, tmp.as_mut_ptr()),
                         _ => unreachable!(),
                     }
                 }
@@ -134,7 +136,10 @@ pub fn gemv_into_many(
 
 /// Does [`gemv_into_many`] amortise the decode for `ty` on this machine?
 pub fn many_supported(path: Path, ty: QuantType) -> bool {
-    path == Path::Avx2 && matches!(ty, QuantType::Iq4Nl | QuantType::Q2_0)
+    path == Path::Avx2 && matches!(
+            ty,
+            QuantType::Iq4Nl | QuantType::Q2_0 | QuantType::Iq3Xxs | QuantType::Iq3S
+        )
 }
 
 /// Which code path a dot product takes.

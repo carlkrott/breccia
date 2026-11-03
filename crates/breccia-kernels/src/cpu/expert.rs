@@ -798,6 +798,31 @@ fn run_shard(set: &ShardSet, path: Path, shard: &Shard) -> Option<Vec<f32>> {
         );
         return Some(values);
     }
+    // Same for gate and up: dequantise each row once for every user, then the
+    // per-user SwiGLU (bit-identical per user, §8t).
+    let (g, up) = (plan.gate, plan.up);
+    if m > 1
+        && shard.kind == ShardKind::GateUp
+        && crate::cpu::many_supported(path, g.ty)
+        && crate::cpu::many_supported(path, up.ty)
+    {
+        let act = &shard.x;
+        let mut xs: Vec<&[f32]> = Vec::with_capacity(m);
+        for &(_, x_off, _) in shard.users.iter() {
+            xs.push(act.get(x_off..x_off + plan.n_embd)?);
+        }
+        let g_rb = crate::cpu::row_bytes(g.ty, g.cols);
+        let u_rb = crate::cpu::row_bytes(up.ty, up.cols);
+        let gv = slices.gate.get(shard.r0 * g_rb..)?.get(..rows * g_rb)?;
+        let uv = slices.up.get(shard.r0 * u_rb..)?.get(..rows * u_rb)?;
+        let mut ups = vec![0f32; rows * m];
+        crate::cpu::gemv_into_many(path, g.ty, gv, rows, g.cols, &xs, &mut values);
+        crate::cpu::gemv_into_many(path, up.ty, uv, rows, up.cols, &xs, &mut ups);
+        for (v, u) in values.iter_mut().zip(&ups) {
+            *v = silu(*v) * u;
+        }
+        return Some(values);
+    }
     for (u, &(_, x_off, _)) in shard.users.iter().enumerate() {
         let ok = one_user(
             &slices,
