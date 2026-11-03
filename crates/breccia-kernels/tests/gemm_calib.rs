@@ -274,13 +274,27 @@ fn gemm_tile_sweep() {
     // `BRECCIA_CALIB_DENSE=1`: the prefill dense projections (ssm_out 6144->2560 and its
     // transpose) at prefill-chunk user counts instead of the expert shapes.
     let dense = std::env::var("BRECCIA_CALIB_DENSE").is_ok();
-    let users_list: &[usize] = if dense { &[8000] } else { &[64, 96, 128, 192, 256, 512, 1024] };
-    let shapes: &[(usize, usize, &str)] =
-        if dense { &[(2560, 6144, "ssm_out")] } else { &SHAPES };
+    let users_list: &[usize] = if dense {
+        &[8000]
+    } else {
+        &[64, 96, 128, 192, 256, 512, 1024]
+    };
+    let shapes: &[(usize, usize, &str)] = if dense {
+        &[(2560, 6144, "ssm_out")]
+    } else {
+        &SHAPES
+    };
     // One quantised type and BF16: the tile optimum is a launch-geometry property,
     // and these two cover the fastest and slowest inner loops.
     let tys: &[QuantType] = if dense {
-        &[QuantType::Iq3S, QuantType::Iq4Xs, QuantType::Q4K, QuantType::Q5K, QuantType::Q6K, QuantType::Bf16]
+        &[
+            QuantType::Iq3S,
+            QuantType::Iq4Xs,
+            QuantType::Q4K,
+            QuantType::Q5K,
+            QuantType::Q6K,
+            QuantType::Bf16,
+        ]
     } else {
         &[QuantType::Iq3S, QuantType::Bf16]
     };

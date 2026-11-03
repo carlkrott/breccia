@@ -1112,7 +1112,12 @@ mod tests {
         }
         let cols: usize = 2560;
         let rows: usize = 3;
-        for ty in [QuantType::Iq4Nl, QuantType::Q2_0, QuantType::Iq3Xxs, QuantType::Iq3S] {
+        for ty in [
+            QuantType::Iq4Nl,
+            QuantType::Q2_0,
+            QuantType::Iq3Xxs,
+            QuantType::Iq3S,
+        ] {
             let bpr = cols.div_ceil(ty.block_elems());
             let bb = ty.block_bytes();
             let mut packed = vec![0u8; rows * bpr * bb];

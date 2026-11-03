@@ -143,7 +143,8 @@ pub fn gemv_into_many(
 
 /// Does [`gemv_into_many`] amortise the decode for `ty` on this machine?
 pub fn many_supported(path: Path, ty: QuantType) -> bool {
-    path == Path::Avx2 && matches!(
+    path == Path::Avx2
+        && matches!(
             ty,
             QuantType::Iq4Nl | QuantType::Q2_0 | QuantType::Iq3Xxs | QuantType::Iq3S
         )
