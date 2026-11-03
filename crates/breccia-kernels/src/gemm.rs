@@ -264,7 +264,11 @@ fn gemm_trace(ty: QuantType, rows: usize, cols: usize, users: usize, path: &str)
         return;
     }
     static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-    let key = format!("{} {rows}x{cols} users~{} {path}", ty.name(), users.next_power_of_two());
+    let key = format!(
+        "{} {rows}x{cols} users~{} {path}",
+        ty.name(),
+        users.next_power_of_two()
+    );
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&key) {
         eprintln!("gemm-trace: {key}");
@@ -942,6 +946,74 @@ impl<'g> GemmMany<'g> {
         self.dispatch(kernel, &[w, x, out, &self.tables], &pc, rows / v.0, users)
     }
 
+    /// [`GemmMany::run_at`] reading X from `x_off` and writing O at `o_off` bytes into
+    /// their buffers (§6: the merged prefill's in-place scratch slices). Never takes
+    /// the dot path: it caches converted weights by `w.id`, and `w` may be a mailbox.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_at_off(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        base_words: u32,
+        (x_off, o_off): (u64, u64),
+    ) -> Result<()> {
+        if users == 0 {
+            return Err(anyhow!("users must be at least 1"));
+        }
+        let offs = [0, x_off, o_off];
+        if let Some((kernel, t)) = self.tiled(rows, users) {
+            gemm_trace(self.ty, rows, cols, users, &format!("tile {}x{}", t.0, t.1));
+            let pc = self.pc(rows, cols, users, base_words);
+            return self.dispatch_grid_off(
+                kernel,
+                &[w, x, out, &self.tables],
+                &offs,
+                &pc,
+                Self::tile_grid(t, rows, users),
+            );
+        }
+        let (kernel, v) = self.plain(rows, users);
+        gemm_trace(self.ty, rows, cols, users, &format!("plain {v:?}"));
+        let pc = self.pc_v(rows, cols, users, base_words, v);
+        let grid = Self::std_grid(rows / v.0, users, &pc);
+        self.dispatch_grid_off(kernel, &[w, x, out, &self.tables], &offs, &pc, grid)
+    }
+
+    /// [`GemmMany::run_pair_at`] with the [`GemmMany::run_at_off`] offsets.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_pair_at_off(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        base_words: u32,
+        (x_off, o_off): (u64, u64),
+    ) -> Result<()> {
+        if users == 0 {
+            return Err(anyhow!("users must be at least 1"));
+        }
+        let kernel = self
+            .pair
+            .as_ref()
+            .ok_or_else(|| anyhow!("no gate+up GEMM shader for {}", self.ty))?;
+        let pc = self.pc(rows, cols, users, base_words);
+        let grid = Self::std_grid(rows, users, &pc);
+        self.dispatch_grid_off(
+            kernel,
+            &[w, x, out, &self.tables],
+            &[0, x_off, o_off],
+            &pc,
+            grid,
+        )
+    }
+
     /// The variant `run` would use for this shape (`(1, USERS_MAX)` = plain build).
     pub fn variant_for(&self, rows: usize, users: usize) -> Variant {
         self.plain(rows, users).1
@@ -1089,6 +1161,18 @@ impl<'g> GemmMany<'g> {
         kernel: &breccia_vk::ctx::Kernel,
         bufs: &[&Buf],
         pc: &[u8],
+        grid: (u32, u32, u32),
+    ) -> Result<()> {
+        self.dispatch_grid_off(kernel, bufs, &[], pc, grid)
+    }
+
+    /// [`GemmMany::dispatch_grid`] with per-binding byte offsets (batch only).
+    fn dispatch_grid_off(
+        &self,
+        kernel: &breccia_vk::ctx::Kernel,
+        bufs: &[&Buf],
+        offs: &[u64],
+        pc: &[u8],
         (gx, gy, gz): (u32, u32, u32),
     ) -> Result<()> {
         // Inside a dispatch batch the dispatch is **recorded** (the same rule
@@ -1096,7 +1180,17 @@ impl<'g> GemmMany<'g> {
         // records ~200 expert groups per block, and one submit+wait each would be
         // 40-60 µs of round trip per GEMM.
         if crate::dispatch_batch::is_open() {
-            return crate::dispatch_batch::record(self.gpu, kernel, bufs, pc, (gx, gy, gz));
+            return crate::dispatch_batch::record_off(
+                self.gpu,
+                kernel,
+                bufs,
+                offs,
+                pc,
+                (gx, gy, gz),
+            );
+        }
+        if offs.iter().any(|&o| o != 0) {
+            return Err(anyhow!("binding offsets need an open dispatch batch"));
         }
         let handles: Vec<vk::Buffer> = bufs.iter().map(|b| b.buf).collect();
         self.gpu

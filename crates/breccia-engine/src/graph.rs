@@ -4347,6 +4347,39 @@ impl<'m> Session<'m> {
         let mut pending_down: Option<(u32, usize)> = None;
         let mut stream_prev: Option<breccia_kernels::batch_cmd::Segment> = None;
         let row_bytes = (n_embd * 4) as u64;
+        // §6, in place (`BRECCIA_PF_INPLACE=0` restores the per-expert packets): one
+        // gather of every (token, expert) row into `pf.scratch` at its slot, then
+        // the GEMMs bind X/O as offsets into it and read streamed weights straight
+        // from the mailbox, so the loop records no copy packet at all. Down writes
+        // the rows gate/up read, which is safe: down's input is `pf.act`.
+        let inplace = pf_inplace();
+        // The fused pair needs the up rows right after the gate rows in the slot.
+        let pair = pair && !(inplace && streamed && self.venues[edev].pf_at(b).g_bytes != gx);
+        if inplace {
+            let pf = self.venues[edev].pf_at(b);
+            let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
+            for (e, base, users) in groups.iter() {
+                if host_set.contains(e) {
+                    continue;
+                }
+                let mut a = 0usize;
+                while a < users.len() {
+                    let mut z = a + 1;
+                    while z < users.len() && users[z] == users[z - 1] + 1 {
+                        z += 1;
+                    }
+                    copies.push((
+                        &pf.scratch,
+                        (*base as u64 + a as u64) * row_bytes,
+                        &pf.mixed,
+                        users[a] as u64 * row_bytes,
+                        (z - a) as u64 * row_bytes,
+                    ));
+                    a = z;
+                }
+            }
+            batch_cmd::record_copies(egpu, &copies)?;
+        }
         for (e, base, users) in groups.iter() {
             if host_set.contains(e) {
                 continue;
@@ -4381,7 +4414,59 @@ impl<'m> Session<'m> {
             } else if !streamed {
                 prev_expert = Some(*e);
             }
-            {
+            if inplace {
+                let v = &self.venues[edev];
+                let pf = v.pf_at(b);
+                let pipes = &v.pipes;
+                let gate = pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
+                let up = pipes.gemm(up_ty).expect("the up multi-user GEMM");
+                let down = pipes.gemm(down_ty).expect("the down multi-user GEMM");
+                let xo = *base as u64 * row_bytes;
+                let words = |bytes: u64| -> Result<u32> {
+                    u32::try_from(bytes / 2)
+                        .map_err(|_| anyhow!("stream slot offset past u32 words"))
+                };
+                let (gbuf, ubuf, dbuf, gb, ub, db) = match pe {
+                    Some(pe) => (
+                        &pe.gate.buf,
+                        &pe.up.buf,
+                        &pe.down.buf,
+                        (*e as u32) * wgate,
+                        (*e as u32) * wup,
+                        (*e as u32) * wdown,
+                    ),
+                    None => {
+                        let off = ((expert_index - 1) % (2 * STREAM_SLOTS)) as u64 * pf.slot_stride;
+                        let sb = &pf.stream.buf;
+                        (
+                            sb,
+                            sb,
+                            sb,
+                            words(off)?,
+                            words(off + pf.g_bytes)?,
+                            words(off + pf.g_bytes + pf.u_bytes)?,
+                        )
+                    }
+                };
+                if pair {
+                    gate.run_pair_at_off(
+                        gbuf,
+                        &pf.scratch,
+                        &pf.act,
+                        n_ff,
+                        n_embd,
+                        mu,
+                        gb,
+                        (xo, 0),
+                    )?;
+                } else {
+                    batch_cmd::skip_next_barrier();
+                    gate.run_at_off(gbuf, &pf.scratch, &pf.gg, n_ff, n_embd, mu, gb, (xo, 0))?;
+                    up.run_at_off(ubuf, &pf.scratch, &pf.uu, n_ff, n_embd, mu, ub, (xo, 0))?;
+                    v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
+                }
+                down.run_at_off(dbuf, &pf.act, &pf.scratch, n_embd, n_ff, mu, db, (0, xo))?;
+            } else {
                 let v = &self.venues[edev];
                 let pf = v.pf_at(b);
                 let pipes = &v.pipes;
@@ -6854,6 +6939,12 @@ fn pf_split_host() -> Option<(usize, bool)> {
 /// i.e. one group per distinct expert at chunk <= 1024; `USERS_MAX` = the old shape).
 /// Past 8 the GEMM rides z slices, replacing serialized gather/GEMM/scatter rounds;
 /// per-user arithmetic unchanged (1k logits byte-identical, prefill -7.6 %, §11l).
+/// §6 in-place expert loop, on unless `BRECCIA_PF_INPLACE=0`.
+fn pf_inplace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_INPLACE").map_or(true, |v| v != "0"))
+}
+
 fn pf_group_users() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {

@@ -1364,6 +1364,21 @@ pub(crate) fn record(
     pc: &[u8],
     grid: (u32, u32, u32),
 ) -> Result<()> {
+    record_off(gpu, kernel, bufs, &[], pc, grid)
+}
+
+/// [`record`] with binding `i` starting `offs[i]` bytes into `bufs[i]` (missing =
+/// 0). A non-zero offset takes a fresh set from the batch's pool instead of the
+/// cached one (the cache key is offset-free); offsets must be multiples of
+/// `minStorageBufferOffsetAlignment`.
+pub(crate) fn record_off(
+    gpu: &Gpu,
+    kernel: &Kernel,
+    bufs: &[&Buf],
+    offs: &[u64],
+    pc: &[u8],
+    grid: (u32, u32, u32),
+) -> Result<()> {
     // **One** clock pair, and it is the total the CLI's `record` line quotes. The
     // five per-phase pairs that used to sit here cost 165 ns of the 266 ns recorded
     // dispatch (`docs/research/11` §A2); they are now behind `BRECCIA_RECORD_PROFILE`
@@ -1390,7 +1405,8 @@ pub(crate) fn record(
         bufs.iter().map(|b| b.id).collect(),
     );
     let cached = SETS.with(|c| c.borrow().get(&key).copied());
-    let persistent = if track_disabled() {
+    let has_off = offs.iter().any(|&o| o != 0);
+    let persistent = if track_disabled() || has_off {
         None
     } else {
         cached.or_else(|| {
@@ -1456,9 +1472,10 @@ pub(crate) fn record(
                 batch_set = sets[0];
                 let infos: Vec<vk::DescriptorBufferInfo> = bufs
                     .iter()
-                    .map(|b| vk::DescriptorBufferInfo {
+                    .enumerate()
+                    .map(|(i, b)| vk::DescriptorBufferInfo {
                         buffer: b.buf,
-                        offset: 0,
+                        offset: offs.get(i).copied().unwrap_or(0),
                         range: vk::WHOLE_SIZE,
                     })
                     .collect();
