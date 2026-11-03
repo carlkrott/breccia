@@ -84,7 +84,14 @@ pub fn gemv_into_many(
         return rows;
     }
     #[cfg(target_arch = "x86_64")]
-    if many_supported(path, ty) {
+    // The kernels read whole blocks through raw pointers: take the many-path only
+    // when every activation and the packed rows cover them (else the checked path).
+    let padded = cols.div_ceil(ty.block_elems()) * ty.block_elems();
+    if many_supported(path, ty)
+        && packed.len() >= rows * crate::cpu::row_bytes(ty, cols)
+        && out.len() >= m * rows
+        && xs.iter().all(|x| x.len() >= padded)
+    {
         let row_bytes = crate::cpu::row_bytes(ty, cols);
         // The dequant-once kernels hold `MANY_MAX` accumulators in registers, so a
         // group larger than that is served in **passes of MANY_MAX users**. Each

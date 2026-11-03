@@ -894,6 +894,23 @@ fn one_user(
     true
 }
 
+/// Row shards for one expert of a grouped chunk, by its share of the chunk's
+/// `pairs` (token, expert) pairs: a hot expert gets split so it does not set the
+/// phase's tail. Row splits leave every dot untouched (each row is one dot).
+fn user_shards(users: usize, pairs: usize, threads: usize, rows: usize) -> usize {
+    let claims = CLAIMS_PER_WORKER * threads;
+    let s = (users * claims).div_ceil(pairs.max(1));
+    s.clamp(1, MAX_GRAIN_SHARDS.min((rows / MIN_SHARD_ROWS).max(1)))
+}
+
+/// Claim order for a grouped phase: largest `users * rows` first (LPT), so the
+/// dynamic claimers finish together. Results scatter back by `seq`, so the
+/// accumulation order is unchanged.
+fn heaviest_first(mut tasks: Vec<Shard>) -> Vec<Shard> {
+    tasks.sort_by_key(|t| std::cmp::Reverse(t.users.len().max(1) * (t.r1 - t.r0)));
+    tasks
+}
+
 fn shard_rows(rows: usize, s: usize, shards: usize) -> (usize, usize) {
     let per = rows.div_ceil(shards);
     let r0 = (s * per).min(rows);
@@ -953,6 +970,7 @@ impl ExpertPool {
             }
         }
         let distinct = by.len();
+        let pairs: usize = by.values().map(Vec::len).sum();
         self.last_distinct = distinct;
         let words = Arc::new(x[..t * n_embd].to_vec());
 
@@ -964,6 +982,7 @@ impl ExpertPool {
                 .iter()
                 .map(|&(token, j)| (token * k + j, token * n_embd, 0.0))
                 .collect();
+            let s1 = s1.max(user_shards(users.len(), pairs, self.threads, n_ff));
             for s in 0..s1 {
                 let (r0, r1) = shard_rows(n_ff, s, s1);
                 first.push((expert, r0, r1, slots.clone()));
@@ -984,7 +1003,7 @@ impl ExpertPool {
                 users: Arc::new(users.clone()),
             })
             .collect();
-        let done1 = self.run_phase(tasks1)?;
+        let done1 = self.run_phase(heaviest_first(tasks1))?;
         let mut act = vec![0f32; t * k * n_ff];
         for (seq, &(_, r0, r1, ref users)) in first.iter().enumerate() {
             let values = done1[seq]
@@ -1006,6 +1025,7 @@ impl ExpertPool {
                 .iter()
                 .map(|&(token, j)| (token, (token * k + j) * n_ff, routes[token].weights[j]))
                 .collect();
+            let s2 = s2.max(user_shards(users.len(), pairs, self.threads, n_embd));
             for s in 0..s2 {
                 let (r0, r1) = shard_rows(n_embd, s, s2);
                 second.push((expert, r0, r1, slots.clone()));
@@ -1026,7 +1046,7 @@ impl ExpertPool {
                 users: Arc::new(users.clone()),
             })
             .collect();
-        let done2 = self.run_phase(tasks2)?;
+        let done2 = self.run_phase(heaviest_first(tasks2))?;
         for (seq, &(_, r0, r1, ref users)) in second.iter().enumerate() {
             let values = done2[seq]
                 .as_ref()
