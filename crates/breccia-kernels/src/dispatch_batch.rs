@@ -1239,9 +1239,14 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
     if groups.is_empty() {
         return Ok(());
     }
+    // Timing bisect only (`BRECCIA_PF_DEBUG_NOBARRIER`): the copy barriers are
+    // what the per-expert loop pays most for; results are undefined with them off.
+    let no_barrier = std::env::var_os("BRECCIA_PF_DEBUG_NOBARRIER").is_some();
     unsafe {
         // Before: the writes this copy consumes (shader or earlier transfer).
-        gpu.copy_dependency(cmd, true);
+        if !no_barrier {
+            gpu.copy_dependency(cmd, true);
+        }
         for (src, dst, regions) in &groups {
             gpu.device.cmd_copy_buffer(cmd, *src, *dst, regions);
         }
@@ -1251,7 +1256,9 @@ pub fn record_copies(gpu: &Gpu, items: &[(&Buf, u64, &Buf, u64, u64)]) -> Result
         // dispatch must close its own dependency. Without this the streamed-expert
         // GEMMs race their uploads — measured as non-deterministic logits on the
         // MI50 (max |Δlogit| 2.46 between two identical prompts, §8w/§8x).
-        gpu.copy_dependency(cmd, false);
+        if !no_barrier {
+            gpu.copy_dependency(cmd, false);
+        }
         // The copy's own barriers fence every prior write, so the dirty set starts
         // empty for the dispatches that follow.
         DIRTY.with(|d| d.borrow_mut().clear());

@@ -3882,9 +3882,14 @@ impl<'m> Session<'m> {
     /// `BRECCIA_PF_PHASES=1`: one line per (block, phase), printed as each phase ends so
     /// a run that later times out still shows where the time went.
     fn pf_mark(b: usize, phase: &str, t: &std::time::Instant) {
+        Self::pf_mark_at(b, phase, t, "");
+    }
+
+    /// `pf_mark` with a trailing detail (the moe phase splits into its own terms).
+    fn pf_mark_at(b: usize, phase: &str, t: &std::time::Instant, extra: &str) {
         if std::env::var_os("BRECCIA_PF_PHASES").is_some() {
             eprintln!(
-                "pf-phase blk {b:>2} {phase:<8} {:8.1} ms",
+                "pf-phase blk {b:>2} {phase:<8} {:8.1} ms{extra}",
                 t.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -4244,6 +4249,7 @@ impl<'m> Session<'m> {
         let bucket_s = bucket_t0.elapsed().as_secs_f64();
         Self::pf_mark(b, "bucket", &pf_tp);
         pf_tp = std::time::Instant::now();
+        let (fill0, wait0) = (self.pf_stream_fill_s, self.pf_stream_wait_s);
 
         let mut ship_s = 0.0f64;
         let mut ship_p = [0.0f64; 4];
@@ -4330,7 +4336,17 @@ impl<'m> Session<'m> {
             && m.layers[b].experts.gate.bytes() as u64 == gx
             && m.layers[b].experts.up.bytes() as u64 == ux;
         let mut prev_expert: Option<usize> = None;
+        // One copy packet per expert: the **previous** expert's down result, this
+        // expert's activation gather, and (when it starts a new streamed expert)
+        // its weight blobs. `record_copies` closes a compute -> copy -> compute
+        // dependency pair, so the pre-merge shape paid six global barriers per
+        // expert — 3 072 in an 8k-token block, measured at 1.5 s of the 1.75 s
+        // expert phase. The merged packet pays two and preserves the same order:
+        // down(k-1), gather(k) and weights(k) all precede GEMM(k), and nothing
+        // between them touches the same bytes.
+        let mut pending_down: Option<(u32, usize)> = None;
         let mut stream_prev: Option<breccia_kernels::batch_cmd::Segment> = None;
+        let row_bytes = (n_embd * 4) as u64;
         for (e, base, users) in groups.iter() {
             if host_set.contains(e) {
                 continue;
@@ -4372,47 +4388,26 @@ impl<'m> Session<'m> {
                 let gate = pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
                 let up = pipes.gemm(up_ty).expect("the up multi-user GEMM");
                 let down = pipes.gemm(down_ty).expect("the down multi-user GEMM");
-                if streamed && new_expert && expert_index > 0 {
-                    let slot = (expert_index - 1) % (2 * STREAM_SLOTS);
-                    // slot -> device, three region groups, one barrier.
-                    let off = slot as u64 * pf.slot_stride;
-                    let down_copy = (
-                        &pf.sf_down,
+                // ---- the expert's copy packet: down(k-1), gather(k), weights(k)
+                let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
+                if let Some((pb, pm)) = pending_down {
+                    copies.push((
+                        &pf.scratch,
+                        (pb as u64) * row_bytes,
+                        &pf.down,
                         0,
-                        &pf.stream.buf,
-                        off + pf.g_bytes + pf.u_bytes,
-                        pf.d_bytes,
-                    );
-                    if pair {
-                        batch_cmd::record_copies(
-                            egpu,
-                            &[
-                                (&pf.sf_gu, 0, &pf.stream.buf, off, gx),
-                                (&pf.sf_gu, gx, &pf.stream.buf, off + pf.g_bytes, ux),
-                                down_copy,
-                            ],
-                        )?;
-                    } else {
-                        batch_cmd::record_copies(
-                            egpu,
-                            &[
-                                (&pf.sf_gate, 0, &pf.stream.buf, off, pf.g_bytes),
-                                (&pf.sf_up, 0, &pf.stream.buf, off + pf.g_bytes, pf.u_bytes),
-                                down_copy,
-                            ],
-                        )?;
-                    }
+                        (pm as u64) * row_bytes,
+                    ));
                 }
                 // Gather the group's activation rows (a run of consecutive tokens
-                // is one copy), then one weights read at the expert's arena base.
-                let mut rows: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
+                // is one region), then one weights read at the expert's arena base.
                 let mut a = 0usize;
                 while a < mu {
                     let mut z = a + 1;
                     while z < mu && users[z] == users[z - 1] + 1 {
                         z += 1;
                     }
-                    rows.push((
+                    copies.push((
                         &pf.x,
                         (a * n_embd * 4) as u64,
                         &pf.mixed,
@@ -4421,7 +4416,25 @@ impl<'m> Session<'m> {
                     ));
                     a = z;
                 }
-                batch_cmd::record_copies(egpu, &rows)?;
+                if streamed && new_expert && expert_index > 0 {
+                    let slot = (expert_index - 1) % (2 * STREAM_SLOTS);
+                    let off = slot as u64 * pf.slot_stride;
+                    if pair {
+                        copies.push((&pf.sf_gu, 0, &pf.stream.buf, off, gx));
+                        copies.push((&pf.sf_gu, gx, &pf.stream.buf, off + pf.g_bytes, ux));
+                    } else {
+                        copies.push((&pf.sf_gate, 0, &pf.stream.buf, off, pf.g_bytes));
+                        copies.push((&pf.sf_up, 0, &pf.stream.buf, off + pf.g_bytes, pf.u_bytes));
+                    }
+                    copies.push((
+                        &pf.sf_down,
+                        0,
+                        &pf.stream.buf,
+                        off + pf.g_bytes + pf.u_bytes,
+                        pf.d_bytes,
+                    ));
+                }
+                batch_cmd::record_copies(egpu, &copies)?;
                 // Resident: the arena holds all 512 experts, so the base is the
                 // expert's own offset. Streamed: the slot *is* expert `e`, base 0.
                 let (gbuf, ubuf, dbuf, gb, ub, db) = match pe {
@@ -4446,19 +4459,25 @@ impl<'m> Session<'m> {
                     v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
                 }
                 down.run_at(dbuf, &pf.act, &pf.down, n_embd, n_ff, mu, db)?;
-                batch_cmd::record_copy(
-                    egpu,
-                    &pf.scratch,
-                    (*base as u64) * (n_embd * 4) as u64,
-                    &pf.down,
-                    0,
-                    (mu * n_embd * 4) as u64,
-                )?;
+                pending_down = Some((*base, mu));
             }
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
                 self.flush()?;
                 self.ensure_batch(edev)?;
             }
+        }
+        // The last expert's result still has to reach the fan-in's scratch.
+        if let Some((pb, pm)) = pending_down {
+            let v = &self.venues[edev];
+            let pf = v.pf_at(b);
+            batch_cmd::record_copy(
+                egpu,
+                &pf.scratch,
+                (pb as u64) * row_bytes,
+                &pf.down,
+                0,
+                (pm as u64) * row_bytes,
+            )?;
         }
         self.submit_batch()?;
         self.flush()?;
@@ -4534,6 +4553,7 @@ impl<'m> Session<'m> {
                 n_embd,
             )?;
         }
+        Self::pf_mark(b, "fan-rec", &t_fan);
         let mut host_wait_s = 0.0f64;
         let mut host_s = 0.0f64;
         if let Some(job) = host_job.take() {
@@ -4597,7 +4617,11 @@ impl<'m> Session<'m> {
                 self.ensure_batch(dev)?;
             }
         }
-        if !micro {
+        // In the chunked dense pass, pass 2 consumes `pf.moe` directly, so the
+        // per-token `moe_out` spread is dead: it costs `t` copy packets between
+        // `t` distinct buffers (2 s at t=8192, measured). Only the per-token
+        // fallback reads the slots.
+        if !micro && !hc_chunk {
             {
                 let v = &self.venues[dev];
                 let pf = v.pf_at(b);
@@ -4617,9 +4641,20 @@ impl<'m> Session<'m> {
             }
         }
         self.submit_batch()?;
+        Self::pf_mark(b, "fan-sub", &t_fan);
         self.flush()?;
+        Self::pf_mark(b, "fan-wait", &t_fan);
         let fanin_s = t_fan.elapsed().as_secs_f64();
-        Self::pf_mark(b, "moe", &pf_tp);
+        {
+            let extra = format!(
+                " hc={hc_chunk} (gemm {:.1} fanin {:.1} fill {:.1} wait {:.1})",
+                gemm_s * 1e3,
+                fanin_s * 1e3,
+                (self.pf_stream_fill_s - fill0) * 1e3,
+                (self.pf_stream_wait_s - wait0) * 1e3
+            );
+            Self::pf_mark_at(b, "moe", &pf_tp, &extra);
+        }
 
         // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
         if !micro {
