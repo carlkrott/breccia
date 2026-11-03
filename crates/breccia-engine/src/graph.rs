@@ -325,9 +325,9 @@ pub struct PfChunk {
     g_bytes: u64,
     u_bytes: u64,
     d_bytes: u64,
-    /// `BRECCIA_PF_SPLIT_HOST`: `[8, n_embd]` mixed + `[8, k]` weights copied down
+    /// `BRECCIA_PF_SPLIT_HOST`: `[srows, n_embd]` mixed + `[srows, k]` weights copied down
     /// in pass 1 for the host lane (system memory, read in bulk), and the host
-    /// partial sum `[8 rows | 1 zero row]` the GPU adds after the fan-in.
+    /// partial sum `[srows rows | 1 zero row]` (srows = `prefill_cap(chunk)`) the GPU adds after the fan-in.
     split: Option<(Mailbox, Mailbox)>,
 }
 
@@ -3981,7 +3981,10 @@ impl<'m> Session<'m> {
         let bound_t0 = std::time::Instant::now();
         // `BRECCIA_PF_SPLIT_HOST`: needs the plain streamed path (no helper card, no
         // micro-batches), a small chunk and a spare scratch row for the zero slot.
-        let split_on = (pf_split_host().is_some()
+        // The count/percentage split is a verify-sized lever only: on a prefill chunk
+        // the host lane is ~3x slower per expert than the card and becomes the critical
+        // path (8k: 116 tok/s at 50 % vs 175 all-GPU, 11-03). Prefill keeps the CPU out.
+        let split_on = ((pf_split_host().is_some() && t <= SPLIT_T_MAX)
             || pf_split_tiers()
             || (pe.is_none() && std::env::var_os("BRECCIA_PF_HOST_COLD").is_some()))
             && streamed
@@ -4610,16 +4613,22 @@ impl<'m> Session<'m> {
         let t_fan = std::time::Instant::now();
         if !host_set.is_empty() {
             // The zero row the host experts' pairs point at (a block may have left
-            // anything in it).
-            let pf = self.venues[edev].pf();
+            // anything in it). It is the scratch's LAST row: `hp.write(part)` below
+            // fills rows 0..t before this batch runs, so any row < t (the old
+            // `SPLIT_T_MAX` row, for t > 8) would carry a token's partial.
+            let pf = self.venues[edev].pf_at(b);
             let hp = &pf.split.as_ref().expect("split scratch").1;
             let nb = (n_embd * 4) as u64;
+            debug_assert!(
+                hp.size() / nb > t as u64,
+                "split scratch too small for t={t}"
+            );
             batch_cmd::record_copy(
                 egpu,
                 &pf.scratch,
                 (t * k) as u64 * nb,
                 &hp.buf,
-                SPLIT_T_MAX as u64 * nb,
+                (hp.size() / nb - 1) * nb,
                 nb,
             )?;
         }
@@ -6841,7 +6850,7 @@ fn routed_pair() -> bool {
 const SPLIT_T_MAX: usize = 8;
 
 /// `BRECCIA_PF_SPLIT_HOST=n` (or `n%`): on a streamed block of a chunk of at most
-/// [`SPLIT_T_MAX`] tokens, the last `n` (or that percentage of the) distinct experts in
+/// [`SPLIT_T_MAX`] tokens (enforced at the call site), the last `n` (or that percentage of the) distinct experts in
 /// expert-id order run on the host pool concurrently with the GPU stream loop; their
 /// weighted sum is added to the fan-in output. Default off. `(count, is_percent)`.
 /// `BRECCIA_PF_SPLIT_TIERS=1`: choose the host's share of a block from the measured
