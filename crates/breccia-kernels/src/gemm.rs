@@ -52,8 +52,7 @@ pub struct GemmMany<'g> {
     /// The mixed-float-dot body, when the device advertises the extension. Only
     /// dispatched when the caller declared its weights to be f16 pairs
     /// ([`GemmMany::set_dot_weights`]) *and* the calibration chose `dot` here.
-    /// Index = [`DotGemm::MT_TILES`] variant; `[DOT_DEFAULT]` is the `"dot"` cell.
-    dot: [Option<DotGemm<'g>>; 4],
+    dot: Option<DotGemm<'g>>,
     /// This type's dequant writing **f16 pairs** (`DEQUANT_F16_OUT`): feeds the dot
     /// from quantised weights through a caller-owned scratch
     /// ([`GemmMany::run_dot_dequant`]). Built only when `dot` is.
@@ -153,8 +152,7 @@ pub struct TileCell {
     #[serde(default)]
     pub cols: usize,
     pub users: usize,
-    /// `"plain"`, `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"`, `"dot"` (128x128 micro-tile) or
-    /// `"dot{BM}x{BN}"` (another [`DotGemm::MT_TILES`] build).
+    /// `"plain"`, `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"` or `"dot"`.
     pub tile: String,
     pub us: f64,
     /// PCI address the cell was measured on; empty = any device.
@@ -275,19 +273,18 @@ pub fn calibrate_shapes(
         // The dot as the engine runs it by default: f16 dequant into a scratch,
         // then the mixed-dot GEMM; the timing includes the dequant.
         let wdot = (gemm.deq16.is_some()
-            && gemm.dot[DOT_DEFAULT].is_some()
+            && gemm.dot.is_some()
             && pcols == cols
             && cols.is_multiple_of(s.ty.block_elems().max(32)))
         .then(|| alloc(gpu, (rows * cols * 2) as u64).ok())
         .flatten();
 
-        // Candidates: plain, the tiles, each dot micro-tile build.
+        // Candidates: plain, the tiles, the dot.
         let mut names = vec!["plain".to_string()];
         names.extend(gemm.tiles.iter().map(|(t, _)| format!("{}x{}", t.0, t.1)));
-        let dots: Vec<usize> = (0..4)
-            .filter(|v| wdot.is_some() && gemm.dot[*v].is_some())
-            .collect();
-        names.extend(dots.iter().map(|v| dot_name(*v)));
+        if wdot.is_some() {
+            names.push("dot".to_string());
+        }
         let n = names.len();
         let run = |c: usize, u: usize| -> Result<()> {
             if c == 0 {
@@ -295,8 +292,7 @@ pub fn calibrate_shapes(
             } else if c <= gemm.tiles.len() {
                 gemm.run_tiled(gemm.tiles[c - 1].0, &w, &x, &o, rows, cols, u)
             } else {
-                let v = dots[c - 1 - gemm.tiles.len()];
-                gemm.run_dot_dequant_v(v, &w, &x, &o, rows, cols, u, wdot.as_ref().unwrap())
+                gemm.run_dot_dequant(&w, &x, &o, rows, cols, u, wdot.as_ref().unwrap())
             }
         };
         let time = |c: usize, u: usize| -> Result<f64> {
@@ -331,7 +327,7 @@ pub fn calibrate_shapes(
                 Ok(()) => rel_err(&crate::ops::download_f32(gpu, &o, rows * u0)?, &want),
                 Err(_) => f64::INFINITY,
             };
-            let gate = if names[c].starts_with("dot") {
+            let gate = if names[c] == "dot" {
                 CALIB_ERR_DOT
             } else {
                 CALIB_ERR_EXACT
@@ -346,7 +342,7 @@ pub fn calibrate_shapes(
         let ok: Vec<bool> = (0..n)
             .map(|c| {
                 err[c]
-                    <= if names[c].starts_with("dot") {
+                    <= if names[c] == "dot" {
                         CALIB_ERR_DOT
                     } else {
                         CALIB_ERR_EXACT
@@ -372,7 +368,7 @@ pub fn calibrate_shapes(
                 last[c] = Some((u, t));
                 line += &format!(" {} {:.0}", names[c], t * 1e6);
                 // The dot rounds to f16: take it only for a real win.
-                let t_eff = if names[c].starts_with("dot") { t / 0.97 } else { t };
+                let t_eff = if names[c] == "dot" { t / 0.97 } else { t };
                 if best.is_none_or(|(_, b)| t_eff < b) {
                     best = Some((c, t_eff));
                 }
@@ -432,26 +428,13 @@ fn gemm_trace(ty: QuantType, rows: usize, cols: usize, users: usize, path: &str)
 pub enum Choice {
     Plain,
     Tile(Tile),
-    /// A [`DotGemm::MT_TILES`] variant.
-    Dot(usize),
-}
-
-/// The `"dot"` cell's build (128x128): older tables name only this one.
-const DOT_DEFAULT: usize = 3;
-
-/// Table name of a dot build: `"dot"` for [`DOT_DEFAULT`], else `"dot{BM}x{BN}"`.
-fn dot_name(v: usize) -> String {
-    if v == DOT_DEFAULT {
-        return "dot".into();
-    }
-    let (m, n) = DotGemm::MT_TILES[v];
-    format!("dot{m}x{n}")
+    Dot,
 }
 
 fn parse_choice(s: &str) -> Option<Choice> {
     match s {
         "plain" => Some(Choice::Plain),
-        t if t.starts_with("dot") => (0..4).find(|v| dot_name(*v) == t).map(Choice::Dot),
+        "dot" => Some(Choice::Dot),
         t => parse_tile(t).map(Choice::Tile),
     }
 }
@@ -482,7 +465,7 @@ fn choice_from_table(
     };
     t.iter()
         .filter(|c| c.ty == want && (c.dev.is_empty() || c.dev == dev))
-        .filter(|c| !(skip_dot && c.tile.starts_with("dot")))
+        .filter(|c| !(skip_dot && c.tile == "dot"))
         .filter_map(|c| Some((d(c), parse_choice(&c.tile)?)))
         .min_by(|a, b| a.0.total_cmp(&b.0))
         .map(|(_, ch)| ch)
@@ -797,17 +780,13 @@ impl<'g> GemmMany<'g> {
                 (env_rpl().unwrap_or(t.0), env_umax().unwrap_or(t.1))
             }),
             upz: default_upz(),
-            dot: std::array::from_fn(|v| {
-                if !DotGemm::supported(gpu) {
-                    None
-                } else if v == DOT_DEFAULT {
-                    DotGemm::new_mt(gpu, v)
-                        .or_else(|_| DotGemm::new_tiled(gpu))
-                        .ok()
-                } else {
-                    DotGemm::new_mt(gpu, v).ok()
-                }
-            }),
+            dot: if DotGemm::supported(gpu) {
+                DotGemm::new_mt(gpu, 3)
+                    .or_else(|_| DotGemm::new_tiled(gpu))
+                    .ok()
+            } else {
+                None
+            },
             deq16: if DotGemm::supported(gpu) {
                 gpu.kernel(crate::gemv::dequant_f16_spv(ty), 4).ok()
             } else {
@@ -851,7 +830,7 @@ impl<'g> GemmMany<'g> {
     /// `scratch` aliases a buffer the caller owns and outlives this GEMM; a matrix
     /// larger than it keeps the quantised path. `None` turns the route off.
     pub fn set_dot_dequant(&mut self, scratch: Option<&Buf>) {
-        self.dot_dequant = scratch.is_some() && self.deq16.is_some() && self.dot[DOT_DEFAULT].is_some();
+        self.dot_dequant = scratch.is_some() && self.deq16.is_some() && self.dot.is_some();
         self.dot_scratch = scratch.map(|b| Buf {
             buf: b.buf,
             mem: b.mem,
@@ -879,8 +858,7 @@ impl<'g> GemmMany<'g> {
         pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
         pc[4..8].copy_from_slice(&(cols as u32).to_le_bytes());
         pc[8..12].copy_from_slice(&(bpr as u32).to_le_bytes());
-        // One invocation per 8-element unit (`DEQUANT_F16_OUT` in dequant_body.glsl).
-        let groups = ((rows * bpr * (qk / 8)) as u32).div_ceil(64);
+        let groups = ((rows * bpr) as u32).div_ceil(64);
         let gx = groups.min(WG_X_MAX);
         // Binding 1 is declared by the shared header but unused by the dequant.
         self.dispatch_grid(
@@ -904,24 +882,8 @@ impl<'g> GemmMany<'g> {
         users: usize,
         scratch: &Buf,
     ) -> Result<()> {
-        self.run_dot_dequant_v(DOT_DEFAULT, w, x, out, rows, cols, users, scratch)
-    }
-
-    /// [`GemmMany::run_dot_dequant`] on dot build `v` ([`DotGemm::MT_TILES`]).
-    #[allow(clippy::too_many_arguments)]
-    fn run_dot_dequant_v(
-        &self,
-        v: usize,
-        w: &Buf,
-        x: &Buf,
-        out: &Buf,
-        rows: usize,
-        cols: usize,
-        users: usize,
-        scratch: &Buf,
-    ) -> Result<()> {
-        let Some(dot) = &self.dot[v] else {
-            return Err(anyhow!("no mixed-dot body {v} on this device"));
+        let Some(dot) = &self.dot else {
+            return Err(anyhow!("no mixed-dot body on this device"));
         };
         self.dequant_f16(w, scratch, rows, cols)?;
         dot.run_tiled(scratch, x, out, rows, cols, users)
@@ -929,7 +891,7 @@ impl<'g> GemmMany<'g> {
 
     /// Whether the dot body is available and declared usable for this matrix.
     pub fn dot_available(&self) -> bool {
-        self.dot[DOT_DEFAULT].is_some() && self.dot_weights
+        self.dot.is_some() && self.dot_weights
     }
 
     pub fn set_tile(&mut self, t: Option<Tile>) {
@@ -1168,14 +1130,12 @@ impl<'g> GemmMany<'g> {
         // once here (the prepass) and caches it by source buffer.
         if base_words == 0 {
             let choice = choice_from_table(&self.dev, self.ty, rows, cols, users, false);
-            let dv = match choice {
-                Some(Choice::Dot(v)) => self.dot[v].as_ref().map(|d| (v, d)),
-                _ => None,
-            };
-            if dv.is_none() && (self.dot_weights || self.dot_bf16 || self.dot_dequant) {
-                dot_log_reject(rows, cols, users, choice, self.dot[DOT_DEFAULT].is_some());
+            if choice != Some(Choice::Dot)
+                && (self.dot_weights || self.dot_bf16 || self.dot_dequant)
+            {
+                dot_log_reject(rows, cols, users, choice, self.dot.is_some());
             }
-            if let Some((v, dot)) = dv {
+            if let (Some(Choice::Dot), Some(dot)) = (choice, self.dot.as_ref()) {
                 if self.dot_weights {
                     dot_log(rows, cols, users);
                     return dot.run_tiled(w, x, out, rows, cols, users);
@@ -1199,7 +1159,7 @@ impl<'g> GemmMany<'g> {
                         && cols.is_multiple_of(self.ty.block_elems().max(32))
                     {
                         dot_log(rows, cols, users);
-                        return self.run_dot_dequant_v(v, w, x, out, rows, cols, users, s);
+                        return self.run_dot_dequant(w, x, out, rows, cols, users, s);
                     }
                 }
             }
@@ -1982,18 +1942,11 @@ mod dot_selection_tests {
         set_tile_table(vec![
             cell("IQ3_S", 640, 128, "dot"),
             cell("IQ3_S", 640, 1024, "4x4"),
-            cell("IQ3_S", 640, 32, "dot64x128"),
         ]);
         assert_eq!(
             choice_from_table("", QuantType::Iq3S, 640, 0, 128, false),
-            Some(Choice::Dot(DOT_DEFAULT))
+            Some(Choice::Dot)
         );
-        assert_eq!(
-            choice_from_table("", QuantType::Iq3S, 640, 0, 32, false),
-            Some(Choice::Dot(2))
-        );
-        assert_eq!(parse_choice("dot64x64"), Some(Choice::Dot(0)));
-        assert_eq!(parse_choice("dot32x32"), None);
         assert_eq!(
             choice_from_table("", QuantType::Iq3S, 640, 0, 1024, false),
             Some(Choice::Tile((4, 4)))
