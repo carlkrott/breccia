@@ -88,17 +88,26 @@ pub struct ArenaOpts {
     pub headroom: u64,
 }
 
-/// VRAM the chunked prefill scratch costs per token of the largest chunk the
-/// planner runs (merged-pass buffers plus the QSA/GDN/HC chunk workspaces). RX,
-/// measured after the arena: one 2100-token chunk at ctx 2164 = 2836 MiB (1.35),
-/// 1366-token chunks at ctx 4200 = 1881 MiB (1.38), one 8100-token chunk at ctx
-/// 8100 = 7141 MiB (0.88: 2780 in `Session::new`, 4361 lazily in the first chunk).
-/// 0.5 is a **placement** choice, not the need (c45936e: at 1k one more resident
-/// block, decode +3.9 %, prefill -20 %): the scratch past it lands in host memory
-/// under the VRAM guard (`Gpu::vram_short`), never in the display's floor.
-/// shortcut: one constant for a curve that is not flat; size it from the
-/// workspaces' own byte counts if the host-memory scratch shows up in a profile.
-pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 1 << 19;
+/// VRAM the chunked prefill scratch needs for a `tokens`-row chunk (merged-pass
+/// buffers plus the QSA/GDN/HC chunk workspaces). RX, measured after the arena:
+/// one 2100-token chunk at ctx 2164 = 2836 MiB, 1366-token chunks at ctx 4200 =
+/// 1881 MiB, one 8100-token chunk at ctx 8100 = 7141 MiB (2780 in `Session::new`,
+/// 4361 lazily in the first chunk). Affine through the 2100 and 8100 points.
+/// The old 0.5 MiB/token placement (c45936e, decode residency at 1k) put 3 GiB
+/// of the 8k workspace in host memory under the VRAM guard: RX 8k 300 -> 427
+/// tok/s with it in VRAM (rmsnorm 11.2 -> 1.7, attn-out 265 -> 47 us/token).
+/// shortcut: fitted on one model and card; derive it from the workspaces' byte
+/// counts when a second model or a different chunk curve shows a spill.
+pub fn prefill_scratch_bytes(tokens: usize) -> u64 {
+    const BASE: u64 = 1329 << 20;
+    // (7141 - 2836) MiB / 6000 tokens = 0.7175 MiB/token.
+    const PER_TOKEN: u64 = 752_350;
+    if tokens == 0 {
+        0
+    } else {
+        BASE + tokens as u64 * PER_TOKEN
+    }
+}
 
 impl ArenaOpts {
     /// Both reserves grown by the scratch a `chunk`-token prefill allocates after
@@ -107,7 +116,7 @@ impl ArenaOpts {
     /// Sized for the largest chunk `prefill_plan` can run (1.5x the target), but
     /// never more tokens than the session's `ctx`.
     pub fn with_prefill_chunk(self, chunk: usize, ctx: usize) -> Self {
-        let extra = crate::graph::prefill_cap(chunk).min(ctx) as u64 * PREFILL_SCRATCH_PER_TOKEN;
+        let extra = prefill_scratch_bytes(crate::graph::prefill_cap(chunk).min(ctx));
         ArenaOpts {
             display_reserve: self.display_reserve + extra,
             headroom: self.headroom + extra,
@@ -353,12 +362,22 @@ mod tests {
     fn prefill_chunk_grows_both_reserves() {
         let o = ArenaOpts::default();
         assert_eq!(o.with_prefill_chunk(0, 4096), o);
-        let per = PREFILL_SCRATCH_PER_TOKEN;
         let c = o.with_prefill_chunk(1024, 4096); // chunks up to 1536 tokens
-        assert_eq!(c.headroom - o.headroom, 1536 * per);
-        assert_eq!(c.display_reserve - o.display_reserve, 1536 * per);
+        assert_eq!(c.headroom - o.headroom, prefill_scratch_bytes(1536));
+        assert_eq!(
+            c.display_reserve - o.display_reserve,
+            prefill_scratch_bytes(1536)
+        );
         let c = o.with_prefill_chunk(2048, 1100); // the ctx caps the chunk
-        assert_eq!(c.headroom - o.headroom, 1100 * per);
+        assert_eq!(c.headroom - o.headroom, prefill_scratch_bytes(1100));
+        // The measured points it was fitted on, within 1 %.
+        for (t, mib) in [(2100usize, 2836u64), (8100, 7141)] {
+            let got = prefill_scratch_bytes(t) >> 20;
+            assert!(
+                got.abs_diff(mib) * 100 <= mib,
+                "{t} tokens: {got} vs {mib} MiB"
+            );
+        }
     }
 
     use super::*;
