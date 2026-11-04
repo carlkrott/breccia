@@ -123,11 +123,17 @@ pub struct TileChoice {
     #[serde(default)]
     pub ty: String,
     pub rows: usize,
+    /// Reduction length (0 in profiles from before the model-shape sweep).
+    #[serde(default)]
+    pub cols: usize,
     pub users: usize,
-    /// `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"`.
+    /// `"plain"`, `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"` or `"dot"`.
     pub tile: String,
-    /// Mean microseconds over the types swept at this cell.
+    /// GPU microseconds of the winner.
     pub us: f64,
+    /// The winner's max |out - plain| / max |plain| on the model's weights.
+    #[serde(default)]
+    pub err: f64,
 }
 
 /// One card's merged-prefill discovery result. Stale (and so not trusted) when

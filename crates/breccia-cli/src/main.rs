@@ -67,10 +67,10 @@ enum Command {
         /// uses as their default. Re-run after a driver or shader change.
         #[arg(long)]
         prefill: bool,
-        /// One-time per-GPU kernel-geometry discovery: sweep the tiled GEMM builds
-        /// over a set of (rows, users) cells on every card and store the winners in
-        /// the profile. No model is needed (cost depends on shape and type, not on
-        /// weight values). The engine installs the table at load, so the kernel
+        /// One-time per-GPU kernel-geometry discovery: measure plain, every tiled
+        /// GEMM build and (BF16) the mixed dot on the model's own weight shapes at
+        /// the engine's user counts, gate each on its error vs plain, and store the
+        /// winners per card. The engine installs the table at load, so the kernel
         /// choice follows the hardware instead of being compiled for one card.
         /// Re-run after a driver or shader change.
         #[arg(long)]
@@ -80,10 +80,10 @@ enum Command {
         /// measurement instead of VRAM alone (`breccia_profile::placement`).
         #[arg(long)]
         tiers: bool,
-        /// Model for `--prefill` (shard glob or path)
+        /// Model for `--prefill` / `--kernels` (shard glob or path)
         #[arg(long, value_name = "GLOB", default_value = DEFAULT_MODEL_GLOB)]
         model: String,
-        /// PCI address(es) for `--prefill` (default: every discrete GPU in the profile)
+        /// PCI address(es) for `--prefill` / `--kernels` (default: every discrete GPU)
         #[arg(long, value_name = "PCI")]
         devices: Vec<String>,
         /// Record the measured host expert-lane thread count in the existing profile;
@@ -809,7 +809,7 @@ fn profile(a: ProfileArgs) -> Result<()> {
         .clone()
         .unwrap_or_else(breccia_profile::default_profile_path);
     if a.kernels {
-        profile_kernels(&path)?;
+        profile_kernels(&path, &a.model, &a.devices)?;
         if !a.prefill && !a.tiers {
             return Ok(());
         }
@@ -1357,12 +1357,14 @@ fn profile_tiers(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// `breccia profile --kernels`: sweep the tiled GEMM builds per card and store the
-/// winners. No model is opened — the sweep allocates synthetic weights of the right
-/// size, because a GEMM's cost depends on its shape and quant type, not on the
-/// values. Cells cover the two expert shapes at the user counts the engine actually
-/// produces (merged-prefill groups ~16-64, chunked prefill 1024).
-fn profile_kernels(path: &std::path::Path) -> Result<()> {
+/// `breccia profile --kernels`: calibrate the GEMM kernel choice per card on the
+/// model's own matrices. Every distinct (type, rows, cols) of the `blk.*` weights
+/// (one expert's slice for a 3-D tensor) is measured at the user counts the engine
+/// produces for it — experts 64-2048 (merged-prefill groups), dense 256-8192
+/// (chunked prefill) — over plain, every built tile and (BF16) the mixed dot, each
+/// gated on its error against plain. `devices` limits the sweep (and the reset) to
+/// those cards.
+fn profile_kernels(path: &std::path::Path, model: &str, only: &[String]) -> Result<()> {
     use breccia_kernels::QuantType;
     let mut prof = breccia_profile::load_profile(path)?.with_context(|| {
         format!(
@@ -1370,39 +1372,69 @@ fn profile_kernels(path: &std::path::Path) -> Result<()> {
             path.display()
         )
     })?;
+    let shards = breccia_format::shard::ShardSet::open_glob(model)
+        .with_context(|| format!("opening the model shards {model}"))?;
+    const EXPERT_USERS: [usize; 8] = [64, 96, 128, 192, 256, 512, 1024, 2048];
+    const DENSE_USERS: [usize; 6] = [256, 512, 1024, 2048, 4096, 8192];
+    let mut shapes: Vec<breccia_kernels::gemm::CalibShape> = Vec::new();
+    for t in shards.tensors() {
+        if !t.name().starts_with("blk.") || !(2..=3).contains(&t.n_dims()) {
+            continue;
+        }
+        let Some(ty) = QuantType::from_ggml(t.ty()) else {
+            continue;
+        };
+        let cols = t.ne(0).unwrap_or(0) as usize;
+        let rows = t.ne(1).unwrap_or(0) as usize;
+        let n = t.ne(2).unwrap_or(1).max(1) as usize;
+        let users: &[usize] = if t.n_dims() == 3 {
+            &EXPERT_USERS
+        } else {
+            &DENSE_USERS
+        };
+        match shapes
+            .iter_mut()
+            .find(|s| (s.ty, s.rows, s.cols) == (ty, rows, cols))
+        {
+            Some(s) => {
+                s.users.extend_from_slice(users);
+                s.users.sort_unstable();
+                s.users.dedup();
+            }
+            None => shapes.push(breccia_kernels::gemm::CalibShape {
+                ty,
+                rows,
+                cols,
+                weights: &t.as_slice()[..(t.n_bytes() as usize / n)],
+                users: users.to_vec(),
+            }),
+        }
+    }
+    println!("  {} distinct weight shapes in {model}", shapes.len());
     let host = breccia_vk::ctx::Host::new()
         .map_err(|e| anyhow::anyhow!("opening the Vulkan host: {e}"))?;
     let devs = host
         .devices()
         .map_err(|e| anyhow::anyhow!("enumerating devices: {e}"))?;
-    // The two expert shapes, at the user counts the engine produces.
-    let mut cells: Vec<(usize, usize, usize)> = Vec::new();
-    for users in [64usize, 96, 128, 192, 256, 512, 1024] {
-        cells.push((640, 2560, users));
-        cells.push((2560, 640, users));
-    }
-    let types = [QuantType::Iq3S, QuantType::Bf16];
+    let swept = |pci: &str| only.is_empty() || only.iter().any(|o| same_pci(o, pci));
     // A partial run must not leave stale cells behind (a crashed second card, or a
     // device this sweep now skips).
     for e in prof.devices.iter_mut() {
-        e.kernel = None;
+        if swept(&e.identity.pci_address) {
+            e.kernel = None;
+        }
     }
     for d in &devs {
         // The CPU/"Processor" entry is the iGPU exposed through RADV's CPU path;
         // it is 10-25x slower on every GEMM shape and not a compute target.
-        if d.name.contains("Processor") {
+        if d.name.contains("Processor") || !swept(&d.pci_address) {
             continue;
         }
         let Ok(gpu) = breccia_vk::ctx::Gpu::create(&host, d, 1) else {
             continue;
         };
-        println!(
-            "  {} ({}): sweeping {} cells",
-            d.name,
-            d.pci_address,
-            cells.len()
-        );
-        let tiles = breccia_kernels::gemm::calibrate_tiles(&gpu, &cells, &types)
+        println!("  {} ({}): calibrating", d.name, d.pci_address);
+        let tiles = breccia_kernels::gemm::calibrate_shapes(&gpu, &shapes)
             .with_context(|| format!("calibrating {}", d.name))?;
         let Some(entry) = prof
             .devices
@@ -1425,16 +1457,18 @@ fn profile_kernels(path: &std::path::Path) -> Result<()> {
                 .map(|t| breccia_profile::schema::TileChoice {
                     ty: t.ty.clone(),
                     rows: t.rows,
+                    cols: t.cols,
                     users: t.users,
                     tile: t.tile.clone(),
                     us: t.us,
+                    err: t.err,
                 })
                 .collect(),
         });
         for t in &tiles {
             println!(
-                "    rows {:5} users {:5} -> tile {:4} ({:.1} us)",
-                t.rows, t.users, t.tile, t.us
+                "    {:7} {:5}x{:5} users {:5} -> {:5} ({:.1} us, err {:.1e})",
+                t.ty, t.rows, t.cols, t.users, t.tile, t.us, t.err
             );
         }
         // Saved per card, so a crash on the second keeps the first verdict.

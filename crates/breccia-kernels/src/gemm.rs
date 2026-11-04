@@ -41,6 +41,8 @@ pub struct GemmMany<'g> {
     /// Tiled build [`GemmMany::run_at`] / [`GemmMany::run_timed`] use for wide-enough
     /// shapes; `None` = the GEMV-shaped builds.
     want_tile: Option<Tile>,
+    /// Normalized PCI address: selects this device's calibrated cells.
+    dev: String,
     /// The 4x4 tiled BF16 build with the HC gated-mean + inject epilogue
     /// (`gemm_tile.glsl`, `BRECCIA_HC_TILE_GATED`); built on demand by
     /// [`GemmMany::enable_hc_tile_gated`].
@@ -125,21 +127,30 @@ fn tile_forced() -> bool {
     *F.get_or_init(|| std::env::var("BRECCIA_GEMM_TILE").is_ok())
 }
 
-/// One calibrated cell: at `(rows, users)` on this device, `tile` measured
-/// `us` microseconds. Written by [`calibrate_tiles`] and installed from
+/// One calibrated cell: at `(rows, cols, users)` on device `dev`, `tile` measured
+/// `us` microseconds. Written by [`calibrate_shapes`] and installed from
 /// `hw_profile.json` at startup, so the choice follows the hardware instead of a
 /// constant compiled for the developer's card.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct TileCell {
     /// Quant type name (`IQ3_S`, `BF16`, …): the optimum differs by type, because
     /// the inner loop's latency does (BF16 wants the small tile at every user count
     /// on the narrow shape; IQ3_S does not).
     pub ty: String,
     pub rows: usize,
+    /// Reduction length; 0 = unknown (older profiles), matched on rows/users only.
+    #[serde(default)]
+    pub cols: usize,
     pub users: usize,
-    /// `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"`.
+    /// `"plain"`, `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"` or `"dot"`.
     pub tile: String,
     pub us: f64,
+    /// PCI address the cell was measured on; empty = any device.
+    #[serde(default)]
+    pub dev: String,
+    /// Max |out - plain| / max |plain| of the winner, on the model's own weights.
+    #[serde(default)]
+    pub err: f64,
 }
 
 /// Cells installed from the profile (per process). Empty = fall back to
@@ -151,7 +162,10 @@ fn tile_table() -> &'static std::sync::RwLock<Vec<TileCell>> {
 
 /// Install the calibrated cells (startup, from `hw_profile.json`). Replaces any
 /// previous table; an empty vector restores the built-in rule.
-pub fn set_tile_table(cells: Vec<TileCell>) {
+pub fn set_tile_table(mut cells: Vec<TileCell>) {
+    for c in cells.iter_mut().filter(|c| !c.dev.is_empty()) {
+        c.dev = breccia_vk::pci::normalize_address(&c.dev);
+    }
     if let Ok(mut t) = tile_table().write() {
         *t = cells;
     }
@@ -163,97 +177,218 @@ fn parse_tile(s: &str) -> Option<Tile> {
     TILES.contains(&t).then_some(t)
 }
 
-/// Sweep the tiled builds over `cells` for `types` and return the winner per cell.
+/// One matrix to calibrate: the model's own weight bytes (one expert's slice for a
+/// 3-D tensor) at its real shape, and the user counts the engine produces for it.
+pub struct CalibShape<'a> {
+    pub ty: QuantType,
+    pub rows: usize,
+    pub cols: usize,
+    pub weights: &'a [u8],
+    pub users: Vec<usize>,
+}
+
+/// Error gate vs the plain kernel (max |out - plain| / max |plain|): the tiles do
+/// the same f32 math in another order, the dot rounds W and X to f16.
+const CALIB_ERR_EXACT: f64 = 1e-4;
+const CALIB_ERR_DOT: f64 = 2e-3;
+/// A candidate whose single dispatch is predicted past this is not run: the
+/// driver's watchdog is 2 s and a calibration hang on the MI50 needs a cold boot.
+const CALIB_MAX_DISPATCH_S: f64 = 0.3;
+
+fn rel_err(got: &[f32], want: &[f32]) -> f64 {
+    let scale = want.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30) as f64;
+    let mut worst = 0f64;
+    for (a, b) in got.iter().zip(want) {
+        if !a.is_finite() {
+            return f64::INFINITY;
+        }
+        worst = worst.max((a - b).abs() as f64);
+    }
+    worst / scale
+}
+
+/// Measure every candidate (plain, each built tile, the mixed dot for BF16) at
+/// each shape and user count on `gpu`, on the model's real weights, and return the
+/// fastest candidate that passes the error gate per cell.
 ///
-/// This is the function an install/startup step calls: it needs no model (the cost
-/// depends on shape and type, not weight values), touches only the device, and
-/// returns rows that go straight into `hw_profile.json` and back through
-/// [`set_tile_table`]. Times are summed across the types swept so one tile serves
-/// every type at that shape; ties go to the larger tile (fewer workgroups, less
-/// LDS churn).
-pub fn calibrate_tiles(
+/// The error gate runs once per (shape, candidate) at the smallest user count,
+/// against the plain kernel; a failing candidate is out for that shape. Tiles are
+/// GPU-timestamped; the dot (no timed variant) is wall-clock min of 3, which only
+/// biases against it. Candidates are timed in increasing user order and one whose
+/// next dispatch is predicted past [`CALIB_MAX_DISPATCH_S`] is skipped.
+pub fn calibrate_shapes(
     gpu: &breccia_vk::ctx::Gpu,
-    cells: &[(usize, usize, usize)],
-    types: &[QuantType],
+    shapes: &[CalibShape],
 ) -> Result<Vec<TileCell>> {
+    use crate::gemv::{alloc, upload, upload_into};
+    let dev = breccia_vk::pci::normalize_address(&gpu.pci_address);
     let mut out = Vec::new();
-    for &(rows, cols, users) in cells {
-        for &ty in types {
-            let Ok(mut gemm) = GemmMany::new(gpu, ty) else {
-                continue;
-            };
-            let wbytes = gemm.weight_bytes(rows, cols);
-            let w = crate::gemv::alloc(gpu, wbytes)?;
-            let x = crate::gemv::alloc(gpu, (users * cols * 4) as u64)?;
-            let o = crate::gemv::alloc(gpu, (users * rows * 4) as u64)?;
-            crate::gemv::upload_into(gpu, &w, &vec![0u8; wbytes as usize])?;
-            crate::gemv::upload_into(gpu, &x, &vec![0u8; users * cols * 4])?;
-            let mut totals = vec![f64::INFINITY; TILES.len()];
-            for (i, t) in TILES.iter().enumerate() {
-                gemm.set_tile(Some(*t));
-                for pass in 0..4 {
-                    let t0 = std::time::Instant::now();
-                    if gemm.run_at(&w, &x, &o, rows, cols, users, 0).is_err() {
-                        break;
-                    }
-                    if pass > 0 {
-                        let dt = t0.elapsed().as_secs_f64() * 1e6;
-                        if dt < totals[i] {
-                            totals[i] = dt;
-                        }
-                    }
+    for s in shapes {
+        let Ok(gemm) = GemmMany::new(gpu, s.ty) else {
+            continue;
+        };
+        let (rows, cols) = (s.rows, s.cols);
+        let wbytes = gemm.weight_bytes(rows, cols) as usize;
+        if s.weights.len() < wbytes {
+            eprintln!(
+                "calib: {} {rows}x{cols}: {} weight bytes, need {wbytes}; skipped",
+                s.ty,
+                s.weights.len()
+            );
+            continue;
+        }
+        let mut users: Vec<usize> = s
+            .users
+            .iter()
+            .copied()
+            .filter(|u| *u >= TILE_MIN_USERS)
+            .collect();
+        users.sort_unstable();
+        users.dedup();
+        let Some(&umax) = users.last() else { continue };
+        let pcols = gemm.padded_cols(cols);
+        let xf: Vec<f32> = (0..umax * pcols)
+            .map(|i| {
+                if i % pcols >= cols {
+                    0.0
+                } else {
+                    (((i * 7 + (i / pcols) * 13) % 29) as f32 - 14.0) * 0.011
                 }
-            }
-            // Mixed-dot candidate: same shapes, f16-pair weights. It is measured
-            // whenever the device advertises the extension, so the table can say
-            // "the dot wins here"; the *runtime* additionally requires the caller to
-            // declare f16 weights (`set_dot_weights`), so a quantised tensor can
-            // never be routed to it by a stale verdict.
-            let mut dot_us = f64::INFINITY;
-            if let Ok(dot) = DotGemm::new_tiled(gpu) {
-                for pass in 0..4 {
-                    let t0 = std::time::Instant::now();
-                    if dot.run_tiled(&w, &x, &o, rows, cols, users).is_err() {
-                        break;
-                    }
-                    if pass > 0 {
-                        let dt = t0.elapsed().as_secs_f64() * 1e6;
-                        if dt < dot_us {
-                            dot_us = dt;
-                        }
-                    }
-                }
-            }
-            gemm.set_tile(None);
-            gpu.destroy_buf(&w);
-            gpu.destroy_buf(&x);
-            gpu.destroy_buf(&o);
-            // Ties (or holes) resolve to the later, larger tile.
-            let mut best = 0usize;
-            for i in 1..TILES.len() {
-                if totals[i] <= totals[best] {
-                    best = i;
-                }
-            }
-            if !totals[best].is_finite() && !dot_us.is_finite() {
-                continue;
-            }
-            let (tile, us) = if dot_us.is_finite() && dot_us < totals[best] * 0.99 {
-                ("dot".to_string(), dot_us)
+            })
+            .collect();
+        let w = upload(gpu, &s.weights[..wbytes])?;
+        let x = alloc(gpu, (umax * pcols * 4) as u64)?;
+        upload_into(gpu, &x, bytemuck_f32(&xf))?;
+        let o = alloc(gpu, (umax * rows * 4) as u64)?;
+        let dot = (s.ty == QuantType::Bf16 && pcols == cols && cols.is_multiple_of(2))
+            .then(|| DotGemm::new_tiled(gpu).ok())
+            .flatten();
+        let wdot = dot
+            .as_ref()
+            .and_then(|_| f16_pairs_from_bf16(gpu, &w, rows, cols).ok());
+
+        // Candidates: plain, the tiles, the dot.
+        let mut names = vec!["plain".to_string()];
+        names.extend(gemm.tiles.iter().map(|(t, _)| format!("{}x{}", t.0, t.1)));
+        if wdot.is_some() {
+            names.push("dot".to_string());
+        }
+        let n = names.len();
+        let run = |c: usize, u: usize| -> Result<()> {
+            if c == 0 {
+                gemm.run_plain_at(&w, &x, &o, rows, cols, u, 0)
+            } else if c <= gemm.tiles.len() {
+                gemm.run_tiled(gemm.tiles[c - 1].0, &w, &x, &o, rows, cols, u)
             } else {
-                let t = TILES[best];
-                (format!("{}x{}", t.0, t.1), totals[best])
+                let (d, b) = (dot.as_ref().unwrap(), wdot.as_ref().unwrap());
+                d.run_tiled(b, &x, &o, rows, cols, u)
+            }
+        };
+        let time = |c: usize, u: usize| -> Result<f64> {
+            if c == 0 {
+                Ok(gemm
+                    .run_timed_plain(&w, &x, &o, rows, cols, u, 0.03)?
+                    .per_iter_s)
+            } else if c <= gemm.tiles.len() {
+                let t = gemm.tiles[c - 1].0;
+                Ok(gemm
+                    .run_timed_tiled(t, &w, &x, &o, rows, cols, u, 0.03)?
+                    .per_iter_s)
+            } else {
+                run(c, u)?;
+                let mut best = f64::INFINITY;
+                for _ in 0..3 {
+                    let t0 = std::time::Instant::now();
+                    run(c, u)?;
+                    best = best.min(t0.elapsed().as_secs_f64());
+                }
+                Ok(best)
+            }
+        };
+
+        // Error gate at the smallest user count, against plain.
+        let u0 = users[0];
+        run(0, u0)?;
+        let want = crate::ops::download_f32(gpu, &o, rows * u0)?;
+        let mut err = vec![0f64; n];
+        for (c, e) in err.iter_mut().enumerate().skip(1) {
+            *e = match run(c, u0) {
+                Ok(()) => rel_err(&crate::ops::download_f32(gpu, &o, rows * u0)?, &want),
+                Err(_) => f64::INFINITY,
             };
+            let gate = if names[c] == "dot" {
+                CALIB_ERR_DOT
+            } else {
+                CALIB_ERR_EXACT
+            };
+            if *e > gate {
+                eprintln!(
+                    "calib: {} {rows}x{cols} {}: error {:.2e} > {gate:.0e}; out",
+                    s.ty, names[c], *e
+                );
+            }
+        }
+        let ok: Vec<bool> = (0..n)
+            .map(|c| {
+                err[c]
+                    <= if names[c] == "dot" {
+                        CALIB_ERR_DOT
+                    } else {
+                        CALIB_ERR_EXACT
+                    }
+            })
+            .collect();
+
+        let mut last: Vec<Option<(usize, f64)>> = vec![None; n];
+        for &u in &users {
+            let mut line = format!("calib: {} {rows}x{cols} u={u}:", s.ty);
+            let mut best: Option<(usize, f64)> = None;
+            for c in (0..n).filter(|c| ok[*c]) {
+                if let Some((lu, lt)) = last[c] {
+                    if lt * u as f64 / lu as f64 > CALIB_MAX_DISPATCH_S {
+                        line += &format!(" {} skip", names[c]);
+                        continue;
+                    }
+                }
+                let Ok(t) = time(c, u) else {
+                    line += &format!(" {} fail", names[c]);
+                    continue;
+                };
+                last[c] = Some((u, t));
+                line += &format!(" {} {:.0}", names[c], t * 1e6);
+                // The dot rounds to f16: take it only for a real win.
+                let t_eff = if names[c] == "dot" { t / 0.97 } else { t };
+                if best.is_none_or(|(_, b)| t_eff < b) {
+                    best = Some((c, t_eff));
+                }
+            }
+            let Some((c, _)) = best else { continue };
+            let us = last[c].map_or(0.0, |(_, t)| t * 1e6);
+            eprintln!("{line} -> {}", names[c]);
             out.push(TileCell {
-                ty: ty.name().to_string(),
+                ty: s.ty.name().to_string(),
                 rows,
-                users,
-                tile,
+                cols,
+                users: u,
+                tile: names[c].clone(),
                 us,
+                dev: dev.clone(),
+                err: err[c],
             });
         }
+        if let Some(b) = wdot {
+            gpu.destroy_buf(&b);
+        }
+        gpu.destroy_buf(&w);
+        gpu.destroy_buf(&x);
+        gpu.destroy_buf(&o);
     }
     Ok(out)
+}
+
+fn bytemuck_f32(v: &[f32]) -> &[u8] {
+    // SAFETY: f32 has no padding and u8 has alignment 1.
+    unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<u8>(), std::mem::size_of_val(v)) }
 }
 
 /// `BRECCIA_GEMM_TRACE=1`: one stderr line per distinct (type, shape, path) a
@@ -276,60 +411,58 @@ fn gemm_trace(ty: QuantType, rows: usize, cols: usize, users: usize, path: &str)
     }
 }
 
-/// What the calibrated table says to run at a shape: one of the GLSL tiles, or the
-/// mixed-float-dot kernel (`DotGemm`).
+/// What the calibrated table says to run at a shape: the plain kernel, one of the
+/// GLSL tiles, or the mixed-float-dot kernel (`DotGemm`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Choice {
+    Plain,
     Tile(Tile),
     Dot,
 }
 
-/// The nearest calibrated cell in log space, per type, as a [`Choice`].
-fn choice_from_table(ty: QuantType, rows: usize, users: usize) -> Option<Choice> {
+fn parse_choice(s: &str) -> Option<Choice> {
+    match s {
+        "plain" => Some(Choice::Plain),
+        "dot" => Some(Choice::Dot),
+        t => parse_tile(t).map(Choice::Tile),
+    }
+}
+
+/// The nearest calibrated cell of type `ty` measured on `dev` (normalized PCI
+/// address; cells with no device match any), in log space over rows, users and —
+/// when both sides know it — cols. `skip_dot` answers for the GLSL path when the
+/// caller cannot use the dot. `None` when nothing applicable has been calibrated.
+fn choice_from_table(
+    dev: &str,
+    ty: QuantType,
+    rows: usize,
+    cols: usize,
+    users: usize,
+    skip_dot: bool,
+) -> Option<Choice> {
     let t = tile_table().read().ok()?;
     let want = ty.name();
-    let mut near: Option<&TileCell> = None;
+    let l = |v: usize| (v.max(1) as f64).ln();
+    let (lr, lc, lu) = (l(rows), l(cols), l(users));
     let d = |c: &TileCell| {
-        ((rows.max(1) as f64).ln() - (c.rows.max(1) as f64).ln()).powi(2)
-            + ((users.max(1) as f64).ln() - (c.users.max(1) as f64).ln()).powi(2)
+        let dc = if cols > 0 && c.cols > 0 {
+            (lc - l(c.cols)).powi(2)
+        } else {
+            0.0
+        };
+        (lr - l(c.rows)).powi(2) + dc + (lu - l(c.users)).powi(2)
     };
-    for c in t.iter().filter(|c| c.ty == want) {
-        near = match near {
-            Some(b) if d(b) <= d(c) => Some(b),
-            _ => Some(c),
-        };
-    }
-    let c = near?;
-    if c.tile == "dot" {
-        return Some(Choice::Dot);
-    }
-    parse_tile(&c.tile).map(Choice::Tile)
+    t.iter()
+        .filter(|c| c.ty == want && (c.dev.is_empty() || c.dev == dev))
+        .filter(|c| !(skip_dot && c.tile == "dot"))
+        .filter_map(|c| Some((d(c), parse_choice(&c.tile)?)))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, ch)| ch)
 }
 
-/// The nearest calibrated cell in log-space, so a shape between two samples uses
-/// the closer one. `None` when nothing has been calibrated.
-fn tile_from_table(ty: QuantType, rows: usize, users: usize) -> Option<Tile> {
-    let t = tile_table().read().ok()?;
-    let want = ty.name();
-    let mut near: Option<&TileCell> = None;
-    let lr = (rows.max(1) as f64).ln();
-    let lu = (users.max(1) as f64).ln();
-    // A calibrated `dot` cell is not a tile: skip it so the GLSL path still has a
-    // sensible answer when the caller cannot use the dot.
-    for c in t.iter().filter(|c| c.ty == want && c.tile != "dot") {
-        let d = |c: &TileCell| {
-            (lr - (c.rows.max(1) as f64).ln()).powi(2) + (lu - (c.users.max(1) as f64).ln()).powi(2)
-        };
-        near = match near {
-            Some(b) if d(b) <= d(c) => Some(b),
-            _ => Some(c),
-        };
-    }
-    near.and_then(|c| parse_tile(&c.tile))
-}
-
-/// The tile for a concrete dispatch, measured (`gemm_calib` `gemm_tile_sweep`,
-/// RX, `out/gemm-tiles-rx.csv`): the 4x4 build is right for wide shapes and large
+/// The tile for a concrete dispatch (`None` = the plain kernel). A calibrated
+/// table wins; otherwise the rule measured (`gemm_calib` `gemm_tile_sweep`, RX,
+/// `out/gemm-tiles-rx.csv`): the 4x4 build is right for wide shapes and large
 /// batches, and the **4x2** build (half the user tile, twice the workgroups) wins
 /// by 1.4-8.2x when the row count is small enough that `rows/64` leaves the tiled
 /// grid starved. Numbers behind the rule:
@@ -340,11 +473,13 @@ fn tile_from_table(ty: QuantType, rows: usize, users: usize) -> Option<Tile> {
 /// | 640 | 512-1024 | 4x4 better (0.4-0.8x for 4x2) |
 /// | 2560 (down) | 64 | 1.16-1.35x |
 /// | 2560 | >= 96 | 4x4 better |
-fn tile_for(ty: QuantType, rows: usize, users: usize) -> Option<Tile> {
+fn tile_for(dev: &str, ty: QuantType, rows: usize, cols: usize, users: usize) -> Option<Tile> {
     // A calibrated table (installed from the profile at startup) wins: it is the
     // only source that travelled with the hardware it was measured on.
-    if let Some(t) = tile_from_table(ty, rows, users) {
-        return Some(t);
+    match choice_from_table(dev, ty, rows, cols, users, true) {
+        Some(Choice::Tile(t)) => return Some(t),
+        Some(Choice::Plain) => return None,
+        _ => {}
     }
     // Fallback rule, measured on this host (RX 6950 XT / MI50, 2026-11).
     // A narrow row count means only rows/64 workgroups per user tile, so the
@@ -483,6 +618,7 @@ macro_rules! tile_spv {
         fn tile_spv(ty: QuantType) -> Vec<(Tile, &'static [u8])> {
             match ty {
                 $(QuantType::$t => vec![
+                    ((4, 2), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_t4x2.spv"))),
                     ((4, 4), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_t4x4.spv"))),
                     ((8, 4), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_t8x4.spv"))),
                     ((8, 8), include_bytes!(concat!(env!("OUT_DIR"), "/gemm_", $s, "_t8x8.spv"))),
@@ -626,6 +762,7 @@ impl<'g> GemmMany<'g> {
             blocked,
             tiles,
             want_tile: env_tile(subgroup_size(gpu), ty),
+            dev: breccia_vk::pci::normalize_address(&gpu.pci_address),
             hcgate: None,
             want: [false, true].map(|x| {
                 let t = tuned(ty, subgroup_size(gpu), x);
@@ -736,16 +873,20 @@ impl<'g> GemmMany<'g> {
     }
 
     /// The tiled pipeline `run_at` would use for `rows x users`, if any.
-    fn tiled(&self, rows: usize, users: usize) -> Option<(&breccia_vk::ctx::Kernel, Tile)> {
+    fn tiled(
+        &self,
+        rows: usize,
+        cols: usize,
+        users: usize,
+    ) -> Option<(&breccia_vk::ctx::Kernel, Tile)> {
         if users < TILE_MIN_USERS {
             return None;
         }
         let t = if self.tile_locked || tile_forced() {
             self.want_tile
         } else {
-            tile_for(self.ty, rows, users)
-        }
-        .or(self.want_tile)?;
+            tile_for(&self.dev, self.ty, rows, cols, users)
+        }?;
         self.tiles
             .iter()
             .find(|(c, _)| *c == t)
@@ -905,7 +1046,7 @@ impl<'g> GemmMany<'g> {
         // `dot_weights` promises f16 pairs already; `dot_bf16` converts the tensor
         // once here (the prepass) and caches it by source buffer.
         if base_words == 0 {
-            let choice = choice_from_table(self.ty, rows, users);
+            let choice = choice_from_table(&self.dev, self.ty, rows, cols, users, false);
             if choice != Some(Choice::Dot) && (self.dot_weights || self.dot_bf16) {
                 dot_log_reject(rows, cols, users, choice, self.dot.is_some());
             }
@@ -930,7 +1071,7 @@ impl<'g> GemmMany<'g> {
                 }
             }
         }
-        if let Some((kernel, t)) = self.tiled(rows, users) {
+        if let Some((kernel, t)) = self.tiled(rows, cols, users) {
             gemm_trace(self.ty, rows, cols, users, &format!("tile {}x{}", t.0, t.1));
             let pc = self.pc(rows, cols, users, base_words);
             return self.dispatch_grid(
@@ -940,6 +1081,22 @@ impl<'g> GemmMany<'g> {
                 Self::tile_grid(t, rows, users),
             );
         }
+        self.run_plain_at(w, x, out, rows, cols, users, base_words)
+    }
+
+    /// The plain (GEMV-shaped) kernel, whatever the tile table says: the reference
+    /// [`calibrate_shapes`] gates every other candidate against.
+    #[allow(clippy::too_many_arguments)]
+    fn run_plain_at(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        base_words: u32,
+    ) -> Result<()> {
         let (kernel, v) = self.plain(rows, users);
         gemm_trace(self.ty, rows, cols, users, &format!("plain {v:?}"));
         let pc = self.pc_v(rows, cols, users, base_words, v);
@@ -965,7 +1122,7 @@ impl<'g> GemmMany<'g> {
             return Err(anyhow!("users must be at least 1"));
         }
         let offs = [0, x_off, o_off];
-        if let Some((kernel, t)) = self.tiled(rows, users) {
+        if let Some((kernel, t)) = self.tiled(rows, cols, users) {
             gemm_trace(self.ty, rows, cols, users, &format!("tile {}x{}", t.0, t.1));
             let pc = self.pc(rows, cols, users, base_words);
             return self.dispatch_grid_off(
@@ -1226,9 +1383,24 @@ impl<'g> GemmMany<'g> {
         users: usize,
         target_s: f64,
     ) -> Result<GemvTiming> {
-        if let Some((_, t)) = self.tiled(rows, users) {
+        if let Some((_, t)) = self.tiled(rows, cols, users) {
             return self.run_timed_tiled(t, w, x, out, rows, cols, users, target_s);
         }
+        self.run_timed_plain(w, x, out, rows, cols, users, target_s)
+    }
+
+    /// Timed [`GemmMany::run_plain_at`] (base 0).
+    #[allow(clippy::too_many_arguments)]
+    fn run_timed_plain(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        target_s: f64,
+    ) -> Result<GemvTiming> {
         let (kernel, v) = self.plain(rows, users);
         let pc = self.pc_v(rows, cols, users, 0, v);
         self.timed(
@@ -1382,6 +1554,7 @@ mod tile_table_tests {
             users,
             tile: tile.into(),
             us: 1.0,
+            ..Default::default()
         }
     }
 
@@ -1393,25 +1566,59 @@ mod tile_table_tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // Built-in rule says 4x2 for a narrow shape at 128 users.
-        assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((4, 2)));
+        assert_eq!(tile_for("", QuantType::Iq3S, 640, 0, 128), Some((4, 2)));
         set_tile_table(vec![
             cell("IQ3_S", 640, 128, "8x8"),
             cell("BF16", 640, 128, "4x4"),
         ]);
-        assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((8, 8)));
-        assert_eq!(tile_for(QuantType::Bf16, 640, 128), Some((4, 4)));
+        assert_eq!(tile_for("", QuantType::Iq3S, 640, 0, 128), Some((8, 8)));
+        assert_eq!(tile_for("", QuantType::Bf16, 640, 0, 128), Some((4, 4)));
         // A type the table does not cover falls back to the rule.
-        assert_eq!(tile_for(QuantType::Q6K, 640, 128), Some((4, 2)));
+        assert_eq!(tile_for("", QuantType::Q6K, 640, 0, 128), Some((4, 2)));
         // Nearest cell wins for a shape between samples.
         set_tile_table(vec![
             cell("IQ3_S", 640, 64, "4x2"),
             cell("IQ3_S", 2560, 1024, "8x8"),
         ]);
-        assert_eq!(tile_for(QuantType::Iq3S, 700, 70), Some((4, 2)));
-        assert_eq!(tile_for(QuantType::Iq3S, 2400, 1000), Some((8, 8)));
+        assert_eq!(tile_for("", QuantType::Iq3S, 700, 0, 70), Some((4, 2)));
+        assert_eq!(tile_for("", QuantType::Iq3S, 2400, 0, 1000), Some((8, 8)));
         // An empty table restores the rule.
         set_tile_table(Vec::new());
-        assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((4, 2)));
+        assert_eq!(tile_for("", QuantType::Iq3S, 640, 0, 128), Some((4, 2)));
+    }
+
+    /// A `plain` verdict means the plain kernel; cells are per device and per cols.
+    #[test]
+    fn plain_verdicts_devices_and_cols() {
+        let _g = super::table_lock::L
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut a = cell("IQ3_S", 2560, 1024, "plain");
+        a.cols = 640;
+        a.dev = "0000:03:00.0".into();
+        let mut b = cell("IQ3_S", 2560, 1024, "8x8");
+        b.cols = 6144;
+        b.dev = "0000:03:00.0".into();
+        let mut c = cell("IQ3_S", 2560, 1024, "4x2");
+        c.dev = "0000:0E:00.0".into();
+        set_tile_table(vec![a, b, c]);
+        let rx = breccia_vk::pci::normalize_address("0000:03:00.0");
+        let mi = breccia_vk::pci::normalize_address("0000:0e:00.0");
+        assert_eq!(tile_for(&rx, QuantType::Iq3S, 2560, 640, 1024), None);
+        assert_eq!(
+            tile_for(&rx, QuantType::Iq3S, 2560, 6144, 1024),
+            Some((8, 8))
+        );
+        assert_eq!(
+            tile_for(&mi, QuantType::Iq3S, 2560, 640, 1024),
+            Some((4, 2))
+        );
+        // A device with no cells uses the rule.
+        assert_eq!(
+            tile_for("0000:99:00.0", QuantType::Iq3S, 2560, 640, 1024),
+            Some((4, 4))
+        );
+        set_tile_table(Vec::new());
     }
 }
 
@@ -1575,6 +1782,7 @@ mod dot_selection_tests {
             users,
             tile: tile.into(),
             us: 1.0,
+            ..Default::default()
         }
     }
 
@@ -1590,17 +1798,20 @@ mod dot_selection_tests {
             cell("IQ3_S", 640, 1024, "4x4"),
         ]);
         assert_eq!(
-            choice_from_table(QuantType::Iq3S, 640, 128),
+            choice_from_table("", QuantType::Iq3S, 640, 0, 128, false),
             Some(Choice::Dot)
         );
         assert_eq!(
-            choice_from_table(QuantType::Iq3S, 640, 1024),
+            choice_from_table("", QuantType::Iq3S, 640, 0, 1024, false),
             Some(Choice::Tile((4, 4)))
         );
         // `tile_for` ignores the dot cell and answers with the nearest real tile.
-        assert_eq!(tile_for(QuantType::Iq3S, 640, 128), Some((4, 4)));
+        assert_eq!(tile_for("", QuantType::Iq3S, 640, 0, 128), Some((4, 4)));
         // A type with no cells falls back to the built-in rule.
-        assert_eq!(choice_from_table(QuantType::Q6K, 640, 128), None);
+        assert_eq!(
+            choice_from_table("", QuantType::Q6K, 640, 0, 128, false),
+            None
+        );
         set_tile_table(Vec::new());
     }
 }

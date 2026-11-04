@@ -1729,15 +1729,19 @@ fn profile_entries(
     let cells: Vec<breccia_kernels::gemm::TileCell> = entries
         .iter()
         .flatten()
-        .filter_map(|e| e.kernel.as_ref())
-        .filter(|k| k.spirv_hash == breccia_kernels::SPIRV_HASH)
-        .flat_map(|k| k.tiles.iter())
-        .map(|t| breccia_kernels::gemm::TileCell {
+        .filter_map(|e| Some((e, e.kernel.as_ref()?)))
+        .filter(|(_, k)| k.spirv_hash == breccia_kernels::SPIRV_HASH)
+        .flat_map(|(e, k)| k.tiles.iter().map(move |t| (e, t)))
+        .map(|(e, t)| breccia_kernels::gemm::TileCell {
             ty: t.ty.clone(),
             rows: t.rows,
+            cols: t.cols,
             users: t.users,
             tile: t.tile.clone(),
             us: t.us,
+            // Cells are per card: the RX and the MI50 disagree at the same shape.
+            dev: e.identity.pci_address.clone(),
+            err: t.err,
         })
         .collect();
     if verbose && !cells.is_empty() {

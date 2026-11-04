@@ -308,6 +308,7 @@ fn a_calibrated_dot_cell_routes_run_at_to_the_dot_body() {
         users,
         tile: "dot".into(),
         us: 1.0,
+        ..Default::default()
     }]);
     let mut gemm = GemmMany::new(&gpu, QuantType::Bf16).expect("gemm");
     assert!(!gemm.dot_available(), "not declared yet");
@@ -392,6 +393,7 @@ fn a_bf16_matrix_runs_on_the_dot_after_the_f16_prepass() {
             users,
             tile: "dot".into(),
             us: 1.0,
+            ..Default::default()
         }]);
         let mut dot = GemmMany::new(&gpu, QuantType::Bf16).expect("gemm");
         // The weights are BF16: the prepass converts and caches them.
