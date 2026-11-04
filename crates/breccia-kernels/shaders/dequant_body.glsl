@@ -21,6 +21,26 @@ layout(local_size_x = 64) in;
 
 void main() {
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+#ifdef DEQUANT_F16_OUT
+    // One invocation per 8-element unit, unit index fastest: neighbouring lanes
+    // write neighbouring 16 B (one per block left IQ3_S stores 512 B apart).
+    uint gid = wg * 64u + gl_LocalInvocationID.x;
+    if (gid >= pc.rows * pc.bpr * UNITS) {
+        return;
+    }
+    uint blk = gid / UNITS;
+    uint u = gid - blk * UNITS;
+    uint row = blk / pc.bpr;
+    uint off = blk * BLOCK_WORDS;
+    uint out_base = row * pc.bpr * QK + (blk - row * pc.bpr) * QK + u * 8u;
+    float v[8];
+    DEQUANT_UNIT(off, u, v);
+    // Host contract: cols % QK == 0, so every pair is in range.
+    for (uint j = 0u; j < 8u; j += 2u) {
+        O16[(out_base + j) / 2u] = packHalf2x16(vec2(v[j], v[j + 1u]));
+    }
+}
+#else
     uint blk = wg * 64u + gl_LocalInvocationID.x;
     uint total = pc.rows * pc.bpr;
     if (blk >= total) {
@@ -35,20 +55,14 @@ void main() {
     float v[8];
     for (uint u = 0u; u < UNITS; ++u) {
         DEQUANT_UNIT(off, u, v);
-#ifdef DEQUANT_F16_OUT
-        // Host contract: cols % QK == 0, so every pair is in range.
-        for (uint j = 0u; j < 8u; j += 2u) {
-            O16[(out_base + u * 8u + j) / 2u] = packHalf2x16(vec2(v[j], v[j + 1u]));
-        }
-#else
         for (uint j = 0u; j < 8u; ++j) {
             uint e = e0 + u * 8u + j;
             if (e < pc.cols) {
                 O[out_base + u * 8u + j] = v[j];
             }
         }
-#endif
     }
 }
+#endif
 
 #endif // BRECCIA_DEQUANT_BODY_GLSL

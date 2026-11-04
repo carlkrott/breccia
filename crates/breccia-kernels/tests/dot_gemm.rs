@@ -502,8 +502,14 @@ fn dot_gemm_dense_shape_speed() {
         ));
     }
     let q = GemmMany::new(&gpu, QuantType::Iq3S).expect("iq3_s gemm");
-    for (rows, cols) in [(12288usize, 2560usize), (2560, 4096)] {
-        for users in [256usize, 1024, 4096] {
+    // No 2560x640: IQ3_S needs cols % 256.
+    let grid: [(usize, usize, &[usize]); 3] = [
+        (12288, 2560, &[256, 1024, 4096]),
+        (2560, 4096, &[256, 1024, 4096]),
+        (640, 2560, &[64, 128, 256, 512]),
+    ];
+    for (rows, cols, us) in grid {
+        for &users in us {
             let w = alloc(&gpu, (rows * cols * 2) as u64).expect("w");
             let wq = alloc(&gpu, q.weight_bytes(rows, cols)).expect("wq");
             let x = alloc(&gpu, (users * cols * 4) as u64).expect("x");
@@ -589,15 +595,32 @@ fn the_dequant_dot_route_records_inside_a_dispatch_batch() {
     let want = breccia_kernels::ops::download_f32(&gpu, &o_ref, rows * users).expect("ref");
     assert!(want.iter().any(|v| *v != 0.0), "reference is all zeros");
 
+    // A second matrix through the same scratch: its dequant must wait for the
+    // first dot to finish reading (write-after-read on the shared scratch).
+    let mut wq2 = Vec::new();
+    for _ in 0..rows * cols / 32 {
+        wq2.extend_from_slice(&half(1.0 / 32.0).to_le_bytes());
+        wq2.extend((0..16).map(|_| next()));
+    }
+    let wq2 = upload(&gpu, &wq2).expect("wq2");
+    q.run_dot_dequant(&wq2, &x, &o_ref, rows, cols, users, &scratch_ref)
+        .expect("reference 2");
+    let want2 = breccia_kernels::ops::download_f32(&gpu, &o_ref, rows * users).expect("ref2");
+    let o2 = alloc(&gpu, (rows * users * 4) as u64).expect("o2");
+
     let scratch = upload(&gpu, &vec![0u8; rows * cols * 2]).expect("zeroed scratch");
     dispatch_batch::begin(&gpu).expect("begin");
     q.run_dot_dequant(&wq, &x, &o, rows, cols, users, &scratch)
         .expect("batched");
+    q.run_dot_dequant(&wq2, &x, &o2, rows, cols, users, &scratch)
+        .expect("batched 2");
     dispatch_batch::end(&gpu).expect("end");
     let got = breccia_kernels::ops::download_f32(&gpu, &o, rows * users).expect("got");
+    let got2 = breccia_kernels::ops::download_f32(&gpu, &o2, rows * users).expect("got2");
     let worst = got
         .iter()
         .zip(&want)
+        .chain(got2.iter().zip(&want2))
         .map(|(a, b)| (a - b).abs())
         .fold(0f32, f32::max);
     println!("dot_batch: batched vs direct worst |diff| {worst:.3e}");
@@ -605,7 +628,7 @@ fn the_dequant_dot_route_records_inside_a_dispatch_batch() {
         worst == 0.0,
         "the batched dequant + dot differs: {worst:.3e}"
     );
-    for b in [&wq, &x, &o_ref, &o, &scratch_ref, &scratch] {
+    for b in [&wq, &wq2, &x, &o_ref, &o, &o2, &scratch_ref, &scratch] {
         gpu.destroy_buf(b);
     }
 }
