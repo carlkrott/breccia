@@ -589,11 +589,23 @@ fn the_dequant_dot_route_records_inside_a_dispatch_batch() {
     let x = upload(&gpu, &xs).expect("x");
     let o_ref = alloc(&gpu, (rows * users * 4) as u64).expect("o_ref");
     let o = alloc(&gpu, (rows * users * 4) as u64).expect("o");
-    let scratch_ref = alloc(&gpu, (rows * cols * 2) as u64).expect("scratch");
+    // Garbage-filled (0x5a5a = f16 203.25, finite), so a dequant that skips cells shows up.
+    let scratch_ref = upload(&gpu, &vec![0x5au8; rows * cols * 2]).expect("scratch");
     q.run_dot_dequant(&wq, &x, &o_ref, rows, cols, users, &scratch_ref)
         .expect("reference");
     let want = breccia_kernels::ops::download_f32(&gpu, &o_ref, rows * users).expect("ref");
     assert!(want.iter().any(|v| *v != 0.0), "reference is all zeros");
+    // The dequant must fill the whole scratch: dot route vs the plain quant GEMM.
+    let o_plain = alloc(&gpu, (rows * users * 4) as u64).expect("o_plain");
+    q.run(&wq, &x, &o_plain, rows, cols, users).expect("plain");
+    let plain = breccia_kernels::ops::download_f32(&gpu, &o_plain, rows * users).expect("plain");
+    let scale = plain.iter().fold(0f32, |m, v| m.max(v.abs()));
+    let off = want.iter().zip(&plain).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+    println!("dot_batch: dot route vs plain worst |diff| {off:.3e} (scale {scale:.3e})");
+    // `f32::max` drops NaN, so check finiteness separately.
+    assert!(want.iter().all(|v| v.is_finite()), "dot route output has non-finite values");
+    assert!(off <= 1e-2 * scale, "dot route vs plain GEMM: {off:.3e} of {scale:.3e}");
+    gpu.destroy_buf(&o_plain);
 
     // A second matrix through the same scratch: its dequant must wait for the
     // first dot to finish reading (write-after-read on the shared scratch).

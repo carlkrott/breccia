@@ -858,7 +858,8 @@ impl<'g> GemmMany<'g> {
         pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
         pc[4..8].copy_from_slice(&(cols as u32).to_le_bytes());
         pc[8..12].copy_from_slice(&(bpr as u32).to_le_bytes());
-        let groups = ((rows * bpr) as u32).div_ceil(64);
+        // DEQUANT_F16_OUT (dequant_body.glsl): one invocation per 8-element unit.
+        let groups = ((rows * bpr * (qk / 8)) as u32).div_ceil(64);
         let gx = groups.min(WG_X_MAX);
         // Binding 1 is declared by the shared header but unused by the dequant.
         self.dispatch_grid(
