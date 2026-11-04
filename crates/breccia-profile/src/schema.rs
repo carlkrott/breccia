@@ -127,7 +127,7 @@ pub struct TileChoice {
     #[serde(default)]
     pub cols: usize,
     pub users: usize,
-    /// `"plain"`, `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"` or `"dot"`.
+    /// `"plain"`, `"4x2"`, `"4x4"`, `"8x4"`, `"8x8"`, `"dot"` or `"dot{BM}x{BN}"`.
     pub tile: String,
     /// GPU microseconds of the winner.
     pub us: f64,
