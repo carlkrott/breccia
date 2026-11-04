@@ -9,7 +9,7 @@
 //! measured. A pipeline with no measurement yet is recorded **alone** in its own
 //! submission, so its first reading is exact (no attribution guesswork); after that
 //! a segment is cut whenever the predicted time of the next dispatch would push the
-//! open submission past the budget (40 % of the timeout). A per-device correction
+//! open submission past the budget (25 % of the timeout). A per-device correction
 //! factor absorbs under-prediction (e.g. attention, whose per-workgroup cost grows
 //! with context). Splitting only adds a full barrier at the cut, so results are
 //! bit-identical. Timing is two timestamps per submission (the per-dispatch probe
@@ -26,7 +26,8 @@ use std::collections::HashMap;
 /// The watchdog (ms) when the driver exposes none: Windows TDR and amdgpu's default.
 const DEFAULT_LOCKUP_MS: f64 = 2000.0;
 /// Fraction of the watchdog one submission may be predicted to use.
-const BUDGET_FRACTION: f64 = 0.4;
+// 0.4 let one under-predicted MI50 8k submission reach 1404 ms of 2000 (predicted 792).
+const BUDGET_FRACTION: f64 = 0.25;
 
 /// The smallest positive amdgpu `lockup_timeout` entry (ms), else the default.
 /// Format: `T` or `GFX,Compute,SDMA,Video`; `0`/empty = driver default, `<0` = off.

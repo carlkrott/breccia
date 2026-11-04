@@ -863,7 +863,7 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
     // fence belongs to another device can be neither waited nor freed here (§8o:
     // two streams, one card each).
     //
-    // Two passes: a slot with **no fence** first (nothing to wait for — that is
+    // A slot with **no fence** first (nothing to wait for — that is
     // what keeps the pipeline deep), and only if every slot is busy do we wait on
     // one of our own. (Taking an own-but-in-flight slot first would make every
     // block wait for the previous block's submission and serialise the stream.)
@@ -871,32 +871,52 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
     // Slots are **device-affine**: a slot's descriptor pool is a device object
     // (it is reset per batch, not recreated), so a slot may only ever serve one
     // device. Sharing a slot across devices corrupts the recorded sets.
+    //
+    // Order: an own idle slot, then an unowned one, then wait on an own one, and
+    // last **reclaim** an idle slot another device owns (its descriptor pool is
+    // dropped and recreated here). Own-first stops one card's guard cuts from
+    // claiming every slot; reclaim covers the case where it already has.
     let open_slots: Vec<usize> = OPEN.with(|o| o.borrow().iter().map(|x| x.slot).collect());
-    let mut slot = usize::MAX;
-    for i in 0..RING {
-        if open_slots.contains(&i) {
-            continue;
-        }
-        let owner = DEVICES.with(|d| d.borrow()[i]);
-        if owner != vk::Device::null() && owner != dev {
-            continue;
-        }
-        if FENCES.with(|f| f.borrow()[i]) == vk::Fence::null() {
-            slot = i;
-            break;
-        }
-    }
-    if slot == usize::MAX {
-        for i in 0..RING {
-            if open_slots.contains(&i) {
-                continue;
+    let owner = |i: usize| DEVICES.with(|d| d.borrow()[i]);
+    let idle = |i: usize| FENCES.with(|f| f.borrow()[i]) == vk::Fence::null();
+    let free = |i: &usize| !open_slots.contains(i);
+    let slot = (0..RING)
+        .filter(free)
+        .find(|&i| owner(i) == dev && idle(i))
+        .or_else(|| {
+            (0..RING)
+                .filter(free)
+                .find(|&i| owner(i) == vk::Device::null())
+        })
+        .or_else(|| (0..RING).filter(free).find(|&i| owner(i) == dev))
+        .or_else(|| {
+            // A guard cut's fence is only reaped by its own device's back-pressure,
+            // so a signalled one still counts as idle here.
+            let done = |i: usize| {
+                idle(i)
+                    || SLOT_DEV.with(|d| {
+                        d.borrow()[i].as_ref().is_some_and(|d| unsafe {
+                            d.get_fence_status(FENCES.with(|f| f.borrow()[i])) == Ok(true)
+                        })
+                    })
+            };
+            let i = (0..RING).filter(free).find(|&i| done(i))?;
+            let fence = FENCES.with(|f| std::mem::take(&mut f.borrow_mut()[i]));
+            if fence != vk::Fence::null() {
+                if let Some(d) = SLOT_DEV.with(|d| d.borrow()[i].clone()) {
+                    unsafe { d.destroy_fence(fence, None) };
+                }
             }
-            if DEVICES.with(|d| d.borrow()[i]) == dev {
-                slot = i;
-                break;
+            let pool = POOLS.with(|p| std::mem::take(&mut p.borrow_mut()[i]));
+            if let Some(d) = SLOT_DEV.with(|d| d.borrow_mut()[i].take()) {
+                if pool != vk::DescriptorPool::null() {
+                    unsafe { d.destroy_descriptor_pool(pool, None) };
+                }
             }
-        }
-    }
+            DEVICES.with(|d| d.borrow_mut()[i] = vk::Device::null());
+            Some(i)
+        })
+        .unwrap_or(usize::MAX);
     if slot == usize::MAX {
         return Err(anyhow!(
             "no free ring slot for device {} ({RING} slots, {} open, {} in flight)",

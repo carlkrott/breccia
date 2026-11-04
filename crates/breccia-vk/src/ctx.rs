@@ -1168,13 +1168,25 @@ impl Gpu {
     /// `BRECCIA_VRAM_FLOOR_MIB=<MiB>` sets the floor (default 256 on a display
     /// card, 64 headless), `=0` turns the guard off.
     pub fn vram_short(&self, bytes: u64) -> Option<String> {
-        if self.vram_floor == 0 {
+        self.vram_below(bytes, self.vram_floor)
+    }
+
+    /// The hard stop: free VRAM under **half** the spill floor. Our own buffers
+    /// stop at the floor (they spill); what still lands past it is one-time driver
+    /// growth (measured: a flat 70 MiB free on the MI50 after the 1k spill), so
+    /// stopping at the floor itself threw away runs that were never at risk.
+    pub fn vram_critical(&self) -> Option<String> {
+        self.vram_below(0, self.vram_floor / 2)
+    }
+
+    fn vram_below(&self, bytes: u64, floor: u64) -> Option<String> {
+        if floor == 0 {
             return None;
         }
         let b = self.mem_budget()?;
         let others = b.others().max(self.vram_others0);
         let avail = b.heap_bytes.saturating_sub(others + b.usage);
-        (avail < bytes + self.vram_floor).then(|| {
+        (avail < bytes + floor).then(|| {
             format!(
                 "device {} ({}): {} MiB free (this process {} MiB, others {} MiB, \
                  {} MiB at start), {} MiB requested, {} MiB floor",
@@ -1185,7 +1197,7 @@ impl Gpu {
                 b.others() >> 20,
                 self.vram_others0 >> 20,
                 bytes >> 20,
-                self.vram_floor >> 20
+                floor >> 20
             )
         })
     }

@@ -2712,7 +2712,7 @@ impl<'m> Session<'m> {
     /// `BRECCIA_VRAM_LOG=1` prints each check.
     fn vram_watch(&self) -> Result<()> {
         for d in &self.model.devices {
-            let short = d.gpu().vram_short(0);
+            let short = d.gpu().vram_critical();
             if std::env::var_os("BRECCIA_VRAM_LOG").is_some() {
                 if let Some(b) = d.gpu().mem_budget() {
                     eprintln!(
@@ -4781,6 +4781,19 @@ impl<'m> Session<'m> {
                 (self.pf_stream_wait_s - wait0) * 1e3
             );
             Self::pf_mark_at(b, "moe", &pf_tp, &extra);
+        }
+        if std::env::var_os("BRECCIA_VRAM_LOG").is_some() {
+            for d in &self.model.devices {
+                if let Some(m) = d.gpu().mem_budget() {
+                    eprintln!(
+                        "vram blk {b:>2}: device {} free {} MiB, ours {} MiB, others {} MiB",
+                        d.gpu().index,
+                        m.free_for_us() >> 20,
+                        m.usage >> 20,
+                        m.others() >> 20
+                    );
+                }
+            }
         }
 
         // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
