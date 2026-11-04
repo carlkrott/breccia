@@ -1207,3 +1207,23 @@ fn dequant_spv(ty: QuantType) -> &'static [u8] {
         QuantType::F32 => spv!("dequant_f32"),
     }
 }
+
+/// [`dequant_spv`] writing f16 pairs (`DEQUANT_F16_OUT`); host contract `cols % QK == 0`.
+pub(crate) fn dequant_f16_spv(ty: QuantType) -> &'static [u8] {
+    match ty {
+        QuantType::Iq2Xxs => spv!("dequant_iq2_xxs_f16"),
+        QuantType::Iq2Xs => spv!("dequant_iq2_xs_f16"),
+        QuantType::Iq2S => spv!("dequant_iq2_s_f16"),
+        QuantType::Iq3Xxs => spv!("dequant_iq3_xxs_f16"),
+        QuantType::Iq3S => spv!("dequant_iq3_s_f16"),
+        QuantType::Iq4Nl => spv!("dequant_iq4_nl_f16"),
+        QuantType::Iq4Xs => spv!("dequant_iq4_xs_f16"),
+        QuantType::Q4K => spv!("dequant_q4_k_f16"),
+        QuantType::Q5K => spv!("dequant_q5_k_f16"),
+        QuantType::Q6K => spv!("dequant_q6_k_f16"),
+        QuantType::Q2_0 => spv!("dequant_q2_0_f16"),
+        QuantType::F16 => spv!("dequant_f16_f16"),
+        QuantType::Bf16 => spv!("dequant_bf16_f16"),
+        QuantType::F32 => spv!("dequant_f32_f16"),
+    }
+}

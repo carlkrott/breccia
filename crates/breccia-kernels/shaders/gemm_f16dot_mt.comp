@@ -1,0 +1,79 @@
+#version 450
+// Micro-tiled mixed-float-dot GEMM: O[u*rows + r] = sum_k W[r,k] * X[u,k].
+// W is f16 pairs (rows*cols/2 words), X f32, f32 accumulation via
+// OpFDot2MixAcc32VALVE (one instruction per two MACs). A workgroup owns
+// BM rows x BN users; each thread a RM x RU register tile, strided so a
+// wavefront reads consecutive LDS words. cols must be a multiple of 32.
+// Defines: BM, BN, RM, RU, NT = (BM/RM)*(BN/RU) (a literal: glslang rejects an
+// expression in local_size_x).
+#extension GL_EXT_spirv_intrinsics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+#ifndef BM
+#define BM 64
+#define BN 64
+#define RM 4
+#define RU 4
+#define NT 256
+#endif
+#define TR (BM / RM)
+#define TU (BN / RU)
+#define KP 16
+
+layout(local_size_x = NT) in;
+layout(std430, binding = 0) readonly buffer Wb { uint w[]; };
+layout(std430, binding = 1) readonly buffer Xb { vec2 x[]; };
+layout(std430, binding = 2) writeonly buffer Ob { float o[]; };
+layout(push_constant) uniform P { uint rows; uint cols; uint users; };
+
+spirv_instruction(extensions = ["SPV_VALVE_mixed_float_dot_product"], capabilities = [6912], id = 6916)
+float dot2mix(f16vec2 a, f16vec2 b, float c);
+
+shared uint Ws[KP][BM];
+shared uint Xs[KP][BN];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint tr = lid % TR;
+    uint tu = lid / TR;
+    uint r0 = gl_WorkGroupID.x * BM;
+    uint u0 = gl_WorkGroupID.y * BN;
+    uint cp = cols / 2u;
+
+    float acc[RM][RU];
+    for (uint i = 0u; i < RM; i++)
+        for (uint j = 0u; j < RU; j++) acc[i][j] = 0.0;
+
+    for (uint k = 0u; k < cp; k += KP) {
+        // Stage W: BM rows x KP pairs, consecutive threads on consecutive pairs.
+        for (uint s = lid; s < BM * KP; s += NT) {
+            uint p = s % KP, rr = s / KP;
+            uint r = min(r0 + rr, rows - 1u);
+            Ws[p][rr] = w[r * cp + k + p];
+        }
+        // Stage X: BN users x KP pairs, converted to f16 once here.
+        for (uint s = lid; s < BN * KP; s += NT) {
+            uint p = s % KP, uu = s / KP;
+            uint u = min(u0 + uu, users - 1u);
+            Xs[p][uu] = packHalf2x16(x[u * cp + k + p]);
+        }
+        barrier();
+        for (uint p = 0u; p < KP; p++) {
+            f16vec2 wv[RM];
+            for (uint i = 0u; i < RM; i++) wv[i] = unpackFloat2x16(Ws[p][tr + i * TR]);
+            for (uint j = 0u; j < RU; j++) {
+                f16vec2 xv = unpackFloat2x16(Xs[p][tu + j * TU]);
+                for (uint i = 0u; i < RM; i++) acc[i][j] = dot2mix(wv[i], xv, acc[i][j]);
+            }
+        }
+        barrier();
+    }
+    for (uint j = 0u; j < RU; j++) {
+        uint u = u0 + tu + j * TU;
+        if (u >= users) continue;
+        for (uint i = 0u; i < RM; i++) {
+            uint r = r0 + tr + i * TR;
+            if (r < rows) o[u * rows + r] = acc[i][j];
+        }
+    }
+}

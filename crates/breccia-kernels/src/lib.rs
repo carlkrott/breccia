@@ -63,6 +63,9 @@ pub use batch::{GemvBatch, XLayout};
 
 /// Hash of every compiled SPIR-V module in this build (see `build.rs`).
 pub const SPIRV_HASH: &str = env!("BRECCIA_SPIRV_HASH");
+/// The same hash over the GEMM and dequant modules only: the kernel tile table's
+/// staleness key, so an attention-shader edit does not drop the table.
+pub const GEMM_SPIRV_HASH: &str = env!("BRECCIA_GEMM_SPIRV_HASH");
 
 /// The hand-assembled mixed-float-dot module (`shaders/mixed_dot_probe.spvasm`),
 /// built by `build.rs` with `spirv-as` + `spirv-val` exactly like the compiled

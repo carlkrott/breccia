@@ -38,7 +38,12 @@ shared float s_iq4nl[16];
 #ifndef BRECCIA_OWN_BINDINGS
 layout(std430, binding = 0) readonly buffer WeightBytes { uint16_t W[]; };
 layout(std430, binding = 1) readonly buffer XVec { vec4 X[]; };
+#ifdef DEQUANT_F16_OUT
+// f16-pair output for the mixed-dot GEMM: O16[e/2] = (e, e+1) as packHalf2x16.
+layout(std430, binding = 2) writeonly buffer OutVec { uint O16[]; };
+#else
 layout(std430, binding = 2) writeonly buffer OutVec { float O[]; };
+#endif
 
 // Quant tables. These live in a small read-only storage buffer (7 KB) rather
 // than in GLSL `const` arrays: a dynamically indexed const array is lowered to

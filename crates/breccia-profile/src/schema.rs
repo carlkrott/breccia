@@ -107,8 +107,8 @@ pub struct DeviceEntry {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct KernelVerdict {
     pub driver_version: String,
-    /// `breccia_kernels::SPIRV_HASH` of the build that measured it: a shader change
-    /// invalidates the table, exactly like `PrefillVerdict`.
+    /// `breccia_kernels::GEMM_SPIRV_HASH` of the build that measured it: a GEMM or
+    /// dequant shader change invalidates the table (the engine re-calibrates it at load).
     pub spirv_hash: String,
     pub timestamp: String,
     /// One row per measured cell.

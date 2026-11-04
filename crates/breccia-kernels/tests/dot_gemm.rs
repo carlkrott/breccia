@@ -255,6 +255,23 @@ fn tiled_dot_gemm_matches_the_naive_body() {
          tiled vs CPU {worst_cpu:.3e}"
     );
     assert!(worst < 1e-4 && worst_cpu < 1e-3, "tiled body diverges");
+    for v in 0..DotGemm::MT_TILES.len() {
+        DotGemm::new_mt(&gpu, v)
+            .expect("micro-tiled")
+            .run_tiled(&w, &x, &b, rows, cols, users)
+            .expect("micro-tiled dispatch");
+        let vm = breccia_kernels::ops::download_f32(&gpu, &b, rows * users).expect("b");
+        let worst_mt = va
+            .iter()
+            .zip(&vm)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        println!(
+            "tiled_dot: micro-tile {:?} vs naive {worst_mt:.3e}",
+            DotGemm::MT_TILES[v]
+        );
+        assert!(worst_mt < 1e-4, "micro-tiled body {v} diverges");
+    }
     gpu.destroy_buf(&w);
     gpu.destroy_buf(&x);
     gpu.destroy_buf(&a);
@@ -454,5 +471,141 @@ fn a_bf16_matrix_runs_on_the_dot_after_the_f16_prepass() {
         gpu.destroy_buf(&x);
         gpu.destroy_buf(&o);
         gpu.destroy_buf(&o2);
+    }
+}
+
+/// Dense-shape speed probe (`BRECCIA_DOT_BIG=1`): the tiled f16 dot vs the
+/// quantised tile build on the model's largest dense projections.
+#[test]
+fn dot_gemm_dense_shape_speed() {
+    let (Ok(selector), Ok(_)) = (
+        std::env::var("BRECCIA_KERNEL_DEVICE"),
+        std::env::var("BRECCIA_DOT_BIG"),
+    ) else {
+        eprintln!("dot_big: SKIPPED — set BRECCIA_KERNEL_DEVICE and BRECCIA_DOT_BIG");
+        return;
+    };
+    let Some((_host, gpu)) = open(&selector) else {
+        return;
+    };
+    if !DotGemm::supported(&gpu) {
+        return;
+    }
+    let mut dots = vec![(
+        "tile64x8".to_string(),
+        DotGemm::new_tiled(&gpu).expect("tiled pipeline"),
+    )];
+    for (v, t) in DotGemm::MT_TILES.iter().enumerate() {
+        dots.push((
+            format!("mt{}x{}", t.0, t.1),
+            DotGemm::new_mt(&gpu, v).expect("micro-tiled"),
+        ));
+    }
+    let q = GemmMany::new(&gpu, QuantType::Iq3S).expect("iq3_s gemm");
+    for (rows, cols) in [(12288usize, 2560usize), (2560, 4096)] {
+        for users in [256usize, 1024, 4096] {
+            let w = alloc(&gpu, (rows * cols * 2) as u64).expect("w");
+            let wq = alloc(&gpu, q.weight_bytes(rows, cols)).expect("wq");
+            let x = alloc(&gpu, (users * cols * 4) as u64).expect("x");
+            let o = alloc(&gpu, (users * rows * 4) as u64).expect("o");
+            let gf = 2.0 * (rows * cols * users) as f64 / 1e9;
+            let time = |f: &dyn Fn()| {
+                (0..4)
+                    .map(|_| {
+                        let t0 = std::time::Instant::now();
+                        f();
+                        t0.elapsed().as_secs_f64() * 1e3
+                    })
+                    .skip(1)
+                    .fold(f64::INFINITY, f64::min)
+            };
+            let tq = time(&|| q.run_at(&wq, &x, &o, rows, cols, users, 0).expect("q"));
+            let mut line = format!(
+                "dot_big: {rows}x{cols} u={users}: iq3_s {tq:.2} ms ({:.1} TF/s)",
+                gf / tq
+            );
+            for (name, g) in &dots {
+                let td = time(&|| g.run_tiled(&w, &x, &o, rows, cols, users).expect("dot"));
+                line += &format!("  {name} {td:.2} ms ({:.1})", gf / td);
+            }
+            let tdq = time(&|| q.dequant_f16(&wq, &w, rows, cols).expect("deq"));
+            let tdd = time(&|| {
+                q.run_dot_dequant(&wq, &x, &o, rows, cols, users, &w)
+                    .expect("dd")
+            });
+            line += &format!(
+                "  deq16 {tdq:.2} ms  deq16+mt {tdd:.2} ms ({:.1})",
+                gf / tdd
+            );
+            println!("{line}");
+            for b in [&w, &wq, &x, &o] {
+                gpu.destroy_buf(b);
+            }
+        }
+    }
+}
+
+/// **Inside a dispatch batch** the dequant + dot route must record, not submit: a
+/// submit+wait dot runs before the batch's recorded dequant has filled the scratch
+/// (the engine's 1k prefill gave flat logits, top-1 3.9 vs 19.6, until it recorded).
+/// The scratch starts zeroed, so a dot that runs early returns all zeros.
+#[test]
+fn the_dequant_dot_route_records_inside_a_dispatch_batch() {
+    use breccia_kernels::dispatch_batch;
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("dot_batch: SKIPPED — set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let Some((_host, gpu)) = open(&selector) else {
+        return;
+    };
+    if !DotGemm::supported(&gpu) {
+        eprintln!("dot_batch: SKIPPED — no extension");
+        return;
+    }
+    let (rows, cols, users) = (256usize, 512usize, 64usize);
+    let q = GemmMany::new(&gpu, QuantType::Iq4Nl).expect("iq4_nl gemm");
+    let mut seed = 0x0bad_5eedu32;
+    let mut next = || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 24) as u8
+    };
+    // IQ4_NL block: f16 scale (1.0 / 64) + 16 bytes of 4-bit codebook indices.
+    let mut wq = Vec::new();
+    for _ in 0..rows * cols / 32 {
+        wq.extend_from_slice(&half(1.0 / 64.0).to_le_bytes());
+        wq.extend((0..16).map(|_| next()));
+    }
+    let xs: Vec<u8> = (0..users * cols)
+        .flat_map(|_| ((next() as f32 - 128.0) / 64.0).to_le_bytes())
+        .collect();
+    let wq = upload(&gpu, &wq).expect("wq");
+    let x = upload(&gpu, &xs).expect("x");
+    let o_ref = alloc(&gpu, (rows * users * 4) as u64).expect("o_ref");
+    let o = alloc(&gpu, (rows * users * 4) as u64).expect("o");
+    let scratch_ref = alloc(&gpu, (rows * cols * 2) as u64).expect("scratch");
+    q.run_dot_dequant(&wq, &x, &o_ref, rows, cols, users, &scratch_ref)
+        .expect("reference");
+    let want = breccia_kernels::ops::download_f32(&gpu, &o_ref, rows * users).expect("ref");
+    assert!(want.iter().any(|v| *v != 0.0), "reference is all zeros");
+
+    let scratch = upload(&gpu, &vec![0u8; rows * cols * 2]).expect("zeroed scratch");
+    dispatch_batch::begin(&gpu).expect("begin");
+    q.run_dot_dequant(&wq, &x, &o, rows, cols, users, &scratch)
+        .expect("batched");
+    dispatch_batch::end(&gpu).expect("end");
+    let got = breccia_kernels::ops::download_f32(&gpu, &o, rows * users).expect("got");
+    let worst = got
+        .iter()
+        .zip(&want)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    println!("dot_batch: batched vs direct worst |diff| {worst:.3e}");
+    assert!(
+        worst == 0.0,
+        "the batched dequant + dot differs: {worst:.3e}"
+    );
+    for b in [&wq, &x, &o_ref, &o, &scratch_ref, &scratch] {
+        gpu.destroy_buf(b);
     }
 }

@@ -500,6 +500,15 @@ impl Model {
         // last block's. `Auto` reads the profile's compute role (see `crate::head`),
         // an ordinal indexes `--devices`, and a PCI address indexes identity.
         let last_dev = placement.device_of(cfg.n_layers - 1);
+        // Before the table is read: a stale one re-calibrates now (devices hold no weights yet).
+        crate::kcal::recalibrate_stale(
+            &devices,
+            &shards,
+            &opts
+                .profile
+                .clone()
+                .unwrap_or_else(breccia_profile::default_profile_path),
+        );
         let entries = profile_entries(&devices, opts.profile.as_deref(), opts.verbose);
         let candidates = head_candidates(&devices, &entries);
         let pf_verdicts = entries
@@ -1240,6 +1249,17 @@ pub struct PipelineSet<'g> {
     /// pipeline however many roles use it).
     gemm:
         std::collections::BTreeMap<breccia_kernels::QuantType, breccia_kernels::gemm::GemmMany<'g>>,
+    /// The device's f16 scratch for the dequant + mixed-dot route, aliased by every
+    /// GEMM above (`set_dot_dequant`) and destroyed here.
+    dot_scratch: Option<(&'g Gpu, breccia_vk::ctx::Buf)>,
+}
+
+impl Drop for PipelineSet<'_> {
+    fn drop(&mut self) {
+        if let Some((gpu, b)) = self.dot_scratch.take() {
+            gpu.destroy_buf(&b);
+        }
+    }
 }
 
 impl<'g> PipelineSet<'g> {
@@ -1319,7 +1339,32 @@ impl<'g> PipelineSet<'g> {
                 }
             }
         }
-        Ok(PipelineSet { map, batch, gemm })
+        // Dequant + mixed dot where the calibration chose `dot` (f16 W and X; KL at
+        // 8k 2.1e-4 vs f32 activations). Default on; `BRECCIA_DOT=0` is the exact arm.
+        // One scratch sized for the largest matrix serves every type on the device.
+        let mut dot_scratch = None;
+        if std::env::var("BRECCIA_DOT").map_or(true, |v| v != "0")
+            && breccia_kernels::gemm::DotGemm::supported(gpu)
+        {
+            let bytes = keys.iter().map(|k| k.rows * k.cols * 2).max().unwrap_or(0) as u64;
+            if bytes > 0 {
+                match breccia_kernels::gemv::alloc(gpu, bytes) {
+                    Ok(b) => {
+                        for g in gemm.values_mut() {
+                            g.set_dot_dequant(Some(&b));
+                        }
+                        dot_scratch = Some((gpu, b));
+                    }
+                    Err(e) => eprintln!("dot scratch ({} MiB): {e}; dot route off", bytes >> 20),
+                }
+            }
+        }
+        Ok(PipelineSet {
+            map,
+            batch,
+            gemm,
+            dot_scratch,
+        })
     }
 
     /// The multi-user GEMM for `ty`, or `None` when the shader set has no GEMM
@@ -1724,13 +1769,14 @@ fn profile_entries(
 
     // Install the calibrated GEMM tile table (startup, from the profile). Only
     // cells measured by *this* build count: a shader change invalidates them, the
-    // same rule `PrefillVerdict` follows. With no table the kernels fall back to
+    // same rule `PrefillVerdict` follows (keyed on the GEMM shaders only; `kcal`
+    // re-calibrates a stale table at load). With no table the kernels fall back to
     // their built-in rule, so a fresh machine behaves exactly as before.
     let cells: Vec<breccia_kernels::gemm::TileCell> = entries
         .iter()
         .flatten()
         .filter_map(|e| Some((e, e.kernel.as_ref()?)))
-        .filter(|(_, k)| k.spirv_hash == breccia_kernels::SPIRV_HASH)
+        .filter(|(_, k)| k.spirv_hash == breccia_kernels::GEMM_SPIRV_HASH)
         .flat_map(|(e, k)| k.tiles.iter().map(move |t| (e, t)))
         .map(|(e, t)| breccia_kernels::gemm::TileCell {
             ty: t.ty.clone(),

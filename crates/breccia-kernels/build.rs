@@ -172,6 +172,13 @@ const GEMM_VARIANTS: &[(u32, u32)] = &[(2, 8), (4, 8), (1, 16), (2, 16)];
 // (4,2) exists to test whether the row-poor gate/up shape is workgroup-starved:
 // a 64x32 tile gives it 10 x 32 = 320 workgroups instead of 10 x 16 = 160, at the
 // same rows per tile and with no reduction (unlike split-K).
+/// `(BM, BN, RM, RU)` of the micro-tiled mixed-dot GEMM builds (`gemm::DotGemm::new_mt`).
+const MT_TILES: [(u32, u32, u32, u32); 4] = [
+    (64, 64, 4, 4),
+    (128, 64, 8, 4),
+    (64, 128, 4, 8),
+    (128, 128, 8, 8),
+];
 const GEMM_TILES: &[(u32, u32)] = &[(4, 2), (4, 4), (8, 4), (8, 8)];
 
 fn main() {
@@ -214,9 +221,38 @@ fn main() {
     // W row reused across the workgroup's users (audit §24 measured the naive body
     // at 0.01x of the tiled GLSL build, which is what this fixes).
     assemble(&out_dir, "shaders/gemm_tile_dot_f16.spvasm");
+    // Micro-tiled mixed-dot GEMM (GLSL via GL_EXT_spirv_intrinsics): BM x BN per
+    // workgroup, RM x RU per thread. Which one runs is calibration's call.
+    for (bm, bn, rm, ru) in MT_TILES {
+        let defs = [
+            format!("BM={bm}"),
+            format!("BN={bn}"),
+            format!("RM={rm}"),
+            format!("RU={ru}"),
+            format!("NT={}", (bm / rm) * (bn / ru)),
+        ];
+        let defs: Vec<&str> = defs.iter().map(String::as_str).collect();
+        compile(
+            &glslc,
+            &out_dir,
+            "gemm_f16dot_mt",
+            &format!("gemm_f16dot_mt{bm}x{bn}"),
+            &defs,
+        );
+    }
 
     for name in SHADERS {
         compile(&glslc, &out_dir, name, name, &[]);
+        // f16-pair output of every dequant, the mixed-dot GEMM's weight feed.
+        if name.starts_with("dequant_") {
+            compile(
+                &glslc,
+                &out_dir,
+                name,
+                &format!("{name}_f16"),
+                &["DEQUANT_F16_OUT=1"],
+            );
+        }
         // fp16-accumulate variant of every fused GEMV (not the reduce pass: it
         // sums fp32 partials by contract).
         if name.starts_with("gemv_") && *name != "gemv_reduce" {
@@ -351,18 +387,23 @@ fn main() {
         }
     }
 
-    spirv_hash(&out_dir);
+    spirv_hash(&out_dir, "BRECCIA_SPIRV_HASH", |_| true);
+    spirv_hash(&out_dir, "BRECCIA_GEMM_SPIRV_HASH", |n| {
+        n.starts_with("gemm_") || n.starts_with("dequant_")
+    });
 }
 
 /// FNV-1a 64 over every module in `OUT_DIR`, in file-name order, exported as
 /// `BRECCIA_SPIRV_HASH`: the shader half of a `breccia profile --prefill` verdict's
 /// staleness key (a shader edit re-asks the per-GPU question; a Rust-only rebuild
 /// does not).
-fn spirv_hash(out_dir: &Path) {
+/// `keep` filters by file name (the GEMM-only variant keys the kernel tile table).
+fn spirv_hash(out_dir: &Path, var: &str, keep: impl Fn(&str) -> bool) {
     let mut names: Vec<PathBuf> = std::fs::read_dir(out_dir)
         .expect("OUT_DIR readable")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "spv"))
+        .filter(|p| keep(&p.file_name().unwrap().to_string_lossy()))
         .collect();
     names.sort();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -377,7 +418,7 @@ fn spirv_hash(out_dir: &Path) {
             h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
         }
     }
-    println!("cargo:rustc-env=BRECCIA_SPIRV_HASH={h:016x}");
+    println!("cargo:rustc-env={var}={h:016x}");
 }
 
 /// QSA stems that get the q8_0 **V**-cache build (`BRECCIA_KV_Q8V`, §8bg): the

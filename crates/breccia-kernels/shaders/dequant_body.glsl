@@ -35,12 +35,19 @@ void main() {
     float v[8];
     for (uint u = 0u; u < UNITS; ++u) {
         DEQUANT_UNIT(off, u, v);
+#ifdef DEQUANT_F16_OUT
+        // Host contract: cols % QK == 0, so every pair is in range.
+        for (uint j = 0u; j < 8u; j += 2u) {
+            O16[(out_base + u * 8u + j) / 2u] = packHalf2x16(vec2(v[j], v[j + 1u]));
+        }
+#else
         for (uint j = 0u; j < 8u; ++j) {
             uint e = e0 + u * 8u + j;
             if (e < pc.cols) {
                 O[out_base + u * 8u + j] = v[j];
             }
         }
+#endif
     }
 }
 

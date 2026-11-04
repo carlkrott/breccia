@@ -53,6 +53,16 @@ pub struct GemmMany<'g> {
     /// dispatched when the caller declared its weights to be f16 pairs
     /// ([`GemmMany::set_dot_weights`]) *and* the calibration chose `dot` here.
     dot: Option<DotGemm<'g>>,
+    /// This type's dequant writing **f16 pairs** (`DEQUANT_F16_OUT`): feeds the dot
+    /// from quantised weights through a caller-owned scratch
+    /// ([`GemmMany::run_dot_dequant`]). Built only when `dot` is.
+    deq16: Option<breccia_vk::ctx::Kernel>,
+    /// Route calibrated `dot` cells of *any* type through `deq16` + the dot, via
+    /// `dot_scratch` ([`GemmMany::set_dot_dequant`]).
+    dot_dequant: bool,
+    /// The device's shared f16 scratch: an alias, owned (and destroyed) by the
+    /// caller, never by this GEMM. Allocated outside any dispatch batch.
+    dot_scratch: Option<Buf>,
     /// The caller's declaration that this matrix's weights are f16 pairs (two per
     /// word). Default false: quantised bits must never be read as f16.
     dot_weights: bool,
@@ -260,12 +270,14 @@ pub fn calibrate_shapes(
         let x = alloc(gpu, (umax * pcols * 4) as u64)?;
         upload_into(gpu, &x, bytemuck_f32(&xf))?;
         let o = alloc(gpu, (umax * rows * 4) as u64)?;
-        let dot = (s.ty == QuantType::Bf16 && pcols == cols && cols.is_multiple_of(2))
-            .then(|| DotGemm::new_tiled(gpu).ok())
-            .flatten();
-        let wdot = dot
-            .as_ref()
-            .and_then(|_| f16_pairs_from_bf16(gpu, &w, rows, cols).ok());
+        // The dot as the engine runs it by default: f16 dequant into a scratch,
+        // then the mixed-dot GEMM; the timing includes the dequant.
+        let wdot = (gemm.deq16.is_some()
+            && gemm.dot.is_some()
+            && pcols == cols
+            && cols.is_multiple_of(s.ty.block_elems().max(32)))
+        .then(|| alloc(gpu, (rows * cols * 2) as u64).ok())
+        .flatten();
 
         // Candidates: plain, the tiles, the dot.
         let mut names = vec!["plain".to_string()];
@@ -280,8 +292,7 @@ pub fn calibrate_shapes(
             } else if c <= gemm.tiles.len() {
                 gemm.run_tiled(gemm.tiles[c - 1].0, &w, &x, &o, rows, cols, u)
             } else {
-                let (d, b) = (dot.as_ref().unwrap(), wdot.as_ref().unwrap());
-                d.run_tiled(b, &x, &o, rows, cols, u)
+                gemm.run_dot_dequant(&w, &x, &o, rows, cols, u, wdot.as_ref().unwrap())
             }
         };
         let time = |c: usize, u: usize| -> Result<f64> {
@@ -770,12 +781,21 @@ impl<'g> GemmMany<'g> {
             }),
             upz: default_upz(),
             dot: if DotGemm::supported(gpu) {
-                DotGemm::new_tiled(gpu).ok()
+                DotGemm::new_mt(gpu, 3)
+                    .or_else(|_| DotGemm::new_tiled(gpu))
+                    .ok()
+            } else {
+                None
+            },
+            deq16: if DotGemm::supported(gpu) {
+                gpu.kernel(crate::gemv::dequant_f16_spv(ty), 4).ok()
             } else {
                 None
             },
             dot_weights: false,
             dot_bf16: false,
+            dot_dequant: false,
+            dot_scratch: None,
             dot_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             tile_locked: false,
             tables,
@@ -804,6 +824,69 @@ impl<'g> GemmMany<'g> {
     /// which promises the buffer is already f16 pairs.
     pub fn set_dot_bf16(&mut self, on: bool) {
         self.dot_bf16 = on;
+    }
+
+    /// Let calibrated `dot` cells run as f16 dequant into `scratch` + the dot GEMM.
+    /// `scratch` aliases a buffer the caller owns and outlives this GEMM; a matrix
+    /// larger than it keeps the quantised path. `None` turns the route off.
+    pub fn set_dot_dequant(&mut self, scratch: Option<&Buf>) {
+        self.dot_dequant = scratch.is_some() && self.deq16.is_some() && self.dot.is_some();
+        self.dot_scratch = scratch.map(|b| Buf {
+            buf: b.buf,
+            mem: b.mem,
+            size: b.size,
+            id: b.id,
+        });
+    }
+
+    /// Dequantise `w` (`rows x cols` of this type) into `scratch` as f16 pairs,
+    /// `rows * cols * 2` bytes. Needs `cols % block_elems == 0` (no padded rows).
+    pub fn dequant_f16(&self, w: &Buf, scratch: &Buf, rows: usize, cols: usize) -> Result<()> {
+        let Some(k) = &self.deq16 else {
+            return Err(anyhow!("no f16 dequant for {} on this device", self.ty));
+        };
+        let qk = self.ty.block_elems();
+        if !cols.is_multiple_of(qk) || scratch.size < (rows * cols * 2) as u64 {
+            return Err(anyhow!(
+                "f16 dequant needs cols % {qk} == 0 and a {} B scratch ({rows}x{cols}, have {})",
+                rows * cols * 2,
+                scratch.size
+            ));
+        }
+        let bpr = cols / qk;
+        let mut pc = [0u8; 16];
+        pc[0..4].copy_from_slice(&(rows as u32).to_le_bytes());
+        pc[4..8].copy_from_slice(&(cols as u32).to_le_bytes());
+        pc[8..12].copy_from_slice(&(bpr as u32).to_le_bytes());
+        let groups = ((rows * bpr) as u32).div_ceil(64);
+        let gx = groups.min(WG_X_MAX);
+        // Binding 1 is declared by the shared header but unused by the dequant.
+        self.dispatch_grid(
+            k,
+            &[w, w, scratch, &self.tables],
+            &pc,
+            (gx, groups.div_ceil(gx), 1),
+        )
+    }
+
+    /// The dot body on quantised weights: [`GemmMany::dequant_f16`] into `scratch`,
+    /// then the mixed-dot GEMM from it. Same output contract as [`GemmMany::run`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_dot_dequant(
+        &self,
+        w: &Buf,
+        x: &Buf,
+        out: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+        scratch: &Buf,
+    ) -> Result<()> {
+        let Some(dot) = &self.dot else {
+            return Err(anyhow!("no mixed-dot body on this device"));
+        };
+        self.dequant_f16(w, scratch, rows, cols)?;
+        dot.run_tiled(scratch, x, out, rows, cols, users)
     }
 
     /// Whether the dot body is available and declared usable for this matrix.
@@ -1047,7 +1130,9 @@ impl<'g> GemmMany<'g> {
         // once here (the prepass) and caches it by source buffer.
         if base_words == 0 {
             let choice = choice_from_table(&self.dev, self.ty, rows, cols, users, false);
-            if choice != Some(Choice::Dot) && (self.dot_weights || self.dot_bf16) {
+            if choice != Some(Choice::Dot)
+                && (self.dot_weights || self.dot_bf16 || self.dot_dequant)
+            {
                 dot_log_reject(rows, cols, users, choice, self.dot.is_some());
             }
             if let (Some(Choice::Dot), Some(dot)) = (choice, self.dot.as_ref()) {
@@ -1067,6 +1152,14 @@ impl<'g> GemmMany<'g> {
                     if let Some(b) = cache.get(&w.id) {
                         dot_log(rows, cols, users);
                         return dot.run_tiled(b, x, out, rows, cols, users);
+                    }
+                }
+                if let (true, Some(s)) = (self.dot_dequant, self.dot_scratch.as_ref()) {
+                    if s.size >= (rows * cols * 2) as u64
+                        && cols.is_multiple_of(self.ty.block_elems().max(32))
+                    {
+                        dot_log(rows, cols, users);
+                        return self.run_dot_dequant(w, x, out, rows, cols, users, s);
                     }
                 }
             }
@@ -1514,7 +1607,7 @@ impl Drop for GemmMany<'_> {
         for (_, k) in &self.tiles {
             self.gpu.destroy_kernel(k);
         }
-        if let Some(k) = &self.hcgate {
+        for k in self.hcgate.iter().chain(self.deq16.iter()) {
             self.gpu.destroy_kernel(k);
         }
         self.gpu.destroy_buf(&self.tables);
@@ -1641,6 +1734,8 @@ mod tile_table_tests {
 pub struct DotGemm<'g> {
     kernel: breccia_vk::ctx::Kernel,
     gpu: &'g Gpu,
+    /// `(rows, users)` per workgroup for [`DotGemm::run_tiled`].
+    tile: (usize, usize),
 }
 
 impl<'g> DotGemm<'g> {
@@ -1665,7 +1760,40 @@ impl<'g> DotGemm<'g> {
         let kernel = gpu
             .kernel(crate::MIXED_DOT_GEMM_TILED, 3)
             .map_err(|e| anyhow!("creating the tiled mixed-dot GEMM pipeline: {e}"))?;
-        Ok(DotGemm { kernel, gpu })
+        Ok(DotGemm {
+            kernel,
+            gpu,
+            tile: (Self::TILE_ROWS, Self::TILE_USERS),
+        })
+    }
+
+    /// `(BM, BN)` of the micro-tiled builds, index = [`DotGemm::new_mt`]'s `variant`.
+    pub const MT_TILES: [(usize, usize); 4] = [(64, 64), (128, 64), (64, 128), (128, 128)];
+
+    /// The **micro-tiled** body (`gemm_f16dot_mt.comp`): BM rows x BN users per
+    /// workgroup, a register tile per thread. Needs `cols % 32 == 0`.
+    pub fn new_mt(gpu: &'g Gpu, variant: usize) -> Result<Self> {
+        if !Self::supported(gpu) {
+            anyhow::bail!(
+                "{} does not advertise VK_VALVE_shader_mixed_float_dot_product",
+                gpu.pci_address
+            );
+        }
+        let spv: &[u8] = match variant {
+            0 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f16dot_mt64x64.spv")),
+            1 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f16dot_mt128x64.spv")),
+            2 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f16dot_mt64x128.spv")),
+            3 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_f16dot_mt128x128.spv")),
+            _ => anyhow::bail!("no micro-tiled mixed-dot build {variant}"),
+        };
+        let kernel = gpu
+            .kernel(spv, 3)
+            .map_err(|e| anyhow!("creating the micro-tiled mixed-dot GEMM pipeline: {e}"))?;
+        Ok(DotGemm {
+            kernel,
+            gpu,
+            tile: Self::MT_TILES[variant],
+        })
     }
 
     /// Compile the pipeline. Errors (rather than silently falling back) when the
@@ -1680,10 +1808,14 @@ impl<'g> DotGemm<'g> {
         let kernel = gpu
             .kernel(crate::MIXED_DOT_GEMM, 3)
             .map_err(|e| anyhow!("creating the mixed-dot GEMM pipeline: {e}"))?;
-        Ok(DotGemm { kernel, gpu })
+        Ok(DotGemm {
+            kernel,
+            gpu,
+            tile: (Self::TILE_ROWS, Self::TILE_USERS),
+        })
     }
 
-    /// [`DotGemm::run`] with the tiled grid (`ceil(rows/64) x ceil(users/8)`).
+    /// [`DotGemm::run`] with the tiled grid (`ceil(rows/BM) x ceil(users/BN)`).
     pub fn run_tiled(
         &self,
         w: &Buf,
@@ -1699,9 +1831,12 @@ impl<'g> DotGemm<'g> {
         if !cols.is_multiple_of(2) {
             anyhow::bail!("mixed-dot GEMM needs an even `cols`, got {cols}");
         }
+        if self.tile.1 > Self::TILE_USERS && !cols.is_multiple_of(32) {
+            anyhow::bail!("micro-tiled mixed-dot GEMM needs `cols % 32 == 0`, got {cols}");
+        }
         let grid = (
-            rows.div_ceil(Self::TILE_ROWS).max(1) as u32,
-            users.div_ceil(Self::TILE_USERS).max(1) as u32,
+            rows.div_ceil(self.tile.0).max(1) as u32,
+            users.div_ceil(self.tile.1).max(1) as u32,
             1,
         );
         self.launch(w, x, o, rows, cols, users, grid)
@@ -1743,6 +1878,17 @@ impl<'g> DotGemm<'g> {
             .u(rows as u32)
             .u(cols as u32)
             .u(users as u32);
+        // Inside a dispatch batch, record: a submit+wait here would run before the
+        // batch's recorded producers (the dequant into `w`, the layer feeding `x`).
+        if crate::dispatch_batch::is_open_on(self.gpu) {
+            return crate::dispatch_batch::record(
+                self.gpu,
+                &self.kernel,
+                &[w, x, o],
+                pc.as_bytes(),
+                grid,
+            );
+        }
         self.gpu
             .bind_kernel(&self.kernel, &[w.buf, x.buf, o.buf])
             .map_err(|e| anyhow!("{e}"))?;
@@ -1900,7 +2046,7 @@ fn dot_log(rows: usize, cols: usize, users: usize) {
         .unwrap_or_else(|e| e.into_inner())
         .insert((rows, users))
     {
-        eprintln!("breccia: mixed-dot on BF16 {rows}x{cols} x {users} users");
+        eprintln!("breccia: mixed-dot on {rows}x{cols} x {users} users");
     }
 }
 

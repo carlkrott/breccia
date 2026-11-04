@@ -1365,7 +1365,6 @@ fn profile_tiers(path: &std::path::Path) -> Result<()> {
 /// gated on its error against plain. `devices` limits the sweep (and the reset) to
 /// those cards.
 fn profile_kernels(path: &std::path::Path, model: &str, only: &[String]) -> Result<()> {
-    use breccia_kernels::QuantType;
     let mut prof = breccia_profile::load_profile(path)?.with_context(|| {
         format!(
             "no hardware profile at {} (run `breccia profile`)",
@@ -1374,42 +1373,7 @@ fn profile_kernels(path: &std::path::Path, model: &str, only: &[String]) -> Resu
     })?;
     let shards = breccia_format::shard::ShardSet::open_glob(model)
         .with_context(|| format!("opening the model shards {model}"))?;
-    const EXPERT_USERS: [usize; 8] = [64, 96, 128, 192, 256, 512, 1024, 2048];
-    const DENSE_USERS: [usize; 6] = [256, 512, 1024, 2048, 4096, 8192];
-    let mut shapes: Vec<breccia_kernels::gemm::CalibShape> = Vec::new();
-    for t in shards.tensors() {
-        if !t.name().starts_with("blk.") || !(2..=3).contains(&t.n_dims()) {
-            continue;
-        }
-        let Some(ty) = QuantType::from_ggml(t.ty()) else {
-            continue;
-        };
-        let cols = t.ne(0).unwrap_or(0) as usize;
-        let rows = t.ne(1).unwrap_or(0) as usize;
-        let n = t.ne(2).unwrap_or(1).max(1) as usize;
-        let users: &[usize] = if t.n_dims() == 3 {
-            &EXPERT_USERS
-        } else {
-            &DENSE_USERS
-        };
-        match shapes
-            .iter_mut()
-            .find(|s| (s.ty, s.rows, s.cols) == (ty, rows, cols))
-        {
-            Some(s) => {
-                s.users.extend_from_slice(users);
-                s.users.sort_unstable();
-                s.users.dedup();
-            }
-            None => shapes.push(breccia_kernels::gemm::CalibShape {
-                ty,
-                rows,
-                cols,
-                weights: &t.as_slice()[..(t.n_bytes() as usize / n)],
-                users: users.to_vec(),
-            }),
-        }
-    }
+    let shapes = breccia_engine::kcal::calib_shapes(&shards);
     println!("  {} distinct weight shapes in {model}", shapes.len());
     let host = breccia_vk::ctx::Host::new()
         .map_err(|e| anyhow::anyhow!("opening the Vulkan host: {e}"))?;
@@ -1434,37 +1398,18 @@ fn profile_kernels(path: &std::path::Path, model: &str, only: &[String]) -> Resu
             continue;
         };
         println!("  {} ({}): calibrating", d.name, d.pci_address);
-        let tiles = breccia_kernels::gemm::calibrate_shapes(&gpu, &shapes)
-            .with_context(|| format!("calibrating {}", d.name))?;
-        let Some(entry) = prof
-            .devices
-            .iter_mut()
-            .find(|e| same_pci(&e.identity.pci_address, &d.pci_address))
+        let Some(tiles) = breccia_engine::kcal::calibrate_card(
+            &mut prof,
+            &gpu,
+            &d.pci_address,
+            format!("{} {}", d.driver_name, d.driver_version),
+            &shapes,
+        )
+        .with_context(|| format!("calibrating {}", d.name))?
         else {
             println!("    not in the profile; skipped");
             continue;
         };
-        entry.kernel = Some(breccia_profile::schema::KernelVerdict {
-            driver_version: format!("{} {}", d.driver_name, d.driver_version),
-            spirv_hash: breccia_kernels::SPIRV_HASH.to_string(),
-            timestamp: breccia_profile::schema::iso8601(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_secs()),
-            ),
-            tiles: tiles
-                .iter()
-                .map(|t| breccia_profile::schema::TileChoice {
-                    ty: t.ty.clone(),
-                    rows: t.rows,
-                    cols: t.cols,
-                    users: t.users,
-                    tile: t.tile.clone(),
-                    us: t.us,
-                    err: t.err,
-                })
-                .collect(),
-        });
         for t in &tiles {
             println!(
                 "    {:7} {:5}x{:5} users {:5} -> {:5} ({:.1} us, err {:.1e})",

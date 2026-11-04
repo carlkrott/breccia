@@ -99,7 +99,8 @@ pub struct ArenaOpts {
 /// shortcut: fitted on one model and card; derive it from the workspaces' byte
 /// counts when a second model or a different chunk curve shows a spill.
 pub fn prefill_scratch_bytes(tokens: usize) -> u64 {
-    const BASE: u64 = 1329 << 20;
+    // + 64 MiB: the dot route's f16 scratch (largest matrix, 12288x2560 here).
+    const BASE: u64 = (1329 + 64) << 20;
     // (7141 - 2836) MiB / 6000 tokens = 0.7175 MiB/token.
     const PER_TOKEN: u64 = 752_350;
     if tokens == 0 {
@@ -372,7 +373,7 @@ mod tests {
         assert_eq!(c.headroom - o.headroom, prefill_scratch_bytes(1100));
         // The measured points it was fitted on, within 1 %.
         for (t, mib) in [(2100usize, 2836u64), (8100, 7141)] {
-            let got = prefill_scratch_bytes(t) >> 20;
+            let got = (prefill_scratch_bytes(t) >> 20) - 64; // the dot scratch came later
             assert!(
                 got.abs_diff(mib) * 100 <= mib,
                 "{t} tokens: {got} vs {mib} MiB"

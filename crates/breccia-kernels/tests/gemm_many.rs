@@ -204,6 +204,102 @@ fn multi_user_gemm_matches_the_single_user_gemv() {
     let _ = vk::WHOLE_SIZE;
 }
 
+/// Dequant-to-f16 + mixed-dot GEMM (`run_dot_dequant`) against the quantised
+/// `run` on real expert weights, one cell per type. f16 W and X: tolerance is
+/// relative to the output's RMS, not per element.
+#[test]
+fn dequant_f16_dot_tracks_the_quantised_gemm() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("deq16: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else {
+        return;
+    };
+    let gpu = &dev.gpu;
+    if !breccia_kernels::gemm::DotGemm::supported(gpu) {
+        eprintln!("deq16: no mixed dot on this device");
+        return;
+    }
+    let Ok(set) = ShardSet::open_glob(MODEL_GLOB) else {
+        eprintln!("deq16: no model");
+        return;
+    };
+    let layout = set.layout().expect("layout");
+    let mut seen: Vec<QuantType> = Vec::new();
+    for block in layout.blocks() {
+        let plan = LayerPlan::from_block(&set, block).expect("plan");
+        for role in [ExpertRole::Down, ExpertRole::Gate] {
+            let ty = plan.role(role.name()).ty;
+            if seen.contains(&ty) {
+                continue;
+            }
+            let Ok(gemm) = GemmMany::new(gpu, ty) else {
+                continue;
+            };
+            seen.push(ty);
+            let (rows, cols) = if role == ExpertRole::Down {
+                (plan.n_embd, plan.n_ff)
+            } else {
+                (plan.n_ff, plan.n_embd)
+            };
+            if gemm.padded_cols(cols) != cols {
+                println!("deq16 {}: padded rows, skipped", ty.name());
+                continue;
+            }
+            let slices = plan.slices(&set, 7).expect("slices");
+            let wq = if role == ExpertRole::Down {
+                slices.down
+            } else {
+                slices.gate
+            };
+            let w = breccia_kernels::gemv::upload(gpu, wq).expect("w");
+            let users = 72usize; // not a multiple of any user tile
+            let mut seed = 0x9e37_79b9u32;
+            let xs: Vec<f32> = (0..users * cols)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    ((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+                })
+                .collect();
+            let x = breccia_kernels::ops::upload_f32(gpu, &xs).expect("x");
+            let oq = alloc(gpu, (users * rows * 4) as u64).expect("oq");
+            let od = alloc(gpu, (users * rows * 4) as u64).expect("od");
+            let scratch = alloc(gpu, (rows * cols * 2) as u64).expect("scratch");
+            gemm.run(&w, &x, &oq, rows, cols, users).expect("quantised");
+            if let Err(e) = gemm.run_dot_dequant(&w, &x, &od, rows, cols, users, &scratch) {
+                println!("deq16 {}: {e}", ty.name());
+            } else {
+                let a = breccia_kernels::ops::download_f32(gpu, &oq, users * rows).expect("a");
+                let b = breccia_kernels::ops::download_f32(gpu, &od, users * rows).expect("b");
+                let rms = (a.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / a.len() as f64)
+                    .sqrt()
+                    .max(1e-30);
+                let worst = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(p, q)| ((p - q).abs() as f64) / rms)
+                    .fold(0.0f64, f64::max);
+                let finite = b.iter().all(|v| v.is_finite());
+                println!(
+                    "deq16 {} {rows}x{cols}: worst/rms {worst:.3e}, finite {finite}",
+                    ty.name()
+                );
+                assert!(
+                    finite && worst < 2e-2,
+                    "{}: f16 dot off by {worst:.3e}",
+                    ty.name()
+                );
+            }
+            for buf in [&w, &x, &oq, &od, &scratch] {
+                gpu.destroy_buf(buf);
+            }
+        }
+    }
+    drop(guard);
+}
+
 /// The chunked-prefill fan-in against `MoeCombine` (single token, must match) and
 /// against a CPU reference for a multi-token chunk.
 #[test]
