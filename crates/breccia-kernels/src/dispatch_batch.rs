@@ -63,6 +63,10 @@ use ash::vk;
 use breccia_vk::ctx::{Buf, Gpu, Kernel, Qc, Timeline};
 use std::cell::{Cell, RefCell};
 
+#[path = "submit_guard.rs"]
+mod guard;
+pub use guard::cuts as guard_cuts;
+
 thread_local! {
     /// Set by [`skip_next_barrier`]: the next recorded dispatch is provably
     /// independent of the one before it, so its trailing fence can be dropped.
@@ -300,6 +304,7 @@ pub fn shutdown() -> Result<()> {
         }
         SLOT_DEV.with(|d| d.borrow_mut()[slot] = None);
     }
+    guard::shutdown();
     for (_, pool, dev) in SET_POOLS.with(|v| std::mem::take(&mut *v.borrow_mut())) {
         unsafe { dev.destroy_descriptor_pool(pool, None) };
     }
@@ -915,6 +920,7 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
         // its GPU-time stamps have not been read yet — read them now, while the
         // pool is still valid and its fence has signalled.
         probe::read_slot(gpu, slot);
+        guard::read(gpu, slot);
     }
     // The slot keeps its descriptor pool across batches: `vkResetDescriptorPool`
     // is ~free against a create/destroy pair per batch, and a two-stream pair runs
@@ -958,6 +964,7 @@ pub fn begin(gpu: &Gpu) -> Result<()> {
     // wait above: the previous submission has completed, so a host reset is legal
     // and the pool cannot hold an in-flight query (§8am's blocker).
     probe::reset_slot(gpu, slot, cmd)?;
+    guard::open(gpu, slot, cmd);
     OPEN.with(|o| {
         o.borrow_mut().push(Open {
             dev: gpu.device.handle(),
@@ -998,6 +1005,7 @@ pub fn end_submit(gpu: &Gpu, signal: Option<(&Timeline, u64)>) -> Result<Segment
     // stage that needed it, not to a phantom one. The slot is passed explicitly:
     // `OPEN` no longer holds it (it was taken above).
     probe::close(slot);
+    guard::close(gpu, slot, cmd);
     if !track_disabled() && DIRTY.with(|d| !d.borrow().is_empty()) {
         unsafe { gpu.barrier_compute_on(cmd) };
         BARRIERS.with(|c| c.set(c.get() + 1));
@@ -1058,6 +1066,7 @@ pub fn wait(gpus: &[&Gpu], seg: Segment) -> Result<f64> {
     // The slot's fence has signalled: this is the one place its GPU-time stamps may
     // be read (§8am).
     probe::read_slot(gpu, slot);
+    guard::read(gpu, slot);
     Ok(secs)
 }
 
@@ -1111,6 +1120,7 @@ pub fn wait_all(gpus: &[&Gpu]) -> Result<f64> {
                 .map_err(|e| anyhow!("waiting for ring slot {slot}: {e}"))?;
             FENCES.with(|f| f.borrow_mut()[slot] = vk::Fence::null());
             probe::read_slot(gpu, slot);
+            guard::read(gpu, slot);
         }
     }
     let secs = t0.elapsed().as_secs_f64();
@@ -1384,8 +1394,22 @@ pub(crate) fn record_off(
     // dispatch (`docs/research/11` §A2); they are now behind `BRECCIA_RECORD_PROFILE`
     // (checked once, cached), which takes the path from 266 to ~70 ns.
     let t0 = std::time::Instant::now();
-    let (slot, cmd) =
+    let (mut slot, mut cmd) =
         open_cmd(gpu).ok_or_else(|| anyhow!("recording a dispatch without an open batch"))?;
+    // Submit guard: cut the submission here if this dispatch could push it toward
+    // the driver's watchdog (`submit_guard.rs`). Results are unchanged: the cut
+    // closes with the same barrier any segment boundary gets.
+    let wg = grid.0.max(1) as u64 * grid.1.max(1) as u64 * grid.2.max(1) as u64;
+    if guard::before_dispatch(gpu, slot, recorded_on(gpu), kernel.pipe, wg) {
+        // shortcut: the cut's fence is reclaimed by ring back-pressure / `wait_all`,
+        // not by the caller's `wait(seg)` -- in-order rings make that safe on RADV;
+        // chain the fences into the Segment if a driver ever completes out of order.
+        end_submit(gpu, None)?;
+        begin(gpu)?;
+        guard::count_cut();
+        (slot, cmd) = open_cmd(gpu).ok_or_else(|| anyhow!("guard cut lost the batch"))?;
+        guard::after_cut(gpu, slot, kernel.pipe, wg);
+    }
     let pool = POOLS.with(|p| p.borrow()[slot]);
     if pool == vk::DescriptorPool::null() {
         return Err(anyhow!("recording a dispatch without an open batch"));

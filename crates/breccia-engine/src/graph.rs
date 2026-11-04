@@ -2425,6 +2425,7 @@ impl<'m> Session<'m> {
                 mc.n_ctx_max
             );
         }
+        self.vram_watch()?;
         self.pos = pos;
         self.cur_tok = tok;
         // ---- embedding: 4 gathered rows ARE the hc copies of the vector ------
@@ -2703,6 +2704,37 @@ impl<'m> Session<'m> {
     ///
     /// Requires a configured [`SessionCfg::prefill_chunk`]; a layer-split
     /// placement hands the chunk's residuals across devices ([`Self::handoff_slots`]).
+    /// **VRAM guard**, between chunks / tokens: stop cleanly when a device is under
+    /// its floor ([`Gpu::vram_short`]). Our own buffers cannot put it there (the
+    /// allocator places them in host memory first), so this catches another
+    /// process filling the card under us; stopping frees our share before the
+    /// display or the driver runs out (11-03: 3 MiB left, `pin failed`, RX hang).
+    /// `BRECCIA_VRAM_LOG=1` prints each check.
+    fn vram_watch(&self) -> Result<()> {
+        for d in &self.model.devices {
+            let short = d.gpu().vram_short(0);
+            if std::env::var_os("BRECCIA_VRAM_LOG").is_some() {
+                if let Some(b) = d.gpu().mem_budget() {
+                    eprintln!(
+                        "vram: device {} free {} MiB, ours {} MiB, others {} MiB",
+                        d.gpu().index,
+                        b.free_for_us() >> 20,
+                        b.usage >> 20,
+                        b.others() >> 20
+                    );
+                }
+            }
+            if let Some(why) = short {
+                bail!(
+                    "VRAM guard: {why}. Stopping before the display or the driver runs \
+                     out; free the card or rerun with a larger \
+                     --arena-display-reserve-mib / --arena-headroom-mib"
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub fn prefill(&mut self, toks: &[u32], pos0: usize) -> Result<Vec<f32>> {
         Ok(self
             .prefill_rows(toks, pos0, false)?
@@ -2735,6 +2767,7 @@ impl<'m> Session<'m> {
         if !self.batching {
             bail!("chunked prefill records into a dispatch batch: it needs --batching");
         }
+        self.vram_watch()?;
         let dev = m.device_of(0);
         let gpu = m.devices[dev].gpu();
         let hc_dim = mc.hc_dim();

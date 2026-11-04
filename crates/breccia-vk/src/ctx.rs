@@ -349,6 +349,24 @@ pub struct Buf {
     pub id: u64,
 }
 
+/// Device-only and [`Gpu::buf_mapped`] buffers under [`SLAB_MAX`] are carved out of shared blocks of this
+/// size instead of getting a kernel allocation each. amdgpu backs allocations
+/// under 2 MiB with 4 KiB pages anywhere in VRAM; ~60k per-token prefill slots at
+/// chunk 8192 left 6.4 GB free in <= 128 KiB pieces, so every larger buffer
+/// silently fell back to system memory (11-04, `amdgpu_vram_mm`).
+pub const SLAB_BYTES: u64 = 64 << 20;
+pub const SLAB_MAX: u64 = 2 << 20;
+
+/// One sub-allocation block: bump-allocated, freed when its last buffer goes.
+struct Slab {
+    mem: vk::DeviceMemory,
+    type_idx: u32,
+    used: u64,
+    live: u32,
+    /// Persistent mapping of the whole block (host-visible types), else 0.
+    ptr: usize,
+}
+
 static BUF_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Buf {
@@ -374,6 +392,10 @@ impl MemBudget {
     /// Bytes this process can still allocate.
     pub fn free_for_us(&self) -> u64 {
         self.budget.saturating_sub(self.usage)
+    }
+    /// Bytes other processes hold on the heap (as the driver attributes them).
+    pub fn others(&self) -> u64 {
+        self.heap_bytes.saturating_sub(self.budget)
     }
 }
 
@@ -508,6 +530,13 @@ pub struct Gpu {
     /// `VK_EXT_memory_budget` advertised (and enabled): [`Gpu::mem_budget`] is
     /// then the driver's own account of what this process may still allocate.
     pub memory_budget: bool,
+    /// VRAM guard ([`Gpu::vram_short`]): bytes always kept free (0 = off) and what
+    /// other processes held on the heap when this device was opened.
+    pub vram_floor: u64,
+    pub vram_others0: u64,
+    vram_spilled: std::sync::atomic::AtomicBool,
+    /// Sub-allocation blocks for small buffers ([`SLAB_BYTES`]).
+    slabs: std::sync::Mutex<Vec<Slab>>,
     pub mem: vk::PhysicalDeviceMemoryProperties,
     pub timestamp_period_ns: f64,
     pub feats: Feats,
@@ -783,11 +812,31 @@ impl Gpu {
         let instance = &host.instance;
 
         // --- queue selection -------------------------------------------------
-        let fam_c =
-            dev.families
-                .iter()
-                .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE))
-                .ok_or_else(|| "no compute-capable queue family".to_string())? as u32;
+        // Hang guard: on a **headless** device prefer a compute-only family (async
+        // compute ring) over the graphics family: on the MI50 a gfx ring reset has
+        // failed into BACO and needed a cold boot, a compute ring resets per queue.
+        // A display device keeps the gfx family: its async ring measured 4.7 %
+        // slower on the RX (1k 344 vs 361 tok/s) and the submit guard already
+        // bounds its stalls. `BRECCIA_QUEUE=gfx|compute` overrides.
+        let want_gfx = match std::env::var("BRECCIA_QUEUE").as_deref() {
+            Ok("gfx") => true,
+            Ok("compute") => false,
+            _ => crate::pci::drives_a_display(&dev.pci_address) != Some(false),
+        };
+        let compute_only = dev.families.iter().position(|f| {
+            f.queue_flags.contains(vk::QueueFlags::COMPUTE)
+                && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        });
+        let any_compute = dev
+            .families
+            .iter()
+            .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE));
+        let fam_c = if want_gfx {
+            any_compute
+        } else {
+            compute_only.or(any_compute)
+        }
+        .ok_or_else(|| "no compute-capable queue family".to_string())? as u32;
         let queue_c_count = dev.families[fam_c as usize].queue_count;
 
         let dedicated_x = dev
@@ -805,13 +854,15 @@ impl Gpu {
             .families
             .iter()
             .enumerate()
-            .find(|(i, f)| *i as u32 != fam_c && f.queue_flags.contains(vk::QueueFlags::TRANSFER))
+            .find(|(i, f)| {
+                *i as u32 != fam_c
+                    && f.queue_flags.contains(vk::QueueFlags::TRANSFER)
+                    // Never park transfers back on the gfx ring we just avoided.
+                    && (want_gfx || !f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+            })
             .map(|(i, _)| i as u32);
-        let any_x = dev
-            .families
-            .iter()
-            .position(|f| f.queue_flags.contains(vk::QueueFlags::TRANSFER))
-            .map(|i| i as u32);
+        // Last resort: the compute family itself (compute queues imply TRANSFER).
+        let any_x = Some(fam_c);
         let fam_x = dedicated_x.or(other_x).or(any_x);
 
         let (family_x, xfer_mode, queue_x_index) = match fam_x {
@@ -1051,7 +1102,7 @@ impl Gpu {
         } else {
             None
         };
-        Ok(Gpu {
+        let mut g = Gpu {
             index,
             device,
             pdev: dev.pdev,
@@ -1088,6 +1139,54 @@ impl Gpu {
             calibrated,
             queue_lock: std::sync::Mutex::new(()),
             thread_cmds: std::sync::Mutex::new(Vec::new()),
+            vram_floor: 0,
+            vram_others0: 0,
+            vram_spilled: std::sync::atomic::AtomicBool::new(false),
+            slabs: std::sync::Mutex::new(Vec::new()),
+        };
+        // The compositor needs room for new framebuffers on a display card (11-03:
+        // 3 MiB left -> `pin failed` -> RX hang); a headless card only driver slack.
+        let base: u64 = if crate::pci::drives_a_display(&g.pci_address) != Some(false) {
+            256
+        } else {
+            64
+        };
+        g.vram_floor = std::env::var("BRECCIA_VRAM_FLOOR_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(base)
+            << 20;
+        g.vram_others0 = g.mem_budget().map_or(0, |b| b.others());
+        Ok(g)
+    }
+
+    /// **VRAM guard**: `Some(why)` when `bytes` more device-local memory would leave
+    /// this device under its floor. Other processes count at no less than they held
+    /// when the device was opened: the kernel evicts their buffers (the
+    /// compositor's, on a display card) when we crowd the heap, the budget then
+    /// reads as if they were gone, and they come back for that room.
+    /// `BRECCIA_VRAM_FLOOR_MIB=<MiB>` sets the floor (default 256 on a display
+    /// card, 64 headless), `=0` turns the guard off.
+    pub fn vram_short(&self, bytes: u64) -> Option<String> {
+        if self.vram_floor == 0 {
+            return None;
+        }
+        let b = self.mem_budget()?;
+        let others = b.others().max(self.vram_others0);
+        let avail = b.heap_bytes.saturating_sub(others + b.usage);
+        (avail < bytes + self.vram_floor).then(|| {
+            format!(
+                "device {} ({}): {} MiB free (this process {} MiB, others {} MiB, \
+                 {} MiB at start), {} MiB requested, {} MiB floor",
+                self.index,
+                self.pci_address,
+                avail >> 20,
+                b.usage >> 20,
+                b.others() >> 20,
+                self.vram_others0 >> 20,
+                bytes >> 20,
+                self.vram_floor >> 20
+            )
         })
     }
 
@@ -1206,6 +1305,31 @@ impl Gpu {
         self.buf_with(size, usage, req, pref, None)
     }
 
+    /// A host-visible buffer and a pointer to its mapping, valid until
+    /// [`Gpu::destroy_buf`]. Small ones share a block (and its one mapping), so the
+    /// caller must never `vkMapMemory`/`vkUnmapMemory` `Buf::mem` itself.
+    pub fn buf_mapped(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        req: vk::MemoryPropertyFlags,
+        pref: vk::MemoryPropertyFlags,
+    ) -> R<(Buf, *mut u8)> {
+        self.buf_alloc(
+            size,
+            usage,
+            req | vk::MemoryPropertyFlags::HOST_VISIBLE,
+            pref,
+            None,
+            true,
+        )
+    }
+
+    /// Blocks currently open for sub-allocation.
+    pub fn slab_count(&self) -> usize {
+        self.slabs.lock().unwrap().len()
+    }
+
     /// [`Gpu::buf`] with an explicit set of queue families.
     ///
     /// `families = Some(&[..])` creates a `VK_SHARING_MODE_CONCURRENT` buffer, which
@@ -1221,6 +1345,19 @@ impl Gpu {
         pref: vk::MemoryPropertyFlags,
         families: Option<&[u32]>,
     ) -> R<Buf> {
+        self.buf_alloc(size, usage, req, pref, families, false)
+            .map(|(b, _)| b)
+    }
+
+    fn buf_alloc(
+        &self,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        req: vk::MemoryPropertyFlags,
+        pref: vk::MemoryPropertyFlags,
+        families: Option<&[u32]>,
+        mapped: bool,
+    ) -> R<(Buf, *mut u8)> {
         unsafe {
             let mut fams: Vec<u32> = families.map(|f| f.to_vec()).unwrap_or_default();
             fams.sort_unstable();
@@ -1245,6 +1382,51 @@ impl Gpu {
                     ));
                 }
             };
+            // VRAM guard: a device-local buffer that would take the card under its
+            // floor goes to host memory (slower, never a hang). shortcut: placement
+            // is per buffer at allocation; nothing migrates back when room frees.
+            let mut idx = idx;
+            if self.mem.memory_types[idx as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            {
+                if let Some(why) = self.vram_short(reqs.size) {
+                    let host = (0..self.mem.memory_type_count).find(|&i| {
+                        reqs.memory_type_bits & (1 << i) != 0
+                            && !self.mem.memory_types[i as usize]
+                                .property_flags
+                                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                    });
+                    let Some(h) = host else {
+                        self.device.destroy_buffer(buffer, None);
+                        return Err(format!("VRAM guard: {why}, and no host memory type"));
+                    };
+                    if !self
+                        .vram_spilled
+                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        eprintln!(
+                            "VRAM guard: {why}: placing this and later buffers in host \
+                             memory (slower) instead"
+                        );
+                    }
+                    idx = h;
+                }
+            }
+            let flags = self.mem.memory_types[idx as usize].property_flags;
+            // Mapped buffers share a block's single mapping; unmapped host-visible
+            // ones stay separate because their callers map `Buf::mem` at offset 0.
+            let host = flags.contains(vk::MemoryPropertyFlags::HOST_VISIBLE);
+            let slab_ok = if mapped {
+                host
+            } else {
+                !host && flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            };
+            if reqs.size < SLAB_MAX && slab_ok {
+                if let Some(r) = self.slab_bind(buffer, &reqs, idx, size)? {
+                    return Ok(r);
+                }
+            }
             let mai = vk::MemoryAllocateInfo::default()
                 .allocation_size(reqs.size)
                 .memory_type_index(idx);
@@ -1263,12 +1445,27 @@ impl Gpu {
                 self.device.destroy_buffer(buffer, None);
                 return Err(format!("vkBindBufferMemory failed: {e}"));
             }
-            Ok(Buf {
+            let mut ptr = std::ptr::null_mut();
+            if mapped {
+                match self
+                    .device
+                    .map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                {
+                    Ok(p) => ptr = p as *mut u8,
+                    Err(e) => {
+                        self.device.destroy_buffer(buffer, None);
+                        self.device.free_memory(mem, None);
+                        return Err(format!("vkMapMemory failed: {e}"));
+                    }
+                }
+            }
+            let b = Buf {
                 buf: buffer,
                 mem,
                 size,
                 id: Buf::next_id(),
-            })
+            };
+            Ok((b, ptr))
         }
     }
 
@@ -1302,9 +1499,104 @@ impl Gpu {
         Ok(())
     }
 
+    /// Bind `buffer` into a shared block of memory type `idx` (opening a new block
+    /// when the newest one is full). `None` when a new block would not fit in VRAM:
+    /// the caller then allocates the buffer on its own.
+    unsafe fn slab_bind(
+        &self,
+        buffer: vk::Buffer,
+        reqs: &vk::MemoryRequirements,
+        idx: u32,
+        size: u64,
+    ) -> R<Option<(Buf, *mut u8)>> {
+        let mut slabs = self.slabs.lock().unwrap();
+        let al = reqs.alignment.max(1);
+        let fits =
+            |s: &Slab| s.type_idx == idx && s.used.div_ceil(al) * al + reqs.size <= SLAB_BYTES;
+        let i = match slabs
+            .iter()
+            .rposition(|s| s.type_idx == idx)
+            .filter(|&i| fits(&slabs[i]))
+        {
+            Some(i) => i,
+            None => {
+                let local = self.mem.memory_types[idx as usize]
+                    .property_flags
+                    .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+                if local && self.vram_short(SLAB_BYTES).is_some() {
+                    return Ok(None);
+                }
+                let mai = vk::MemoryAllocateInfo::default()
+                    .allocation_size(SLAB_BYTES)
+                    .memory_type_index(idx);
+                let Ok(mem) = self.device.allocate_memory(&mai, None) else {
+                    return Ok(None);
+                };
+                let mut ptr = 0;
+                let ty = self.mem.memory_types[idx as usize].property_flags;
+                if ty.contains(vk::MemoryPropertyFlags::HOST_VISIBLE) {
+                    match self.device.map_memory(
+                        mem,
+                        0,
+                        vk::WHOLE_SIZE,
+                        vk::MemoryMapFlags::empty(),
+                    ) {
+                        Ok(p) => ptr = p as usize,
+                        Err(_) => {
+                            self.device.free_memory(mem, None);
+                            return Ok(None);
+                        }
+                    }
+                }
+                slabs.push(Slab {
+                    mem,
+                    type_idx: idx,
+                    used: 0,
+                    live: 0,
+                    ptr,
+                });
+                slabs.len() - 1
+            }
+        };
+        let s = &mut slabs[i];
+        let off = s.used.div_ceil(al) * al;
+        if let Err(e) = self.device.bind_buffer_memory(buffer, s.mem, off) {
+            self.device.destroy_buffer(buffer, None);
+            if s.live == 0 {
+                self.device.free_memory(slabs.swap_remove(i).mem, None);
+            }
+            return Err(format!(
+                "vkBindBufferMemory (block offset {off}) failed: {e}"
+            ));
+        }
+        s.used = off + reqs.size;
+        s.live += 1;
+        let ptr = if s.ptr == 0 {
+            std::ptr::null_mut()
+        } else {
+            (s.ptr + off as usize) as *mut u8
+        };
+        let b = Buf {
+            buf: buffer,
+            mem: s.mem,
+            size,
+            id: Buf::next_id(),
+        };
+        Ok(Some((b, ptr)))
+    }
+
     pub fn destroy_buf(&self, b: &Buf) {
         unsafe {
             self.device.destroy_buffer(b.buf, None);
+            let mut slabs = self.slabs.lock().unwrap();
+            if let Some(i) = slabs.iter().position(|s| s.mem == b.mem) {
+                debug_assert!(slabs[i].live > 0, "slab buffer destroyed twice");
+                slabs[i].live = slabs[i].live.saturating_sub(1);
+                if slabs[i].live == 0 {
+                    self.device.free_memory(slabs.swap_remove(i).mem, None);
+                }
+                return;
+            }
             self.device.free_memory(b.mem, None);
         }
     }

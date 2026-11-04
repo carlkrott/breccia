@@ -91,9 +91,13 @@ pub struct ArenaOpts {
 /// VRAM the chunked prefill scratch costs per token of the largest chunk the
 /// planner runs (merged-pass buffers plus the QSA/GDN/HC chunk workspaces). RX,
 /// measured after the arena: one 2100-token chunk at ctx 2164 = 2836 MiB (1.35),
-/// 1366-token chunks at ctx 4200 = 1881 MiB (1.38); flat in ctx, so 1.5 for slack.
-/// shortcut: measured on this model only; derive it from the session's real
-/// allocations once a second model ships.
+/// 1366-token chunks at ctx 4200 = 1881 MiB (1.38), one 8100-token chunk at ctx
+/// 8100 = 7141 MiB (0.88: 2780 in `Session::new`, 4361 lazily in the first chunk).
+/// 0.5 is a **placement** choice, not the need (c45936e: at 1k one more resident
+/// block, decode +3.9 %, prefill -20 %): the scratch past it lands in host memory
+/// under the VRAM guard (`Gpu::vram_short`), never in the display's floor.
+/// shortcut: one constant for a curve that is not flat; size it from the
+/// workspaces' own byte counts if the host-memory scratch shows up in a profile.
 pub const PREFILL_SCRATCH_PER_TOKEN: u64 = 1 << 19;
 
 impl ArenaOpts {

@@ -464,8 +464,8 @@ impl Mailbox {
 
     fn with_preferred(gpu: &Gpu, size: u64, pref: vk::MemoryPropertyFlags) -> Result<Self> {
         let size = size.max(16);
-        let buf = gpu
-            .buf(
+        let (buf, ptr) = gpu
+            .buf_mapped(
                 size + breccia_kernels::gemv::TAIL_PAD,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_SRC
@@ -475,13 +475,8 @@ impl Mailbox {
                     | vk::MemoryPropertyFlags::HOST_COHERENT,
             )
             .map_err(|e| anyhow!("allocating the {size}-byte mailbox: {e}"))?;
-        // SAFETY: host-visible, host-coherent memory owned by this struct; the
-        // mapping outlives every use and is released before the buffer.
-        let ptr = unsafe {
-            gpu.device
-                .map_memory(buf.mem, 0, buf.size, vk::MemoryMapFlags::empty())
-                .map_err(|e| anyhow!("mapping the mailbox: {e}"))? as *mut u8
-        };
+        // Small mailboxes share a block (one per-token mailbox per kernel
+        // allocation splintered VRAM, 11-04); the mapping lives until destroy_buf.
         Ok(Mailbox { buf, ptr, size })
     }
 
@@ -538,8 +533,7 @@ impl Mailbox {
     }
 
     pub fn release(&self, gpu: &Gpu) {
-        // SAFETY: unmapped exactly once, before the memory is freed.
-        unsafe { gpu.device.unmap_memory(self.buf.mem) };
+        // Freeing the memory unmaps it (shared blocks: with their last buffer).
         gpu.destroy_buf(&self.buf);
     }
 }
