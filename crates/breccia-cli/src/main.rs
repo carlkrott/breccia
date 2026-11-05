@@ -5097,7 +5097,6 @@ struct Vision {
 impl Vision {
     /// Encode one image file's bytes on the CPU -> `(nx, ny, rows)`.
     fn encode(&self, data: &[u8]) -> Result<(usize, usize, Vec<f32>)> {
-        std::fs::create_dir_all(&self.dir)?;
         let img = self.dir.join("image");
         let prefix = self.dir.join("embd");
         std::fs::write(&img, data)?;
@@ -5116,7 +5115,12 @@ impl Vision {
             out.status,
             String::from_utf8_lossy(&out.stderr).lines().rev().take(3).collect::<Vec<_>>().join(" | ")
         );
-        let img = load_image_dump(&prefix.to_string_lossy())?;
+        let p = prefix.to_string_lossy();
+        let img = load_image_dump(&p);
+        for f in [self.dir.join("image"), format!("{p}.f32").into(), format!("{p}.pos").into()] {
+            let _ = std::fs::remove_file(f);
+        }
+        let img = img?;
         println!("image    {}x{} encoded in {:.2} s", img.0, img.1, t.elapsed().as_secs_f64());
         Ok(img)
     }
@@ -5233,12 +5237,17 @@ fn serve_http(a: ServeArgs) -> Result<()> {
             });
             let model = breccia_format::expand_glob(&a.gguf)?.into_iter().next().context("no model shard")?;
             println!("vision   {mmproj} via {} (CPU, <= {} tokens)", encoder.display(), a.image_tokens);
+            // owner-only and new: a pre-made (or symlinked) dir in a shared /tmp is refused
+            let dir = std::env::temp_dir().join(format!("breccia-vision-{}", std::process::id()));
+            std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+                .create(&dir)
+                .with_context(|| format!("creating {}", dir.display()))?;
             Some(Vision {
                 encoder,
                 mmproj,
                 model,
                 max_tokens: a.image_tokens,
-                dir: std::env::temp_dir().join(format!("breccia-vision-{}", std::process::id())),
+                dir,
             })
         }
     };

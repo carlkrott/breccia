@@ -71,3 +71,11 @@ Live (default dual devices, q6 KV, ctx 4096, scripts vis-serve.sh):
 | 1024^2 | 32x32 | 3.25 s | 12.9 s | 1041 | "...serene, painterly mountain landscape at twilight ... soft pink and orange alpenglow against a cool blue sky..." (= Stage 1 CLI) |
 | 2048^2 | 45x45 | 8.72 s | 22.8 s | 2042 | "...serene, stylized mountain landscape at twilight or dawn ... soft pink and orange alpenglow ... dark coniferous forest silhouetted..." |
 | text after | - | - | 1.7 s | 14 | normal thinking reply (image cleared) |
+
+Non-square check (2560x1440 JPEG wallpaper, same budget): Breccia 60x33 = 1980 cells, encode 8.16 s, request 21.0 s,
+"A serene twilight landscape features snow-capped mountains glowing with soft pink alpenglow against a deep blue sky,
+rising above a dense, dark coniferous forest." llama.cpp server (--image-min-tokens 1024 --image-max-tokens 2048,
+vision/ref-wide.sh): same 1997 prompt tokens, "A serene twilight scene features snow-capped mountains glowing with soft
+pink and orange alpenglow against a deep blue sky, framed by a dark, silhouetted forest in the foreground." -> x/y
+layout right for nx != ny. Encoder temp dir: $TMPDIR/breccia-vision-<pid>, created 0700 at startup (existing = fatal),
+files removed after each encode.

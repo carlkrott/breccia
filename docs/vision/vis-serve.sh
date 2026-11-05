@@ -24,8 +24,11 @@ def ask(content, n=160):
     except urllib.error.HTTPError as e:
         return time.time() - t, e.code, e.read().decode()[:200]
     return time.time() - t, r["usage"], r["choices"][0]["message"]["content"]
-for name in ("img448", "img1024", "img2048"):
-    url = "data:image/png;base64," + base64.b64encode(open(f"{V}/{name}.png", "rb").read()).decode()
+import os
+for path in os.environ.get("IMGS", f"{V}/img448.png {V}/img1024.png {V}/img2048.png").split():
+    name = os.path.basename(path).rsplit(".", 1)[0][:12]
+    mime = "image/jpeg" if path.endswith(".jpg") else "image/png"
+    url = f"data:{mime};base64," + base64.b64encode(open(path, "rb").read()).decode()
     dt, u, txt = ask([{"type": "image_url", "image_url": {"url": url}},
                       {"type": "text", "text": "Describe this image in one sentence."}])
     print(f"[{name}] {dt:.1f}s usage={u}\n  {txt!r}", flush=True)
