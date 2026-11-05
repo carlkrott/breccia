@@ -132,6 +132,120 @@ void main() {
     }
 }
 
+#elif defined(BRECCIA_KV_OCTAVE_FQ)
+
+// # `BRECCIA_KV_OCTAVE_FQ` — Octave KV **fake-quant** (quality gate only)
+//
+// The vLLM ROCm "Octave" KV format (vllm/v1/attention/ops/rocm_octave.py,
+// Apache-2.0): fixed sign flips + orthonormal Walsh-Hadamard, then a Lloyd-Max
+// N(0,1) codebook per block with the scale chosen so x . x_hat = |x|^2. Here each
+// row is quantised **and dequantised and un-rotated** before the ordinary f16 store,
+// so every attention kernel reads exactly what a rotated-space Octave kernel would
+// compute (the rotation is orthonormal) and the logits measure the format's loss
+// without a new cache layout. Mode in `pc.pad0`: bits 0-3 K (0 f16, 1 block K =
+// 4-bit RoPE block 0 + 3-bit NoPE blocks, 2 compact K = 3-bit over all 256),
+// bits 4-7 V bits (0 f16, 3, 4). `qsa::cpu::octave_roundtrip` is the same in Rust.
+// One invocation per (token, kv_head): append cost is negligible next to attention.
+
+#define OCT_D 256u
+const float LUT3[8] = float[8](-127.0, -79.0, -45.0, -14.0, 14.0, 45.0, 79.0, 127.0);
+const float LUT4[16] = float[16](-126.0, -95.0, -74.0, -58.0, -43.0, -30.0, -18.0, -6.0,
+                                 6.0, 18.0, 30.0, 43.0, 58.0, 74.0, 95.0, 126.0);
+
+float oct_sign(uint d) {
+    uint h = d * 0x9E3779B9u + 0x5E17u;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+    return (h & 1u) != 0u ? -1.0 : 1.0;
+}
+
+float row[OCT_D];
+
+void oct_fwht(uint o, uint n) {
+    for (uint h = 1u; h < n; h *= 2u) {
+        for (uint i = 0u; i < n; i += 2u * h) {
+            for (uint j = i; j < i + h; ++j) {
+                float a = row[o + j];
+                float b = row[o + j + h];
+                row[o + j] = a + b;
+                row[o + j + h] = a - b;
+            }
+        }
+    }
+    float s = inversesqrt(float(n));
+    for (uint j = 0u; j < n; ++j) {
+        row[o + j] *= s;
+    }
+}
+
+float oct_lut(uint bits, uint c) { return bits == 4u ? LUT4[c] : LUT3[c]; }
+
+// Quantise row[o..o+n) to `bits` and write the dequantised value back.
+void oct_quant(uint o, uint n, uint bits) {
+    uint levels = 1u << bits;
+    float mult = bits == 4u ? 46.0 : 59.0;
+    float ss = 0.0;
+    for (uint j = 0u; j < n; ++j) { ss += row[o + j] * row[o + j]; }
+    float rms = max(sqrt(ss / float(n)), 1e-12);
+    float dot = 0.0;
+    uint codes[OCT_D];
+    for (uint j = 0u; j < n; ++j) {
+        float y = row[o + j] / rms * mult;
+        uint c = 0u;
+        for (uint k = 1u; k < levels; ++k) {
+            if (y > 0.5 * (oct_lut(bits, k - 1u) + oct_lut(bits, k))) { c = k; }
+        }
+        codes[j] = c;
+        dot += row[o + j] * oct_lut(bits, c);
+    }
+    // Stored as fp16(scale * LUT_ONE) and read back / LUT_ONE (LUT_ONE = 64).
+    float sc = dot > 0.0 ? ss / dot * 64.0 : 0.0;
+    sc = breccia_f16_bits_to_f32(breccia_f32_to_f16_bits(sc)) / 64.0;
+    for (uint j = 0u; j < n; ++j) { row[o + j] = oct_lut(bits, codes[j]) * sc; }
+}
+
+void oct_roundtrip(uint kmode, uint bits) {
+    for (uint d = 0u; d < OCT_D; ++d) { row[d] = row[d] * oct_sign(d); }
+    if (kmode == 1u) {
+        for (uint b = 0u; b < OCT_D / 64u; ++b) {
+            oct_fwht(b * 64u, 64u);
+            oct_quant(b * 64u, 64u, b == 0u ? 4u : 3u); // RoPE dims 0..63 = block 0
+            oct_fwht(b * 64u, 64u);
+        }
+    } else {
+        oct_fwht(0u, OCT_D);
+        oct_quant(0u, OCT_D, bits);
+        oct_fwht(0u, OCT_D);
+    }
+    for (uint d = 0u; d < OCT_D; ++d) { row[d] = row[d] * oct_sign(d); }
+}
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint unit = wg * 128u + gl_LocalInvocationID.x;
+    if (unit >= pc.tokens * pc.n_kv_head || pc.head_dim != OCT_D) {
+        return;
+    }
+    uint kvh = unit % pc.n_kv_head;
+    uint t = unit / pc.n_kv_head;
+    uint kmode = pc.pad0 & 15u;
+    uint vbits = (pc.pad0 >> 4) & 15u;
+
+    uint cell = uint(int(pc.pos0) + int(t));
+    uint page = PT[cell / pc.page_cells];
+    uint in_page = cell % pc.page_cells;
+    uint pairs = OCT_D / 2u;
+    uint word = ((page * pc.n_kv_head + kvh) * pc.page_cells + in_page) * pairs;
+    uint src = t * (pc.n_kv_head * OCT_D) + kvh * OCT_D;
+
+    for (uint d = 0u; d < OCT_D; ++d) { row[d] = KC[src + d]; }
+    if (kmode != 0u) { oct_roundtrip(kmode, 3u); }
+    for (uint p = 0u; p < pairs; ++p) { KP[word + p] = breccia_pack_f16x2(row[2u * p], row[2u * p + 1u]); }
+
+    for (uint d = 0u; d < OCT_D; ++d) { row[d] = VC[src + d]; }
+    if (vbits != 0u) { oct_roundtrip(0u, vbits); }
+    for (uint p = 0u; p < pairs; ++p) { VP[word + p] = breccia_pack_f16x2(row[2u * p], row[2u * p + 1u]); }
+}
+
 #else
 
 void main() {

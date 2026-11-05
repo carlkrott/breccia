@@ -1682,3 +1682,69 @@ fn qsa_flash_matches_the_three_kernel_path() {
         state.release(gpu);
     }
 }
+
+/// Octave KV fake-quant append (`BRECCIA_KV_OCTAVE_FQ`): what lands in the f16 pools
+/// must be `qsa::cpu::octave_roundtrip` of the input, element for element, up to the
+/// rare nearest-code flip a 1-ulp f32 difference at a codebook midpoint causes.
+#[test]
+fn qsa_kv_append_octave_matches_the_reference() {
+    let fx = need_gpu!("octave");
+    let gpu = fx.dev.gpu();
+    let (max_pos, cells) = (4096usize, 64usize);
+    let qsa = Qsa::new(gpu, max_pos).expect("qsa");
+    let (nkv, hd, pc) = (qsa::MODEL_N_KV_HEAD, qsa::MODEL_HEAD_DIM, qsa::PAGE_CELLS);
+    let dim = nkv * hd;
+    // Spread scales per row so the fitted scale and the fp16 store are exercised.
+    let mut k_all = normalish(0x0C1, cells * dim);
+    let mut v_all = normalish(0x0C2, cells * dim);
+    for (i, x) in k_all.iter_mut().enumerate() {
+        *x *= 0.05 + (i / hd % 7) as f32 * 3.0;
+    }
+    for (i, x) in v_all.iter_mut().enumerate() {
+        *x *= 0.2 + (i / hd % 5) as f32;
+    }
+    let f16 = |h: u16| -> f32 {
+        let (s, e, m) = ((h >> 15) as u32, ((h >> 10) & 31) as i32, (h & 1023) as f32);
+        let v = if e == 0 { m * 2f32.powi(-24) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
+        if s == 1 { -v } else { v }
+    };
+    for (mode, kmode, kbits, vbits) in [(1 | 4 << 4, 1, 0, 4), (2 | 3 << 4, 2, 3, 3)] {
+        let state = QsaState::with_layout(gpu, cells, max_pos, qsa::VLayout::F16).expect("state");
+        let fill = qsa.workspace(gpu, cells, cells).expect("ws");
+        write_f32(gpu, &fill.k_cur, &k_all);
+        write_f32(gpu, &fill.v_cur, &v_all);
+        qsa.kv_append_octave(&state, &fill, 0, mode).expect("append");
+        let pages = cells / pc;
+        let pt = breccia_kernels::gemv::download(gpu, &state.page_table, pages * 4).expect("pt");
+        let kp = breccia_kernels::gemv::download(gpu, &state.k_pool, state.k_pool.size as usize).expect("k");
+        let vp = breccia_kernels::gemv::download(gpu, &state.v_pool, state.v_pool.size as usize).expect("v");
+        let (mut flips, mut total, mut err, mut nrm) = (0usize, 0usize, 0.0f64, 0.0f64); // flips/total in rows
+        for (pool, src, km, bits) in [(&kp, &k_all, kmode, kbits), (&vp, &v_all, 0, vbits)] {
+            for cell in 0..cells {
+                let page = u32::from_le_bytes(pt[cell / pc * 4..cell / pc * 4 + 4].try_into().unwrap()) as usize;
+                for kvh in 0..nkv {
+                    let row = &src[cell * dim + kvh * hd..][..hd];
+                    let want = qsa::cpu::octave_roundtrip(row, km, bits);
+                    let rms = (row.iter().map(|x| x * x).sum::<f32>() / hd as f32).sqrt();
+                    let base = ((page * nkv + kvh) * pc + cell % pc) * hd * 2;
+                    total += 1;
+                    let mut off = false;
+                    for d in 0..hd {
+                        let got = f16(u16::from_le_bytes([pool[base + 2 * d], pool[base + 2 * d + 1]]));
+                        let w = qsa::cpu::to_f16(want[d]);
+                        off |= (got - w).abs() > 2e-3 * rms + 1e-3 * w.abs();
+                        err += f64::from(got - row[d]).powi(2);
+                        nrm += f64::from(row[d]).powi(2);
+                    }
+                    flips += usize::from(off);
+                }
+            }
+        }
+        qsa.release(gpu, fill);
+        state.release(gpu);
+        eprintln!("octave mode {mode:#x}: {flips}/{total} rows off-reference, rel-MSE vs input {:.4}", err / nrm);
+        // A code flip at a midpoint spreads over its whole WHT block, so count rows.
+        assert!(flips * 50 <= total, "mode {mode:#x}: {flips}/{total} rows off the CPU reference");
+        assert!(err / nrm < 0.04, "mode {mode:#x}: rel-MSE {} above the 3-bit bound", err / nrm);
+    }
+}

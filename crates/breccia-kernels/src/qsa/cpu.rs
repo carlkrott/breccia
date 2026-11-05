@@ -81,6 +81,75 @@ pub fn to_q8_0(x: &[f32]) -> Vec<f32> {
     out
 }
 
+/// `qsa_kv_append.comp`'s `BRECCIA_KV_OCTAVE_FQ` round-trip in Rust (vLLM ROCm
+/// Octave, Apache-2.0): sign flips, orthonormal FWHT, Lloyd-Max N(0,1) codebook with
+/// the scale fitted so `x . x_hat = |x|^2` (stored fp16 as `scale * 64`), back out.
+/// `kmode` 1 = block K (64-dim blocks, block 0 = RoPE dims at 4 bits, rest 3 bits),
+/// anything else = one 256-dim block at `bits`. Same f32 op order as the shader.
+pub fn octave_roundtrip(x: &[f32], kmode: u32, bits: u32) -> Vec<f32> {
+    const LUT3: [f32; 8] = [-127.0, -79.0, -45.0, -14.0, 14.0, 45.0, 79.0, 127.0];
+    const LUT4: [f32; 16] = [
+        -126.0, -95.0, -74.0, -58.0, -43.0, -30.0, -18.0, -6.0, 6.0, 18.0, 30.0, 43.0, 58.0,
+        74.0, 95.0, 126.0,
+    ];
+    fn sign(d: u32) -> f32 {
+        let mut h = d.wrapping_mul(0x9E37_79B9).wrapping_add(0x5E17);
+        h ^= h >> 16;
+        h = h.wrapping_mul(0x7feb_352d);
+        h ^= h >> 15;
+        h = h.wrapping_mul(0x846c_a68b);
+        h ^= h >> 16;
+        if h & 1 != 0 { -1.0 } else { 1.0 }
+    }
+    fn fwht(r: &mut [f32]) {
+        let n = r.len();
+        let mut h = 1;
+        while h < n {
+            for i in (0..n).step_by(2 * h) {
+                for j in i..i + h {
+                    let (a, b) = (r[j], r[j + h]);
+                    r[j] = a + b;
+                    r[j + h] = a - b;
+                }
+            }
+            h *= 2;
+        }
+        let s = 1.0 / (n as f32).sqrt();
+        r.iter_mut().for_each(|v| *v *= s);
+    }
+    fn quant(r: &mut [f32], bits: u32) {
+        let lut: &[f32] = if bits == 4 { &LUT4 } else { &LUT3 };
+        let mult = if bits == 4 { 46.0 } else { 59.0 };
+        let ss: f32 = r.iter().fold(0.0, |a, v| a + v * v);
+        let rms = (ss / r.len() as f32).sqrt().max(1e-12);
+        let mut dot = 0.0f32;
+        let codes: Vec<usize> = r
+            .iter()
+            .map(|&v| {
+                let y = v / rms * mult;
+                let c = (1..lut.len()).filter(|&k| y > 0.5 * (lut[k - 1] + lut[k])).last().unwrap_or(0);
+                dot += v * lut[c];
+                c
+            })
+            .collect();
+        let sc = to_f16(if dot > 0.0 { ss / dot * 64.0 } else { 0.0 }) / 64.0;
+        r.iter_mut().zip(&codes).for_each(|(v, &c)| *v = lut[c] * sc);
+    }
+    let mut r: Vec<f32> = x.iter().enumerate().map(|(d, v)| v * sign(d as u32)).collect();
+    if kmode == 1 {
+        for (b, blk) in r.chunks_mut(64).enumerate() {
+            fwht(blk);
+            quant(blk, if b == 0 { 4 } else { 3 });
+            fwht(blk);
+        }
+    } else {
+        fwht(&mut r);
+        quant(&mut r, bits);
+        fwht(&mut r);
+    }
+    r.iter().enumerate().map(|(d, v)| v * sign(d as u32)).collect()
+}
+
 fn sigmoid(x: f64) -> f64 {
     if x >= 0.0 {
         1.0 / (1.0 + (-x).exp())
@@ -512,6 +581,36 @@ mod tests {
         assert_eq!(to_f16(2049.0), 2048.0);
         assert_eq!(to_f16(2051.0), 2052.0);
         assert!(to_f16(1e6).is_infinite());
+    }
+
+    #[test]
+    fn octave_roundtrip_hits_the_lloyd_max_error() {
+        // Gaussian rows: Lloyd-Max N(0,1) rel-MSE is ~0.034 (3-bit), ~0.0095 (4-bit).
+        let mut st = 0x1234_5678u64;
+        let mut g = || {
+            let mut u = || {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                ((st >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+            };
+            let (a, b) = (u(), u());
+            ((-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()) as f32
+        };
+        let mut rel = |kmode, bits| {
+            let (mut e, mut n) = (0.0f64, 0.0f64);
+            for _ in 0..200 {
+                let x: Vec<f32> = (0..256).map(|_| g() * 3.0).collect();
+                let y = octave_roundtrip(&x, kmode, bits);
+                e += x.iter().zip(&y).map(|(a, b)| ((a - b) as f64).powi(2)).sum::<f64>();
+                n += x.iter().map(|a| (*a as f64).powi(2)).sum::<f64>();
+            }
+            e / n
+        };
+        let (r3, r4, rk) = (rel(0, 3), rel(0, 4), rel(1, 0));
+        assert!((0.028..0.040).contains(&r3), "3-bit rel-MSE {r3}");
+        assert!((0.007..0.012).contains(&r4), "4-bit rel-MSE {r4}");
+        assert!(rk > r4 && rk < r3, "block K rel-MSE {rk} between 4- and 3-bit");
     }
 
     #[test]

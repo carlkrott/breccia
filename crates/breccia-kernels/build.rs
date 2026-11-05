@@ -386,9 +386,14 @@ fn main() {
                 &["BRECCIA_KV_Q8V"],
             );
         }
+        // Octave KV fake-quant (quality gate only, `BRECCIA_KV_OCTAVE_FQ` env).
+        if *name == "qsa_kv_append" {
+            compile(&glslc, &out_dir, name, "qsa_kv_append_octfq", &["BRECCIA_KV_OCTAVE_FQ"]);
+        }
     }
 
-    spirv_hash(&out_dir, "BRECCIA_SPIRV_HASH", |_| true);
+    // The fake-quant gate module is not on the default path: keep profile verdicts fresh.
+    spirv_hash(&out_dir, "BRECCIA_SPIRV_HASH", |n| !n.contains("_octfq"));
     spirv_hash(&out_dir, "BRECCIA_GEMM_SPIRV_HASH", |n| {
         n.starts_with("gemm_") || n.starts_with("dequant_")
     });

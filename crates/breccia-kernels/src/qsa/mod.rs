@@ -268,6 +268,23 @@ pub enum VLayout {
     Q8_0,
 }
 
+/// `BRECCIA_KV_OCTAVE_FQ` (quality gate, f16 cache only): round-trip K/V through the
+/// vLLM Octave format on append. Encoding: bits 0-3 K (1 block k3 = 4-bit RoPE block,
+/// 3-bit NoPE blocks; 2 compact 3-bit), bits 4-7 V bits (3/4). Unknown -> panic.
+pub fn octave_fq_mode() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("BRECCIA_KV_OCTAVE_FQ").as_deref() {
+        Err(_) | Ok("") | Ok("off") => 0,
+        Ok("k3v4") => 1 | 4 << 4,
+        Ok("k3v3") => 1 | 3 << 4,
+        Ok("compact") => 2 | 3 << 4,
+        Ok("k3") => 1,
+        Ok("v4") => 4 << 4,
+        Ok("v3") => 3 << 4,
+        Ok(o) => panic!("BRECCIA_KV_OCTAVE_FQ={o}: want k3v4|k3v3|compact|k3|v4|v3|off"),
+    })
+}
+
 /// Process-wide V layout: the launch flag's value, else the env default. One
 /// static (not one per function) so `set_current` and `current` agree.
 static V_LAYOUT: std::sync::OnceLock<VLayout> = std::sync::OnceLock::new();
@@ -724,6 +741,8 @@ pub struct Qsa<'g> {
     kv_append: Pipe<'g>,
     /// `BRECCIA_KV_Q8V`: quantise V on write (`qsa_kv_append.comp` q8_0 build).
     kv_append_q8: Pipe<'g>,
+    /// `BRECCIA_KV_OCTAVE_FQ`: Octave round-trip before the f16 store (quality gate).
+    kv_append_oct: Pipe<'g>,
     idx_tail: Pipe<'g>,
     idx_pool: Pipe<'g>,
     idx_score: Pipe<'g>,
@@ -782,6 +801,12 @@ impl<'g> Qsa<'g> {
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_kv_append_q8v.spv")),
             5,
             "qsa kv append (q8_0 V)",
+        )?;
+        let kv_append_oct = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_kv_append_octfq.spv")),
+            5,
+            "qsa kv append (octave fake-quant)",
         )?;
         let idx_tail = Pipe::new(
             gpu,
@@ -914,6 +939,7 @@ impl<'g> Qsa<'g> {
             q_norm,
             kv_append,
             kv_append_q8,
+            kv_append_oct,
             idx_tail,
             idx_pool,
             idx_score,
@@ -1138,6 +1164,18 @@ impl<'g> Qsa<'g> {
     /// Append this call's K/V to the paged cache (V quantised to q8_0 when the
     /// state's layout says so).
     pub fn kv_append(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        self.kv_append_octave(state, ws, pos0, octave_fq_mode())
+    }
+
+    /// [`Self::kv_append`] with an explicit Octave fake-quant mode
+    /// ([`octave_fq_mode`] encoding; 0 = plain).
+    pub fn kv_append_octave(
+        &self,
+        state: &QsaState,
+        ws: &QsaWorkspace,
+        pos0: usize,
+        oct: u32,
+    ) -> Result<()> {
         if pos0 + ws.tokens > state.capacity_cells {
             return Err(anyhow!(
                 "kv_append would write cells {pos0}..{} but the cache holds {} \
@@ -1152,8 +1190,9 @@ impl<'g> Qsa<'g> {
             .i(pos0 as i32)
             .u(MODEL_N_KV_HEAD as u32)
             .u(MODEL_HEAD_DIM as u32)
-            .u(PAGE_CELLS as u32);
-        let (pipe, gx, gy) = self.kv_append_target(state, ws.tokens);
+            .u(PAGE_CELLS as u32)
+            .u(oct);
+        let (pipe, gx, gy) = self.kv_append_target(state, ws.tokens, oct);
         pipe.run(
             &[
                 &state.k_pool,
@@ -1171,8 +1210,9 @@ impl<'g> Qsa<'g> {
     /// differ because q8_0's scale is a max over the block, so the q8_0 build runs
     /// one invocation per (token, kv_head, 32-element block) and the f16 build one
     /// per (token, kv_head, d-pair). Same bindings, same push constants.
-    fn kv_append_target(&self, state: &QsaState, tokens: usize) -> (&Pipe<'g>, u32, u32) {
+    fn kv_append_target(&self, state: &QsaState, tokens: usize, oct: u32) -> (&Pipe<'g>, u32, u32) {
         let (pipe, units, wg) = match state.v_layout {
+            VLayout::F16 if oct != 0 => (&self.kv_append_oct, tokens * MODEL_N_KV_HEAD, 128),
             VLayout::F16 => (
                 &self.kv_append,
                 tokens * MODEL_N_KV_HEAD * sizes::f16_row_words(),
@@ -1889,8 +1929,9 @@ impl Qsa<'_> {
             .i(pos0 as i32)
             .u(MODEL_N_KV_HEAD as u32)
             .u(MODEL_HEAD_DIM as u32)
-            .u(PAGE_CELLS as u32);
-        let (kv_pipe, kx, ky) = self.kv_append_target(state, t);
+            .u(PAGE_CELLS as u32)
+            .u(octave_fq_mode());
+        let (kv_pipe, kx, ky) = self.kv_append_target(state, t, octave_fq_mode());
         let kva = kv_pipe.run_timed(
             &[
                 &state.k_pool,

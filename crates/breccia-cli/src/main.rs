@@ -997,12 +997,31 @@ fn profile_placement(
             .collect(),
         None => synthetic_prefix(&[760, 13017, 1433, 364, 279, 5447], 8000, 0x5eed, vocab as u32),
     };
-    let dir = std::env::temp_dir().join(format!("breccia-placement-{}", std::process::id()));
+    // Logs stay for inspection, so they live in a fresh owner-only state dir (never a
+    // guessable shared-tmp path that another user could pre-create or symlink).
+    let dir = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state")))
+        .context("neither XDG_STATE_HOME nor HOME is set")?
+        .join("breccia/placement");
     std::fs::create_dir_all(&dir)?;
+    let dir = dir.join(format!(
+        "{}-{}",
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs(),
+        std::process::id()
+    ));
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)?; // fails if it already exists
+    }
+    let new_file = |p: &std::path::Path| {
+        std::fs::OpenOptions::new().write(true).create_new(true).open(p)
+    };
     let ids = |name: &str, len: usize| -> Result<std::path::PathBuf> {
         let f = dir.join(name);
         let text: Vec<String> = prompt[..len.min(prompt.len())].iter().map(u32::to_string).collect();
-        std::fs::write(&f, text.join(","))?;
+        std::io::Write::write_all(&mut new_file(&f)?, text.join(",").as_bytes())?;
         Ok(f)
     };
     let pf_ids = ids("prefill.ids", prompt.len())?;
@@ -1040,7 +1059,7 @@ fn profile_placement(
             cmd.env("BRECCIA_PREFILL_ONLY", "1");
         }
         let log = dir.join(format!("k{k}-{}.log", if decode { "decode" } else { "prefill" }));
-        let f = std::fs::File::create(&log)?;
+        let f = new_file(&log)?;
         let mut child = cmd
             .stdout(f.try_clone()?)
             .stderr(f)
@@ -1167,6 +1186,51 @@ fn session_threads(flag: Option<usize>) -> usize {
 
 fn same_pci(a: &str, b: &str) -> bool {
     !a.is_empty() && breccia_vk::pci::normalize_address(a) == breccia_vk::pci::normalize_address(b)
+}
+
+/// The block split for two `--devices` with no `--split-blocks`: the saved
+/// `profile --placement` verdict's dual split, in `devs` order, plus the index of
+/// the fast card (the prefill expert helper). Carl 11-05: always dual at the measured
+/// split (38/10 decode; RX alone was +8-18 % prefill, decode a tie), so the decode
+/// choice wins and prefill's is only a fallback when decode chose one card.
+fn placement_default(devs: &[String]) -> Option<(Vec<usize>, usize)> {
+    if devs.len() != 2 {
+        return None;
+    }
+    let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path()).ok()??;
+    placement_split(prof.placement.as_ref()?, devs)
+}
+
+fn placement_split(
+    v: &breccia_profile::schema::PlacementVerdict,
+    devs: &[String],
+) -> Option<(Vec<usize>, usize)> {
+    let blocks = [&v.decode, &v.prefill]
+        .into_iter()
+        .map(|c| &c.blocks)
+        .find(|b| b.len() == 2 && b.iter().all(|&n| n > 0))?;
+    let [fast, slow] = v.devices.as_slice() else { return None };
+    if same_pci(fast, &devs[0]) && same_pci(slow, &devs[1]) {
+        Some((blocks.clone(), 0))
+    } else if same_pci(slow, &devs[0]) && same_pci(fast, &devs[1]) {
+        Some((vec![blocks[1], blocks[0]], 1))
+    } else {
+        None
+    }
+}
+
+/// `--split-blocks` parsed, else [`placement_default`] (which also points the prefill
+/// expert helper at the fast card unless `BRECCIA_PF_EXPERT_DEVICE` is set).
+fn split_or_placement(split: Option<&str>, devs: &[String]) -> Option<Vec<usize>> {
+    if let Some(s) = split {
+        return Some(s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect());
+    }
+    let (blocks, fast) = placement_default(devs)?;
+    if std::env::var_os("BRECCIA_PF_EXPERT_DEVICE").is_none() {
+        std::env::set_var("BRECCIA_PF_EXPERT_DEVICE", fast.to_string());
+    }
+    println!("split-blocks {blocks:?} (profile placement verdict; --split-blocks overrides)");
+    Some(blocks)
 }
 
 /// `--prefill-chunk` per `devs` entry: an explicit value wins (0 included);
@@ -2206,6 +2270,27 @@ mod tests {
         assert!(profile_parity_ok(&r, &[0.0, 2.0, 1.9])); // big KL, same top-1: pass
         assert!(!profile_parity_ok(&r, &[0.0, 1.0, 1.1])); // top-1 moved: block
         assert!(logits_kl(&r, &[0.0, 2.0, 1.9]) > 1e-3);
+    }
+
+    #[test]
+    fn placement_split_follows_device_order_and_prefers_dual() {
+        use breccia_profile::schema::{PlacementChoice, PlacementVerdict};
+        let c = |b: Vec<usize>| PlacementChoice { blocks: b, tok_s: 1.0, tried: vec![] };
+        let mut v = PlacementVerdict {
+            timestamp: String::new(),
+            model: String::new(),
+            devices: vec!["0000:03:00.0".into(), "0000:0e:00.0".into()],
+            prefill: c(vec![48, 0]),
+            decode: c(vec![38, 10]),
+        };
+        let (rx, mi) = ("0000:03:00.0".to_string(), "0000:0e:00.0".to_string());
+        assert_eq!(placement_split(&v, &[rx.clone(), mi.clone()]), Some((vec![38, 10], 0)));
+        assert_eq!(placement_split(&v, &[mi.clone(), rx.clone()]), Some((vec![10, 38], 1)));
+        assert_eq!(placement_split(&v, &[rx.clone(), "0000:05:00.0".into()]), None);
+        v.decode = c(vec![48, 0]);
+        assert_eq!(placement_split(&v, &[rx.clone(), mi.clone()]), None);
+        v.prefill = c(vec![44, 4]);
+        assert_eq!(placement_split(&v, &[rx, mi]), Some((vec![44, 4], 0)));
     }
 
     #[test]
@@ -4336,11 +4421,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         &breccia_engine::LoadOptions {
             devices: a.devices.clone(),
             ctx_capacity: a.ctx,
-            blocks: a.split_blocks.as_ref().map(|s| {
-                s.split(',')
-                    .filter_map(|t| t.trim().parse::<usize>().ok())
-                    .collect()
-            }),
+            blocks: split_or_placement(a.split_blocks.as_deref(), &a.devices),
             head_device: match a.head_device.as_deref() {
                 None => breccia_engine::HeadSpec::Auto,
                 Some(v) => breccia_engine::HeadSpec::parse(v)?,
@@ -4942,6 +5023,7 @@ fn serve_http(a: ServeArgs) -> Result<()> {
         &breccia_engine::LoadOptions {
             devices: a.devices.clone(),
             ctx_capacity: a.ctx,
+            blocks: split_or_placement(None, &a.devices),
             head_device: breccia_engine::HeadSpec::Auto,
             arena,
             verbose: true,
