@@ -116,7 +116,10 @@ pub fn fingerprint(input: &FingerprintInput) -> String {
         feed(&mut h, &g.pci_topology);
     }
     feed(&mut h, &input.cpu_model);
-    h.update(&input.total_ram_bytes.to_le_bytes());
+    // Whole GiB: MemTotal drifts by KiB across boots (kernel reserves), which must not
+    // throw away every calibration; a real RAM change moves it by GiB.
+    let ram_gib = (input.total_ram_bytes + (1 << 29)) >> 30;
+    h.update(&ram_gib.to_le_bytes());
     h.finalize().to_hex().to_string()
 }
 
@@ -210,6 +213,9 @@ mod tests {
         let mut a = this_machine();
         let base = fingerprint(&a);
         a.cpu_model = a.cpu_model.clone(); // no-op rewrite
+        assert_eq!(base, fingerprint(&a));
+        // MemTotal drift seen 2026-11-05 (-12 KiB) must not invalidate.
+        a.total_ram_bytes -= 12 * 1024;
         assert_eq!(base, fingerprint(&a));
     }
 
