@@ -292,7 +292,7 @@ impl Placement {
     }
 }
 
-/// Estimated per-token state/KV bytes a device must also hold.
+/// Session state/KV bytes a device must also hold (one session).
 pub fn state_bytes(
     cfg: &crate::config::ModelConfig,
     layer_device: &[usize],
@@ -310,8 +310,13 @@ pub fn state_bytes(
                 total += (128 * 48 * 128 * 4 + 3 * 10240 * 4) as u64;
             }
             crate::config::LayerKind::Qsa => {
-                // f16 K/V per cell (2048 B) + pooled indexer key (~128 B/cell).
-                total += capacity_cells as u64 * (2048 + 132);
+                // The bytes `QsaState::new` allocates (graph.rs passes the same args),
+                // in the process's KV layout (q6_0 default: 972 B/cell, f16 2188).
+                total += breccia_kernels::qsa::state_bytes(
+                    capacity_cells,
+                    capacity_cells.max(8),
+                    breccia_kernels::qsa::VLayout::current(),
+                );
             }
         }
     }

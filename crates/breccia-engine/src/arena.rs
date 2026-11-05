@@ -86,6 +86,9 @@ pub struct ArenaOpts {
     /// Bytes left free on a headless device (the session's scratch and allocator
     /// slack; measured at ~120 MiB on this model).
     pub headroom: u64,
+    /// Sessions whose KV/recurrent state each device must also hold (allocated
+    /// after the arena, so it is reserved here): one, or the streams on a card.
+    pub sessions: usize,
 }
 
 /// VRAM the chunked prefill scratch needs for a `tokens`-row chunk (merged-pass
@@ -121,6 +124,7 @@ impl ArenaOpts {
         ArenaOpts {
             display_reserve: self.display_reserve + extra,
             headroom: self.headroom + extra,
+            ..self
         }
     }
 }
@@ -130,6 +134,7 @@ impl Default for ArenaOpts {
         ArenaOpts {
             display_reserve: 768 << 20,
             headroom: 256 << 20,
+            sessions: 1,
         }
     }
 }

@@ -789,7 +789,13 @@ impl Model {
                 )
             }
             ArenaSpec::Auto(aopts) => {
-                let budgets = probe_budgets(&devices, *aopts, opts.verbose)?;
+                let state: Vec<u64> = (0..devices.len())
+                    .map(|i| {
+                        placement::state_bytes(&cfg, &placement.layer_device, i, opts.ctx_capacity)
+                            * aopts.sessions as u64
+                    })
+                    .collect();
+                let budgets = probe_budgets(&devices, *aopts, &state, opts.verbose)?;
                 // The arena follows `placement.device_of(b)`: the measured tier
                 // decision lives in `Placement` (rate-weighted counts), so the arena
                 // device and the execution device cannot disagree. Overriding the
@@ -1944,7 +1950,19 @@ fn tier_rates_for_specs(specs: &[placement::DeviceSpec], users: u32) -> Option<V
     Some(out)
 }
 
-fn probe_budgets(devices: &[Device], opts: ArenaOpts, verbose: bool) -> Result<Vec<DeviceBudget>> {
+/// Session state a display card's reserve already absorbs: every measured run
+/// up to 32k (q6_0 state 163-388 MiB on the RX) kept its 2560 MiB reserve and a
+/// usable desktop. Only state above this is charged there, so 8k/32k residency is
+/// unchanged; a headless card's headroom is measured slack, so it pays all of it.
+/// shortcut: one measured card; re-measure if the desktop stalls at 100k+.
+const STATE_IN_DISPLAY_RESERVE: u64 = 512 << 20;
+
+fn probe_budgets(
+    devices: &[Device],
+    opts: ArenaOpts,
+    state: &[u64],
+    verbose: bool,
+) -> Result<Vec<DeviceBudget>> {
     let mut out = Vec::with_capacity(devices.len());
     for (i, dev) in devices.iter().enumerate() {
         let gpu = dev.gpu();
@@ -1964,10 +1982,11 @@ fn probe_budgets(devices: &[Device], opts: ArenaOpts, verbose: bool) -> Result<V
         // fact is read from sysfs (see `pci::drives_a_display`), never assumed.
         // `unknown` is treated as a display: the safe direction.
         let display = breccia_vk::pci::drives_a_display(pci).unwrap_or(true);
+        let st = state.get(i).copied().unwrap_or(0);
         let reserve = if display {
-            opts.display_reserve
+            opts.display_reserve + st.saturating_sub(STATE_IN_DISPLAY_RESERVE)
         } else {
-            opts.headroom
+            opts.headroom + st
         };
         if verbose {
             eprintln!(

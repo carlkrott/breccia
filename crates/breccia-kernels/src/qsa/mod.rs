@@ -477,6 +477,29 @@ pub mod sizes {
     }
 }
 
+/// The six buffers [`QsaState::with_layout`] allocates, in its slot order.
+fn buffer_sizes(capacity_cells: usize, max_pos: usize, v_layout: VLayout) -> [(u64, &'static str); 6] {
+    let pages = capacity_cells.div_ceil(PAGE_CELLS);
+    let (k_bytes, v_bytes) = match v_layout {
+        VLayout::F16 => (sizes::f16_pool_bytes(pages), sizes::f16_pool_bytes(pages)),
+        VLayout::Q8_0 => (sizes::f16_pool_bytes(pages), sizes::q8v_pool_bytes(pages)),
+        VLayout::Q6_0 => (sizes::q6_pool_bytes(pages), sizes::q6_pool_bytes(pages)),
+    };
+    [
+        (k_bytes, "kv k_pool"),
+        (v_bytes, "kv v_pool"),
+        (pages as u64 * 4, "kv page_table"),
+        (sizes::idx_tail_bytes(), "indexer tail"),
+        (sizes::pooled_idx_bytes(sizes::pooled_blocks(pages * PAGE_CELLS)), "indexer pooled"),
+        (max_pos as u64 * 12, "position table"),
+    ]
+}
+
+/// Bytes one layer's [`QsaState`] allocates (for VRAM budgeting before any session exists).
+pub fn state_bytes(capacity_cells: usize, max_pos: usize, v_layout: VLayout) -> u64 {
+    buffer_sizes(capacity_cells, max_pos, v_layout).iter().map(|b| b.0).sum()
+}
+
 /// `(i, i, i)` for `i < max_pos`: the text position table.
 fn identity_triples(max_pos: usize) -> Vec<u32> {
     (0..max_pos as u32).flat_map(|i| [i, i, i]).collect()
@@ -534,8 +557,6 @@ impl QsaState {
             ));
         }
         let pages = capacity_cells.div_ceil(PAGE_CELLS);
-        let cells = pages * PAGE_CELLS;
-        let max_blocks = sizes::pooled_blocks(cells);
         // The V pool's byte count is the one number the capacity argument turns on,
         // so it is chosen from the layout and then **checked against the row count
         // the kernels index** (cells x n_kv_head rows) instead of being trusted.
@@ -566,14 +587,8 @@ impl QsaState {
             "the V pool is one of the two layouts the kernels index, not a literal"
         );
 
-        let sizes = [
-            (k_bytes, "kv k_pool"),
-            (v_bytes, "kv v_pool"),
-            (pages as u64 * 4, "kv page_table"),
-            (sizes::idx_tail_bytes(), "indexer tail"),
-            (sizes::pooled_idx_bytes(max_blocks), "indexer pooled"),
-            (max_pos as u64 * 12, "position table"),
-        ];
+        let sizes = buffer_sizes(capacity_cells, max_pos, v_layout);
+        assert_eq!((sizes[0].0, sizes[1].0), (k_bytes, v_bytes));
         assert_eq!(
             sizes.len(),
             6,
@@ -662,7 +677,7 @@ impl QsaState {
             idx_tail,
             idx_pooled,
             positions,
-            capacity_cells: cells,
+            capacity_cells: pages * PAGE_CELLS,
             max_pos,
             v_layout,
         })

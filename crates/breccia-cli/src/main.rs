@@ -1344,9 +1344,10 @@ fn stream_chunk_arena(
     let spec = match spec {
         breccia_engine::ArenaSpec::Auto(o) => {
             // Every stream on the card allocates its own scratch.
-            breccia_engine::ArenaSpec::Auto(
-                (0..per_card).fold(o, |o, _| o.with_prefill_chunk(chunk, ctx)),
-            )
+            breccia_engine::ArenaSpec::Auto(breccia_engine::ArenaOpts {
+                sessions: per_card,
+                ..(0..per_card).fold(o, |o, _| o.with_prefill_chunk(chunk, ctx))
+            })
         }
         other => other,
     };
@@ -3453,6 +3454,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
             let opts = breccia_engine::ArenaOpts {
                 display_reserve: a.arena_display_reserve_mib << 20,
                 headroom: a.arena_headroom_mib << 20,
+                ..Default::default()
             };
             multi_arena_specs(spec, n_streams, opts)?
         }
@@ -3504,6 +3506,7 @@ fn bench_token_multi(a: &TokenArgs, prompt: &[u32], glob: &str) -> Result<()> {
                 breccia_engine::ArenaOpts {
                     display_reserve: f.display_reserve + extra,
                     headroom: f.headroom + extra,
+                    ..f
                 }
             });
             stream_specs[s] = breccia_engine::ArenaSpec::Auto(o);
@@ -3907,6 +3910,7 @@ fn bench_agents(a: AgentArgs) -> Result<()> {
     let opts = breccia_engine::ArenaOpts {
         display_reserve: a.arena_display_reserve_mib << 20,
         headroom: a.arena_headroom_mib << 20,
+        ..Default::default()
     };
     let groups: Vec<breccia_engine::ArenaSpec> = match a.gpu_experts.as_deref() {
         Some(spec) => multi_arena_specs(spec, n, opts)?,
@@ -4528,6 +4532,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                     breccia_engine::ArenaOpts {
                         display_reserve: (a.arena_display_reserve_mib + margin) << 20,
                         headroom: a.arena_headroom_mib << 20,
+                        ..Default::default()
                     }
                     .with_prefill_chunk(a.prefill_chunk, a.ctx),
                 );
