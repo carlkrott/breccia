@@ -5282,6 +5282,35 @@ struct EngineBackend<'a, 'm> {
 /// shortcut: a fixed RAM cap (~7 images' prompt state at ~135 MB each); make it a flag if a box needs more.
 const PREFIX_CAP_BYTES: usize = 1 << 30;
 
+/// Drops entries unused for `ttl`, then the least recently used until the rest fit in `cap` bytes.
+fn prune_prefixes<K, T>(
+    v: &mut Vec<(K, std::time::Instant, T)>,
+    now: std::time::Instant,
+    ttl: std::time::Duration,
+    cap: usize,
+    bytes: impl Fn(&T) -> usize,
+) {
+    v.retain(|e| now - e.1 < ttl);
+    v.sort_by_key(|e| std::cmp::Reverse(e.1));
+    let mut total = 0;
+    v.retain(|e| {
+        total += bytes(&e.2);
+        total <= cap
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn prefix_prune_ttl_then_lru() {
+    use std::time::Duration as D;
+    let now = std::time::Instant::now();
+    let at = |s: u64| now - D::from_secs(s);
+    // (name, last use, bytes): c expired, then a is the oldest over the 100-byte cap
+    let mut v = vec![("a", at(600), 60), ("b", at(10), 50), ("c", at(1900), 10), ("d", at(0), 40)];
+    prune_prefixes(&mut v, now, D::from_secs(1800), 100, |&b| b);
+    assert_eq!(v.iter().map(|e| e.0).collect::<Vec<_>>(), ["d", "b"]);
+}
+
 impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn model_name(&self) -> String {
         self.name.clone()
@@ -5320,7 +5349,7 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         // request with the same tokens and images up to there (same server = same encoder)
         let now = std::time::Instant::now();
         let ttl = self.vision.as_ref().map_or(std::time::Duration::ZERO, |v| v.ttl);
-        self.prefixes.retain(|e| now - e.1 < ttl);
+        prune_prefixes(&mut self.prefixes, now, ttl, PREFIX_CAP_BYTES, |st| st.bytes());
         let cut = runs.last().map_or(0, |&(c0, len)| c0 + len + 1);
         if cut == 0 || cut >= prompt.len() {
             return self.sess.generate(prompt, n, None).map(|g| g.tokens).map_err(|e| e.to_string());
@@ -5346,13 +5375,7 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         if let Some(st) = saved {
             println!("prefix   {} cells kept ({} MiB), request {:.2} s", st.cells, st.bytes() >> 20, t.elapsed().as_secs_f64());
             self.prefixes.push((key, now, st));
-            // least recently used first out
-            self.prefixes.sort_by_key(|e| std::cmp::Reverse(e.1));
-            let mut total = 0;
-            self.prefixes.retain(|e| {
-                total += e.2.bytes();
-                total <= PREFIX_CAP_BYTES
-            });
+            prune_prefixes(&mut self.prefixes, now, ttl, PREFIX_CAP_BYTES, |st| st.bytes());
         }
         Ok(g.tokens)
     }
