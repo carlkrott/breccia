@@ -269,10 +269,30 @@ fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<Vec<u32>, String> {
     let mut out = Vec::new();
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-        let content = m
-            .get("content")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
+        // OpenAI content is a string or an array of parts; image parts must fail loudly,
+        // not run as an empty prompt.
+        let content = match m.get("content") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(parts)) => {
+                let mut text = String::new();
+                for p in parts {
+                    match p.get("type").and_then(|t| t.as_str()) {
+                        Some("text") => {
+                            text += p.get("text").and_then(|t| t.as_str()).unwrap_or("")
+                        }
+                        t => {
+                            return Err(format!(
+                                "content part type {:?} is not supported (no image input yet)",
+                                t.unwrap_or("?")
+                            ))
+                        }
+                    }
+                }
+                text
+            }
+            Some(_) => return Err("content must be a string or an array of parts".into()),
+        };
         if let Some(s) = im_start {
             out.push(s);
         }

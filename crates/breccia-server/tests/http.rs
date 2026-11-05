@@ -115,3 +115,35 @@ fn chat_puts_the_control_tokens_in_by_id() {
     // + "assistant\n"(10) = 20 prompt tokens.
     assert_eq!(v["usage"]["prompt_tokens"], 20);
 }
+
+#[test]
+fn chat_rejects_image_parts_and_joins_text_parts() {
+    let mut m = Mock;
+    let img = dispatch(
+        "POST",
+        "/v1/chat/completions",
+        &body(serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            ]}],
+            "max_tokens": 3
+        })),
+        &mut m,
+    );
+    assert_eq!(img.status, 400, "{}", String::from_utf8_lossy(&img.body));
+    let text = dispatch(
+        "POST",
+        "/v1/chat/completions",
+        &body(serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+            "max_tokens": 3
+        })),
+        &mut m,
+    );
+    let v: serde_json::Value = serde_json::from_slice(&text.body).unwrap();
+    assert_eq!(
+        v["usage"]["prompt_tokens"], 20,
+        "array text must match the string form"
+    );
+}
