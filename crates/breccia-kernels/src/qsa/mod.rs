@@ -158,10 +158,11 @@ fn flash_attn(tokens: usize) -> bool {
     gqa_scores(tokens) && mode.unwrap_or(tokens >= FLASH_MIN_TOKENS)
 }
 
-/// RX 6950 XT ABBA, prefill-only: chunk 8192 +13 % (507 vs 447 tok/s), chunk 1024 -9 %
-/// (one workgroup per token x kv head walks every slot serially; the tiled path is wider).
-/// shortcut: one measured point each side, re-measure 2k/4k chunks to place the crossover.
-const FLASH_MIN_TOKENS: usize = 4096;
+/// RX 6950 XT ABBA, 8k prompt, prefill-only, flash vs tiled: chunk 8192 507 vs 447 tok/s
+/// (+13 %), 4096 523 vs 556 (-6 %), 2048 509 vs 531 (-4 %); 1k prompt chunk 1024 -9 %.
+/// One workgroup per token x kv head walks every slot serially; the tiled path is wider.
+/// Tiled at chunk 4096 beats flash at 8192, so flash only helps an explicit 8k+ chunk.
+const FLASH_MIN_TOKENS: usize = 8192;
 
 /// Ids (4 slots each) per split-apply workgroup: ctx 1k -> 17 chunks, 4k -> 33.
 /// `CHUNK_BLOCKS` in `qsa_attn_apply_split.comp` must match.
