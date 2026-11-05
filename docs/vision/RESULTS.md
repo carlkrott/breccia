@@ -39,9 +39,16 @@ Checks:
 
 | case | greedy prefix vs llama.cpp server | first-token top-20 overlap | Breccia output |
 |---|---|---|---|
-| 448^2 (196 tok) | 6/47, split at a near-tie ("captures" vs "depicts") | 13/20 | "This image captures a serene, misty mountain landscape at dawn or dusk, featuring snow-capped peaks glowing with soft alpenglow above a dense, dark forest of coniferous trees shrouded in blue-toned..." |
-| 1024^2 (1024 tok) | 10/45, split at "mist" vs "painterly" (ref lp -1.06 vs -1.39) | 16/20 | "This image depicts a serene, painterly mountain landscape at twilight, featuring snow-capped peaks glowing with soft pink and orange alpenglow against a cool blue sky, with a dense, dark forest of coniferous trees" |
+| 448^2 (196 tok) | 6/47, split at "captures" (p~0.28) vs ref "depicts" (p~0.65) | 13/20 | "This image captures a serene, misty mountain landscape at dawn or dusk, featuring snow-capped peaks glowing with soft alpenglow above a dense, dark forest of coniferous trees shrouded in blue-toned..." |
+| 1024^2 (1024 tok) | 10/45, split at a near-tie: "painterly" (p~0.25) vs ref "mist" (p~0.35) | 16/20 | "This image depicts a serene, painterly mountain landscape at twilight, featuring snow-capped peaks glowing with soft pink and orange alpenglow against a cool blue sky, with a dense, dark forest of coniferous trees" |
 
 Ref (server, 448): "This image depicts a serene, misty mountain landscape at dawn or dusk, with snow-capped peaks glowing softly in alpenglow above a dense, dark coniferous forest shrouded in blue haze."
-Divergence is likely numeric, unproven (IQ3 GPU kernels + q6_0 KV vs CPU f16 KV), same content and colours. Not yet run: q6 vs f16 KV A/B on image prompts.
+KV gate (same prompts, BRECCIA_KV=f16 vs default q6_0):
+| KV | 448 prefix | 1024 prefix | 1024 top-20 |
+|---|---|---|---|
+| q6_0 | 6/47 | 10/45 | 16/20 |
+| f16  | 6/47 | 4/45 ("A serene, painterly landscape...") | 16/20 |
+f16 agrees no longer than q6 -> q6 KV costs no vision fidelity here; the gap vs llama.cpp is GPU IQ3 kernels vs CPU
+(llama.cpp CPU fed the same dump reproduces the server exactly). Colours checked against img1024.png: pink/salmon
+alpenglow on the peaks, blue sky, painterly look -> Breccia's "pink and orange alpenglow ... cool blue sky" is right.
 Decode 448: 16.0 tok/s, 1024: 25.2 tok/s (single runs, not ABBA; not a speed claim).
