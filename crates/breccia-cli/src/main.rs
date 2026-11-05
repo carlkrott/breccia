@@ -4592,6 +4592,46 @@ fn bench_token(a: TokenArgs) -> Result<()> {
 
     // ---- A. one token, twice: finite logits and a stable top-1 -------------
     let t_first = std::time::Instant::now();
+    // ---- `BRECCIA_SEQS=N`: N sequences on this one session (shared weights and
+    // prefill scratch, own state), prompt i = the prompt rotated by i tokens;
+    // `BRECCIA_SEQS_PARITY=1` re-runs each prompt alone and compares the tokens.
+    if bench_seqs() > 1 {
+        let n = bench_seqs();
+        let prompts: Vec<Vec<u32>> = (0..n)
+            .map(|i| {
+                let mut p = prompt.clone();
+                let l = p.len();
+                p.rotate_left(i % l);
+                p
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let read0 = io_read_mib();
+        let gens = sess.generate_seqs(&prompts, a.gen).context("sequence-slot generation")?;
+        let fw: usize = gens.iter().map(|g| g.forwards).sum();
+        let dec = gens[0].decode_seconds;
+        println!(
+            "seqs {n}: aggregate {:.2} tok/s ({:.2} per sequence), wall {:.1} s incl. prefill, {:.2} GiB storage read",
+            fw as f64 / dec,
+            fw as f64 / dec / n as f64,
+            t.elapsed().as_secs_f64(),
+            (io_read_mib() - read0) / 1024.0
+        );
+        let mut bad = 0;
+        for (i, g) in gens.iter().enumerate() {
+            println!("seq {i}: {:?}", &g.tokens[..g.tokens.len().min(12)]);
+            if std::env::var("BRECCIA_SEQS_PARITY").is_ok_and(|v| v == "1") {
+                sess.use_seq(0)?;
+                let solo = sess.generate(&prompts[i], a.gen, None)?;
+                let same = solo.tokens.iter().zip(&g.tokens).take_while(|(x, y)| x == y).count();
+                println!("seq {i} parity: {same}/{} tokens equal the solo run", g.tokens.len());
+                bad += usize::from(same != g.tokens.len());
+            }
+        }
+        anyhow::ensure!(bad == 0, "{bad} sequence(s) diverged from their solo run");
+        return Ok(());
+    }
+
     let l1 = feed_prompt(&mut sess, &prompt, a.prefill_chunk).context("the first forward pass")?;
     let first_seconds = t_first.elapsed().as_secs_f64();
     let l2 = feed_prompt(&mut sess, &prompt, a.prefill_chunk).context("the repeat forward pass")?;
@@ -4689,44 +4729,6 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             w.ms_per_token(),
             (io_read_mib() - r0) / 1024.0
         );
-    }
-
-    // ---- `BRECCIA_SEQS=N`: N sequences on this one session (shared weights and
-    // prefill scratch, own state), prompt i = the prompt rotated by i tokens;
-    // `BRECCIA_SEQS_PARITY=1` re-runs each prompt alone and compares the tokens.
-    if bench_seqs() > 1 {
-        let n = bench_seqs();
-        let prompts: Vec<Vec<u32>> = (0..n)
-            .map(|i| {
-                let mut p = prompt.clone();
-                let l = p.len();
-                p.rotate_left(i % l);
-                p
-            })
-            .collect();
-        let t = std::time::Instant::now();
-        let gens = sess.generate_seqs(&prompts, a.gen).context("sequence-slot generation")?;
-        let fw: usize = gens.iter().map(|g| g.forwards).sum();
-        let dec = gens[0].decode_seconds;
-        println!(
-            "seqs {n}: aggregate {:.2} tok/s ({:.2} per sequence), wall {:.1} s incl. prefill",
-            fw as f64 / dec,
-            fw as f64 / dec / n as f64,
-            t.elapsed().as_secs_f64()
-        );
-        let mut bad = 0;
-        for (i, g) in gens.iter().enumerate() {
-            println!("seq {i}: {:?}", &g.tokens[..g.tokens.len().min(12)]);
-            if std::env::var("BRECCIA_SEQS_PARITY").is_ok_and(|v| v == "1") {
-                sess.use_seq(0)?;
-                let solo = sess.generate(&prompts[i], a.gen, None)?;
-                let same = solo.tokens.iter().zip(&g.tokens).take_while(|(x, y)| x == y).count();
-                println!("seq {i} parity: {same}/{} tokens equal the solo run", g.tokens.len());
-                bad += usize::from(same != g.tokens.len());
-            }
-        }
-        anyhow::ensure!(bad == 0, "{bad} sequence(s) diverged from their solo run");
-        return Ok(());
     }
 
     // ---- B/C. measured generations ----------------------------------------

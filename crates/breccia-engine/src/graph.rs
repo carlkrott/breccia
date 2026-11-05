@@ -2342,6 +2342,8 @@ impl<'m> Session<'m> {
             for len in prefill_plan(prompt.len(), self.prefill_target) {
                 l = self.prefill(&prompt[pos..pos + len], pos)?;
                 pos += len;
+                // keeps the bench hang-watch fed during long multi-sequence prefills
+                eprintln!("seq {i}: prefill {pos}/{}", prompt.len());
             }
             logits.push(l); // prefill leaves self.pos at the last prompt cell
         }
