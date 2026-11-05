@@ -126,6 +126,7 @@ const SHADERS: &[&str] = &[
     "qsa_attn_scores_small",
     "qsa_attn_apply",
     "qsa_attn_apply_gqa",
+    "qsa_attn_flash_gqa",
     "qsa_attn_apply_split",
     "qsa_attn_apply_reduce",
     // int8-dot decode path (§8bb): the q8_1 quantiser and the IQ3_S dp4a GEMV.
@@ -428,6 +429,7 @@ const KV_Q8V_SHADERS: &[&str] = &[
     "qsa_kv_append",
     "qsa_attn_apply",
     "qsa_attn_apply_gqa",
+    "qsa_attn_flash_gqa",
     "qsa_attn_apply_split",
 ];
 

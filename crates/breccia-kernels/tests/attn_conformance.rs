@@ -1613,3 +1613,72 @@ fn qsa_topk_paths_by_context() {
         qsa.release(gpu, ws);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Fused prefill attention (`qsa_attn_flash_gqa.comp`)
+// ---------------------------------------------------------------------------
+
+/// `Qsa::flash` against the scores/softmax/apply triple on the same inputs: 32
+/// prefill rows over a 2048-cell cache, ragged per-row selections that span
+/// several 256-slot chunks and include blocks past the row (causally dead cells).
+/// The online softmax sums in chunk order, so the bar is relative, not bitwise.
+#[test]
+fn qsa_flash_matches_the_three_kernel_path() {
+    let fx = need_gpu!("qsa_flash");
+    let gpu = fx.dev.gpu();
+    let (max_pos, cells, t) = (4096usize, 2048usize, 32usize);
+    let qsa = Qsa::new(gpu, max_pos).expect("qsa");
+    let dim = qsa::MODEL_N_KV_HEAD * qsa::MODEL_HEAD_DIM;
+    let k_all = normalish(0xA1, cells * dim);
+    let v_all = normalish(0xA2, cells * dim);
+    let q = normalish(0xA3, t * qsa::MODEL_N_HEAD * qsa::MODEL_HEAD_DIM);
+    let q_full = normalish(0xA4, t * qsa::QGATE_DIM);
+    for layout in [qsa::VLayout::F16, qsa::VLayout::Q8_0] {
+        let state = QsaState::with_layout(gpu, cells, max_pos, layout).expect("state");
+        let fill = qsa.workspace(gpu, cells, cells).expect("fill ws");
+        write_f32(gpu, &fill.k_cur, &k_all);
+        write_f32(gpu, &fill.v_cur, &v_all);
+        qsa.kv_append(&state, &fill, 0).expect("append");
+        qsa.release(gpu, fill);
+
+        let ws = qsa.workspace(gpu, t, cells).expect("ws");
+        assert_eq!(ws.attn_rows, t, "one tile: attend()/apply() cover every row");
+        let pos0 = cells - t;
+        let (mut ids, mut counts) = (vec![0u32; t * ws.max_ids], vec![0u32; t]);
+        let mut s = 0x9E37u64;
+        for r in 0..t {
+            // Every 3rd block from a row-dependent start, own block last; the
+            // count ranges 1 chunk .. max_ids, the tail blocks lie past `pos0 + r`.
+            let n = (ws.max_ids / 4 + r * 13).min(ws.max_ids);
+            for i in 0..n - 1 {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ids[r * ws.max_ids + i] = ((s >> 33) as usize % (cells / qsa::IDX_BLOCK)) as u32;
+            }
+            ids[r * ws.max_ids + n - 1] = ((pos0 + r) / qsa::IDX_BLOCK) as u32;
+            counts[r] = n as u32;
+        }
+        write_f32(gpu, &ws.q, &q);
+        write_f32(gpu, &ws.q_full, &q_full);
+        gemv::upload_into(gpu, &ws.ids, &breccia_kernels::ops::u32_to_bytes(&ids)).expect("ids");
+        gemv::upload_into(gpu, &ws.counts, &breccia_kernels::ops::u32_to_bytes(&counts))
+            .expect("counts");
+
+        let n_out = t * qsa::ATTN_OUT_DIM;
+        qsa.attend(&state, &ws, pos0).expect("attend");
+        qsa.apply(&state, &ws, pos0).expect("apply");
+        let want = read_f32(gpu, &ws.attn_out, n_out);
+        write_f32(gpu, &ws.attn_out, &vec![f32::NAN; n_out]);
+        qsa.flash(&state, &ws, pos0).expect("flash");
+        let got = read_f32(gpu, &ws.attn_out, n_out);
+        let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+        let err = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, |m, e| if e.is_nan() || m.is_nan() { f32::NAN } else { m.max(e) });
+        println!("qsa flash {layout:?}: max |flash - triple| {err:.3e} (scale {scale:.3e})");
+        assert!(err <= 1e-4 * scale, "{layout:?}: flash differs by {err} (scale {scale})");
+        qsa.release(gpu, ws);
+        state.release(gpu);
+    }
+}

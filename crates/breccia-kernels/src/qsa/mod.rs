@@ -149,6 +149,20 @@ fn gqa_scores(tokens: usize) -> bool {
         && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_GQA_SCORES").map_or(true, |v| v != "0"))
 }
 
+/// Prefill attention as one fused pass (`qsa_attn_flash_gqa.comp`) on the GQA
+/// sizes instead of the scores/softmax/apply triple. On for chunks of at least
+/// [`FLASH_MIN_TOKENS`]; `BRECCIA_QSA_FLASH=0` off, `=1` any size.
+fn flash_attn(tokens: usize) -> bool {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| std::env::var("BRECCIA_QSA_FLASH").ok().map(|v| v != "0"));
+    gqa_scores(tokens) && mode.unwrap_or(tokens >= FLASH_MIN_TOKENS)
+}
+
+/// RX 6950 XT ABBA, prefill-only: chunk 8192 +13 % (507 vs 447 tok/s), chunk 1024 -9 %
+/// (one workgroup per token x kv head walks every slot serially; the tiled path is wider).
+/// shortcut: one measured point each side, re-measure 2k/4k chunks to place the crossover.
+const FLASH_MIN_TOKENS: usize = 4096;
+
 /// Ids (4 slots each) per split-apply workgroup: ctx 1k -> 17 chunks, 4k -> 33.
 /// `CHUNK_BLOCKS` in `qsa_attn_apply_split.comp` must match.
 const SPLIT_CHUNK_BLOCKS: usize = 16;
@@ -727,6 +741,10 @@ pub struct Qsa<'g> {
     /// 12 heads that share it (`qsa_attn_apply_gqa.comp`, plan §12 item 3).
     attn_apply_gqa: Pipe<'g>,
     attn_apply_gqa_q8: Pipe<'g>,
+    /// Prefill scores + online softmax + apply in one pass, no score matrix
+    /// (`qsa_attn_flash_gqa.comp`).
+    attn_flash: Pipe<'g>,
+    attn_flash_q8: Pipe<'g>,
     /// Decode/verify apply, split over slot chunks (`qsa_attn_apply_split.comp`)
     /// and summed by `qsa_attn_apply_reduce.comp`.
     attn_apply_split: Pipe<'g>,
@@ -854,6 +872,18 @@ impl<'g> Qsa<'g> {
             7,
             "qsa attention apply (kv-head groups, q8_0 V)",
         )?;
+        let attn_flash = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_flash_gqa.spv")),
+            8,
+            "qsa flash attention (kv-head groups)",
+        )?;
+        let attn_flash_q8 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_flash_gqa_q8v.spv")),
+            8,
+            "qsa flash attention (kv-head groups, q8_0 V)",
+        )?;
         let attn_apply_split = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_split.spv")),
@@ -898,6 +928,8 @@ impl<'g> Qsa<'g> {
             attn_apply_q8,
             attn_apply_gqa,
             attn_apply_gqa_q8,
+            attn_flash,
+            attn_flash_q8,
             attn_apply_split,
             attn_apply_split_q8,
             attn_apply_reduce,
@@ -1461,6 +1493,40 @@ impl<'g> Qsa<'g> {
             .run(&ws.attn, &ws.attn, MODEL_N_HEAD * ws.tokens, ws.slots)
     }
 
+    /// Fused prefill attention over all `ws.tokens` rows: scores, online softmax and
+    /// gated apply straight into `attn_out`, without the `attn` score matrix.
+    pub fn flash(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        let pc = Pc::new()
+            .u(ws.tokens as u32)
+            .u(MODEL_N_HEAD as u32)
+            .u(MODEL_HEAD_DIM as u32)
+            .u(ws.slots as u32)
+            .u(ws.max_ids as u32)
+            .i(pos0 as i32)
+            .u(PAGE_CELLS as u32)
+            .u(MODEL_N_KV_HEAD as u32)
+            .u(0);
+        let pipe = match state.v_layout {
+            VLayout::F16 => &self.attn_flash,
+            VLayout::Q8_0 => &self.attn_flash_q8,
+        };
+        let (gx, gy) = grid_for(ws.tokens * MODEL_N_KV_HEAD, 1);
+        pipe.run(
+            &[
+                &ws.q,
+                &state.k_pool,
+                &state.v_pool,
+                &state.page_table,
+                &ws.ids,
+                &ws.counts,
+                &ws.q_full,
+                &ws.attn_out,
+            ],
+            &pc,
+            (gx, gy, 1),
+        )
+    }
+
     /// Probability-weighted V, gated by `sigmoid(gate)` from the `attn_q` half.
     /// See [`Qsa::attend`]: one tile, for callers whose chunk fits one.
     pub fn apply(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
@@ -1633,6 +1699,10 @@ impl<'g> Qsa<'g> {
         // tile deep, and each tile's scores are consumed before the next overwrites
         // them. A call that is not GQA-sized has `attn_rows == tokens` (one tile).
         let mut row0 = 0usize;
+        if flash_attn(t) {
+            self.flash(state, ws, pos0)?;
+            row0 = t;
+        }
         while row0 < t {
             let tile = (t - row0).min(ws.attn_rows).max(1);
             self.attend_tile(state, ws, pos0, row0, tile)?;

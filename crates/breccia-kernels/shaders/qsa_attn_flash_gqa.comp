@@ -1,0 +1,218 @@
+#version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+//
+// Fused prefill attention: `qsa_attn_scores_gqa` + softmax + `qsa_attn_apply_gqa`
+// in one pass with an online softmax, so the `[24*T, slots]` score matrix is never
+// written. One workgroup per (token, kv head), 256 invocations = head_dim.
+//
+// Per chunk of 256 selected slots:
+//   1. stage the K/V cell bases in LDS (as both source kernels);
+//   2. scores: each subgroup takes every `sgs`-th slot, dots its K row with the 12
+//      queries held in registers (the scores kernel's lane split and reduction);
+//   3. online softmax: each subgroup owns heads h = sg_id, sg_id + sgs, ...: the
+//      chunk max, the running max/sum update and p = exp(s - m) in place;
+//   4. apply: invocation d rescales its 12 accumulators by exp(m_old - m_new) and
+//      adds p * V[d] (the apply kernel's loop).
+// Output = acc / sum * sigmoid(gate). Not bit-identical to the three-kernel path
+// (the softmax sum runs in chunk order with rescaling); `BRECCIA_QSA_FLASH=0` reverts.
+//
+// Host contract as the GQA pair: `n_head == GROUP * n_kv_head`, `head_dim == 256`.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QVec { float Q[]; }; // [T, n_head, head_dim]
+layout(std430, binding = 1) readonly buffer KPool { uint KP[]; }; // paged f16 pairs
+layout(std430, binding = 2) readonly buffer VPool { uint VP[]; }; // paged f16 pairs / q8_0
+layout(std430, binding = 3) readonly buffer PageTable { uint PT[]; };
+layout(std430, binding = 4) readonly buffer Ids { uint IDS[]; }; // [T, max_blocks]
+layout(std430, binding = 5) readonly buffer Counts { uint CNT[]; }; // [T]
+layout(std430, binding = 6) readonly buffer QFull { float QF[]; }; // [T, n_head*512]
+layout(std430, binding = 7) writeonly buffer Out { float O[]; }; // [T, n_head, head_dim]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_head;
+    uint head_dim;
+    uint slots;
+    uint id_stride;
+    int pos0;
+    uint page_cells;
+    uint n_kv_head;
+    uint tok0;
+} pc;
+
+#define WG_X_MAX 65535u
+#define KQ_SCALE 0.0625
+#define GROUP 12u
+#define CHUNK 256u
+#define LOCAL_MAX 8u
+#define DEAD 0xffffffffu
+#define NEG (-3.0e38)
+
+#include "f16_storage.glsl"
+#include "ops_math.glsl"
+
+shared uint KB[CHUNK];          // K row base of each staged slot, or DEAD
+shared uint VB[CHUNK];          // V row/element base, or DEAD
+shared float PS[CHUNK * GROUP]; // [slot][head] scores, then probabilities
+shared float M[GROUP];          // running max per head
+shared float L[GROUP];          // running sum per head
+shared float ALPHA[GROUP];      // this chunk's rescale of the accumulators
+
+#ifdef BRECCIA_KV_Q8V
+#define Q8_BLOCK_ELEMS 32u
+#define Q8_BLOCK_WORDS 9u
+float load_v(uint row, uint elem) {
+    uint at = (row * (pc.head_dim / Q8_BLOCK_ELEMS) + (elem / Q8_BLOCK_ELEMS)) * Q8_BLOCK_WORDS;
+    float scale = uintBitsToFloat(VP[at]);
+    int q = bitfieldExtract(int(VP[at + 1u + ((elem % Q8_BLOCK_ELEMS) >> 2u)]),
+                            int((elem % 4u) * 8u), 8);
+    return float(q) * scale;
+}
+#else
+float load_v(uint base, uint elem) {
+    return breccia_load_f16(VP[(base + elem) >> 1], base + elem);
+}
+#endif
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint t = wg / pc.n_kv_head;
+    if (t >= pc.tokens) {
+        return; // whole workgroup
+    }
+    uint kvh = wg - t * pc.n_kv_head;
+    uint tg = t + pc.tok0;
+    uint h0 = kvh * GROUP;
+    uint d = gl_LocalInvocationID.x;
+    uint sg_size = gl_SubgroupSize;
+    uint sgs = 256u / sg_size;
+    uint sg_id = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint n_local = pc.head_dim / sg_size;
+    uint qrow = tg * pc.n_head + h0;
+
+    float q[GROUP][LOCAL_MAX];
+    [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+        [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+            q[h][m] = m < n_local ? Q[(qrow + h) * pc.head_dim + lane + m * sg_size] : 0.0;
+        }
+    }
+    float acc[GROUP];
+    [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+        acc[h] = 0.0;
+    }
+    if (d < GROUP) {
+        M[d] = NEG;
+        L[d] = 0.0;
+    }
+
+    uint count = CNT[tg];
+    int pos = pc.pos0 + int(tg);
+    uint live = min(pc.slots, count * 4u);
+
+    for (uint c0 = 0u; c0 < live; c0 += CHUNK) {
+        barrier();
+        uint s = c0 + d;
+        uint kb = DEAD, vb = DEAD;
+        if (s < live) {
+            int cell = int(IDS[tg * pc.id_stride + s / 4u]) * 4 + int(s % 4u);
+            if (cell <= pos) {
+                uint page = PT[uint(cell) / pc.page_cells];
+                uint in_page = uint(cell) % pc.page_cells;
+                kb = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
+                     in_page * pc.head_dim;
+#ifdef BRECCIA_KV_Q8V
+                vb = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
+#else
+                vb = kb;
+#endif
+            }
+        }
+        KB[d] = kb;
+        VB[d] = vb;
+        barrier();
+
+        uint n = min(CHUNK, live - c0);
+        for (uint j = sg_id; j < n; j += sgs) {
+            uint b = KB[j];
+            if (b == DEAD) {
+                if (lane < GROUP) {
+                    PS[j * GROUP + lane] = NEG;
+                }
+                continue;
+            }
+            float k[LOCAL_MAX];
+            [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+                uint e = lane + m * sg_size;
+                k[m] = m < n_local ? breccia_load_f16(KP[(b + e) >> 1], b + e) : 0.0;
+            }
+            [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+                float a = 0.0;
+                [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+                    if (m < n_local) {
+                        a += q[h][m] * k[m];
+                    }
+                }
+                for (uint off = sg_size >> 1; off > 0u; off >>= 1u) {
+                    a += subgroupShuffleXor(a, off);
+                }
+                if (lane == 0u) {
+                    PS[j * GROUP + h] = a * KQ_SCALE;
+                }
+            }
+        }
+        barrier();
+
+        for (uint h = sg_id; h < GROUP; h += sgs) {
+            float mx = NEG;
+            for (uint j = lane; j < n; j += sg_size) {
+                mx = max(mx, PS[j * GROUP + h]);
+            }
+            float m_old = M[h];
+            float m_new = max(m_old, subgroupMax(mx));
+            float sum = 0.0;
+            for (uint j = lane; j < n; j += sg_size) {
+                float sc = PS[j * GROUP + h];
+                // Dead slots stay exactly 0 even while every live score so far is NEG.
+                float p = sc > 0.5 * NEG ? exp(sc - m_new) : 0.0;
+                PS[j * GROUP + h] = p;
+                sum += p;
+            }
+            float alpha = exp(m_old - m_new); // 1 while both are NEG, 0 on the first live chunk
+            sum = subgroupAdd(sum);
+            if (lane == 0u) {
+                M[h] = m_new;
+                L[h] = L[h] * alpha + sum;
+                ALPHA[h] = alpha;
+            }
+        }
+        barrier();
+
+        [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+            acc[h] *= ALPHA[h];
+        }
+        for (uint j = 0u; j < n; ++j) {
+            uint b = VB[j];
+            if (b == DEAD) {
+                continue;
+            }
+            float v = load_v(b, d);
+            [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+                acc[h] += PS[j * GROUP + h] * v;
+            }
+        }
+    }
+    barrier();
+
+    [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
+        uint hh = h0 + h;
+        uint gate_at = tg * (pc.n_head * 2u * pc.head_dim) + hh * (2u * pc.head_dim) +
+                       pc.head_dim + d;
+        float l = L[h];
+        float o = l > 0.0 ? acc[h] / l : 0.0;
+        O[(tg * pc.n_head + hh) * pc.head_dim + d] = o * breccia_sigmoid(QF[gate_at]);
+    }
+}
