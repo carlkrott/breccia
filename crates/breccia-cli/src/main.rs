@@ -5273,9 +5273,14 @@ struct EngineBackend<'a, 'm> {
     max_tokens: usize,
     vision: Option<Vision>,
     ctx: usize,
-    /// encoded by `set_image` in prompt order, consumed by the next `complete`
-    images: Vec<(usize, usize, Vec<f32>)>,
+    /// encoded by `set_image` in prompt order (+ the image bytes' hash), consumed by the next `complete`
+    images: Vec<(usize, usize, Vec<f32>, blake3::Hash)>,
+    /// state after an image prompt's last image, keyed by its tokens + images; last use, held in RAM
+    prefixes: Vec<(blake3::Hash, std::time::Instant, breccia_engine::PrefixState)>,
 }
+
+/// shortcut: a fixed RAM cap (~7 images' prompt state at ~135 MB each); make it a flag if a box needs more.
+const PREFIX_CAP_BYTES: usize = 1 << 30;
 
 impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn model_name(&self) -> String {
@@ -5311,10 +5316,45 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
             let spans: Vec<_> = runs.iter().zip(&images).map(|(r, i)| (r.0, i.0, i.1, &i.2[..])).collect();
             self.sess.set_images(&spans).map_err(|e| e.to_string())?;
         }
-        self.sess
-            .generate(prompt, n, None)
-            .map(|g| g.tokens)
-            .map_err(|e| e.to_string())
+        // the prompt state through the last image's vision_end is reused by a later
+        // request with the same tokens and images up to there (same server = same encoder)
+        let now = std::time::Instant::now();
+        let ttl = self.vision.as_ref().map_or(std::time::Duration::ZERO, |v| v.ttl);
+        self.prefixes.retain(|e| now - e.1 < ttl);
+        let cut = runs.last().map_or(0, |&(c0, len)| c0 + len + 1);
+        if cut == 0 || cut >= prompt.len() {
+            return self.sess.generate(prompt, n, None).map(|g| g.tokens).map_err(|e| e.to_string());
+        }
+        let mut h = blake3::Hasher::new();
+        prompt[..cut].iter().for_each(|t| {
+            h.update(&t.to_le_bytes());
+        });
+        images.iter().for_each(|i| {
+            h.update(i.3.as_bytes());
+        });
+        let key = h.finalize();
+        let t = std::time::Instant::now();
+        let (g, saved) = match self.prefixes.iter_mut().find(|e| e.0 == key) {
+            Some(e) => {
+                e.1 = now;
+                println!("prefix   {} cells from RAM", e.2.cells); // request time: the client's
+                self.sess.generate_prefix(prompt, n, None, breccia_engine::Prefix::Resume(&e.2))
+            }
+            None => self.sess.generate_prefix(prompt, n, None, breccia_engine::Prefix::Save(cut)),
+        }
+        .map_err(|e| e.to_string())?;
+        if let Some(st) = saved {
+            println!("prefix   {} cells kept ({} MiB), request {:.2} s", st.cells, st.bytes() >> 20, t.elapsed().as_secs_f64());
+            self.prefixes.push((key, now, st));
+            // least recently used first out
+            self.prefixes.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let mut total = 0;
+            self.prefixes.retain(|e| {
+                total += e.2.bytes();
+                total <= PREFIX_CAP_BYTES
+            });
+        }
+        Ok(g.tokens)
     }
     fn eos(&self) -> Option<u32> {
         self.tok.eos
@@ -5327,9 +5367,9 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
             self.images.clear();
         }
         let v = self.vision.as_ref().ok_or("image input is off (start the server with --mmproj)")?;
-        let img = v.encode(data).map_err(|e| format!("{e:#}"))?;
-        let n = img.0 * img.1;
-        self.images.push(img);
+        let (nx, ny, rows) = v.encode(data).map_err(|e| format!("{e:#}"))?;
+        self.images.push((nx, ny, rows, blake3::hash(data)));
+        let n = nx * ny;
         Ok(n)
     }
     fn clear_images(&mut self) {
@@ -5420,6 +5460,7 @@ fn serve_http(a: ServeArgs) -> Result<()> {
         vision,
         ctx: a.ctx,
         images: Vec::new(),
+        prefixes: Vec::new(),
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))

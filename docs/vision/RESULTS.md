@@ -109,4 +109,25 @@ Unit tests: server image order + ctx stop (http.rs), cache hit / expiry prune (b
 
 EmbeddingGemma-2 (MSI :8141) not used: the exact content hash is the right key for reuse; a near-duplicate image
 cannot reuse rows (they depend on the exact pixels and grid); the MSI serves the text GGUF without an mmproj.
-Not done: reusing the prefill (KV) state for a resent image prompt; prefill is still recomputed every request.
+
+## Prefix reuse: saved prompt state for image prompts (2026-11-05)
+
+`breccia serve` keeps the prompt state up to the end of the last image (`<|vision_end|>`) in host RAM:
+GDN state + conv per block, the used QSA K/V pool prefix (page-major, q6 scales inline), idx tail/pooled, PLE
+history, position. Key = blake3(prompt tokens up to the cut + each image's content hash). A hit restores the state
+and prefills only the text after the images. Entries expire after the image TTL (`--image-ttl-min`, 30 min sliding,
+pruned on every request); RAM cap 1 GiB total, least recently used dropped first. Engine API:
+`Session::generate_prefix(prompt, n, debug, Prefix::{None, Save(cells), Resume(&state)})`.
+
+Live (ctx 4096, q6 KV, dual default, script vis-prefix.sh, greedy, order A B A B A so B overwrites A's cells):
+| request | time | prompt tok | prefix | output |
+|---|---|---|---|---|
+| A red+blue (first request: warm-up + 2 encodes) | 45.5 s | 2079 | 2055 cells saved, 135 MiB in 0.32 s | "Red circle / Blue triangle" |
+| B wallpaper+red (1 encode 9.0 s) | 27.0 s | 3035 | 3011 cells saved, 145 MiB in 0.35 s | "Image 1: ... mountain ... blue / Image 2: ... circle ... red" |
+| A again | 6.7 s | 2079 | restored in 0.03 s | identical to cold |
+| B again | 6.7 s | 3035 | restored in 0.03 s | identical to cold |
+| A again | 6.7 s | 2079 | restored in 0.03 s | identical to cold |
+| text after | 1.6 s | 14 | - | normal reply |
+Fully cached resend: 11.7 s (Stage 3, encode cached, prefill recomputed) -> 6.7 s; for B, 27.0 -> 6.7 s.
+The remaining 6.7 s is the per-request reset (zeroing the full pools), the image row upload, the ~24-token
+tail prefill and decode; not split further.

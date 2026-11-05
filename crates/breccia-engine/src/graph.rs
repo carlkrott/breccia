@@ -2154,6 +2154,80 @@ impl<'m> Session<'m> {
         }
     }
 
+    /// Every per-sequence buffer that holds the first `cells` prompt cells, with
+    /// the byte prefix that covers them: GDN state + conv whole, QSA K/V pool
+    /// pages (page-major, identity page table), the indexer tail whole and the
+    /// pooled-key blocks. Positions and the page table are not written by kernels.
+    fn prefix_bufs(&self, cells: usize) -> Result<Vec<(usize, &Buf, usize)>> {
+        use breccia_kernels::qsa::{sizes, VLayout, PAGE_CELLS};
+        let m = self.model;
+        let mut v = Vec::new();
+        for b in 0..m.cfg.n_layers {
+            let d = m.device_of(b);
+            if let Some(st) = &self.gdn_state[b] {
+                v.push((d, &st.state, st.state.size as usize));
+                v.push((d, &st.conv, st.conv.size as usize));
+            }
+            if let Some(st) = &self.qsa_state[b] {
+                anyhow::ensure!(cells <= st.capacity_cells, "prefix of {cells} cells over the cache's {}", st.capacity_cells);
+                let pages = cells.div_ceil(PAGE_CELLS);
+                let (k, vb) = match st.v_layout {
+                    VLayout::F16 => (sizes::f16_pool_bytes(pages), sizes::f16_pool_bytes(pages)),
+                    VLayout::Q8_0 => (sizes::f16_pool_bytes(pages), sizes::q8v_pool_bytes(pages)),
+                    VLayout::Q6_0 => (sizes::q6_pool_bytes(pages), sizes::q6_pool_bytes(pages)),
+                };
+                v.push((d, &st.k_pool, k as usize));
+                v.push((d, &st.v_pool, vb as usize));
+                v.push((d, &st.idx_tail, sizes::idx_tail_bytes() as usize));
+                v.push((d, &st.idx_pooled, sizes::pooled_idx_bytes(sizes::pooled_blocks(cells)) as usize));
+            }
+        }
+        Ok(v)
+    }
+
+    /// Copy the sequence state after the first `cells` prompt cells to host RAM.
+    pub fn save_prefix(&mut self, cells: usize) -> Result<PrefixState> {
+        self.flush()?;
+        let m = self.model;
+        let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
+        batch_cmd::wait_all(&gpus)?;
+        let t = std::time::Instant::now();
+        let bufs = self
+            .prefix_bufs(cells)?
+            .into_iter()
+            .map(|(d, buf, n)| breccia_kernels::gemv::download(gpus[d], buf, n))
+            .collect::<Result<Vec<_>>>()?;
+        let st = PrefixState { cells, cur_tok: self.cur_tok, ple: self.ple.as_ref().map(|p| p.state()), bufs };
+        eprintln!("breccia: prefix of {cells} cells saved, {} MiB in {:.2} s", st.bytes() >> 20, t.elapsed().as_secs_f64());
+        Ok(st)
+    }
+
+    /// Put a [`Self::save_prefix`] state back; the session must be reset with
+    /// the same images set (their positions are not part of the state).
+    fn restore_prefix(&mut self, s: &PrefixState) -> Result<()> {
+        self.flush()?;
+        let m = self.model;
+        let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
+        batch_cmd::wait_all(&gpus)?;
+        let t = std::time::Instant::now();
+        let bufs = self.prefix_bufs(s.cells)?;
+        anyhow::ensure!(
+            bufs.len() == s.bufs.len() && bufs.iter().zip(&s.bufs).all(|(b, h)| b.2 == h.len()),
+            "the saved prefix does not fit this session's state layout"
+        );
+        anyhow::ensure!(self.ple.is_some() == s.ple.is_some(), "the saved prefix's PLE state does not match");
+        for ((d, buf, _), host) in bufs.into_iter().zip(&s.bufs) {
+            breccia_kernels::gemv::upload_into(gpus[d], buf, host)?;
+        }
+        if let (Some(p), Some(ps)) = (self.ple.as_mut(), &s.ple) {
+            p.restore(ps);
+        }
+        self.pos = s.cells - 1;
+        self.cur_tok = s.cur_tok;
+        eprintln!("breccia: prefix of {} cells restored in {:.2} s", s.cells, t.elapsed().as_secs_f64());
+        Ok(())
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         let m = self.model;
         for b in 0..m.cfg.n_layers {
@@ -6565,6 +6639,20 @@ impl<'m> Session<'m> {
         n: usize,
         debug: Option<&mut Vec<LayerTrace>>,
     ) -> Result<Generation> {
+        Ok(self.generate_prefix(prompt, n, debug, Prefix::None)?.0)
+    }
+
+    /// [`Self::generate`] that also saves (`Prefix::Save(cells)`) or resumes from
+    /// (`Prefix::Resume`) the state after the first `cells` prompt cells. Saving
+    /// splits the prompt pass at `cells`, so a resumed run computes the rest
+    /// exactly as the saving run did.
+    pub fn generate_prefix(
+        &mut self,
+        prompt: &[u32],
+        n: usize,
+        debug: Option<&mut Vec<LayerTrace>>,
+        prefix: Prefix<'_>,
+    ) -> Result<(Generation, Option<PrefixState>)> {
         if prompt.is_empty() {
             bail!("the prompt is empty: the n-gram window and the first token both need history");
         }
@@ -6587,14 +6675,33 @@ impl<'m> Session<'m> {
         let mut trace = debug;
         let mut pos = 0usize;
         let mut logits = Vec::new();
+        let mut saved = None;
+        let cut = match prefix {
+            Prefix::None => 0,
+            Prefix::Save(c) => c,
+            Prefix::Resume(st) => st.cells,
+        };
+        if cut > 0 {
+            anyhow::ensure!(self.prefill_chunk > 0, "a saved prefix needs chunked prefill");
+            anyhow::ensure!(cut < prompt.len(), "the prefix ({cut} cells) must leave prompt to run");
+        }
+        if let Prefix::Resume(st) = prefix {
+            self.restore_prefix(st)?;
+            pos = cut;
+        }
         if self.prefill_chunk > 0 {
             // Chunked prompt pass (§8s): same tokens, same arithmetic, grouped
             // expert lane. The chunk sizes come from the planner, so a prompt does
             // not end in a tiny tail chunk (`prefill_plan`). `pos` is the outer
-            // one — decode continues from it.
-            for len in prefill_plan(prompt.len(), self.prefill_target) {
-                logits = self.prefill(&prompt[pos..pos + len], pos)?;
-                pos += len;
+            // one — decode continues from it. A prefix splits it at `cut`.
+            for end in [cut, prompt.len()] {
+                for len in prefill_plan(end.saturating_sub(pos), self.prefill_target) {
+                    logits = self.prefill(&prompt[pos..pos + len], pos)?;
+                    pos += len;
+                }
+                if end == cut && matches!(prefix, Prefix::Save(_)) && cut > 0 {
+                    saved = Some(self.save_prefix(cut)?);
+                }
             }
         } else {
             for &t in prompt {
@@ -6657,14 +6764,17 @@ impl<'m> Session<'m> {
             last_logits = logits.clone();
         }
         let decode_seconds = t_decode.elapsed().as_secs_f64();
-        Ok(Generation {
-            tokens: out,
-            last_logits,
-            first_step_logits,
-            decode_seconds,
-            forwards: self.forwards,
-            expert_bytes: self.expert_bytes,
-        })
+        Ok((
+            Generation {
+                tokens: out,
+                last_logits,
+                first_step_logits,
+                decode_seconds,
+                forwards: self.forwards,
+                expert_bytes: self.expert_bytes,
+            },
+            saved,
+        ))
     }
 }
 
@@ -6830,6 +6940,29 @@ impl Drop for Session<'_> {
 /// silent wrong-value bug of this class; `docs/phase-4/01-forward-pass.md` §8bc.)
 fn hc_inject_bytes() -> u64 {
     160
+}
+
+/// What [`Session::generate_prefix`] does with the prompt's first cells.
+#[derive(Clone, Copy)]
+pub enum Prefix<'a> {
+    None,
+    Save(usize),
+    Resume(&'a PrefixState),
+}
+
+/// The sequence state after a prompt's first `cells` cells, in host RAM.
+pub struct PrefixState {
+    pub cells: usize,
+    cur_tok: u32,
+    ple: Option<PleState>,
+    bufs: Vec<Vec<u8>>,
+}
+
+impl PrefixState {
+    pub fn bytes(&self) -> usize {
+        self.bufs.iter().map(Vec::len).sum::<usize>()
+            + self.ple.as_ref().map_or(0, |p| p.hist.len() * 4)
+    }
 }
 
 /// A finished generation.
