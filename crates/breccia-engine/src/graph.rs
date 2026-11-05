@@ -6099,9 +6099,11 @@ impl<'m> Session<'m> {
         let wi = match self.hc_chunk_ws[dev].iter().position(|w| w.tokens == t) {
             Some(i) => i,
             None => {
-                // Keep at most two (a prompt's chunks have at most two sizes, ~47 MB each
-                // at T=512): drain the GPU, then drop the oldest.
-                if self.hc_chunk_ws[dev].len() >= 2 {
+                // Keep one (~104 MiB at T=1333): `prefill_plan` runs the larger size
+                // first, so a prompt switches once (one flush), and the arena reserve
+                // (`prefill_scratch_bytes`) only counts one. Keeping two spilled the
+                // second past the RX floor at 2x100k. Drain the GPU, then drop it.
+                if !self.hc_chunk_ws[dev].is_empty() {
                     batch_cmd::record_barrier_to_host(gpu)?;
                     self.submit_batch()?;
                     self.flush()?;

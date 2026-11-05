@@ -1421,6 +1421,9 @@ impl Gpu {
                             "VRAM guard: {why}: placing this and later buffers in host \
                              memory (slower) instead"
                         );
+                        if std::env::var_os("BRECCIA_VRAM_LOG").is_some() {
+                            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+                        }
                     }
                     idx = h;
                 }
