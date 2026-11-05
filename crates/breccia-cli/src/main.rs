@@ -4329,6 +4329,23 @@ fn prefill_only(
     if let Some(path) = &a.dump_logits {
         let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
         std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))?;
+        // `BRECCIA_TAIL_LOGITS=K`: teacher-forced quality gate. Prefill all but the
+        // last K prompt tokens, decode those K one by one (the decode KV-append path
+        // too) and write all K full logit rows to `<path>.tail` (raw f32, row-major).
+        // One last-token row is too peaked to see KV-cache loss; K rows are not.
+        if let Some(k) = std::env::var("BRECCIA_TAIL_LOGITS").ok().and_then(|v| v.parse::<usize>().ok()) {
+            let k = k.min(prompt.len() - 1);
+            let n = prompt.len() - k;
+            feed_prompt(sess, &prompt[..n], a.prefill_chunk).context("tail-logits prefill")?;
+            let mut out = Vec::new();
+            for (pos, &t) in prompt.iter().enumerate().skip(n) {
+                let l = sess.token(t, pos, None)?;
+                out.extend(l.iter().flat_map(|x| x.to_le_bytes()));
+            }
+            let tail = path.with_extension("tail");
+            std::fs::write(&tail, out).with_context(|| format!("writing {}", tail.display()))?;
+            println!("tail logits: {k} teacher-forced rows -> {}", tail.display());
+        }
     }
     if let Some(path) = &a.json {
         let best = secs.iter().copied().fold(f64::MAX, f64::min);
