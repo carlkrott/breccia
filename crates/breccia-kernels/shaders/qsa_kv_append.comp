@@ -177,12 +177,18 @@ void oct_fwht(uint o, uint n) {
     }
 }
 
-float oct_lut(uint bits, uint c) { return bits == 4u ? LUT4[c] : LUT3[c]; }
+// 5/6-bit: not upstream Octave (it stops at 4), same method with float N(0,1)
+// Lloyd-Max levels from scripts/lloydmax.py (unit scale, so mult = 1).
+const float LUT5[32] = float[32](-3.260732, -2.691120, -2.317739, -2.028728, -1.787233, -1.576228, -1.386340, -1.211804, -1.048783, -0.894565, -0.747136, -0.604934, -0.466700, -0.331378, -0.198052, -0.065890, 0.065890, 0.198052, 0.331378, 0.466700, 0.604934, 0.747136, 0.894565, 1.048783, 1.211804, 1.386340, 1.576228, 1.787233, 2.028728, 2.317739, 2.691120, 3.260732);
+const float LUT6[64] = float[64](-3.744101, -3.240437, -2.917407, -2.672274, -2.471305, -2.298981, -2.146810, -2.009611, -1.883977, -1.767542, -1.658589, -1.555831, -1.458276, -1.365141, -1.275794, -1.189720, -1.106488, -1.025736, -0.947155, -0.870477, -0.795468, -0.721922, -0.649656, -0.578503, -0.508314, -0.438950, -0.370283, -0.302193, -0.234567, -0.167297, -0.100278, -0.033410, 0.033410, 0.100278, 0.167297, 0.234567, 0.302193, 0.370283, 0.438950, 0.508314, 0.578503, 0.649656, 0.721922, 0.795468, 0.870477, 0.947155, 1.025736, 1.106488, 1.189720, 1.275794, 1.365141, 1.458276, 1.555831, 1.658589, 1.767542, 1.883977, 2.009611, 2.146810, 2.298981, 2.471305, 2.672274, 2.917407, 3.240437, 3.744101);
+float oct_lut(uint bits, uint c) {
+    return bits == 6u ? LUT6[c] : bits == 5u ? LUT5[c] : bits == 4u ? LUT4[c] : LUT3[c];
+}
 
 // Quantise row[o..o+n) to `bits` and write the dequantised value back.
 void oct_quant(uint o, uint n, uint bits) {
     uint levels = 1u << bits;
-    float mult = bits == 4u ? 46.0 : 59.0;
+    float mult = bits >= 5u ? 1.0 : bits == 4u ? 46.0 : 59.0;
     float ss = 0.0;
     for (uint j = 0u; j < n; ++j) { ss += row[o + j] * row[o + j]; }
     float rms = max(sqrt(ss / float(n)), 1e-12);
@@ -209,6 +215,12 @@ void oct_roundtrip(uint kmode, uint bits) {
         for (uint b = 0u; b < OCT_D / 64u; ++b) {
             oct_fwht(b * 64u, 64u);
             oct_quant(b * 64u, 64u, b == 0u ? 4u : 3u); // RoPE dims 0..63 = block 0
+            oct_fwht(b * 64u, 64u);
+        }
+    } else if (kmode >= 5u) { // uniform 5/6-bit K, 64-dim blocks
+        for (uint b = 0u; b < OCT_D / 64u; ++b) {
+            oct_fwht(b * 64u, 64u);
+            oct_quant(b * 64u, 64u, kmode);
             oct_fwht(b * 64u, 64u);
         }
     } else {

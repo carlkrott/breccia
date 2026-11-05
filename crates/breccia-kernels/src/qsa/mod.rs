@@ -282,10 +282,14 @@ pub fn octave_fq_mode() -> u32 {
         Ok("v4") => 4 << 4,
         Ok("v3") => 3 << 4,
         // llama.cpp `-ctk X -ctv X` reference points (bit 8 = ggml blocks of 32).
+        // Octave method extended to 5/6 bits (K uniform per 64-dim block = kmode bits).
+        Ok("k5v5") => 5 | 5 << 4,
+        Ok("k6v6") => 6 | 6 << 4,
+        Ok("q6_0") => 256 | 6 | 6 << 4,
         Ok("q8_0") => 256 | 8 | 8 << 4,
         Ok("q5_0") => 256 | 5 | 5 << 4,
         Ok("q4_0") => 256 | 4 | 4 << 4,
-        Ok(o) => panic!("BRECCIA_KV_OCTAVE_FQ={o}: want k3v4|k3v3|compact|k3|v4|v3|q8_0|q5_0|q4_0|off"),
+        Ok(o) => panic!("BRECCIA_KV_OCTAVE_FQ={o}: want k3v4|k3v3|compact|k3|v4|v3|k5v5|k6v6|q8_0|q6_0|q5_0|q4_0|off"),
     })
 }
 
