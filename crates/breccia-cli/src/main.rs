@@ -4532,6 +4532,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                     breccia_engine::ArenaOpts {
                         display_reserve: (a.arena_display_reserve_mib + margin) << 20,
                         headroom: a.arena_headroom_mib << 20,
+                        sessions: bench_seqs(),
                         ..Default::default()
                     }
                     .with_prefill_chunk(a.prefill_chunk, a.ctx),
@@ -4688,6 +4689,44 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             w.ms_per_token(),
             (io_read_mib() - r0) / 1024.0
         );
+    }
+
+    // ---- `BRECCIA_SEQS=N`: N sequences on this one session (shared weights and
+    // prefill scratch, own state), prompt i = the prompt rotated by i tokens;
+    // `BRECCIA_SEQS_PARITY=1` re-runs each prompt alone and compares the tokens.
+    if bench_seqs() > 1 {
+        let n = bench_seqs();
+        let prompts: Vec<Vec<u32>> = (0..n)
+            .map(|i| {
+                let mut p = prompt.clone();
+                let l = p.len();
+                p.rotate_left(i % l);
+                p
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        let gens = sess.generate_seqs(&prompts, a.gen).context("sequence-slot generation")?;
+        let fw: usize = gens.iter().map(|g| g.forwards).sum();
+        let dec = gens[0].decode_seconds;
+        println!(
+            "seqs {n}: aggregate {:.2} tok/s ({:.2} per sequence), wall {:.1} s incl. prefill",
+            fw as f64 / dec,
+            fw as f64 / dec / n as f64,
+            t.elapsed().as_secs_f64()
+        );
+        let mut bad = 0;
+        for (i, g) in gens.iter().enumerate() {
+            println!("seq {i}: {:?}", &g.tokens[..g.tokens.len().min(12)]);
+            if std::env::var("BRECCIA_SEQS_PARITY").is_ok_and(|v| v == "1") {
+                sess.use_seq(0)?;
+                let solo = sess.generate(&prompts[i], a.gen, None)?;
+                let same = solo.tokens.iter().zip(&g.tokens).take_while(|(x, y)| x == y).count();
+                println!("seq {i} parity: {same}/{} tokens equal the solo run", g.tokens.len());
+                bad += usize::from(same != g.tokens.len());
+            }
+        }
+        anyhow::ensure!(bad == 0, "{bad} sequence(s) diverged from their solo run");
+        return Ok(());
     }
 
     // ---- B/C. measured generations ----------------------------------------
@@ -5546,4 +5585,9 @@ mod image_cache_tests {
             .flat_map(|e| std::fs::read_dir(e.path()).unwrap().flatten().map(|f| f.path()))
             .collect()
     }
+}
+
+/// `BRECCIA_SEQS`: sequences the single-session bench runs (default 1).
+fn bench_seqs() -> usize {
+    std::env::var("BRECCIA_SEQS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
 }

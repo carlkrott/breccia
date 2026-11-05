@@ -1950,13 +1950,6 @@ fn tier_rates_for_specs(specs: &[placement::DeviceSpec], users: u32) -> Option<V
     Some(out)
 }
 
-/// Session state a display card's reserve already absorbs: every measured run
-/// up to 32k (q6_0 state 163-388 MiB on the RX) kept its 2560 MiB reserve and a
-/// usable desktop. Only state above this is charged there, so 8k/32k residency is
-/// unchanged; a headless card's headroom is measured slack, so it pays all of it.
-/// shortcut: one measured card; re-measure if the desktop stalls at 100k+.
-const STATE_IN_DISPLAY_RESERVE: u64 = 512 << 20;
-
 fn probe_budgets(
     devices: &[Device],
     opts: ArenaOpts,
@@ -1983,11 +1976,10 @@ fn probe_budgets(
         // `unknown` is treated as a display: the safe direction.
         let display = breccia_vk::pci::drives_a_display(pci).unwrap_or(true);
         let st = state.get(i).copied().unwrap_or(0);
-        let reserve = if display {
-            opts.display_reserve + st.saturating_sub(STATE_IN_DISPLAY_RESERVE)
-        } else {
-            opts.headroom + st
-        };
+        // State is charged in full on both kinds of card: the old 512 MiB display
+        // discount was measured at RES 2560; at the 768 default a 100k context (RX
+        // state 944 MiB) left 295 MiB free and tripped the VRAM guard (rv2, 11-05).
+        let reserve = if display { opts.display_reserve } else { opts.headroom } + st;
         if verbose {
             eprintln!(
                 "breccia: arena: device {i} {} free {} MiB ({}) - {} {} MiB = {} MiB",

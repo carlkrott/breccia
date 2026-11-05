@@ -662,6 +662,69 @@ struct SpecSnap {
     head_ws: Vec<HcWorkspace>,
 }
 
+/// One sequence's recurrent / KV state, per block on the device that owns it.
+type SeqState = (Vec<Option<GdnState>>, Vec<Option<QsaState>>);
+
+fn alloc_seq_state(model: &Model, ctx_capacity: usize) -> Result<SeqState> {
+    let mc = &model.cfg;
+    let mut gdn_state = Vec::with_capacity(mc.n_layers);
+    let mut qsa_state = Vec::with_capacity(mc.n_layers);
+    for b in 0..mc.n_layers {
+        let gpu = model.devices[model.device_of(b)].gpu();
+        match mc.layer_kind(b) {
+            LayerKind::Gdn => {
+                let st = GdnState::new(gpu)
+                    .with_context(|| format!("allocating the GDN state of block {b}"))?;
+                st.reset(gpu)?;
+                gdn_state.push(Some(st));
+                qsa_state.push(None);
+            }
+            LayerKind::Qsa => {
+                let st = QsaState::new(gpu, ctx_capacity, ctx_capacity.max(8))
+                    .with_context(|| format!("allocating the QSA state of block {b}"))?;
+                gdn_state.push(None);
+                qsa_state.push(Some(st));
+            }
+        }
+    }
+    Ok((gdn_state, qsa_state))
+}
+
+fn release_seq_state(model: &Model, gdn_state: &[Option<GdnState>], qsa_state: &[Option<QsaState>]) {
+    for b in 0..model.cfg.n_layers {
+        let gpu = model.devices[model.device_of(b)].gpu();
+        if let Some(st) = &gdn_state[b] {
+            gpu.destroy_buf(&st.state);
+            gpu.destroy_buf(&st.conv);
+        }
+        if let Some(st) = &qsa_state[b] {
+            for buf in [&st.k_pool, &st.v_pool, &st.page_table, &st.idx_tail, &st.idx_pooled, &st.positions] {
+                gpu.destroy_buf(buf);
+            }
+        }
+    }
+}
+
+fn new_ple(model: &Model) -> Result<Option<PleHost>> {
+    Ok(match &model.ple {
+        Some(p) => Some(PleHost::new(&model.cfg, &p.norm_key, &p.norm_query, &p.norm_conv, &p.conv)?),
+        None => None,
+    })
+}
+
+/// A sequence parked while another one runs on the same [`Session`]: everything
+/// `Session::reset` lists as per-sequence (§8az) except the QSA workspaces, which
+/// are rewritten every call and so are shared like the prefill scratch.
+struct SeqSlot {
+    gdn_state: Vec<Option<GdnState>>,
+    qsa_state: Vec<Option<QsaState>>,
+    ple: Option<PleHost>,
+    image: Vec<(usize, usize, usize, Buf)>,
+    pos: usize,
+    cur_tok: u32,
+    sampler: Sampler,
+}
+
 /// A loaded, ready-to-run session: pipelines, state, and the host expert pool.
 pub struct Session<'m> {
     pub model: &'m Model,
@@ -675,6 +738,12 @@ pub struct Session<'m> {
     ship_imp_off: bool,
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
+    /// Extra sequences sharing this session's weights, pipelines and prefill
+    /// scratch (`add_seq`); entry `active_seq` is `None` (its state is the
+    /// fields above). Empty for an ordinary one-sequence session.
+    seqs: Vec<Option<SeqSlot>>,
+    active_seq: usize,
+    seq_ctx: usize,
     /// Speculative-verify rollback slots; `None` (the default) leaves every path unchanged.
     spec: Option<Box<SpecSnap>>,
     /// One `QsaWorkspace` per QSA layer, allocated at `ctx_capacity` and reused
@@ -1247,26 +1316,7 @@ impl<'m> Session<'m> {
         }
 
         // Per-layer recurrent / KV state, on the device that owns the block.
-        let mut gdn_state = Vec::with_capacity(mc.n_layers);
-        let mut qsa_state = Vec::with_capacity(mc.n_layers);
-        for b in 0..mc.n_layers {
-            let gpu = model.devices[model.device_of(b)].gpu();
-            match mc.layer_kind(b) {
-                LayerKind::Gdn => {
-                    let st = GdnState::new(gpu)
-                        .with_context(|| format!("allocating the GDN state of block {b}"))?;
-                    st.reset(gpu)?;
-                    gdn_state.push(Some(st));
-                    qsa_state.push(None);
-                }
-                LayerKind::Qsa => {
-                    let st = QsaState::new(gpu, ctx_capacity, ctx_capacity.max(8))
-                        .with_context(|| format!("allocating the QSA state of block {b}"))?;
-                    gdn_state.push(None);
-                    qsa_state.push(Some(st));
-                }
-            }
-        }
+        let (gdn_state, qsa_state) = alloc_seq_state(model, ctx_capacity)?;
 
         // Hoist the QSA workspaces: capacity-sized once, mutated per call.
         let mut qsa_ws: Vec<Option<QsaWorkspace>> = Vec::with_capacity(mc.n_layers);
@@ -1297,16 +1347,7 @@ impl<'m> Session<'m> {
                 cpu::path(),
             ))),
         };
-        let ple = match &model.ple {
-            Some(p) => Some(PleHost::new(
-                mc,
-                &p.norm_key,
-                &p.norm_query,
-                &p.norm_conv,
-                &p.conv,
-            )?),
-            None => None,
-        };
+        let ple = new_ple(model)?;
         LIVE_SESSIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(Session {
             model,
@@ -1316,6 +1357,9 @@ impl<'m> Session<'m> {
             ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() == Ok("0"),
             gdn_state,
             qsa_state,
+            seqs: Vec::new(),
+            active_seq: 0,
+            seq_ctx: ctx_capacity,
             spec: None,
             qsa_ws,
             pool,
@@ -2226,6 +2270,119 @@ impl<'m> Session<'m> {
         self.cur_tok = s.cur_tok;
         eprintln!("breccia: prefix of {} cells restored in {:.2} s", s.cells, t.elapsed().as_secs_f64());
         Ok(())
+    }
+
+    /// Sequences this session holds: 1, plus one per [`Self::add_seq`].
+    pub fn n_seqs(&self) -> usize {
+        self.seqs.len().max(1)
+    }
+
+    /// Add a sequence that shares this session's weights, pipelines and prefill
+    /// scratch and has its own recurrent / KV state (same context capacity).
+    /// Returns its index; [`Self::use_seq`] makes it the one the forwards run on.
+    pub fn add_seq(&mut self) -> Result<usize> {
+        anyhow::ensure!(self.spec.is_none(), "sequence slots do not support speculative decoding");
+        if self.seqs.is_empty() {
+            self.seqs.push(None); // sequence 0 is the session's own state
+        }
+        let (gdn_state, qsa_state) = alloc_seq_state(self.model, self.seq_ctx)?;
+        let ple = new_ple(self.model)?;
+        self.seqs.push(Some(SeqSlot {
+            gdn_state,
+            qsa_state,
+            ple,
+            image: Vec::new(),
+            pos: 0,
+            cur_tok: 0,
+            sampler: self.sampler,
+        }));
+        Ok(self.seqs.len() - 1)
+    }
+
+    /// Make sequence `i` the active one: finish the in-flight work, then swap its
+    /// state into the session's fields (descriptor sets are cached per buffer, so
+    /// the swap costs no rebinding work beyond the first use).
+    pub fn use_seq(&mut self, i: usize) -> Result<()> {
+        if i == self.active_seq {
+            return Ok(());
+        }
+        anyhow::ensure!(i < self.seqs.len(), "no sequence {i} (have {})", self.n_seqs());
+        self.flush()?;
+        let mut slot = self.seqs[i].take().expect("a parked sequence");
+        std::mem::swap(&mut self.gdn_state, &mut slot.gdn_state);
+        std::mem::swap(&mut self.qsa_state, &mut slot.qsa_state);
+        std::mem::swap(&mut self.ple, &mut slot.ple);
+        std::mem::swap(&mut self.image, &mut slot.image);
+        std::mem::swap(&mut self.pos, &mut slot.pos);
+        std::mem::swap(&mut self.cur_tok, &mut slot.cur_tok);
+        std::mem::swap(&mut self.sampler, &mut slot.sampler);
+        self.seqs[self.active_seq] = Some(slot);
+        self.active_seq = i;
+        Ok(())
+    }
+
+    /// Run `prompts[i]` on sequence `i` (adding sequences as needed): each prompt's
+    /// chunked prefill in turn, then `n` tokens per sequence decoded round-robin,
+    /// one token per sequence per round. Returns one [`Generation`] per prompt;
+    /// `decode_seconds` is the shared decode wall time, so the aggregate rate is
+    /// `Σ forwards / decode_seconds`.
+    pub fn generate_seqs(&mut self, prompts: &[Vec<u32>], n: usize) -> Result<Vec<Generation>> {
+        anyhow::ensure!(self.prefill_chunk > 0, "sequence slots need chunked prefill");
+        anyhow::ensure!(prompts.iter().all(|p| !p.is_empty()), "a prompt is empty");
+        while self.n_seqs() < prompts.len() {
+            self.add_seq()?;
+        }
+        let k = prompts.len();
+        let mut logits = Vec::with_capacity(k);
+        for (i, prompt) in prompts.iter().enumerate() {
+            self.use_seq(i)?;
+            self.reset()?;
+            let mut pos = 0usize;
+            let mut l = Vec::new();
+            for len in prefill_plan(prompt.len(), self.prefill_target) {
+                l = self.prefill(&prompt[pos..pos + len], pos)?;
+                pos += len;
+            }
+            logits.push(l); // prefill leaves self.pos at the last prompt cell
+        }
+        self.flush()?;
+        self.forwards = 0;
+        self.expert_bytes = 0;
+        self.timers.clear();
+        let mut outs: Vec<Vec<u32>> = vec![Vec::with_capacity(n); k];
+        let mut lasts: Vec<Vec<f32>> = vec![Vec::new(); k];
+        let t = std::time::Instant::now();
+        for step in 0..n {
+            for i in 0..k {
+                self.use_seq(i)?;
+                let next = self
+                    .sampler
+                    .sample(&logits[i], &self.sampling)
+                    .ok_or_else(|| anyhow!("the sampler produced no token"))?;
+                outs[i].push(next);
+                if step + 1 == n {
+                    continue;
+                }
+                let pos = self.pos + 1; // token() leaves self.pos at the cell it ran
+                logits[i] = self.token(next, pos, None)?;
+                lasts[i] = logits[i].clone();
+            }
+        }
+        self.flush()?;
+        let decode_seconds = t.elapsed().as_secs_f64();
+        let per = self.forwards / k.max(1);
+        Ok(outs
+            .into_iter()
+            .zip(lasts)
+            .map(|(tokens, last_logits)| Generation {
+                tokens,
+                last_logits,
+                first_step_logits: Vec::new(),
+                decode_seconds,
+                forwards: per,
+                expert_bytes: self.expert_bytes / k.max(1) as u64,
+            })
+            .collect())
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -6877,23 +7034,11 @@ impl Drop for Session<'_> {
             }
         }
         self.spec_release();
-        for b in 0..m.cfg.n_layers {
-            let gpu = m.devices[m.device_of(b)].gpu();
-            if let Some(st) = &self.gdn_state[b] {
-                gpu.destroy_buf(&st.state);
-                gpu.destroy_buf(&st.conv);
-            }
-            if let Some(st) = &self.qsa_state[b] {
-                for buf in [
-                    &st.k_pool,
-                    &st.v_pool,
-                    &st.page_table,
-                    &st.idx_tail,
-                    &st.idx_pooled,
-                    &st.positions,
-                ] {
-                    gpu.destroy_buf(buf);
-                }
+        release_seq_state(m, &self.gdn_state, &self.qsa_state);
+        for slot in self.seqs.iter_mut().filter_map(Option::take) {
+            release_seq_state(m, &slot.gdn_state, &slot.qsa_state);
+            for (_, _, _, buf) in &slot.image {
+                m.devices[m.device_of(0)].gpu().destroy_buf(buf);
             }
         }
         for (dev, ws) in self.qsa_chunk_ws.iter_mut().enumerate() {

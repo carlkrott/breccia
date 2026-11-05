@@ -58,6 +58,7 @@
 pub mod bench;
 pub mod cpu;
 
+use ash::vk;
 use anyhow::{anyhow, Result};
 use breccia_vk::ctx::{Buf, Gpu};
 
@@ -497,7 +498,30 @@ fn buffer_sizes(capacity_cells: usize, max_pos: usize, v_layout: VLayout) -> [(u
 
 /// Bytes one layer's [`QsaState`] allocates (for VRAM budgeting before any session exists).
 pub fn state_bytes(capacity_cells: usize, max_pos: usize, v_layout: VLayout) -> u64 {
-    buffer_sizes(capacity_cells, max_pos, v_layout).iter().map(|b| b.0).sum()
+    // With `BRECCIA_KV_HOST=1` the K/V pools (the first two) live in host memory.
+    let skip = if kv_host() { 2 } else { 0 };
+    buffer_sizes(capacity_cells, max_pos, v_layout).iter().skip(skip).map(|b| b.0).sum()
+}
+
+/// `BRECCIA_KV_HOST=1`: allocate the K/V pools in host memory (GTT) that the GPU
+/// reads over PCIe. Decode reads only the selected top-k cells per layer, so the
+/// pools need not take VRAM; the indexer, page table and positions stay on the card.
+pub fn kv_host() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_KV_HOST").is_ok_and(|v| v == "1"))
+}
+
+fn alloc_host(gpu: &Gpu, size: u64) -> Result<Buf> {
+    let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    gpu.buf(
+        size.max(4) + crate::gemv::TAIL_PAD,
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_DST
+            | vk::BufferUsageFlags::TRANSFER_SRC,
+        host,
+        host,
+    )
+    .map_err(|e| anyhow!("{e}"))
 }
 
 /// `(i, i, i)` for `i < max_pos`: the text position table.
@@ -595,8 +619,9 @@ impl QsaState {
             "QsaState has six buffers; the positional slot list must match it"
         );
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
-        for (bytes, what) in sizes.iter() {
-            match alloc(gpu, *bytes) {
+        for (i, (bytes, what)) in sizes.iter().enumerate() {
+            let a = if i < 2 && kv_host() { alloc_host(gpu, *bytes) } else { alloc(gpu, *bytes) };
+            match a {
                 Ok(b) => bufs.push(b),
                 Err(e) => {
                     for b in &bufs {
