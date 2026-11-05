@@ -152,6 +152,7 @@ fn chat_rejects_image_parts_and_joins_text_parts() {
 struct VisionMock {
     got: Vec<Vec<u8>>,
     prompt: Vec<u32>,
+    cleared: bool,
 }
 
 const VS: u32 = 1000;
@@ -190,6 +191,9 @@ impl Backend for VisionMock {
         self.got.push(data.to_vec());
         Ok(6 - 2 * index) // 6, 4, 2, ...
     }
+    fn clear_images(&mut self) {
+        self.cleared = true;
+    }
     fn context(&self) -> Option<usize> {
         Some(40)
     }
@@ -197,7 +201,7 @@ impl Backend for VisionMock {
 
 #[test]
 fn chat_image_part_expands_pads_in_place() {
-    let mut m = VisionMock { got: vec![], prompt: vec![] };
+    let mut m = VisionMock { got: vec![], prompt: vec![], cleared: false };
     let r = dispatch(
         "POST",
         "/v1/chat/completions",
@@ -239,7 +243,7 @@ fn chat_image_part_expands_pads_in_place() {
 
 #[test]
 fn chat_images_encode_in_order_and_stop_at_the_context() {
-    let mut m = VisionMock { got: vec![], prompt: vec![] };
+    let mut m = VisionMock { got: vec![], prompt: vec![], cleared: false };
     let img = |b64: &str| serde_json::json!({"type": "image_url", "image_url": format!("data:image/png;base64,{b64}")});
     // two images in two messages: 6 then 4 cells, each at its own pad
     let r = dispatch(
@@ -278,6 +282,7 @@ fn chat_images_encode_in_order_and_stop_at_the_context() {
     assert!(String::from_utf8_lossy(&r.body).contains("image 2 of 3"), "{}", String::from_utf8_lossy(&r.body));
     assert_eq!(m.got, [b"A", b"B"]);
     assert!(m.prompt.is_empty());
+    assert!(m.cleared, "failed request left its images in the backend");
 }
 
 #[test]

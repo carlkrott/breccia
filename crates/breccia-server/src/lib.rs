@@ -44,6 +44,8 @@ pub trait Backend {
         let _ = (index, data);
         Err("this server takes no image input (start it with --mmproj)".into())
     }
+    /// Drop encoded images that no `complete` will use (a request failed).
+    fn clear_images(&mut self) {}
     /// Prompt + generation cells the backend holds, if bounded.
     fn context(&self) -> Option<usize> {
         None
@@ -200,6 +202,7 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
             Err(e) => return Response::json(400, json!({"error": {"message": e}})),
         }
     } else {
+        b.clear_images(); // images only ever come with the chat request that sent them
         match req.get("prompt") {
             Some(Value::String(s)) => match b.tokenize(s) {
                 Ok(ids) => ids,
@@ -286,16 +289,25 @@ fn with_images<B: Backend>(ids: Vec<u32>, images: Vec<Vec<u8>>, b: &mut B) -> Re
     let mut total = ids.len() - images.len(); // text tokens
     let mut cells = Vec::with_capacity(images.len());
     for (i, data) in images.iter().enumerate() {
-        let n = b.set_image(i, data)?;
-        total += n;
-        if let Some(ctx) = b.context().filter(|&c| total >= c) {
-            return Err(format!(
+        let n = b.set_image(i, data);
+        total += n.as_ref().map_or(0, |&n| n);
+        let err = match (n, b.context()) {
+            (Err(e), _) => Some(e),
+            (Ok(_), Some(ctx)) if total >= ctx => Some(format!(
                 "image {} of {} brings the prompt to {total} tokens, over the {ctx}-token context",
                 i + 1,
                 images.len()
-            ));
+            )),
+            (Ok(n), _) => {
+                cells.push(n);
+                None
+            }
+        };
+        if let Some(e) = err {
+            // no complete() follows: don't leave this request's images for the next one
+            b.clear_images();
+            return Err(e);
         }
-        cells.push(n);
     }
     let mut out = Vec::with_capacity(total);
     let mut cells = cells.into_iter();

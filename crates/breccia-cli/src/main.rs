@@ -5332,6 +5332,9 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         self.images.push(img);
         Ok(n)
     }
+    fn clear_images(&mut self) {
+        self.images.clear();
+    }
     fn context(&self) -> Option<usize> {
         Some(self.ctx)
     }
