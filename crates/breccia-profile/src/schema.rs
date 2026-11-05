@@ -37,6 +37,30 @@ pub struct HwProfile {
     /// a VRAM-only rule, so it is the same code on one card, three cards or none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiers: Option<TierVerdict>,
+    /// `breccia profile --placement`: the measured block split of a multi-card
+    /// device set, per workload (prefill and decode can disagree).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementVerdict>,
+}
+
+/// One device set's measured block split (single stream).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PlacementVerdict {
+    pub timestamp: String,
+    pub model: String,
+    /// PCI addresses, fastest prefill card first (the `--devices` order measured).
+    pub devices: Vec<String>,
+    pub prefill: PlacementChoice,
+    pub decode: PlacementChoice,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PlacementChoice {
+    /// Blocks per `devices` entry; a trailing 0 = that card is not used.
+    pub blocks: Vec<usize>,
+    pub tok_s: f64,
+    /// Every candidate measured, `"blocks tok/s"`.
+    pub tried: Vec<String>,
 }
 
 /// One tier's measured expert-FFN rates.
@@ -336,6 +360,7 @@ mod tests {
             quick: false,
             cpu_lane: None,
             tiers: None,
+            placement: None,
             devices: vec![DeviceEntry {
                 identity: DeviceIdentity {
                     backend: BackendKind::Vulkan,

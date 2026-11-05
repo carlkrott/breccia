@@ -80,6 +80,15 @@ enum Command {
         /// measurement instead of VRAM alone (`breccia_profile::placement`).
         #[arg(long)]
         tiers: bool,
+        /// `--placement`: on a two-card set, measure single-stream prefill (8k) and
+        /// decode for "fast card alone" and growing block shares on the slower card,
+        /// each in a fresh `bench token` process, and store the best split per
+        /// workload. Needs `--prefill` verdicts (they order the cards).
+        #[arg(long)]
+        placement: bool,
+        /// Prompt ids for `--placement` (default: a synthetic 8000-id prompt)
+        #[arg(long, value_name = "PATH")]
+        placement_prompt: Option<PathBuf>,
         /// Model for `--prefill` / `--kernels` (shard glob or path)
         #[arg(long, value_name = "GLOB", default_value = DEFAULT_MODEL_GLOB)]
         model: String,
@@ -491,6 +500,8 @@ fn run(cli: Cli) -> Result<()> {
             prefill,
             kernels,
             tiers,
+            placement,
+            placement_prompt,
             model,
             devices,
             cpu_lane,
@@ -504,6 +515,8 @@ fn run(cli: Cli) -> Result<()> {
             prefill,
             kernels,
             tiers,
+            placement,
+            placement_prompt,
             model,
             devices,
             cpu_lane,
@@ -797,6 +810,8 @@ struct ProfileArgs {
     /// that makes the kernel geometry follow the hardware.
     kernels: bool,
     tiers: bool,
+    placement: bool,
+    placement_prompt: Option<PathBuf>,
     model: String,
     devices: Vec<String>,
     cpu_lane: Option<usize>,
@@ -813,6 +828,9 @@ fn profile(a: ProfileArgs) -> Result<()> {
         if !a.prefill && !a.tiers {
             return Ok(());
         }
+    }
+    if a.placement {
+        return profile_placement(&path, &a.model, &a.devices, a.placement_prompt.as_deref());
     }
     if a.tiers {
         profile_tiers(&path)?;
@@ -887,6 +905,7 @@ fn profile(a: ProfileArgs) -> Result<()> {
     // (driver + shader hash) decides whether it still applies.
     if let Ok(Some(old)) = breccia_profile::load_profile(&path) {
         profile.cpu_lane = old.cpu_lane.filter(|v| cpu_lane_fresh(v, &profile.host));
+        profile.placement = old.placement;
         for e in &mut profile.devices {
             e.prefill = old
                 .devices
@@ -921,6 +940,201 @@ fn profile(a: ProfileArgs) -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `breccia profile --placement`: the single-stream block split of a two-card set,
+/// measured per workload. Candidate `k` puts the last `k` blocks on the slower card
+/// (its experts stream to the faster one in prefill, `BRECCIA_PF_EXPERT_DEVICE=0`);
+/// `k = 0` is the faster card alone. Each candidate is a fresh `bench token` process,
+/// so VRAM is fully released between them and a hang costs one candidate (the
+/// in-process chunk sweep kept the previous model's VRAM: MI50 2048, 11-05).
+fn profile_placement(
+    path: &std::path::Path,
+    model: &str,
+    devices: &[String],
+    prompt_file: Option<&std::path::Path>,
+) -> Result<()> {
+    const STEP: usize = 2;
+    let mut prof = breccia_profile::load_profile(path)?
+        .with_context(|| format!("no hardware profile at {}", path.display()))?;
+    // Fastest prefill card first: it runs the attention/dense blocks best and
+    // takes every block at k = 0.
+    let mut cards: Vec<(String, f64, usize)> = prof
+        .devices
+        .iter()
+        .filter(|e| e.identity.device_type == "DISCRETE_GPU")
+        .filter(|e| devices.is_empty() || devices.iter().any(|d| same_pci(d, &e.identity.pci_address)))
+        .filter_map(|e| {
+            let v = e.prefill.as_ref()?;
+            Some((e.identity.pci_address.clone(), v.on_ms, v.best_chunk))
+        })
+        .collect();
+    // shortcut: two cards only (the 7995x set); a third needs a split per extra card.
+    if cards.len() != 2 {
+        anyhow::bail!(
+            "--placement needs exactly two GPUs with a prefill verdict, found {} \
+             (run `breccia profile --prefill` first)",
+            cards.len()
+        );
+    }
+    cards.sort_by(|a, b| a.1.total_cmp(&b.1));
+    let shards = breccia_format::shard::ShardSet::open_glob(model)
+        .with_context(|| format!("opening the model shards {model}"))?;
+    let vocab = shards
+        .layout()?
+        .embedding
+        .as_ref()
+        .context("no `token_embd.weight` in the shard set")?
+        .ne1() as usize;
+    let n = breccia_engine::ModelConfig::from_metadata(&shards.metadata()?, vocab)?.n_layers as usize;
+    drop(shards);
+    let prompt: Vec<u32> = match prompt_file {
+        Some(p) => std::fs::read_to_string(p)
+            .with_context(|| format!("reading {}", p.display()))?
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter_map(|t| t.trim().parse().ok())
+            .collect(),
+        None => synthetic_prefix(&[760, 13017, 1433, 364, 279, 5447], 8000, 0x5eed, vocab as u32),
+    };
+    let dir = std::env::temp_dir().join(format!("breccia-placement-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let ids = |name: &str, len: usize| -> Result<std::path::PathBuf> {
+        let f = dir.join(name);
+        let text: Vec<String> = prompt[..len.min(prompt.len())].iter().map(u32::to_string).collect();
+        std::fs::write(&f, text.join(","))?;
+        Ok(f)
+    };
+    let pf_ids = ids("prefill.ids", prompt.len())?;
+    let dec_ids = ids("decode.ids", 2000)?;
+    let exe = std::env::current_exe()?;
+    // One `bench token` run; prefill tok/s or decode tok/s from its stdout.
+    let run = |k: usize, decode: bool| -> Result<f64> {
+        let (fast, slow) = (&cards[0], &cards[1]);
+        let devs = if k == 0 { fast.0.clone() } else { format!("{},{}", fast.0, slow.0) };
+        let (ids, ctx, gen, runs) = if decode {
+            (&dec_ids, 2100, 64, 2)
+        } else {
+            (&pf_ids, prompt.len() + 100, 1, 1)
+        };
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["bench", "token", "--streams", "1", "--gpu-experts", "auto", "--prefill-merged"])
+            .args(["--runs", &runs.to_string(), "--ctx", &ctx.to_string(), "--gen", &gen.to_string()])
+            .args(["--devices", &devs, "--arena-display-reserve-mib", "2560"])
+            .arg("--prompt-ids-file")
+            .arg(ids);
+        if k > 0 {
+            cmd.args(["--split-blocks", &format!("{},{}", n - k, k)]);
+        }
+        // Prefill-only knobs stay off the decode runs: the 4096 chunk's scratch cost
+        // decode its residency (42,6: 3199 vs 1025 MiB scratch, 17.9 vs ~22 tok/s, 11-05).
+        if k > 0 && !decode {
+            // A dual model runs the smallest per-card chunk; the fast card's is the
+            // one that measured best (38,10: 4096 455.9 vs 1024 389.9 tok/s, 11-05).
+            if fast.2 > 0 {
+                cmd.args(["--prefill-chunk", &fast.2.to_string()]);
+            }
+            cmd.env("BRECCIA_PF_EXPERT_DEVICE", "0");
+        }
+        if !decode {
+            cmd.env("BRECCIA_PREFILL_ONLY", "1");
+        }
+        let log = dir.join(format!("k{k}-{}.log", if decode { "decode" } else { "prefill" }));
+        let f = std::fs::File::create(&log)?;
+        let mut child = cmd
+            .stdout(f.try_clone()?)
+            .stderr(f)
+            .spawn()?;
+        // A stuck run (a card hang shows as a silent process) is killed, not waited on.
+        let t = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if t.elapsed().as_secs() > 900 {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("k={k} timed out (log {})", log.display());
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        };
+        let out = std::fs::read_to_string(&log)?;
+        let key = if decode { "decode " } else { "prefill run" };
+        out.lines()
+            .filter(|l| l.trim_start().starts_with(key))
+            .filter_map(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                let i = w.iter().position(|&x| x == "tok/s")?;
+                w.get(i.checked_sub(1)?)?.parse::<f64>().ok()
+            })
+            .reduce(f64::max)
+            .with_context(|| format!("k={k}: no {key} tok/s ({status}, log {})", log.display()))
+    };
+    // Warm-up, discarded: prefill streams most experts from the page cache, and a
+    // cold cache halves it (p1-rx 254 vs 556 tok/s after a cargo build, 11-05).
+    let _ = run(0, false);
+    let mut best = [(0usize, 0.0f64); 2];
+    let mut dual = [(0usize, 0.0f64); 2];
+    let mut tried: [Vec<String>; 2] = Default::default();
+    // Prefill falls off as soon as blocks leave the fast card (48,0 546 vs 46,2 509 vs
+    // 44,4 506 tok/s, 11-05), so it stops after two non-improving shares. Decode is flat
+    // up to ~38,10 and only drops once residency changes, so it sweeps every share to n/2.
+    let mut worse = [0usize; 2];
+    for k in (0..=n / 2).step_by(STEP) {
+        for (w, decode) in [(0, false), (1, true)] {
+            if worse[w] >= 2 {
+                continue;
+            }
+            let tok_s = match run(k, decode) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("breccia: placement {e:#}");
+                    0.0
+                }
+            };
+            println!("  k={k:>2} ({},{k}) {} {tok_s:.1} tok/s", n - k, ["prefill", "decode"][w]);
+            tried[w].push(format!("{},{k} {tok_s:.1}", n - k));
+            if k > 0 && tok_s > dual[w].1 {
+                dual[w] = (k, tok_s);
+            }
+            if tok_s > best[w].1 {
+                best[w] = (k, tok_s);
+                worse[w] = 0;
+            } else if !decode {
+                worse[w] += 1;
+            }
+        }
+    }
+    // Within single-run noise (~3 %) of the fast card alone the best dual share wins:
+    // dual is the default (Carl 10-27) and only a measured loss keeps the second card idle.
+    for w in 0..2 {
+        if best[w].0 == 0 && dual[w].0 > 0 && dual[w].1 >= 0.97 * best[w].1 {
+            best[w] = dual[w];
+        }
+    }
+    let choice = |w: usize| breccia_profile::schema::PlacementChoice {
+        blocks: vec![n - best[w].0, best[w].0],
+        tok_s: best[w].1,
+        tried: tried[w].clone(),
+    };
+    let v = breccia_profile::schema::PlacementVerdict {
+        timestamp: breccia_profile::schema::iso8601(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        ),
+        model: model.to_string(),
+        devices: cards.iter().map(|c| c.0.clone()).collect(),
+        prefill: choice(0),
+        decode: choice(1),
+    };
+    println!(
+        "placement: prefill {:?} {:.1} tok/s · decode {:?} {:.1} tok/s",
+        v.prefill.blocks, v.prefill.tok_s, v.decode.blocks, v.decode.tok_s
+    );
+    prof.placement = Some(v);
+    breccia_profile::save_profile(&prof, path)?;
+    println!("wrote {} (per-candidate logs in {})", path.display(), dir.display());
     Ok(())
 }
 
@@ -1482,7 +1696,9 @@ fn profile_prefill_chunk(path: &std::path::Path, model_glob: &str, addr: &str) -
         for _ in 0..3 {
             let t = std::time::Instant::now();
             logits = feed_prompt(&mut sess, &prompt, chunk)?;
-            ms = ms.min(t.elapsed().as_secs_f64() * 1e3 / prompt.len() as f64);
+            let pass = t.elapsed().as_secs_f64() * 1e3 / prompt.len() as f64;
+            eprintln!("    chunk {chunk} pass: {pass:.2} ms/token"); // a slow card's progress
+            ms = ms.min(pass);
         }
         let (kl, same) = match &base {
             Some(b) => (logits_kl(b, &logits), profile_parity_ok(b, &logits)),
@@ -1500,6 +1716,19 @@ fn profile_prefill_chunk(path: &std::path::Path, model_glob: &str, addr: &str) -
         }
         if wins {
             best = (chunk, ms);
+            // Best so far is stored now: a later candidate that spills VRAM or is
+            // stopped as hung (MI50 2048, 11-05) must not leave best_chunk 0.
+            let mut prof = breccia_profile::load_profile(path)?
+                .with_context(|| format!("{} vanished", path.display()))?;
+            if let Some(v) = prof
+                .devices
+                .iter_mut()
+                .find(|e| same_pci(&e.identity.pci_address, addr))
+                .and_then(|e| e.prefill.as_mut())
+            {
+                v.best_chunk = chunk;
+            }
+            breccia_profile::save_profile(&prof, path)?;
         }
     }
     Ok(best.0)

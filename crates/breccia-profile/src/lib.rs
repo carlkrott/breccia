@@ -187,6 +187,7 @@ pub fn build_profile(
         notes: all_notes,
         cpu_lane: None,
         tiers: None,
+        placement: None,
     }
 }
 

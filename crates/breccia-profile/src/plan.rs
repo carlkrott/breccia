@@ -383,6 +383,7 @@ mod tests {
             quick: false,
             cpu_lane: None,
             tiers: None,
+            placement: None,
             devices: vec![
                 entry(
                     1,
