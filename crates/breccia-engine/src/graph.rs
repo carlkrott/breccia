@@ -742,6 +742,9 @@ pub struct Session<'m> {
     /// scratch (`add_seq`); entry `active_seq` is `None` (its state is the
     /// fields above). Empty for an ordinary one-sequence session.
     seqs: Vec<Option<SeqSlot>>,
+    /// Batched decode ([`Session::decode_seqs`]): chunk row `i` is sequence
+    /// `rows_seq[i].0` at cell `rows_seq[i].1`. Empty outside that call.
+    rows_seq: Vec<(usize, usize)>,
     active_seq: usize,
     seq_ctx: usize,
     /// Speculative-verify rollback slots; `None` (the default) leaves every path unchanged.
@@ -1358,6 +1361,7 @@ impl<'m> Session<'m> {
             gdn_state,
             qsa_state,
             seqs: Vec::new(),
+            rows_seq: Vec::new(),
             active_seq: 0,
             seq_ctx: ctx_capacity,
             spec: None,
@@ -2321,6 +2325,63 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// Swap parked sequence `s`'s recurrent/KV/PLE state with the active one's
+    /// (call twice to undo). Only Rust handles move: commands already recorded
+    /// keep the buffers they bound, so no flush is needed.
+    fn swap_seq_state(&mut self, s: usize) {
+        if s == self.active_seq {
+            return;
+        }
+        let slot = self.seqs[s].as_mut().expect("a parked sequence");
+        std::mem::swap(&mut self.gdn_state, &mut slot.gdn_state);
+        std::mem::swap(&mut self.qsa_state, &mut slot.qsa_state);
+        std::mem::swap(&mut self.ple, &mut slot.ple);
+    }
+
+    /// One decode step for several sequences as ONE chunk forward: row `i` is
+    /// `toks[i] = (sequence, token)` at that sequence's next cell. Dense, router and
+    /// experts run once over all rows (weights read once per step); only the mixer
+    /// runs per row on its own sequence's state. Returns one logits row per entry.
+    pub fn decode_seqs(&mut self, toks: &[(usize, u32)]) -> Result<Vec<Vec<f32>>> {
+        anyhow::ensure!(self.prefill_merged, "batched decode needs --prefill-merged");
+        // prefill_rows embeds image rows by cell and pos0 is 0 here
+        anyhow::ensure!(self.image.is_empty(), "batched decode does not take image sequences");
+        let mut rows = Vec::with_capacity(toks.len());
+        for (i, &(s, _)) in toks.iter().enumerate() {
+            anyhow::ensure!(s < self.n_seqs(), "no sequence {s}");
+            anyhow::ensure!(toks[..i].iter().all(|x| x.0 != s), "sequence {s} twice in one step");
+            let (pos, img) = if s == self.active_seq {
+                (self.pos, !self.image.is_empty())
+            } else {
+                let sl = self.seqs[s].as_ref().expect("a parked sequence");
+                (sl.pos, !sl.image.is_empty())
+            };
+            anyhow::ensure!(!img, "batched decode does not take image sequences");
+            anyhow::ensure!(pos + 1 < self.seq_ctx, "sequence {s} is at its context limit");
+            rows.push((s, pos + 1));
+        }
+        let ids: Vec<u32> = toks.iter().map(|x| x.1).collect();
+        self.rows_seq = rows;
+        let (pos_was, tok_was) = (self.pos, self.cur_tok); // prefill_rows overwrites the active pos
+        // pos0 0: row i's mixer reads its own cell from `rows_seq`, and the
+        // per-token prelude addresses `pf.out` row `pos - pos0 = i`.
+        let r = self.prefill_rows(&ids, 0, true);
+        let rows = std::mem::take(&mut self.rows_seq);
+        (self.pos, self.cur_tok) = (pos_was, tok_was);
+        let logits = r?;
+        self.pf_tokens -= ids.len(); // decode, not prompt tokens
+        self.forwards += ids.len();
+        for (&(s, pos), &tok) in rows.iter().zip(&ids) {
+            if s == self.active_seq {
+                (self.pos, self.cur_tok) = (pos, tok);
+            } else {
+                let sl = self.seqs[s].as_mut().expect("a parked sequence");
+                (sl.pos, sl.cur_tok) = (pos, tok);
+            }
+        }
+        Ok(logits)
+    }
+
     /// Run `prompts[i]` on sequence `i` (adding sequences as needed): each prompt's
     /// chunked prefill in turn, then `n` tokens per sequence decoded round-robin,
     /// one token per sequence per round. Returns one [`Generation`] per prompt;
@@ -2354,7 +2415,25 @@ impl<'m> Session<'m> {
         let mut outs: Vec<Vec<u32>> = vec![Vec::with_capacity(n); k];
         let mut lasts: Vec<Vec<f32>> = vec![Vec::new(); k];
         let t = std::time::Instant::now();
+        // BRECCIA_SEQ_BATCH=1: one chunk forward per step over every sequence
+        let batched = std::env::var("BRECCIA_SEQ_BATCH").as_deref() == Ok("1");
         for step in 0..n {
+            if batched {
+                let mut toks = Vec::with_capacity(k);
+                for i in 0..k {
+                    let next = self
+                        .sampler
+                        .sample(&logits[i], &self.sampling)
+                        .ok_or_else(|| anyhow!("the sampler produced no token"))?;
+                    outs[i].push(next);
+                    toks.push((i, next));
+                }
+                if step + 1 < n {
+                    logits = self.decode_seqs(&toks)?;
+                    lasts.clone_from(&logits);
+                }
+                continue;
+            }
             for i in 0..k {
                 self.use_seq(i)?;
                 let next = self
@@ -3126,7 +3205,7 @@ impl<'m> Session<'m> {
         self.flush()?;
         self.timers.mark(PLE);
 
-        let micro_blocked = if pf_micro() {
+        let micro_blocked = if pf_micro() && self.rows_seq.is_empty() {
             self.micro_blocker(t, pos0)
         } else {
             Some(String::new())
@@ -3725,6 +3804,7 @@ impl<'m> Session<'m> {
             // path). Everything else keeps the per-token host round trip.
             let batched = t > 1
                 && !self.spec_rows_active()
+                && self.rows_seq.is_empty()
                 && self.venues[dev].ple_emb_chunk.is_some()
                 && std::env::var_os("BRECCIA_NO_PLE_BATCH").is_none();
             if batched {
@@ -3746,19 +3826,39 @@ impl<'m> Session<'m> {
                         .as_mut()
                         .ok_or_else(|| anyhow!("no PLE host state"))?;
                     for i in 0..t {
+                        if !self.rows_seq.is_empty() {
+                            break; // per-sequence hashing below
+                        }
                         let r = ple.rows_for(self.pf_toks[i]);
                         all.extend_from_slice(&r);
                         per.push(r);
                     }
                 }
+                // Batched decode: each row hashes on its own sequence's rolling context.
+                for (i, (s, _)) in self.rows_seq.clone().into_iter().enumerate() {
+                    self.swap_seq_state(s);
+                    let r = self.ple.as_mut().map(|p| p.rows_for(self.pf_toks[i]));
+                    self.swap_seq_state(s);
+                    let r = r.ok_or_else(|| anyhow!("no PLE host state"))?;
+                    all.extend_from_slice(&r);
+                    per.push(r);
+                }
                 let t_prefetch = std::time::Instant::now();
                 prefetch_rows(table, &all, row_bytes);
                 self.pf_ple_prefetch_s += t_prefetch.elapsed().as_secs_f64();
                 for (i, rows) in per.iter().enumerate() {
+                    let seq = self.rows_seq.get(i).map(|r| r.0);
+                    if let Some(s) = seq {
+                        self.swap_seq_state(s);
+                    }
                     self.swap_r_in(dev, i);
                     self.cur_tok = self.pf_toks[i];
-                    self.ple_step_rows(b, rows)?;
+                    let r = self.ple_step_rows(b, rows);
                     self.swap_r_in(dev, i);
+                    if let Some(s) = seq {
+                        self.swap_seq_state(s);
+                    }
+                    r?;
                     self.spec_ple_row(i, t);
                 }
             }
@@ -3786,6 +3886,9 @@ impl<'m> Session<'m> {
         }
 
         // ---- pass 1: the whole chunk's dense chain, one submission -----------
+        if !self.rows_seq.is_empty() {
+            bail!("block {b}: batched decode needs the merged expert pass (a multi-user GEMM per expert type)");
+        }
         self.ensure_batch(dev)?;
         for i in 0..t {
             self.swap_r_in(dev, i);
@@ -4327,7 +4430,7 @@ impl<'m> Session<'m> {
         // path (8k: 116 tok/s at 50 % vs 175 all-GPU, 11-03). Prefill keeps the CPU out.
         let split_on = ((pf_split_host().is_some() && t <= SPLIT_T_MAX)
             || pf_split_tiers()
-            || (pe.is_none() && std::env::var_os("BRECCIA_PF_HOST_COLD").is_some()))
+            || (pe.is_none() && (pf_host_cold() || !self.rows_seq.is_empty())))
             && streamed
             && xdev.is_none()
             && !micro
@@ -4509,7 +4612,7 @@ impl<'m> Session<'m> {
                     )
                 })
                 .flatten();
-            if pe.is_none() && std::env::var_os("BRECCIA_PF_HOST_COLD").is_some() {
+            if pe.is_none() && (pf_host_cold() || !self.rows_seq.is_empty()) {
                 // A cold block has no arena: compute it on the host lane instead of
                 // streaming every expert blob over PCIe (item 5). The device loop
                 // skips groups whose expert is in `host_set`, so nothing streams.
@@ -6070,6 +6173,9 @@ impl<'m> Session<'m> {
         if self.spec_rows_active() {
             return false;
         }
+        if !self.rows_seq.is_empty() {
+            return true;
+        }
         let lw = &self.model.layers[b];
         let ws: Vec<&crate::model::W> = match lw.kind {
             LayerKind::Qsa if self.pf[dev][PF_QSACHUNK] => match lw.qsa.as_ref() {
@@ -6193,6 +6299,9 @@ impl<'m> Session<'m> {
             }
         }
         self.timers.mark(MIXER);
+        if !self.rows_seq.is_empty() {
+            return self.record_mixer_rows(b, dev);
+        }
         if m.layers[b].kind == LayerKind::Gdn {
             return self.record_gdn_chunk(b, dev, t, chunk);
         }
@@ -6274,6 +6383,31 @@ impl<'m> Session<'m> {
         if let Some(tap) = tap {
             let len = (t * breccia_kernels::qsa::IDX_DIM * 4) as u64;
             batch_cmd::record_copy(gpu, tap, 0, &ws.idx_k, 0, len)?;
+        }
+        Ok(())
+    }
+
+    /// Batched decode's mixer: row `i` of `pf.mixed` through the single-token
+    /// mixer on sequence `rows_seq[i]`'s state, into row `i` of `pf.out`.
+    fn record_mixer_rows(&mut self, b: usize, dev: usize) -> Result<()> {
+        let m = self.model;
+        let gpu = m.devices[dev].gpu();
+        let nb = (m.cfg.n_embd * 4) as u64;
+        for (i, (s, pos)) in self.rows_seq.clone().into_iter().enumerate() {
+            {
+                let v = &self.venues[dev];
+                let hc = v.hc_ws.as_ref().expect("the session's hc workspace");
+                batch_cmd::record_copies(gpu, &[(&hc.mixed, 0, &v.pf_at(b).mixed, i as u64 * nb, nb)])?;
+            }
+            self.swap_seq_state(s);
+            let r = match m.layers[b].kind {
+                LayerKind::Gdn => self.run_gdn(b, dev),
+                LayerKind::Qsa => self.run_qsa(b, dev, pos),
+            };
+            self.swap_seq_state(s);
+            r?;
+            let v = &self.venues[dev];
+            batch_cmd::record_copies(gpu, &[(&v.pf_at(b).out, i as u64 * nb, &v.block_out.buf, 0, nb)])?;
         }
         Ok(())
     }
@@ -7313,6 +7447,10 @@ fn zero_pf(gpu: &breccia_vk::ctx::Gpu, pf: &PfChunk) -> Result<()> {
         breccia_kernels::gemv::upload_into(gpu, b, &vec![0u8; b.size as usize])?;
     }
     Ok(())
+}
+
+fn pf_host_cold() -> bool {
+    std::env::var_os("BRECCIA_PF_HOST_COLD").is_some()
 }
 
 fn pf_split_tiers() -> bool {
