@@ -147,3 +147,101 @@ fn chat_rejects_image_parts_and_joins_text_parts() {
         "array text must match the string form"
     );
 }
+
+/// Vision backend: specials for the image tokens, records what it was handed.
+struct VisionMock {
+    got: Vec<u8>,
+    prompt: Vec<u32>,
+}
+
+const VS: u32 = 1000;
+const PAD: u32 = 1001;
+const VE: u32 = 1002;
+
+impl Backend for VisionMock {
+    fn model_name(&self) -> String {
+        "vmock".into()
+    }
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
+        Mock.tokenize(text)
+    }
+    fn decode_text(&self, ids: &[u32]) -> String {
+        Mock.decode_text(ids)
+    }
+    fn complete(&mut self, prompt: &[u32], _max: usize) -> Result<Vec<u32>, String> {
+        self.prompt = prompt.to_vec();
+        Ok(vec![b'k' as u32 + 1])
+    }
+    fn eos(&self) -> Option<u32> {
+        None
+    }
+    fn special(&self, text: &str) -> Option<u32> {
+        match text {
+            "<|vision_start|>" => Some(VS),
+            "<|image_pad|>" => Some(PAD),
+            "<|vision_end|>" => Some(VE),
+            _ => None,
+        }
+    }
+    fn set_image(&mut self, data: &[u8]) -> Result<usize, String> {
+        self.got = data.to_vec();
+        Ok(6)
+    }
+}
+
+#[test]
+fn chat_image_part_expands_pads_in_place() {
+    let mut m = VisionMock { got: vec![], prompt: vec![] };
+    let r = dispatch(
+        "POST",
+        "/v1/chat/completions",
+        &body(serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8hIQ=="}},
+                {"type": "text", "text": "hi"}
+            ]}],
+            "max_tokens": 3
+        })),
+        &mut m,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(m.got, b"hello!!");
+    let user: Vec<u32> = b"user\n".iter().map(|&b| b as u32 + 1).collect();
+    let mut want = user.clone();
+    want.push(VS);
+    want.extend([PAD; 6]);
+    want.push(VE);
+    want.extend(b"hi".iter().map(|&b| b as u32 + 1));
+    assert_eq!(&m.prompt[..want.len()], &want[..]);
+    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    // want + "\n" + "assistant\n" (no im_start/im_end specials here)
+    assert_eq!(v["usage"]["prompt_tokens"], want.len() + 11);
+
+    // remote URLs and a second image are refused
+    for content in [
+        serde_json::json!([{"type": "image_url", "image_url": {"url": "https://x/y.png"}}]),
+        serde_json::json!([
+            {"type": "image_url", "image_url": "data:image/png;base64,AA=="},
+            {"type": "image_url", "image_url": "data:image/png;base64,AA=="}
+        ]),
+    ] {
+        let r = dispatch(
+            "POST",
+            "/v1/chat/completions",
+            &body(serde_json::json!({"messages": [{"role": "user", "content": content}]})),
+            &mut m,
+        );
+        assert_eq!(r.status, 400);
+    }
+}
+
+#[test]
+fn base64_matches_known_vectors() {
+    use breccia_server::base64_decode as d;
+    assert_eq!(d("").unwrap(), b"");
+    assert_eq!(d("Zg==").unwrap(), b"f");
+    assert_eq!(d("Zm8=").unwrap(), b"fo");
+    assert_eq!(d("Zm9v").unwrap(), b"foo");
+    assert_eq!(d("Zm9vYmFy\n").unwrap(), b"foobar");
+    assert!(d("Zm9v!").is_err());
+}

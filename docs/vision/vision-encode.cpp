@@ -2,6 +2,7 @@
 // on whatever ggml backend is visible, dump f32 [n_tokens, n_embd] + positions.
 // Usage: vision-encode <mmproj> <text-model.gguf> <image> <out-prefix> [max_tokens] [cpu]
 // The text model loads vocab_only (metadata + tokenizer, no weights).
+// Env: VE_MIN_TOKENS (image_min_tokens), VE_THREADS (default 16), VE_BENCH=1 (encode twice, report warm).
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
@@ -30,7 +31,8 @@ int main(int argc, char ** argv) {
     mtmd_context_params cp = mtmd_context_params_default();
     cp.use_gpu       = !cpu;
     cp.print_timings = true;
-    cp.n_threads     = 16;
+    cp.n_threads     = getenv("VE_THREADS") ? atoi(getenv("VE_THREADS")) : 16;
+    if (getenv("VE_MIN_TOKENS")) cp.image_min_tokens = atoi(getenv("VE_MIN_TOKENS"));
     cp.warmup        = false;
     if (max_tokens > 0) cp.image_max_tokens = max_tokens;
     auto t0 = std::chrono::steady_clock::now();
@@ -61,8 +63,9 @@ int main(int argc, char ** argv) {
         }
         const size_t n_tok = mtmd_input_chunk_get_n_tokens(ch);
         // encode twice: the first pass carries pipeline/shader compile cost
-        double ms[2];
-        for (int r = 0; r < 2; r++) {
+        double ms[2] = {0, 0};
+        const int passes = getenv("VE_BENCH") ? 2 : 1;
+        for (int r = 0; r < passes; r++) {
             auto a = std::chrono::steady_clock::now();
             if (mtmd_encode_chunk(ctx, ch) != 0) { fprintf(stderr, "encode failed\n"); return 1; }
             ms[r] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
@@ -86,7 +89,7 @@ int main(int argc, char ** argv) {
         printf("{\"n_tokens\":%zu,\"n_embd\":%d,\"n_pos\":%d,\"load_ms\":%.0f,\"encode_ms_cold\":%.1f,"
                "\"encode_ms\":%.1f,\"mean\":%.6g,\"rms\":%.6g,\"backend\":\"%s\"}\n",
                n_tok, n_embd, (int) mtmd_input_chunk_get_n_pos(ch),
-               std::chrono::duration<double, std::milli>(t1 - t0).count(), ms[0], ms[1],
+               std::chrono::duration<double, std::milli>(t1 - t0).count(), ms[0], ms[passes - 1],
                sum / (n_tok * n_embd), sqrt(sq / (n_tok * n_embd)), cpu ? "cpu" : "gpu");
     }
     mtmd_input_chunks_free(chunks);

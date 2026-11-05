@@ -37,6 +37,12 @@ pub trait Backend {
         let _ = text;
         None
     }
+    /// Encode one image (the raw file bytes) for the next `complete`; returns how
+    /// many `<|image_pad|>` cells it fills. The prompt then holds that many pads.
+    fn set_image(&mut self, data: &[u8]) -> Result<usize, String> {
+        let _ = data;
+        Err("this server takes no image input (start it with --mmproj)".into())
+    }
 }
 
 pub struct Response {
@@ -111,6 +117,9 @@ fn handle<B: Backend>(mut stream: TcpStream, backend: &mut B) -> Result<(), Stri
             .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
             .map_err(|e| e.to_string())?;
     }
+    if len > 64 << 20 {
+        return Err(format!("request body of {len} bytes is over the 64 MiB cap"));
+    }
     let mut body = vec![0u8; len];
     if len > 0 {
         reader.read_exact(&mut body).map_err(|e| e.to_string())?;
@@ -181,7 +190,7 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
         .unwrap_or(128) as usize;
 
     let prompt_ids = if chat {
-        match chat_prompt(&req, b) {
+        match chat_prompt(&req, b).and_then(|(ids, img)| with_image(ids, img, b)) {
             Ok(ids) => ids,
             Err(e) => return Response::json(400, json!({"error": {"message": e}})),
         }
@@ -258,45 +267,111 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
     }
 }
 
+/// Encode the request's image (if any) and widen its one `<|image_pad|>` to the
+/// image's cell count.
+fn with_image<B: Backend>(
+    mut ids: Vec<u32>,
+    image: Option<Vec<u8>>,
+    b: &mut B,
+) -> Result<Vec<u32>, String> {
+    let Some(data) = image else { return Ok(ids) };
+    let pad = b.special("<|image_pad|>").ok_or("the model has no <|image_pad|> token")?;
+    let at = ids.iter().position(|&t| t == pad).ok_or("no image cell in the prompt")?;
+    let n = b.set_image(&data)?;
+    ids.splice(at..at + 1, std::iter::repeat_n(pad, n));
+    Ok(ids)
+}
+
+/// Images arrive as `data:<mime>;base64,<...>` URLs (no remote fetch).
+fn image_bytes(part: &Value) -> Result<Vec<u8>, String> {
+    let url = part
+        .get("image_url")
+        .and_then(|u| u.get("url").or(Some(u)))
+        .and_then(|u| u.as_str())
+        .ok_or("image_url part without a url")?;
+    let b64 = url
+        .strip_prefix("data:")
+        .and_then(|r| r.split_once(";base64,"))
+        .map(|(_, d)| d)
+        .ok_or("image_url must be a data:<mime>;base64,... URL (remote URLs are not fetched)")?;
+    base64_decode(b64)
+}
+
+/// Standard base64 (padding and whitespace tolerated).
+pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return Err(format!("invalid base64 byte {c:#x}")),
+        };
+        acc = acc << 6 | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// A ChatML prompt, the template this model's GGUF declares. Control tokens go in by
-/// id (they are single vocabulary entries, not text).
-fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<Vec<u32>, String> {
+/// id (they are single vocabulary entries, not text). An image part becomes
+/// `<|vision_start|><|image_pad|><|vision_end|>` in place (one image per request);
+/// its bytes are returned for [`Backend::set_image`].
+fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<(Vec<u32>, Option<Vec<u8>>), String> {
     let Some(Value::Array(msgs)) = req.get("messages") else {
         return Err("messages must be an array".into());
     };
     let im_start = b.special("<|im_start|>");
     let im_end = b.special("<|im_end|>");
     let mut out = Vec::new();
+    let mut image = None;
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
-        // OpenAI content is a string or an array of parts; image parts must fail loudly,
-        // not run as an empty prompt.
-        let content = match m.get("content") {
-            None | Some(Value::Null) => String::new(),
-            Some(Value::String(s)) => s.clone(),
+        if let Some(s) = im_start {
+            out.push(s);
+        }
+        // OpenAI content is a string or an array of parts, in order
+        let mut text = format!("{role}\n");
+        match m.get("content") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(s)) => text += s,
             Some(Value::Array(parts)) => {
-                let mut text = String::new();
                 for p in parts {
                     match p.get("type").and_then(|t| t.as_str()) {
                         Some("text") => {
                             text += p.get("text").and_then(|t| t.as_str()).unwrap_or("")
                         }
+                        Some("image_url") => {
+                            if image.is_some() {
+                                return Err("one image per request".into());
+                            }
+                            let ids = ["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
+                                .map(|t| b.special(t).ok_or("the model has no vision tokens"));
+                            image = Some(image_bytes(p)?);
+                            out.extend(b.tokenize(&std::mem::take(&mut text))?);
+                            for id in ids {
+                                out.push(id?);
+                            }
+                        }
                         t => {
                             return Err(format!(
-                                "content part type {:?} is not supported (no image input yet)",
+                                "content part type {:?} is not supported",
                                 t.unwrap_or("?")
                             ))
                         }
                     }
                 }
-                text
             }
             Some(_) => return Err("content must be a string or an array of parts".into()),
         };
-        if let Some(s) = im_start {
-            out.push(s);
-        }
-        out.extend(b.tokenize(&format!("{role}\n{content}"))?);
+        out.extend(b.tokenize(&text)?);
         if let Some(e) = im_end {
             out.push(e);
         }
@@ -306,7 +381,7 @@ fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<Vec<u32>, String> {
         out.push(s);
     }
     out.extend(b.tokenize("assistant\n")?);
-    Ok(out)
+    Ok((out, image))
 }
 
 fn now_secs() -> u64 {

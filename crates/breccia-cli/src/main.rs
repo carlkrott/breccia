@@ -126,6 +126,15 @@ enum Command {
         /// Merged prefill chunk
         #[arg(long, default_value_t = 1024)]
         prefill_chunk: usize,
+        /// Vision projector GGUF: enables image input (chat `image_url` data URLs)
+        #[arg(long, value_name = "GGUF")]
+        mmproj: Option<String>,
+        /// Image encoder sidecar (docs/vision/vision-encode.cpp); default: `vision-encode` next to this binary, else on PATH
+        #[arg(long, value_name = "BIN")]
+        vision_encoder: Option<String>,
+        /// Image token budget (max; min is 1024 or this, if lower)
+        #[arg(long, default_value_t = 2048)]
+        image_tokens: usize,
         /// Resolve and print the backend/device/placement plan, launch nothing
         #[arg(long)]
         dry_run_plan: bool,
@@ -534,6 +543,9 @@ fn run(cli: Cli) -> Result<()> {
             gpu_experts,
             max_tokens,
             prefill_chunk,
+            mmproj,
+            vision_encoder,
+            image_tokens,
             dry_run_plan,
             args,
         } => {
@@ -548,6 +560,9 @@ fn run(cli: Cli) -> Result<()> {
                     gpu_experts,
                     max_tokens,
                     prefill_chunk,
+                    mmproj,
+                    vision_encoder,
+                    image_tokens,
                 })
             }
         }
@@ -2984,6 +2999,25 @@ fn with_image(mut prompt: Vec<u32>) -> Result<Vec<u32>> {
         let _ = IMAGE.set(None);
         return Ok(prompt);
     };
+    let (nx, ny, rows) = load_image_dump(&prefix)?;
+    let n = nx * ny;
+    let at = prompt
+        .iter()
+        .position(|&t| t == IMAGE_PAD)
+        .ok_or_else(|| anyhow::anyhow!("BRECCIA_IMAGE_EMBD needs one <|image_pad|> ({IMAGE_PAD}) in the prompt"))?;
+    anyhow::ensure!(
+        prompt.iter().filter(|&&t| t == IMAGE_PAD).count() == 1,
+        "one image per prompt (exactly one {IMAGE_PAD})"
+    );
+    prompt.splice(at..at + 1, std::iter::repeat_n(IMAGE_PAD, n));
+    println!("image    {nx}x{ny} = {n} rows at cell {at} from {prefix}");
+    let _ = IMAGE.set(Some((at, nx, ny, rows)));
+    Ok(prompt)
+}
+
+/// A `vision-encode` dump: `<prefix>.pos` ("t x y" lines, raster, x fastest) and
+/// `<prefix>.f32` rows -> `(nx, ny, rows)`.
+fn load_image_dump(prefix: &str) -> Result<(usize, usize, Vec<f32>)> {
     let pos = std::fs::read_to_string(format!("{prefix}.pos")).with_context(|| format!("{prefix}.pos"))?;
     // lines "t x y"; must be a raster grid, x fastest
     let xy: Vec<(usize, usize)> = pos
@@ -3005,18 +3039,7 @@ fn with_image(mut prompt: Vec<u32>) -> Result<Vec<u32>> {
     let bytes = std::fs::read(format!("{prefix}.f32")).with_context(|| format!("{prefix}.f32"))?;
     let rows: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
     anyhow::ensure!(rows.len() % n == 0, "{prefix}.f32: {} floats not a multiple of {n} rows", rows.len());
-    let at = prompt
-        .iter()
-        .position(|&t| t == IMAGE_PAD)
-        .ok_or_else(|| anyhow::anyhow!("BRECCIA_IMAGE_EMBD needs one <|image_pad|> ({IMAGE_PAD}) in the prompt"))?;
-    anyhow::ensure!(
-        prompt.iter().filter(|&&t| t == IMAGE_PAD).count() == 1,
-        "one image per prompt (exactly one {IMAGE_PAD})"
-    );
-    prompt.splice(at..at + 1, std::iter::repeat_n(IMAGE_PAD, n));
-    println!("image    {nx}x{ny} = {n} rows at cell {at} from {prefix}");
-    let _ = IMAGE.set(Some((at, nx, ny, rows)));
-    Ok(prompt)
+    Ok((nx, ny, rows))
 }
 
 /// Reset and feed every prompt token; returns the last token's logits.
@@ -5057,6 +5080,46 @@ struct ServeArgs {
     gpu_experts: String,
     max_tokens: usize,
     prefill_chunk: usize,
+    mmproj: Option<String>,
+    vision_encoder: Option<String>,
+    image_tokens: usize,
+}
+
+/// The image encoder sidecar: `vision-encode <mmproj> <model> <image> <prefix> <max_tokens> cpu`.
+struct Vision {
+    encoder: std::path::PathBuf,
+    mmproj: String,
+    model: std::path::PathBuf,
+    max_tokens: usize,
+    dir: std::path::PathBuf,
+}
+
+impl Vision {
+    /// Encode one image file's bytes on the CPU -> `(nx, ny, rows)`.
+    fn encode(&self, data: &[u8]) -> Result<(usize, usize, Vec<f32>)> {
+        std::fs::create_dir_all(&self.dir)?;
+        let img = self.dir.join("image");
+        let prefix = self.dir.join("embd");
+        std::fs::write(&img, data)?;
+        let t = std::time::Instant::now();
+        let out = std::process::Command::new(&self.encoder)
+            .args([self.mmproj.as_ref(), self.model.as_os_str(), img.as_os_str(), prefix.as_os_str()])
+            .args([self.max_tokens.to_string(), "cpu".into()])
+            .env("VE_MIN_TOKENS", self.max_tokens.min(1024).to_string())
+            .env_remove("VE_BENCH")
+            .env("VE_THREADS", std::env::var("VE_THREADS").unwrap_or("30".into()))
+            .output()
+            .with_context(|| format!("running {}", self.encoder.display()))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "image encoder failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+        );
+        let img = load_image_dump(&prefix.to_string_lossy())?;
+        println!("image    {}x{} encoded in {:.2} s", img.0, img.1, t.elapsed().as_secs_f64());
+        Ok(img)
+    }
 }
 
 /// The engine, adapted to what the HTTP layer needs.
@@ -5065,6 +5128,9 @@ struct EngineBackend<'a, 'm> {
     tok: breccia_format::tokenizer::Tokenizer,
     name: String,
     max_tokens: usize,
+    vision: Option<Vision>,
+    /// encoded by `set_image`, consumed by the next `complete`
+    image: Option<(usize, usize, Vec<f32>)>,
 }
 
 impl breccia_server::Backend for EngineBackend<'_, '_> {
@@ -5079,6 +5145,14 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
     fn complete(&mut self, prompt: &[u32], max_tokens: usize) -> Result<Vec<u32>, String> {
         let n = max_tokens.min(self.max_tokens).max(1);
+        match self.image.take() {
+            Some((nx, ny, rows)) => {
+                let at = prompt.iter().position(|&t| t == IMAGE_PAD).ok_or("no image cells in the prompt")?;
+                self.sess.set_image(at, nx, ny, &rows).map_err(|e| e.to_string())?
+            }
+            // a stale image must not ride on a raw-id prompt that holds image_pad
+            None => self.sess.clear_image(),
+        }
         self.sess
             .generate(prompt, n, None)
             .map(|g| g.tokens)
@@ -5089,6 +5163,13 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
     fn special(&self, text: &str) -> Option<u32> {
         self.tok.id(text)
+    }
+    fn set_image(&mut self, data: &[u8]) -> Result<usize, String> {
+        let v = self.vision.as_ref().ok_or("image input is off (start the server with --mmproj)")?;
+        let img = v.encode(data).map_err(|e| format!("{e:#}"))?;
+        let n = img.0 * img.1;
+        self.image = Some(img);
+        Ok(n)
     }
 }
 
@@ -5143,11 +5224,31 @@ fn serve_http(a: ServeArgs) -> Result<()> {
         tok.eos
     );
     let name = "breccia".to_string();
+    let vision = match a.mmproj {
+        None => None,
+        Some(mmproj) => {
+            let encoder = a.vision_encoder.map(Into::into).unwrap_or_else(|| {
+                let side = std::env::current_exe().ok().and_then(|e| Some(e.parent()?.join("vision-encode")));
+                side.filter(|p| p.exists()).unwrap_or_else(|| "vision-encode".into())
+            });
+            let model = breccia_format::expand_glob(&a.gguf)?.into_iter().next().context("no model shard")?;
+            println!("vision   {mmproj} via {} (CPU, <= {} tokens)", encoder.display(), a.image_tokens);
+            Some(Vision {
+                encoder,
+                mmproj,
+                model,
+                max_tokens: a.image_tokens,
+                dir: std::env::temp_dir().join(format!("breccia-vision-{}", std::process::id())),
+            })
+        }
+    };
     let backend = EngineBackend {
         sess: &mut sess,
         tok,
         name,
         max_tokens: a.max_tokens,
+        vision,
+        image: None,
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))

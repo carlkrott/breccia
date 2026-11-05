@@ -52,3 +52,22 @@ f16 agrees no longer than q6 -> q6 KV costs no vision fidelity here; the gap vs 
 (llama.cpp CPU fed the same dump reproduces the server exactly). Colours checked against img1024.png: pink/salmon
 alpenglow on the peaks, blue sky, painterly look -> Breccia's "pink and orange alpenglow ... cool blue sky" is right.
 Decode 448: 16.0 tok/s, 1024: 25.2 tok/s (single runs, not ABBA; not a speed claim).
+
+## Stage 2: `breccia serve` takes images (2026-11-05)
+
+`breccia serve --mmproj <mmproj.gguf> [--vision-encoder BIN] [--image-tokens 2048]`. Chat `image_url` parts
+(`data:<mime>;base64,...` only, one image per request, 64 MiB body cap) become
+`<|vision_start|><|image_pad|>x(nx*ny)<|vision_end|>` in place; the CPU sidecar (`vision-encode`, next to the
+binary or on PATH, VE_THREADS default 30) encodes per request with min 1024 / max 2048 tokens; usage counts the
+image cells. A request without an image clears any previous one. Without `--mmproj` image parts are a 400.
+
+Token budget on CPU (img2048.png = 2560x1440 wallpaper at 2048^2, 30 threads, warm): 2025 tok 7.9 s, 4096 tok 34 s
+(over the 10 s limit -> 2048 max). 16 threads: 2025 tok 9.8 s.
+
+Live (default dual devices, q6 KV, ctx 4096, scripts vis-serve.sh):
+| image | grid | encode | request | prompt tok | answer |
+|---|---|---|---|---|---|
+| 448^2 (lifted to min) | 32x32 | 3.14 s | 36.6 s (first request, warm-up) | 1041 | "...serene, misty mountain landscape at dawn or dusk, with snow-capped peaks glowing softly in alpenglow above a dense, dark coniferous forest under a cool blue sky." |
+| 1024^2 | 32x32 | 3.25 s | 12.9 s | 1041 | "...serene, painterly mountain landscape at twilight ... soft pink and orange alpenglow against a cool blue sky..." (= Stage 1 CLI) |
+| 2048^2 | 45x45 | 8.72 s | 22.8 s | 2042 | "...serene, stylized mountain landscape at twilight or dawn ... soft pink and orange alpenglow ... dark coniferous forest silhouetted..." |
+| text after | - | - | 1.7 s | 14 | normal thinking reply (image cleared) |

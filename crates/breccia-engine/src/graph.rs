@@ -2135,7 +2135,8 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
-    fn clear_image(&mut self) {
+    /// Drop the image set by [`Self::set_image`] (also done by `reset`).
+    pub fn clear_image(&mut self) {
         if let Some((_, _, _, buf)) = self.image.take() {
             self.model.devices[self.model.device_of(0)].gpu().destroy_buf(&buf);
         }
