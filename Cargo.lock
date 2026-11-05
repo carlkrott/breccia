@@ -110,6 +110,7 @@ name = "breccia-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "breccia-engine",
  "breccia-flags",
  "breccia-format",
@@ -118,6 +119,7 @@ dependencies = [
  "breccia-server",
  "breccia-vk",
  "clap",
+ "libc",
  "serde",
  "serde_json",
  "tracing",

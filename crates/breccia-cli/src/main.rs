@@ -135,6 +135,12 @@ enum Command {
         /// Image token budget (max; min is 1024 or this, if lower)
         #[arg(long, default_value_t = 2048)]
         image_tokens: usize,
+        /// Encoded-image cache dir (sharded by content hash); default $XDG_CACHE_HOME/breccia/vision
+        #[arg(long, value_name = "DIR")]
+        image_cache: Option<String>,
+        /// Minutes an unused cached image is kept (each hit restarts the clock)
+        #[arg(long, default_value_t = 30)]
+        image_ttl_min: u64,
         /// Resolve and print the backend/device/placement plan, launch nothing
         #[arg(long)]
         dry_run_plan: bool,
@@ -546,6 +552,8 @@ fn run(cli: Cli) -> Result<()> {
             mmproj,
             vision_encoder,
             image_tokens,
+            image_cache,
+            image_ttl_min,
             dry_run_plan,
             args,
         } => {
@@ -563,6 +571,8 @@ fn run(cli: Cli) -> Result<()> {
                     mmproj,
                     vision_encoder,
                     image_tokens,
+                    image_cache,
+                    image_ttl_min,
                 })
             }
         }
@@ -5083,46 +5093,165 @@ struct ServeArgs {
     mmproj: Option<String>,
     vision_encoder: Option<String>,
     image_tokens: usize,
+    image_cache: Option<String>,
+    image_ttl_min: u64,
 }
 
-/// The image encoder sidecar: `vision-encode <mmproj> <model> <image> <prefix> <max_tokens> cpu`.
+/// The image encoder sidecar: `vision-encode <mmproj> <model> <image> <prefix> <max_tokens> cpu`,
+/// behind a disk cache of its output: `<cache>/<2 hex>/<64 hex>.{f32,pos}`, keyed by
+/// blake3 of the image bytes + mmproj identity + token budget. An entry unused for
+/// `ttl` is pruned (a hit refreshes it); the OS page cache is the hot tier.
 struct Vision {
     encoder: std::path::PathBuf,
     mmproj: String,
     model: std::path::PathBuf,
     max_tokens: usize,
-    dir: std::path::PathBuf,
+    n_embd: usize,
+    cache: std::path::PathBuf,
+    ttl: std::time::Duration,
+    salt: String,
 }
 
+/// shortcut: fixed size cap (~190 images at 2048 tokens), make it a flag if that is too small
+const IMAGE_CACHE_CAP: u64 = 4 << 30;
+
 impl Vision {
-    /// Encode one image file's bytes on the CPU -> `(nx, ny, rows)`.
+    fn new(
+        encoder: std::path::PathBuf,
+        mmproj: String,
+        model: std::path::PathBuf,
+        max_tokens: usize,
+        n_embd: usize,
+        cache: std::path::PathBuf,
+        ttl: std::time::Duration,
+    ) -> Result<Self> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700)
+            .create(&cache)
+            .with_context(|| format!("creating {}", cache.display()))?;
+        // owner-only: someone else's dir (or a symlink to one) is refused
+        let meta = std::fs::symlink_metadata(&cache)?;
+        anyhow::ensure!(
+            meta.is_dir() && meta.uid() == unsafe { libc::geteuid() },
+            "{} is not a directory owned by this user",
+            cache.display()
+        );
+        if meta.mode() & 0o077 != 0 {
+            std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let mm = std::fs::metadata(&mmproj).with_context(|| mmproj.clone())?;
+        let salt = format!("{mmproj}\0{}\0{:?}\0{}\0{max_tokens}", mm.len(), mm.modified()?, max_tokens.min(1024));
+        let v = Self { encoder, mmproj, model, max_tokens, n_embd, cache, ttl, salt };
+        v.prune();
+        Ok(v)
+    }
+
+    /// One image file's bytes -> `(nx, ny, rows)`: from the cache, else encoded on the CPU.
     fn encode(&self, data: &[u8]) -> Result<(usize, usize, Vec<f32>)> {
-        let img = self.dir.join("image");
-        let prefix = self.dir.join("embd");
-        std::fs::write(&img, data)?;
         let t = std::time::Instant::now();
+        let key = blake3::Hasher::new().update(self.salt.as_bytes()).update(data).finalize().to_hex();
+        let shard = self.cache.join(&key[..2]);
+        let entry = shard.join(key.as_str()).to_string_lossy().into_owned();
+        if let Some(img) = self.hit(&entry) {
+            println!("image    {}x{} from cache {} in {:.2} s", img.0, img.1, &key[..12], t.elapsed().as_secs_f64());
+            return Ok(img);
+        }
+        std::os::unix::fs::DirBuilderExt::mode(std::fs::DirBuilder::new().recursive(true), 0o700).create(&shard)?;
+        let tmp = shard.join(format!(".tmp-{}-{key}", std::process::id())).to_string_lossy().into_owned();
+        let img = format!("{tmp}.img");
+        std::fs::write(&img, data)?;
         let out = std::process::Command::new(&self.encoder)
-            .args([self.mmproj.as_ref(), self.model.as_os_str(), img.as_os_str(), prefix.as_os_str()])
+            .args([self.mmproj.as_ref(), self.model.as_os_str(), img.as_ref(), tmp.as_ref()])
             .args([self.max_tokens.to_string(), "cpu".into()])
             .env("VE_MIN_TOKENS", self.max_tokens.min(1024).to_string())
             .env_remove("VE_BENCH")
             .env("VE_THREADS", std::env::var("VE_THREADS").unwrap_or("30".into()))
             .output()
-            .with_context(|| format!("running {}", self.encoder.display()))?;
-        anyhow::ensure!(
-            out.status.success(),
-            "image encoder failed ({}): {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).lines().rev().take(3).collect::<Vec<_>>().join(" | ")
-        );
-        let p = prefix.to_string_lossy();
-        let img = load_image_dump(&p);
-        for f in [self.dir.join("image"), format!("{p}.f32").into(), format!("{p}.pos").into()] {
-            let _ = std::fs::remove_file(f);
+            .with_context(|| format!("running {}", self.encoder.display()));
+        let _ = std::fs::remove_file(&img);
+        let loaded = out.and_then(|out| {
+            anyhow::ensure!(
+                out.status.success(),
+                "image encoder failed ({}): {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).lines().rev().take(3).collect::<Vec<_>>().join(" | ")
+            );
+            load_image_dump(&tmp)
+        });
+        // .pos last: its rename is the commit (a lone .f32 is pruned as a crash leftover)
+        let commit = loaded.is_ok()
+            && std::fs::rename(format!("{tmp}.f32"), format!("{entry}.f32")).is_ok()
+            && std::fs::rename(format!("{tmp}.pos"), format!("{entry}.pos")).is_ok();
+        if !commit {
+            for ext in ["f32", "pos"] {
+                let _ = std::fs::remove_file(format!("{tmp}.{ext}"));
+            }
         }
-        let img = img?;
-        println!("image    {}x{} encoded in {:.2} s", img.0, img.1, t.elapsed().as_secs_f64());
+        let img = loaded?;
+        println!("image    {}x{} encoded in {:.2} s (cached {})", img.0, img.1, t.elapsed().as_secs_f64(), &key[..12]);
+        self.prune();
         Ok(img)
+    }
+
+    /// A live, well-formed entry (its clock restarted); a stale or broken one is removed.
+    fn hit(&self, entry: &str) -> Option<(usize, usize, Vec<f32>)> {
+        let pos = format!("{entry}.pos");
+        let age = std::fs::metadata(&pos).ok()?.modified().ok()?.elapsed().unwrap_or_default();
+        let img = (age < self.ttl).then(|| load_image_dump(entry).ok()).flatten();
+        match img.filter(|(nx, ny, rows)| rows.len() == nx * ny * self.n_embd) {
+            Some(img) => {
+                let _ = std::fs::File::open(&pos).and_then(|f| f.set_modified(std::time::SystemTime::now()));
+                Some(img)
+            }
+            None => {
+                let _ = std::fs::remove_file(&pos);
+                let _ = std::fs::remove_file(format!("{entry}.f32"));
+                None
+            }
+        }
+    }
+
+    /// Drop entries unused for `ttl` and crash leftovers, then the oldest over the cap.
+    fn prune(&self) {
+        let mut live = Vec::new(); // (last use, bytes, entry)
+        let shards = std::fs::read_dir(&self.cache).into_iter().flatten().flatten();
+        for f in shards.flat_map(|d| std::fs::read_dir(d.path()).into_iter().flatten().flatten()) {
+            let path = f.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()).map(str::to_owned) else { continue };
+            let Ok(meta) = f.metadata() else { continue };
+            let age = meta.modified().ok().and_then(|m| m.elapsed().ok()).unwrap_or_default();
+            if name.starts_with(".tmp-") {
+                // this process encodes one at a time, so only another (dead) server's are this old
+                if age > std::time::Duration::from_secs(3600) {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
+            let Some(stem) = name.strip_suffix(".pos") else {
+                if name.ends_with(".f32") && !path.with_extension("pos").exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            };
+            let entry = path.with_file_name(stem);
+            let bytes = meta.len() + std::fs::metadata(path.with_extension("f32")).map(|m| m.len()).unwrap_or(0);
+            if age >= self.ttl {
+                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(path.with_extension("f32"));
+            } else {
+                live.push((meta.modified().ok(), bytes, entry));
+            }
+        }
+        live.sort();
+        let mut total: u64 = live.iter().map(|e| e.1).sum();
+        for (_, bytes, entry) in live {
+            if total <= IMAGE_CACHE_CAP {
+                break;
+            }
+            let _ = std::fs::remove_file(entry.with_extension("pos"));
+            let _ = std::fs::remove_file(entry.with_extension("f32"));
+            total -= bytes;
+        }
     }
 }
 
@@ -5133,8 +5262,9 @@ struct EngineBackend<'a, 'm> {
     name: String,
     max_tokens: usize,
     vision: Option<Vision>,
-    /// encoded by `set_image`, consumed by the next `complete`
-    image: Option<(usize, usize, Vec<f32>)>,
+    ctx: usize,
+    /// encoded by `set_image` in prompt order, consumed by the next `complete`
+    images: Vec<(usize, usize, Vec<f32>)>,
 }
 
 impl breccia_server::Backend for EngineBackend<'_, '_> {
@@ -5149,13 +5279,27 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
     fn complete(&mut self, prompt: &[u32], max_tokens: usize) -> Result<Vec<u32>, String> {
         let n = max_tokens.min(self.max_tokens).max(1);
-        match self.image.take() {
-            Some((nx, ny, rows)) => {
-                let at = prompt.iter().position(|&t| t == IMAGE_PAD).ok_or("no image cells in the prompt")?;
-                self.sess.set_image(at, nx, ny, &rows).map_err(|e| e.to_string())?
+        let images = std::mem::take(&mut self.images);
+        // runs of image_pad, in order: (cell0, len)
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        for (i, &t) in prompt.iter().enumerate() {
+            match runs.last_mut() {
+                _ if t != IMAGE_PAD => {}
+                Some((c0, n)) if *c0 + *n == i => *n += 1,
+                _ => runs.push((i, 1)),
             }
-            // a stale image must not ride on a raw-id prompt that holds image_pad
-            None => self.sess.clear_image(),
+        }
+        if runs.is_empty() {
+            // a text prompt; images left by a failed request are dropped
+            self.sess.clear_image();
+        } else {
+            let fits = runs.len() == images.len() && runs.iter().zip(&images).all(|(r, i)| r.1 == i.0 * i.1);
+            if !fits {
+                self.sess.clear_image();
+                return Err(format!("{} image_pad run(s) in the prompt for {} image(s)", runs.len(), images.len()));
+            }
+            let spans: Vec<_> = runs.iter().zip(&images).map(|(r, i)| (r.0, i.0, i.1, &i.2[..])).collect();
+            self.sess.set_images(&spans).map_err(|e| e.to_string())?;
         }
         self.sess
             .generate(prompt, n, None)
@@ -5168,12 +5312,18 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn special(&self, text: &str) -> Option<u32> {
         self.tok.id(text)
     }
-    fn set_image(&mut self, data: &[u8]) -> Result<usize, String> {
+    fn set_image(&mut self, index: usize, data: &[u8]) -> Result<usize, String> {
+        if index == 0 {
+            self.images.clear();
+        }
         let v = self.vision.as_ref().ok_or("image input is off (start the server with --mmproj)")?;
         let img = v.encode(data).map_err(|e| format!("{e:#}"))?;
         let n = img.0 * img.1;
-        self.image = Some(img);
+        self.images.push(img);
         Ok(n)
+    }
+    fn context(&self) -> Option<usize> {
+        Some(self.ctx)
     }
 }
 
@@ -5228,6 +5378,7 @@ fn serve_http(a: ServeArgs) -> Result<()> {
         tok.eos
     );
     let name = "breccia".to_string();
+    let n_embd = model.cfg.n_embd;
     let vision = match a.mmproj {
         None => None,
         Some(mmproj) => {
@@ -5237,18 +5388,15 @@ fn serve_http(a: ServeArgs) -> Result<()> {
             });
             let model = breccia_format::expand_glob(&a.gguf)?.into_iter().next().context("no model shard")?;
             println!("vision   {mmproj} via {} (CPU, <= {} tokens)", encoder.display(), a.image_tokens);
-            // owner-only and new: a pre-made (or symlinked) dir in a shared /tmp is refused
-            let dir = std::env::temp_dir().join(format!("breccia-vision-{}", std::process::id()));
-            std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
-                .create(&dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
-            Some(Vision {
-                encoder,
-                mmproj,
-                model,
-                max_tokens: a.image_tokens,
-                dir,
-            })
+            let cache = a.image_cache.map(Into::into).unwrap_or_else(|| {
+                let base = std::env::var_os("XDG_CACHE_HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"));
+                base.join("breccia/vision")
+            });
+            let ttl = std::time::Duration::from_secs(a.image_ttl_min * 60);
+            println!("image cache {} (unused entries kept {} min)", cache.display(), a.image_ttl_min);
+            Some(Vision::new(encoder, mmproj, model, a.image_tokens, n_embd, cache, ttl)?)
         }
     };
     let backend = EngineBackend {
@@ -5257,8 +5405,63 @@ fn serve_http(a: ServeArgs) -> Result<()> {
         name,
         max_tokens: a.max_tokens,
         vision,
-        image: None,
+        ctx: a.ctx,
+        images: Vec::new(),
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))
+}
+
+#[cfg(test)]
+mod image_cache_tests {
+    use super::Vision;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn second_encode_is_a_cache_hit_and_expired_entries_go() {
+        let dir = std::env::temp_dir().join(format!("breccia-imgcache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // fake encoder: a 2x1 grid of 4-wide rows, counting its runs
+        let enc = dir.join("enc.sh");
+        let runs = dir.join("runs");
+        std::fs::write(
+            &enc,
+            format!("#!/bin/sh\necho x >> {}\nprintf '0 0 0\\n0 1 0\\n' > \"$4.pos\"\nhead -c 32 /dev/zero > \"$4.f32\"\n", runs.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&enc, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mmproj = dir.join("mmproj.gguf");
+        std::fs::write(&mmproj, b"mm").unwrap();
+        let cache = dir.join("cache");
+        let ttl = std::time::Duration::from_secs(60);
+        let v = Vision::new(enc, mmproj.to_string_lossy().into(), "m".into(), 2048, 4, cache.clone(), ttl).unwrap();
+        let n_runs = || std::fs::read_to_string(&runs).map(|s| s.lines().count()).unwrap_or(0);
+
+        assert_eq!(v.encode(b"img A").unwrap().0, 2);
+        assert_eq!(v.encode(b"img A").unwrap(), (2, 1, vec![0.0; 8]));
+        assert_eq!(n_runs(), 1, "the resend must come from the cache");
+        v.encode(b"img B").unwrap();
+        assert_eq!(n_runs(), 2);
+        let pos: Vec<_> = walk(&cache).into_iter().filter(|p| p.extension().is_some_and(|e| e == "pos")).collect();
+        assert_eq!(pos.len(), 2);
+        assert!(walk(&cache).iter().all(|p| !p.to_string_lossy().contains(".tmp-")));
+
+        // A unused past the TTL is pruned; B (just used) stays
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let a = pos[0].clone();
+        std::fs::File::open(&a).unwrap().set_modified(old).unwrap();
+        v.prune();
+        assert_eq!(walk(&cache).len(), 2, "one entry = .f32 + .pos left");
+        assert!(!a.exists() && !a.with_extension("f32").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn walk(d: &std::path::Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .flat_map(|e| std::fs::read_dir(e.path()).unwrap().flatten().map(|f| f.path()))
+            .collect()
+    }
 }

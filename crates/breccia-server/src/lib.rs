@@ -37,11 +37,16 @@ pub trait Backend {
         let _ = text;
         None
     }
-    /// Encode one image (the raw file bytes) for the next `complete`; returns how
-    /// many `<|image_pad|>` cells it fills. The prompt then holds that many pads.
-    fn set_image(&mut self, data: &[u8]) -> Result<usize, String> {
-        let _ = data;
+    /// Encode the request's image number `index` (the raw file bytes) for the next
+    /// `complete`; returns how many `<|image_pad|>` cells it fills. The prompt then
+    /// holds that many pads per image, in order. Index 0 drops earlier ones.
+    fn set_image(&mut self, index: usize, data: &[u8]) -> Result<usize, String> {
+        let _ = (index, data);
         Err("this server takes no image input (start it with --mmproj)".into())
+    }
+    /// Prompt + generation cells the backend holds, if bounded.
+    fn context(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -190,7 +195,7 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
         .unwrap_or(128) as usize;
 
     let prompt_ids = if chat {
-        match chat_prompt(&req, b).and_then(|(ids, img)| with_image(ids, img, b)) {
+        match chat_prompt(&req, b).and_then(|(ids, imgs)| with_images(ids, imgs, b)) {
             Ok(ids) => ids,
             Err(e) => return Response::json(400, json!({"error": {"message": e}})),
         }
@@ -267,19 +272,40 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
     }
 }
 
-/// Encode the request's image (if any) and widen its one `<|image_pad|>` to the
-/// image's cell count.
-fn with_image<B: Backend>(
-    mut ids: Vec<u32>,
-    image: Option<Vec<u8>>,
-    b: &mut B,
-) -> Result<Vec<u32>, String> {
-    let Some(data) = image else { return Ok(ids) };
+/// Encode the request's images one at a time (in prompt order) and widen each
+/// one's `<|image_pad|>` to its cell count. Stops at the first image that would
+/// overflow the context, before encoding the rest.
+fn with_images<B: Backend>(ids: Vec<u32>, images: Vec<Vec<u8>>, b: &mut B) -> Result<Vec<u32>, String> {
+    if images.is_empty() {
+        return Ok(ids);
+    }
     let pad = b.special("<|image_pad|>").ok_or("the model has no <|image_pad|> token")?;
-    let at = ids.iter().position(|&t| t == pad).ok_or("no image cell in the prompt")?;
-    let n = b.set_image(&data)?;
-    ids.splice(at..at + 1, std::iter::repeat_n(pad, n));
-    Ok(ids)
+    if ids.iter().filter(|&&t| t == pad).count() != images.len() {
+        return Err("the text holds a literal <|image_pad|>".into());
+    }
+    let mut total = ids.len() - images.len(); // text tokens
+    let mut cells = Vec::with_capacity(images.len());
+    for (i, data) in images.iter().enumerate() {
+        let n = b.set_image(i, data)?;
+        total += n;
+        if let Some(ctx) = b.context().filter(|&c| total >= c) {
+            return Err(format!(
+                "image {} of {} brings the prompt to {total} tokens, over the {ctx}-token context",
+                i + 1,
+                images.len()
+            ));
+        }
+        cells.push(n);
+    }
+    let mut out = Vec::with_capacity(total);
+    let mut cells = cells.into_iter();
+    for t in ids {
+        match (t == pad).then(|| cells.next()).flatten() {
+            Some(n) => out.extend(std::iter::repeat_n(pad, n)),
+            None => out.push(t),
+        }
+    }
+    Ok(out)
 }
 
 /// Images arrive as `data:<mime>;base64,<...>` URLs (no remote fetch).
@@ -324,14 +350,14 @@ pub fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 /// id (they are single vocabulary entries, not text). An image part becomes
 /// `<|vision_start|><|image_pad|><|vision_end|>` in place (one image per request);
 /// its bytes are returned for [`Backend::set_image`].
-fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<(Vec<u32>, Option<Vec<u8>>), String> {
+fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<(Vec<u32>, Vec<Vec<u8>>), String> {
     let Some(Value::Array(msgs)) = req.get("messages") else {
         return Err("messages must be an array".into());
     };
     let im_start = b.special("<|im_start|>");
     let im_end = b.special("<|im_end|>");
     let mut out = Vec::new();
-    let mut image = None;
+    let mut images = Vec::new();
     for m in msgs {
         let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
         if let Some(s) = im_start {
@@ -349,12 +375,9 @@ fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<(Vec<u32>, Option<Vec<u
                             text += p.get("text").and_then(|t| t.as_str()).unwrap_or("")
                         }
                         Some("image_url") => {
-                            if image.is_some() {
-                                return Err("one image per request".into());
-                            }
                             let ids = ["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
                                 .map(|t| b.special(t).ok_or("the model has no vision tokens"));
-                            image = Some(image_bytes(p)?);
+                            images.push(image_bytes(p)?);
                             out.extend(b.tokenize(&std::mem::take(&mut text))?);
                             for id in ids {
                                 out.push(id?);
@@ -381,7 +404,7 @@ fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<(Vec<u32>, Option<Vec<u
         out.push(s);
     }
     out.extend(b.tokenize("assistant\n")?);
-    Ok((out, image))
+    Ok((out, images))
 }
 
 fn now_secs() -> u64 {

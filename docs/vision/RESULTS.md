@@ -79,3 +79,31 @@ vision/ref-wide.sh): same 1997 prompt tokens, "A serene twilight scene features 
 pink and orange alpenglow against a deep blue sky, framed by a dark, silhouetted forest in the foreground." -> x/y
 layout right for nx != ny. Encoder temp dir: $TMPDIR/breccia-vision-<pid>, created 0700 at startup (existing = fatal),
 files removed after each encode.
+
+## Stage 3: multi-image requests + on-disk image cache (2026-11-05)
+
+`breccia serve ... [--image-cache DIR] [--image-ttl-min 30]`. Default dir `$XDG_CACHE_HOME|~/.cache/breccia/vision`
+(created 0700, must be owned by the server user). Each encoded image is stored as `<key[..2]>/<key>.f32|.pos`, key =
+blake3(mmproj path+size+mtime, min/max tokens, image bytes) -> a resent image skips the CPU encoder. A cache hit refreshes
+the entry's TTL (sliding 30 min). Entries unused for the TTL, orphan files and stale `.tmp-*` files are pruned at startup and
+after each encode; total size capped at 4 GiB (oldest first). Writes go to `.tmp-<pid>-<key>` files, then a rename.
+
+Several `image_url` parts per request: encoded one at a time, in order. Each expands its own `<|image_pad|>` run with
+its own M-RoPE span. After each image the prompt length is checked against `--ctx`; going over stops with a 400
+naming the image. The pad-run count must match the image count. A request without images drops earlier ones.
+
+Live (ctx 4096, q6 KV, dual default, script vis-multi.sh):
+| request | time | prompt tok | result |
+|---|---|---|---|
+| red circle + blue triangle (cold, first request) | 44.5 s | 2079 | "Red circle / Blue triangle" (2 encodes 3.3 + 3.1 s) |
+| same resend | 11.7 s | 2079 | same; both images "from cache in 0.00 s" |
+| swapped order | 13.3 s | 2079 | "Blue triangle / Red circle" (order follows the request) |
+| 3 x 2048^2 | 9.0 s | - | 400 "image 3 of 3 brings the prompt to 6108 tokens, over the 4096-token context" |
+| 2560x1440 wallpaper + red circle | 24.2 s | 3027 | image 1 alpenglow landscape, image 2 "solid red circle ... plain white background" |
+| text after | 1.6 s | 14 | normal reply |
+Cache dir after: 4 entries (10 MiB per 32x32, ~20 MiB per ~2k-token image), dirs 0700, no `.tmp` left.
+Unit tests: server image order + ctx stop (http.rs), cache hit / expiry prune (breccia-cli image_cache_tests).
+
+EmbeddingGemma-2 (MSI :8141) not used: the exact content hash is the right key for reuse; a near-duplicate image
+cannot reuse rows (they depend on the exact pixels and grid); the MSI serves the text GGUF without an mmproj.
+Not done: reusing the prefill (KV) state for a resent image prompt; prefill is still recomputed every request.

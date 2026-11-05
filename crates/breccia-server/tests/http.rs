@@ -150,7 +150,7 @@ fn chat_rejects_image_parts_and_joins_text_parts() {
 
 /// Vision backend: specials for the image tokens, records what it was handed.
 struct VisionMock {
-    got: Vec<u8>,
+    got: Vec<Vec<u8>>,
     prompt: Vec<u32>,
 }
 
@@ -183,9 +183,15 @@ impl Backend for VisionMock {
             _ => None,
         }
     }
-    fn set_image(&mut self, data: &[u8]) -> Result<usize, String> {
-        self.got = data.to_vec();
-        Ok(6)
+    fn set_image(&mut self, index: usize, data: &[u8]) -> Result<usize, String> {
+        if index == 0 {
+            self.got.clear();
+        }
+        self.got.push(data.to_vec());
+        Ok(6 - 2 * index) // 6, 4, 2, ...
+    }
+    fn context(&self) -> Option<usize> {
+        Some(40)
     }
 }
 
@@ -205,7 +211,7 @@ fn chat_image_part_expands_pads_in_place() {
         &mut m,
     );
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    assert_eq!(m.got, b"hello!!");
+    assert_eq!(m.got, [b"hello!!"]);
     let user: Vec<u32> = b"user\n".iter().map(|&b| b as u32 + 1).collect();
     let mut want = user.clone();
     want.push(VS);
@@ -217,13 +223,9 @@ fn chat_image_part_expands_pads_in_place() {
     // want + "\n" + "assistant\n" (no im_start/im_end specials here)
     assert_eq!(v["usage"]["prompt_tokens"], want.len() + 11);
 
-    // remote URLs and a second image are refused
+    // remote URLs are refused
     for content in [
         serde_json::json!([{"type": "image_url", "image_url": {"url": "https://x/y.png"}}]),
-        serde_json::json!([
-            {"type": "image_url", "image_url": "data:image/png;base64,AA=="},
-            {"type": "image_url", "image_url": "data:image/png;base64,AA=="}
-        ]),
     ] {
         let r = dispatch(
             "POST",
@@ -233,6 +235,49 @@ fn chat_image_part_expands_pads_in_place() {
         );
         assert_eq!(r.status, 400);
     }
+}
+
+#[test]
+fn chat_images_encode_in_order_and_stop_at_the_context() {
+    let mut m = VisionMock { got: vec![], prompt: vec![] };
+    let img = |b64: &str| serde_json::json!({"type": "image_url", "image_url": format!("data:image/png;base64,{b64}")});
+    // two images in two messages: 6 then 4 cells, each at its own pad
+    let r = dispatch(
+        "POST",
+        "/v1/chat/completions",
+        &body(serde_json::json!({"messages": [
+            {"role": "user", "content": [img("QQ=="), {"type": "text", "text": "a"}]},
+            {"role": "user", "content": [img("Qg==")]}
+        ]})),
+        &mut m,
+    );
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(m.got, [b"A", b"B"]);
+    let t = |s: &[u8]| s.iter().map(|&b| b as u32 + 1).collect::<Vec<u32>>();
+    let mut want = t(b"user\n");
+    want.push(VS);
+    want.extend([PAD; 6]);
+    want.push(VE);
+    want.extend(t(b"a\nuser\n"));
+    want.push(VS);
+    want.extend([PAD; 4]);
+    want.push(VE);
+    assert_eq!(&m.prompt[..want.len()], &want[..]);
+
+    // ctx 40: text 33 + 6 fits, + 4 does not -> 400 before the third encode
+    m.prompt.clear();
+    let r = dispatch(
+        "POST",
+        "/v1/chat/completions",
+        &body(serde_json::json!({"messages": [{"role": "user", "content": [
+            img("QQ=="), img("Qg=="), img("Qw=="), {"type": "text", "text": "hello world"}
+        ]}]})),
+        &mut m,
+    );
+    assert_eq!(r.status, 400);
+    assert!(String::from_utf8_lossy(&r.body).contains("image 2 of 3"), "{}", String::from_utf8_lossy(&r.body));
+    assert_eq!(m.got, [b"A", b"B"]);
+    assert!(m.prompt.is_empty());
 }
 
 #[test]

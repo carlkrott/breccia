@@ -742,10 +742,10 @@ pub struct Session<'m> {
     pf_weights: Vec<Vec<f32>>,
     pf_mixed: Vec<f32>,
     pf_toks: Vec<u32>,
-    /// Image embedding rows for the prompt (`set_image`): cells `cell0..cell0+n`
-    /// take `rows[i]` (f32 `[n, n_embd]` on the first block's device) instead of
-    /// `token_embd`; the prompt carries the PLE stand-in token at those cells.
-    image: Option<(usize, usize, usize, Buf)>, // (cell0, nx, ny, rows)
+    /// Image embedding rows for the prompt (`set_images`), sorted by cell: cells
+    /// `cell0..cell0+n` take `rows[i]` (f32 `[n, n_embd]` on the first block's
+    /// device) instead of `token_embd`; the prompt carries the PLE stand-in token there.
+    image: Vec<(usize, usize, usize, Buf)>, // (cell0, nx, ny, rows)
     /// The merged pass's own counters (reset per measured window with the rest):
     /// host wall seconds of the expert GEMMs and of the fan-in, the dispatches
     /// they recorded, the distinct experts they touched and the expert bytes they
@@ -1348,7 +1348,7 @@ impl<'m> Session<'m> {
             pf_weights: Vec::new(),
             pf_mixed: Vec::new(),
             pf_toks: Vec::new(),
-            image: None,
+            image: Vec::new(),
             pf_gemm_s: 0.0,
             pf_fanin_s: 0.0,
             pf_stream_bytes: 0,
@@ -2109,35 +2109,47 @@ impl<'m> Session<'m> {
     /// lay out the IMRoPE positions for it (every QSA layer). The prompt's tokens
     /// at those cells must be the PLE stand-in (`IMAGE_PLE_TOKEN`). `reset` undoes it.
     pub fn set_image(&mut self, cell0: usize, nx: usize, ny: usize, rows: &[f32]) -> Result<()> {
+        self.set_images(&[(cell0, nx, ny, rows)])
+    }
+
+    /// [`Self::set_image`] for several images at once, sorted by `cell0` and not
+    /// overlapping; replaces any earlier ones.
+    pub fn set_images(&mut self, imgs: &[(usize, usize, usize, &[f32])]) -> Result<()> {
         let m = self.model;
         let n_embd = m.cfg.n_embd;
-        let n = nx * ny;
-        if n == 0 || rows.len() != n * n_embd {
-            bail!("image rows: {} floats for a {nx}x{ny} grid of {n_embd}-wide rows", rows.len());
+        for &(_, nx, ny, rows) in imgs {
+            let n = nx * ny;
+            if n == 0 || rows.len() != n * n_embd {
+                bail!("image rows: {} floats for a {nx}x{ny} grid of {n_embd}-wide rows", rows.len());
+            }
         }
         self.flush()?;
         self.clear_image();
-        self.image_positions(cell0, nx, ny)?;
         let gpu = m.devices[m.device_of(0)].gpu();
-        let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
-        self.image = Some((cell0, nx, ny, breccia_kernels::gemv::upload(gpu, &bytes)?));
-        Ok(())
+        for &(cell0, nx, ny, rows) in imgs {
+            let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+            let buf = breccia_kernels::gemv::upload(gpu, &bytes)?;
+            self.image.push((cell0, nx, ny, buf));
+        }
+        // mrope_triples rejects unsorted or overlapping spans; drop the uploads then
+        self.image_positions().inspect_err(|_| self.clear_image())
     }
 
-    /// The IMRoPE position table of every QSA layer for one image at `cell0`.
-    fn image_positions(&self, cell0: usize, nx: usize, ny: usize) -> Result<()> {
+    /// The IMRoPE position table of every QSA layer for the images held.
+    fn image_positions(&self) -> Result<()> {
         let m = self.model;
+        let spans: Vec<_> = self.image.iter().map(|&(c0, nx, ny, _)| (c0, nx, ny)).collect();
         for b in 0..m.cfg.n_layers {
             if let Some(st) = &self.qsa_state[b] {
-                st.set_image_positions(m.devices[m.device_of(b)].gpu(), &[(cell0, nx, ny)])?;
+                st.set_image_positions(m.devices[m.device_of(b)].gpu(), &spans)?;
             }
         }
         Ok(())
     }
 
-    /// Drop the image set by [`Self::set_image`] (also done by `reset`).
+    /// Drop the images set by [`Self::set_images`] (also done by `reset`).
     pub fn clear_image(&mut self) {
-        if let Some((_, _, _, buf)) = self.image.take() {
+        for (_, _, _, buf) in std::mem::take(&mut self.image) {
             self.model.devices[self.model.device_of(0)].gpu().destroy_buf(&buf);
         }
     }
@@ -2858,8 +2870,8 @@ impl<'m> Session<'m> {
             let v = &self.venues[dev];
             let img = self
                 .image
-                .as_ref()
-                .filter(|(c0, nx, ny, _)| (*c0..c0 + nx * ny).contains(&(pos0 + i)));
+                .iter()
+                .find(|(c0, nx, ny, _)| (*c0..c0 + nx * ny).contains(&(pos0 + i)));
             if let Some((c0, _, _, buf)) = img {
                 // image row: the encoder's embedding replicated over the hc streams, like a token row
                 let row = (mc.n_embd * 4) as u64;
@@ -6556,18 +6568,21 @@ impl<'m> Session<'m> {
         if prompt.is_empty() {
             bail!("the prompt is empty: the n-gram window and the first token both need history");
         }
-        // reset() undoes set_image; a generate() over the image's prompt keeps it
-        // (only when the prompt still holds it: a --then prompt is text)
-        let mut img = self.image.take();
-        if img.as_ref().is_some_and(|i| prompt.get(i.0) != Some(&IMAGE_PLE_TOKEN)) {
-            self.image = img.take(); // reset() frees it
+        // reset() undoes set_images; a generate() over the images' prompt keeps them
+        // (only when the prompt still holds every one: a --then prompt is text)
+        let held = |&(c0, nx, ny, _): &(usize, usize, usize, Buf)| {
+            prompt.get(c0..c0 + nx * ny).is_some_and(|c| c.iter().all(|&t| t == IMAGE_PLE_TOKEN))
+        };
+        let mut img = std::mem::take(&mut self.image);
+        if !img.iter().all(held) {
+            self.image = std::mem::take(&mut img); // reset() frees them
         }
         let r = self.reset();
         self.image = img;
         r?;
-        if let Some((c0, nx, ny, _)) = self.image {
+        if !self.image.is_empty() {
             anyhow::ensure!(self.prefill_chunk > 0, "an image prompt needs chunked prefill");
-            self.image_positions(c0, nx, ny)?;
+            self.image_positions()?;
         }
         let mut trace = debug;
         let mut pos = 0usize;
