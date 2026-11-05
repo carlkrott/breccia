@@ -1426,12 +1426,14 @@ fn profile_kernels(path: &std::path::Path, model: &str, only: &[String]) -> Resu
 /// The prefill chunk one card runs fastest at. Each candidate gets a fresh model
 /// and session (workspaces are sized at `Session::new`) under the `auto` arena
 /// with that chunk's scratch reserve, so a bigger chunk also pays for the expert
-/// blocks it pushes out of VRAM. A candidate must keep the 512 arm's top-1 (KL
+/// blocks it pushes out of VRAM. A candidate must keep the first arm's top-1 (KL
 /// report-only) and beat the smaller winner by more than 2 % to replace it.
+/// Measured on an 8k prompt: RX ABBA chunk 4096 vs 2048 = 556 vs 539 tok/s (+3 %),
+/// which a 2100-token sweep capped at 2048 could never pick.
 fn profile_prefill_chunk(path: &std::path::Path, model_glob: &str, addr: &str) -> Result<usize> {
-    const CANDIDATES: [usize; 3] = [512, 1024, 2048];
-    // Planner splits evenly up to 1.5x the target: 3x700 / 2x1050 / 1x2100.
-    const TOKENS: usize = 2100;
+    const CANDIDATES: [usize; 3] = [1024, 2048, 4096];
+    // Planner splits evenly up to 1.5x the target: 8x1012 / 4x2025 / 2x4050.
+    const TOKENS: usize = 8100;
     let mut base: Option<Vec<f32>> = None;
     let mut best = (0usize, f64::MAX);
     for chunk in CANDIDATES {
@@ -1477,7 +1479,7 @@ fn profile_prefill_chunk(path: &std::path::Path, model_glob: &str, addr: &str) -
         feed_prompt(&mut sess, &prompt, chunk)?; // warm-up: pipelines, workspaces
         let mut ms = f64::MAX;
         let mut logits = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..3 {
             let t = std::time::Instant::now();
             logits = feed_prompt(&mut sess, &prompt, chunk)?;
             ms = ms.min(t.elapsed().as_secs_f64() * 1e3 / prompt.len() as f64);
@@ -1489,7 +1491,7 @@ fn profile_prefill_chunk(path: &std::path::Path, model_glob: &str, addr: &str) -
         let ok = same;
         let wins = ok && ms < best.1 * 0.98;
         println!(
-            "  chunk {chunk:>4}: {ms:.2} ms/token, KL vs 512 {kl:.2e}, top-1 {}{}",
+            "  chunk {chunk:>4}: {ms:.2} ms/token, KL vs first {kl:.2e}, top-1 {}{}",
             if same { "same" } else { "DIFFERENT" },
             if wins { " <- best so far" } else { "" }
         );
