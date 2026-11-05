@@ -1,0 +1,178 @@
+#version 450
+//
+// QSA indexer top-k by radix select (upstream strata `block_topk_kernel` rule:
+// radix threshold, ties to the lowest index, ids ascending).
+//
+// Same set and IDS/CNT contract as `qsa_topk.comp` (top `min(topk, visible)`
+// blocks, ties to the lower index, the own block appended when missed), but
+// emitted in ascending block order rather than descending score — the order only
+// changes the attention's fp summation order. Scores are read, never written.
+//
+// One workgroup (256 threads) per token. Every block whose score is above -1e29
+// takes part (the same data-driven rule as the serial kernel: the
+// -1e30 / -inf mask never enters the histogram). Up to 4 passes of 8 bits over an order-preserving uint key; a pass
+// stops early when the chosen bin is taken whole. Emission: each thread owns a
+// contiguous run of blocks, a shared-memory scan gives its output offset (no
+// subgroup ops, so wave32 RDNA and wave64 GCN behave the same).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer Scores { float SC[]; }; // [T, n_blocks]
+layout(std430, binding = 1) writeonly buffer Ids { uint IDS[]; };   // [T, max_ids]
+layout(std430, binding = 2) writeonly buffer Cnt { uint CNT[]; };   // [T]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_blocks;
+    uint topk_blocks;
+    uint max_ids;
+    int pos0;
+    uint dense; // unused (the dense path stays on qsa_topk.comp)
+} pc;
+
+#define WG_X_MAX 65535u
+
+shared uint hist[256];
+shared uvec2 s_scan[256];
+shared uint s_prefix;
+shared uint s_mask;
+shared uint s_left;
+shared uint s_done;
+shared uint s_own_found;
+shared uint s_want;
+
+uint key_of(float s) {
+    uint u = floatBitsToUint(s);
+    return (u & 0x80000000u) != 0u ? ~u : (u | 0x80000000u);
+}
+
+void main() {
+    uint t = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = t * pc.n_blocks;
+    int pos = pc.pos0 + int(t);
+    uint own = uint(pos) / 4u;
+    uint n_vis = pc.n_blocks; // liveness comes from the scores, as in the serial kernel
+
+    if (tid == 0u) {
+        s_prefix = 0u;
+        s_mask = 0u;
+        s_done = 0u;
+        s_own_found = 0u;
+    }
+    barrier();
+
+    // Find the want-th largest key: prefix/mask cover the decided high bits,
+    // `left` = how many of the keys matching the prefix are still to take.
+    for (uint pass = 0u; pass < 4u; ++pass) {
+        if (s_done != 0u) {
+            break;
+        }
+        uint shift = 24u - 8u * pass;
+        uint prefix = s_prefix;
+        uint mask = s_mask;
+        hist[tid] = 0u;
+        barrier();
+        for (uint b = tid; b < n_vis; b += 256u) {
+            float s = SC[base + b];
+            uint k = key_of(s);
+            if (s > -1.0e29 && (k & mask) == prefix) {
+                atomicAdd(hist[(k >> shift) & 255u], 1u);
+            }
+        }
+        barrier();
+        if (tid == 0u && pass == 0u) {
+            uint live = 0u; // pass 0 histograms every live block
+            for (uint i = 0u; i < 256u; ++i) {
+                live += hist[i];
+            }
+            s_want = min(min(pc.topk_blocks, live), pc.max_ids);
+            s_left = s_want;
+        }
+        if (tid == 0u && s_left == 0u) {
+            s_done = 1u;
+        } else if (tid == 0u) {
+            uint left = s_left;
+            uint cum = 0u;
+            uint bin = 0u;
+            for (int i = 255; i >= 0; --i) {
+                uint h = hist[uint(i)];
+                if (cum + h >= left) {
+                    bin = uint(i);
+                    left -= cum;
+                    s_done = (h == left || pass == 3u) ? 1u : 0u;
+                    break;
+                }
+                cum += h;
+            }
+            s_left = left;
+            s_prefix = prefix | (bin << shift);
+            s_mask = mask | (255u << shift);
+        }
+        barrier();
+    }
+
+    uint want = s_want;
+    uint prefix = s_prefix;
+    uint mask = s_mask;
+    uint budget = s_left; // keys equal to the prefix that are taken, lowest index first
+
+    uint per = (n_vis + 255u) / 256u;
+    uint lo = min(tid * per, n_vis);
+    uint hi = min(lo + per, n_vis);
+    uvec2 c = uvec2(0u);
+    if (want > 0u) {
+        for (uint b = lo; b < hi; ++b) {
+            float s = SC[base + b];
+            uint k = key_of(s) & mask;
+            bool live = s > -1.0e29;
+            c += uvec2(live && k > prefix ? 1u : 0u, live && k == prefix ? 1u : 0u);
+        }
+    }
+    s_scan[tid] = c;
+    barrier();
+    for (uint off = 1u; off < 256u; off <<= 1u) {
+        uvec2 v = tid >= off ? s_scan[tid - off] : uvec2(0u);
+        barrier();
+        s_scan[tid] += v;
+        barrier();
+    }
+    uvec2 ex = s_scan[tid] - c;
+
+    if (want > 0u) {
+        uint eq_seen = ex.y;
+        uint out_i = ex.x + min(ex.y, budget);
+        for (uint b = lo; b < hi; ++b) {
+            float s = SC[base + b];
+            if (!(s > -1.0e29)) {
+                continue;
+            }
+            uint k = key_of(s) & mask;
+            bool take = k > prefix;
+            if (k == prefix) {
+                take = eq_seen < budget;
+                eq_seen += 1u;
+            }
+            if (take) {
+                IDS[t * pc.max_ids + out_i] = b;
+                out_i += 1u;
+                if (b == own) {
+                    s_own_found = 1u;
+                }
+            }
+        }
+    }
+    barrier();
+
+    if (tid == 0u) {
+        uint count = want;
+        if (s_own_found == 0u && count < pc.max_ids) {
+            IDS[t * pc.max_ids + count] = own;
+            count += 1u;
+        }
+        CNT[t] = count;
+    }
+}

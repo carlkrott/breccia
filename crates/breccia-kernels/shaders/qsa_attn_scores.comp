@@ -7,8 +7,9 @@
 //
 // # What "selected" means here (and why the sparse path is bounded)
 //
-// `qsa_topk.comp` writes, per token, a list of **4-cell indexer block ids** in
-// descending indexer score, plus the incomplete tail block (always selected).
+// The top-k kernel writes, per token, a list of **4-cell indexer block ids**
+// (radix: ascending id; serial/rank: descending score), plus the incomplete tail
+// block (always selected). Nothing here depends on the order.
 // Slot `r*4 + k` of that list names cell `ids[r]*4 + k`, so one query touches at
 // most `idx_top_k + idx_block - 1 = 2051` cells (spec §10.4, `qsa.hpp:127-136`)
 // no matter how long the cache is. That is the budget the indexer exists for, and

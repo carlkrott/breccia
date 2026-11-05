@@ -183,13 +183,18 @@ fn split_apply(tokens: usize) -> bool {
 /// per row, which wins at 1k-4k (0.76 ms vs the serial kernel's 6.30 ms at 4k) but
 /// costs 268 M compares per row at a 64k cache. `Serial` is k block-wide argmax
 /// passes — O(k * n_blocks) with a sequential dependency of `k` (up to 512) passes.
-/// `Auto` picks `Rank` below [`RANK_TOPK_MAX_BLOCKS`] and `Serial` above; both are
-/// measured, and `BRECCIA_QSA_TOPK=serial|rank` forces one.
+/// `Radix` (`qsa_topk_radix.comp`, upstream strata's radix select) takes the same
+/// set in one O(n) pass per bit-byte: 1024-row chunk at 128k cells, RX 5.8 vs serial
+/// 34.1 us/row/layer, MI50 5.7 vs 91.7; 1 row at 32k RX 66 vs rank 303 us
+/// (`qsa_idx_bench`, 2026-11-05). `Auto` = `Radix`; `BRECCIA_QSA_TOPK=serial|rank`
+/// forces an old kernel (`rank` also sizes the candidate buffer it needs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TopkPath {
     Auto,
     Serial,
     Rank,
+    /// `qsa_topk_radix.comp`: radix select, same set, ids ascending, scores kept.
+    Radix,
 }
 
 impl TopkPath {
@@ -198,6 +203,7 @@ impl TopkPath {
             "auto" => Some(TopkPath::Auto),
             "serial" => Some(TopkPath::Serial),
             "rank" => Some(TopkPath::Rank),
+            "radix" => Some(TopkPath::Radix),
             _ => None,
         }
     }
@@ -207,30 +213,29 @@ impl TopkPath {
             TopkPath::Auto => "auto",
             TopkPath::Serial => "serial",
             TopkPath::Rank => "rank",
+            TopkPath::Radix => "radix",
         }
     }
 }
 
-/// Calls below `GQA_MIN_TOKENS` rows with at most `RANK_TOPK_MAX_BLOCKS` blocks
-/// select with `qsa_topk_rank.comp` (a rank per block, same ids and order as the
-/// serial `qsa_topk.comp`). `BRECCIA_QSA_TOPK_RANK=0` opts out.
-/// Measured crossover (RX 6950 XT, `qsa_topk_paths_by_context`, one dispatch per
-/// call, 1 row): rank 0.15 / 0.31 / 0.97 ms at 1050 / 4097 / 16385 blocks against
-/// serial 0.60 / 1.25 / 3.63 ms — rank is 4x ahead and its O(n^2) only overtakes
-/// the serial kernel's O(k*n) at ~61k blocks (244k cells), so the cap sits at the
-/// full 262144-token cache rather than at 16k blocks, where it used to force the
-/// slower kernel for every context past 64k tokens.
-const RANK_TOPK_MAX_BLOCKS: usize = 65536;
 fn cand_topk() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("BRECCIA_QSA_TOPK_CAND").map_or(true, |v| v != "0"))
 }
 
-fn rank_topk(tokens: usize, n_blocks: usize) -> bool {
+/// Indexer scores with `qsa_idx_score_tiled.comp` (upstream strata's FP32 tiled
+/// GEMM): 1024-row chunk at 128k cells RX 2.8 vs 56.2 us/row/layer, MI50 5.6 vs
+/// 179; max rel diff 6e-7. `BRECCIA_QSA_SCORE=naive` keeps the per-(token, block)
+/// kernel.
+fn tiled_score() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    tokens < GQA_MIN_TOKENS
-        && n_blocks <= RANK_TOPK_MAX_BLOCKS
-        && *ON.get_or_init(|| std::env::var("BRECCIA_QSA_TOPK_RANK").map_or(true, |v| v != "0"))
+    *ON.get_or_init(|| std::env::var("BRECCIA_QSA_SCORE").map_or(true, |v| v != "naive"))
+}
+
+/// The candidate buffer (`tokens x n_blocks` f32, 128 MiB per 1024-row chunk at
+/// 128k cells) is only for the forced rank path.
+fn rank_forced() -> bool {
+    std::env::var("BRECCIA_QSA_TOPK").is_ok_and(|v| v == "rank")
 }
 
 /// Calls of `1..GQA_MIN_TOKENS` rows (decode, speculative verify) score with
@@ -841,6 +846,8 @@ pub struct Qsa<'g> {
     idx_tail: Pipe<'g>,
     idx_pool: Pipe<'g>,
     idx_score: Pipe<'g>,
+    idx_score_tiled: Pipe<'g>,
+    topk_radix: Pipe<'g>,
     topk: Pipe<'g>,
     topk_rank: Pipe<'g>,
     topk_thr: Pipe<'g>,
@@ -957,6 +964,18 @@ impl<'g> Qsa<'g> {
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_topk_cand.spv")),
             5,
             "qsa indexer top-k candidates",
+        )?;
+        let idx_score_tiled = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_idx_score_tiled.spv")),
+            3,
+            "qsa indexer score (tiled)",
+        )?;
+        let topk_radix = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_topk_radix.spv")),
+            3,
+            "qsa indexer top-k (radix)",
         )?;
         let topk_rank = Pipe::new(
             gpu,
@@ -1094,6 +1113,8 @@ impl<'g> Qsa<'g> {
             idx_tail,
             idx_pool,
             idx_score,
+            idx_score_tiled,
+            topk_radix,
             topk,
             topk_rank,
             topk_thr,
@@ -1168,7 +1189,7 @@ impl<'g> Qsa<'g> {
             tokens * max_ids,
             tokens,
             tokens,
-            tokens * n_blocks.max(1),
+            if rank_forced() { tokens * n_blocks.max(1) } else { 1 },
             tokens,
             MODEL_N_HEAD * attn_rows * slots,
             tokens * ATTN_OUT_DIM,
@@ -1483,6 +1504,18 @@ impl<'g> Qsa<'g> {
 
     /// Score every completed block against every token's indexer query.
     pub fn idx_score(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
+        self.idx_score_with(state, ws, pos0, tiled_score())
+    }
+
+    /// [`Self::idx_score`] on a named kernel (tests and A/B): `tiled` =
+    /// `qsa_idx_score_tiled.comp`, else the per-(token, block) kernel.
+    pub fn idx_score_with(
+        &self,
+        state: &QsaState,
+        ws: &QsaWorkspace,
+        pos0: usize,
+        tiled: bool,
+    ) -> Result<()> {
         if ws.n_blocks > state.max_blocks() {
             return Err(anyhow!(
                 "idx_score covers {} blocks but the state holds {} pooled rows",
@@ -1498,6 +1531,14 @@ impl<'g> Qsa<'g> {
             .i(pos0 as i32)
             .u(IDX_BLOCK as u32)
             .f(1.0 / (IDX_DIM as f32).sqrt());
+        if tiled {
+            let grid = (ws.n_blocks.div_ceil(64) as u32, ws.tokens.div_ceil(32) as u32, 1);
+            return self.idx_score_tiled.run(
+                &[&ws.idx_q, &state.idx_pooled, &ws.idx_scores],
+                &pc,
+                grid,
+            );
+        }
         let (gx, gy) = grid_for(ws.tokens * ws.n_blocks, 1);
         self.idx_score.run(
             &[&ws.idx_q, &state.idx_pooled, &ws.idx_scores],
@@ -1519,8 +1560,7 @@ impl<'g> Qsa<'g> {
             .and_then(TopkPath::parse)
         {
             Some(p) if p != TopkPath::Auto => p,
-            _ if rank_topk(ws.tokens, ws.n_blocks) => TopkPath::Rank,
-            _ => TopkPath::Serial,
+            _ => TopkPath::Radix,
         };
         self.topk_with(ws, pos0, path)
     }
@@ -1581,8 +1621,15 @@ impl<'g> Qsa<'g> {
             .u(ws.max_ids as u32)
             .i(pos0 as i32)
             .u(0); // dense off: a word Pc does not push is undefined in the shader
+        if path == TopkPath::Radix {
+            let (gx, gy) = grid_for(ws.tokens, 1);
+            return self
+                .topk_radix
+                .run(&[&ws.idx_scores, &ws.ids, &ws.counts], &pc, (gx, gy, 1));
+        }
         if path == TopkPath::Rank {
-            if cand_topk() {
+            // The candidate buffer exists only when rank is forced by env.
+            if cand_topk() && ws.cand.size >= (ws.tokens * ws.n_blocks * 4) as u64 {
                 // Threshold + compact, then rank the candidates only. Exact: every
                 // candidate outscores every non-candidate, so rank-among-candidates
                 // is rank-among-all.

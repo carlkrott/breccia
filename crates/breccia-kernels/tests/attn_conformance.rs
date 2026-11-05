@@ -992,11 +992,13 @@ fn qsa_sparse_selection_and_attention_match_at_2062_cells() {
         qsa::cpu::topk_blocks(&scores, qsa::IDX_TOPK_BLOCKS, Some(pos0 / qsa::IDX_BLOCK));
     let count = got_counts[0] as usize;
     assert_eq!(count, want_ids.len(), "selection length");
-    let got_row: Vec<u32> = got_ids[..count].to_vec();
-    assert_eq!(
-        got_row, want_ids,
-        "selection order/set differs (descending score, ties to the lower block, tail last)"
-    );
+    // The set is the contract (ties to the lower block, own block added); the
+    // default radix path emits it in ascending order, serial in descending score.
+    let mut got_row: Vec<u32> = got_ids[..count].to_vec();
+    let mut want_set = want_ids.clone();
+    got_row.sort_unstable();
+    want_set.sort_unstable();
+    assert_eq!(got_row, want_set, "selection set differs (ties to the lower block)");
     println!(
         "qsa sparse  blocks={n_blocks} cells={cells} selected={count} blocks ({} cells)",
         count * qsa::IDX_BLOCK
@@ -1022,7 +1024,8 @@ fn qsa_sparse_selection_and_attention_match_at_2062_cells() {
                 gate[h * 2 * qsa::MODEL_HEAD_DIM + qsa::MODEL_HEAD_DIM + d];
         }
     }
-    let cells_sel = qsa::cpu::cells_of(&want_ids, qsa::IDX_BLOCK);
+    // Slots follow the kernel's id order; the set equals `want_ids` (checked above).
+    let cells_sel = qsa::cpu::cells_of(&got_ids[..count], qsa::IDX_BLOCK);
     let cells_of = cells_sel.clone();
     let want = qsa::cpu::attend(
         &q,
@@ -1625,11 +1628,11 @@ fn qsa_topk_ties_and_dead_blocks_match_the_reference() {
             );
             let c = counts[t] as usize;
             assert_eq!(c, want.len(), "cells={cells} t={t}: count");
-            assert_eq!(
-                &ids[t * ws.max_ids..][..c],
-                &want[..],
-                "cells={cells} t={t}: ids/order"
-            );
+            let mut got = ids[t * ws.max_ids..][..c].to_vec();
+            let mut want = want;
+            got.sort_unstable();
+            want.sort_unstable();
+            assert_eq!(got, want, "cells={cells} t={t}: id set");
         }
         qsa.release(gpu, ws);
     }
@@ -1726,6 +1729,33 @@ fn qsa_topk_paths_by_context() {
             }
             agree += ok;
         }
+        // Radix: same set as serial (ids ascending, so compare sorted rows). These
+        // scores have many ties (1000 levels), which exercises ties-to-lower-index.
+        let rows = |ids: &[u32], cnt: &[u32]| -> Vec<Vec<u32>> {
+            (0..tokens)
+                .map(|t| {
+                    let mut v = ids[t * ws.max_ids..][..cnt[t] as usize].to_vec();
+                    v.sort_unstable();
+                    v
+                })
+                .collect()
+        };
+        upload();
+        qsa.topk_with(&ws, pos0, qsa::TopkPath::Serial).unwrap();
+        let serial_rows = rows(
+            &breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).unwrap(),
+            &breccia_kernels::ops::download_u32(gpu, &ws.counts, tokens).unwrap(),
+        );
+        upload();
+        let t0 = std::time::Instant::now();
+        qsa.topk_with(&ws, pos0, qsa::TopkPath::Radix).unwrap();
+        let radix_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let radix_rows = rows(
+            &breccia_kernels::ops::download_u32(gpu, &ws.ids, tokens * ws.max_ids).unwrap(),
+            &breccia_kernels::ops::download_u32(gpu, &ws.counts, tokens).unwrap(),
+        );
+        assert_eq!(serial_rows, radix_rows, "cells={cells} tokens={tokens}: radix set != serial");
+        println!("    radix {radix_ms:.2} ms (single call), set == serial");
         println!(
             "  {cells:>6} {tokens:>7} {:>9} {serial:>8.2} {rank:>7.2}   {agree}/{n}",
             n_blocks,
@@ -1999,7 +2029,24 @@ fn qsa_idx_bench() {
             })
             .fold(f64::INFINITY, f64::min)
     };
-    let score = time(&|| qsa.idx_score(&state, &ws, pos0).unwrap());
+    let score = time(&|| qsa.idx_score_with(&state, &ws, pos0, false).unwrap());
+    let tiled = time(&|| qsa.idx_score_with(&state, &ws, pos0, true).unwrap());
+    let read_scores = || {
+        let b = gemv::download(gpu, &ws.idx_scores, t * ws.n_blocks * 4).expect("scores");
+        b.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect::<Vec<f32>>()
+    };
+    let st = read_scores();
+    qsa.idx_score_with(&state, &ws, pos0, false).unwrap();
+    let sn = read_scores();
+    // Live scores: relative error vs the naive kernel; dead (-1e30) must match exactly.
+    let (mut max_rel, mut dead_mismatch) = (0f32, 0usize);
+    for (x, y) in sn.iter().zip(&st) {
+        if *x <= -1e29 || *y <= -1e29 {
+            dead_mismatch += (*x != *y) as usize;
+        } else {
+            max_rel = max_rel.max((x - y).abs() / x.abs().max(1e-3));
+        }
+    }
     let read_ids = || {
         let ids = gemv::download(gpu, &ws.ids, t * ws.max_ids * 4).expect("ids");
         let counts = gemv::download(gpu, &ws.counts, t * 4).expect("counts");
@@ -2016,30 +2063,51 @@ fn qsa_idx_bench() {
     };
     // The serial kernel destroys the scores, so every top-k run rescores first and
     // the top-k cell is (score + top-k) - score.
-    let serial = time(&|| {
-        qsa.idx_score(&state, &ws, pos0).unwrap();
-        qsa.topk_with(&ws, pos0, qsa::TopkPath::Serial).unwrap();
-    }) - score;
-    let a = read_ids();
-    let rank = time(&|| {
-        qsa.idx_score(&state, &ws, pos0).unwrap();
-        qsa.topk_with(&ws, pos0, qsa::TopkPath::Rank).unwrap();
-    }) - score;
-    let b = read_ids();
+    let topk = |path: qsa::TopkPath| {
+        let s = time(&|| {
+            qsa.idx_score_with(&state, &ws, pos0, false).unwrap();
+            qsa.topk_with(&ws, pos0, path).unwrap();
+        }) - score;
+        (s, read_ids())
+    };
+    let (serial, a) = topk(qsa::TopkPath::Serial);
+    let (rank, b) = topk(qsa::TopkPath::Rank);
+    let (radix, c) = topk(qsa::TopkPath::Radix);
+    // The new pair: tiled scores + radix, overlap against naive + serial.
+    qsa.idx_score_with(&state, &ws, pos0, true).unwrap();
+    qsa.topk_with(&ws, pos0, qsa::TopkPath::Radix).unwrap();
+    let d = read_ids();
+    let (mut inter, mut total) = (0usize, 0usize);
+    for (x, y) in a.iter().zip(&d) {
+        total += x.len().max(y.len());
+        inter += x.iter().filter(|i| y.binary_search(i).is_ok()).count();
+    }
     let us = |s: f64| s * 1e6 / t as f64;
     println!(
-        "idx bench rows {t} cells {cells} blocks {}: score {:.2} us/row/layer ({:.1} x12) | topk serial {:.2} ({:.1} x12) | rank {:.2} ({:.1} x12) | same sets {} (counts {} vs {})",
+        "idx bench rows {t} cells {cells} blocks {}: score naive {:.2} us/row/layer ({:.1} x12) tiled {:.2} ({:.1} x12) | topk serial {:.2} ({:.1} x12) rank {:.2} ({:.1} x12) radix {:.2} ({:.1} x12)",
         ws.n_blocks,
         us(score),
         12.0 * us(score),
+        us(tiled),
+        12.0 * us(tiled),
         us(serial),
         12.0 * us(serial),
         us(rank),
         12.0 * us(rank),
-        a == b,
-        a[0].len(),
-        b[0].len()
+        us(radix),
+        12.0 * us(radix),
     );
+    println!(
+        "idx parity: tiled max rel {max_rel:.2e} dead mismatch {dead_mismatch} | rank==serial {} radix==serial {} (counts {} {} {}) | tiled+radix vs naive+serial overlap {inter}/{total} = {:.5}",
+        a == b,
+        a == c,
+        a[0].len(),
+        b[0].len(),
+        c[0].len(),
+        inter as f64 / total.max(1) as f64
+    );
+    assert_eq!(a, c, "radix top-k must pick the serial set on equal scores");
+    assert_eq!(dead_mismatch, 0, "tiled scorer mask differs");
     qsa.release(gpu, ws);
     state.release(gpu);
 }

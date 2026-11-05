@@ -1,0 +1,139 @@
+#version 450
+//
+// QSA lightning indexer — block scores as an FP32 tiled GEMM (same output as
+// `qsa_idx_score.comp`, another fp summation order, so not bitwise).
+//
+// Port of upstream strata `block_scores_simt_kernel` (qsa_select.cu): rows =
+// (query, indexer head), columns = pooled blocks, K = idx_dim through shared
+// memory in chunks of 32. 256 threads; each holds 2 queries x 4 heads x 4 blocks
+// in registers, sums relu per head, scales. A workgroup covers 32 queries x 64
+// blocks. Requires idx_n_head == 4 and idx_dim % 32 == 0 (the model's 4 x 128).
+//
+// Mask as the naive kernel: a block whose last cell is past the query's position
+// is dead (-1e30).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QVec { vec4 Q4[]; };          // [T, 4, idx_dim]
+layout(std430, binding = 1) readonly buffer PooledVec { vec4 P4[]; };     // [blocks, idx_dim]
+layout(std430, binding = 2) writeonly buffer Scores { float SC[]; };      // [T, n_blocks]
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n_blocks;
+    uint idx_n_head; // 4 (fixed by the tile)
+    uint idx_dim;    // 128
+    int pos0;
+    uint idx_block;  // 4
+    float scale;
+    uint pad0;
+} pc;
+
+#define QT 32u
+#define NB 64u
+#define KC 32u
+#define QS (QT * 4u + 4u)
+#define KS (NB + 4u)
+#define MASK_DEAD (-1.0e30)
+
+shared float Qs[KC * QS];
+shared float Ks[KC * KS];
+
+void main() {
+    uint q0 = gl_WorkGroupID.y * QT;
+    uint b0 = gl_WorkGroupID.x * NB;
+    uint tid = gl_LocalInvocationID.x;
+    uint tx = tid & 15u;
+    uint ty = tid >> 4u;
+    uint qlast = min(q0 + QT, pc.tokens) - 1u;
+    int last_pos = pc.pos0 + int(qlast);
+    uint d4 = pc.idx_dim / 4u;
+
+    // Whole tile dead for every query of the tile: write the mask, skip the math.
+    if (int(b0 * pc.idx_block + pc.idx_block - 1u) > last_pos) {
+        for (uint i = tid; i < QT * NB; i += 256u) {
+            uint q = q0 + i / NB;
+            uint b = b0 + i % NB;
+            if (q < pc.tokens && b < pc.n_blocks) {
+                SC[q * pc.n_blocks + b] = MASK_DEAD;
+            }
+        }
+        return;
+    }
+
+    float acc[8][4];
+    for (uint i = 0u; i < 8u; ++i) {
+        for (uint j = 0u; j < 4u; ++j) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    for (uint kc = 0u; kc < pc.idx_dim; kc += KC) {
+        for (uint i = 0u; i < 4u; ++i) { // 128 query rows x 8 vec4
+            uint idx = tid + i * 256u;
+            uint r = idx >> 3u;
+            uint k4 = idx & 7u;
+            vec4 v = vec4(0.0);
+            if (q0 + (r >> 2u) < pc.tokens) {
+                v = Q4[(q0 * 4u + r) * d4 + kc / 4u + k4];
+            }
+            Qs[(k4 * 4u + 0u) * QS + r] = v.x;
+            Qs[(k4 * 4u + 1u) * QS + r] = v.y;
+            Qs[(k4 * 4u + 2u) * QS + r] = v.z;
+            Qs[(k4 * 4u + 3u) * QS + r] = v.w;
+        }
+        for (uint i = 0u; i < 2u; ++i) { // 64 pooled keys x 8 vec4
+            uint idx = tid + i * 256u;
+            uint c = idx >> 3u;
+            uint k4 = idx & 7u;
+            vec4 v = vec4(0.0);
+            if (b0 + c < pc.n_blocks) {
+                v = P4[(b0 + c) * d4 + kc / 4u + k4];
+            }
+            Ks[(k4 * 4u + 0u) * KS + c] = v.x;
+            Ks[(k4 * 4u + 1u) * KS + c] = v.y;
+            Ks[(k4 * 4u + 2u) * KS + c] = v.z;
+            Ks[(k4 * 4u + 3u) * KS + c] = v.w;
+        }
+        barrier();
+        for (uint k = 0u; k < KC; ++k) {
+            float qr[8];
+            float kr[4];
+            for (uint i = 0u; i < 8u; ++i) {
+                qr[i] = Qs[k * QS + ty * 8u + i];
+            }
+            for (uint j = 0u; j < 4u; ++j) {
+                kr[j] = Ks[k * KS + tx * 4u + j];
+            }
+            for (uint i = 0u; i < 8u; ++i) {
+                for (uint j = 0u; j < 4u; ++j) {
+                    acc[i][j] = fma(qr[i], kr[j], acc[i][j]);
+                }
+            }
+        }
+        barrier();
+    }
+
+    for (uint i = 0u; i < 2u; ++i) {
+        uint q = q0 + ty * 2u + i;
+        if (q >= pc.tokens) {
+            continue;
+        }
+        int pos = pc.pos0 + int(q);
+        for (uint j = 0u; j < 4u; ++j) {
+            uint b = b0 + tx * 4u + j;
+            if (b >= pc.n_blocks) {
+                continue;
+            }
+            float sc = MASK_DEAD;
+            if (int(b * pc.idx_block + pc.idx_block - 1u) <= pos) {
+                sc = 0.0;
+                for (uint h = 0u; h < 4u; ++h) {
+                    sc += max(acc[i * 4u + h][j], 0.0);
+                }
+                sc *= pc.scale;
+            }
+            SC[q * pc.n_blocks + b] = sc;
+        }
+    }
+}
