@@ -91,10 +91,13 @@ void main() {
             }
             s_want = min(min(pc.topk_blocks, live), pc.max_ids);
             s_left = s_want;
+            // Every live block fits (short context): prefix/mask 0 make all
+            // live keys "equal", taken with budget = live, no further passes.
+            s_done = s_want == live ? 1u : 0u;
         }
-        if (tid == 0u && s_left == 0u) {
+        if (tid == 0u && s_done == 0u && s_left == 0u) {
             s_done = 1u;
-        } else if (tid == 0u) {
+        } else if (tid == 0u && s_done == 0u) {
             uint left = s_left;
             uint cum = 0u;
             uint bin = 0u;

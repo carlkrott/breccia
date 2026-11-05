@@ -223,6 +223,18 @@ fn cand_topk() -> bool {
     *ON.get_or_init(|| std::env::var("BRECCIA_QSA_TOPK_CAND").map_or(true, |v| v != "0"))
 }
 
+/// The top-k path [`Qsa::topk`] runs: `BRECCIA_QSA_TOPK`, else radix.
+fn topk_path() -> TopkPath {
+    match std::env::var("BRECCIA_QSA_TOPK")
+        .ok()
+        .as_deref()
+        .and_then(TopkPath::parse)
+    {
+        Some(p) if p != TopkPath::Auto => p,
+        _ => TopkPath::Radix,
+    }
+}
+
 /// Indexer scores with `qsa_idx_score_tiled.comp` (upstream strata's FP32 tiled
 /// GEMM): 1024-row chunk at 128k cells RX 2.8 vs 56.2 us/row/layer, MI50 5.6 vs
 /// 179; max rel diff 6e-7. `BRECCIA_QSA_SCORE=naive` keeps the per-(token, block)
@@ -1504,7 +1516,8 @@ impl<'g> Qsa<'g> {
 
     /// Score every completed block against every token's indexer query.
     pub fn idx_score(&self, state: &QsaState, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
-        self.idx_score_with(state, ws, pos0, tiled_score())
+        // T=1 (decode): the 32-query tile wastes 31 rows; naive measured 3-15% faster.
+        self.idx_score_with(state, ws, pos0, tiled_score() && ws.tokens > 1)
     }
 
     /// [`Self::idx_score`] on a named kernel (tests and A/B): `tiled` =
@@ -1554,15 +1567,7 @@ impl<'g> Qsa<'g> {
     /// Which selection kernel [`Qsa::topk`] uses. `Auto` is the measured choice;
     /// the others exist for A/B and for contexts where the auto rule is wrong.
     pub fn topk(&self, ws: &QsaWorkspace, pos0: usize) -> Result<()> {
-        let path = match std::env::var("BRECCIA_QSA_TOPK")
-            .ok()
-            .as_deref()
-            .and_then(TopkPath::parse)
-        {
-            Some(p) if p != TopkPath::Auto => p,
-            _ => TopkPath::Radix,
-        };
-        self.topk_with(ws, pos0, path)
+        self.topk_with(ws, pos0, topk_path())
     }
 
     /// Compute the rank select's score threshold (`qsa_topk_thr.comp`).
@@ -2222,11 +2227,19 @@ impl Qsa<'_> {
             .i(pos0 as i32)
             .u(IDX_BLOCK as u32)
             .f(1.0 / (IDX_DIM as f32).sqrt());
-        let (sgx, sgy) = grid_for(t * ws.n_blocks, 1);
-        let score = self.idx_score.run_timed(
+        // Same kernels as the production path (tiled score, radix top-k unless
+        // env picks serial); rank's multi-dispatch is timed as serial.
+        let (score_k, sgrid) = if tiled_score() && t > 1 {
+            let g = (ws.n_blocks.div_ceil(64) as u32, t.div_ceil(32) as u32, 1);
+            (&self.idx_score_tiled, g)
+        } else {
+            let (sgx, sgy) = grid_for(t * ws.n_blocks, 1);
+            (&self.idx_score, (sgx, sgy, 1))
+        };
+        let score = score_k.run_timed(
             &[&ws.idx_q, &state.idx_pooled, &ws.idx_scores],
             &pc_sc,
-            (sgx, sgy, 1),
+            sgrid,
             target_s,
         )?;
         let pc_tk = Pc::new()
@@ -2234,9 +2247,11 @@ impl Qsa<'_> {
             .u(ws.n_blocks as u32)
             .u(ws.topk_blocks as u32)
             .u(ws.max_ids as u32)
-            .i(pos0 as i32);
+            .i(pos0 as i32)
+            .u(0); // dense off
         let (tgx2, tgy2) = grid_for(t, 1);
-        let tk = self.topk.run_timed(
+        let topk_k = if topk_path() == TopkPath::Radix { &self.topk_radix } else { &self.topk };
+        let tk = topk_k.run_timed(
             &[&ws.idx_scores, &ws.ids, &ws.counts],
             &pc_tk,
             (tgx2, tgy2, 1),
