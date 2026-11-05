@@ -95,12 +95,15 @@ naming the image. The pad-run count must match the image count. A request withou
 Live (ctx 4096, q6 KV, dual default, script vis-multi.sh):
 | request | time | prompt tok | result |
 |---|---|---|---|
-| red circle + blue triangle (cold, first request) | 44.5 s | 2079 | "Red circle / Blue triangle" (2 encodes 3.3 + 3.1 s) |
+| red circle + blue triangle (first request: includes server warm-up + 2 encodes) | 44.5 s | 2079 | "Red circle / Blue triangle" (2 encodes 3.3 + 3.1 s) |
 | same resend | 11.7 s | 2079 | same; both images "from cache in 0.00 s" |
 | swapped order | 13.3 s | 2079 | "Blue triangle / Red circle" (order follows the request) |
 | 3 x 2048^2 | 9.0 s | - | 400 "image 3 of 3 brings the prompt to 6108 tokens, over the 4096-token context" |
 | 2560x1440 wallpaper + red circle | 24.2 s | 3027 | image 1 alpenglow landscape, image 2 "solid red circle ... plain white background" |
 | text after | 1.6 s | 14 | normal reply |
+What the cache saves is the encode only: ~3.2 s per 1k-token image, ~9 s per 2k one. The resend and swapped requests
+(11.7 / 13.3 s, fully cached) are prefill + decode, still paid on every request; most of the 44.5 -> 11.7 s gap is warm-up.
+The cache key also covers the encoder binary (path, size, mtime), so a rebuilt or swapped encoder never serves old rows.
 Cache dir after: 4 entries (10 MiB per 32x32, ~20 MiB per ~2k-token image), dirs 0700, no `.tmp` left.
 Unit tests: server image order + ctx stop (http.rs), cache hit / expiry prune (breccia-cli image_cache_tests).
 

@@ -5140,7 +5140,17 @@ impl Vision {
             std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o700))?;
         }
         let mm = std::fs::metadata(&mmproj).with_context(|| mmproj.clone())?;
-        let salt = format!("{mmproj}\0{}\0{:?}\0{}\0{max_tokens}", mm.len(), mm.modified()?, max_tokens.min(1024));
+        // the encoder binary is in the key too: a rebuilt or swapped encoder must not serve old rows
+        let enc = std::fs::metadata(&encoder).with_context(|| format!("{}", encoder.display()))?;
+        let salt = format!(
+            "{mmproj}\0{}\0{:?}\0{}\0{max_tokens}\0{}\0{}\0{:?}",
+            mm.len(),
+            mm.modified()?,
+            max_tokens.min(1024),
+            encoder.display(),
+            enc.len(),
+            enc.modified()?
+        );
         let v = Self { encoder, mmproj, model, max_tokens, n_embd, cache, ttl, salt };
         v.prune();
         Ok(v)
