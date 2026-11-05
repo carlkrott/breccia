@@ -2969,6 +2969,56 @@ fn parse_prompt_ids(a: &TokenArgs) -> Result<Vec<u32>> {
     Ok(out)
 }
 
+/// `<|image_pad|>`: llama.cpp's PLE stand-in for an image row (`qwen4exp.ple.image_token_id`).
+const IMAGE_PAD: u32 = 248056;
+
+/// One encoded image: `(cell0, nx, ny, rows f32 [nx*ny, n_embd])`.
+type Image = (usize, usize, usize, Vec<f32>);
+static IMAGE: std::sync::OnceLock<Option<Image>> = std::sync::OnceLock::new();
+
+/// `BRECCIA_IMAGE_EMBD=<prefix>` (Stage 1 vision): `<prefix>.f32` / `<prefix>.pos`
+/// from `vision-encode` (mmproj sidecar). The prompt's single `<|image_pad|>` is
+/// expanded to the image's `nx*ny` cells, whose rows replace `token_embd`.
+fn with_image(mut prompt: Vec<u32>) -> Result<Vec<u32>> {
+    let Ok(prefix) = std::env::var("BRECCIA_IMAGE_EMBD") else {
+        let _ = IMAGE.set(None);
+        return Ok(prompt);
+    };
+    let pos = std::fs::read_to_string(format!("{prefix}.pos")).with_context(|| format!("{prefix}.pos"))?;
+    // lines "t x y"; must be a raster grid, x fastest
+    let xy: Vec<(usize, usize)> = pos
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let v: Vec<usize> = l.split_whitespace().map(str::parse).collect::<Result<_, _>>()?;
+            anyhow::ensure!(v.len() == 3, "bad pos line {l:?}");
+            Ok((v[1], v[2]))
+        })
+        .collect::<Result<_>>()?;
+    let nx = xy.iter().map(|p| p.0 + 1).max().unwrap_or(0);
+    let ny = xy.iter().map(|p| p.1 + 1).max().unwrap_or(0);
+    let n = xy.len();
+    anyhow::ensure!(
+        n > 0 && n == nx * ny && xy.iter().enumerate().all(|(i, &(x, y))| x == i % nx && y == i / nx),
+        "{prefix}.pos: {n} tokens is not a raster {nx}x{ny} grid"
+    );
+    let bytes = std::fs::read(format!("{prefix}.f32")).with_context(|| format!("{prefix}.f32"))?;
+    let rows: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    anyhow::ensure!(rows.len() % n == 0, "{prefix}.f32: {} floats not a multiple of {n} rows", rows.len());
+    let at = prompt
+        .iter()
+        .position(|&t| t == IMAGE_PAD)
+        .ok_or_else(|| anyhow::anyhow!("BRECCIA_IMAGE_EMBD needs one <|image_pad|> ({IMAGE_PAD}) in the prompt"))?;
+    anyhow::ensure!(
+        prompt.iter().filter(|&&t| t == IMAGE_PAD).count() == 1,
+        "one image per prompt (exactly one {IMAGE_PAD})"
+    );
+    prompt.splice(at..at + 1, std::iter::repeat_n(IMAGE_PAD, n));
+    println!("image    {nx}x{ny} = {n} rows at cell {at} from {prefix}");
+    let _ = IMAGE.set(Some((at, nx, ny, rows)));
+    Ok(prompt)
+}
+
 /// Reset and feed every prompt token; returns the last token's logits.
 fn feed_prompt(
     sess: &mut breccia_engine::Session<'_>,
@@ -2976,6 +3026,11 @@ fn feed_prompt(
     chunk: usize,
 ) -> Result<Vec<f32>> {
     sess.reset()?;
+    // only the prompt the image was spliced into (not e.g. --then-prompt-ids)
+    if let Some(Some((c0, nx, ny, rows))) = IMAGE.get().filter(|i| i.as_ref().is_some_and(|i| prompt.get(i.0) == Some(&IMAGE_PAD))) {
+        anyhow::ensure!(chunk > 0, "an image prompt needs chunked prefill (--prefill-chunk N)");
+        sess.set_image(*c0, *nx, *ny, rows)?;
+    }
     let mut logits = Vec::new();
     if chunk > 0 {
         let mut pos = 0usize;
@@ -4394,7 +4449,11 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         }
         None => parse_prompt_ids(&a)?,
     };
+    let prompt = with_image(prompt)?;
     if a.streams > 1 {
+        if IMAGE.get().is_some_and(|i| i.is_some()) {
+            anyhow::bail!("BRECCIA_IMAGE_EMBD is single-stream only");
+        }
         return bench_token_multi(&a, &prompt, &glob);
     }
     println!(

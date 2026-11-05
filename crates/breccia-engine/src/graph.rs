@@ -32,6 +32,9 @@
 //! on the critical path, submit overhead included.
 
 use anyhow::{anyhow, bail, Context, Result};
+
+/// `<|image_pad|>`: the prompt token at every image cell (the PLE n-gram stand-in, llama.cpp `ple_image_token_id`).
+pub const IMAGE_PLE_TOKEN: u32 = 248056;
 use breccia_vk::ctx::Buf;
 
 use breccia_kernels::batch_cmd;
@@ -739,6 +742,10 @@ pub struct Session<'m> {
     pf_weights: Vec<Vec<f32>>,
     pf_mixed: Vec<f32>,
     pf_toks: Vec<u32>,
+    /// Image embedding rows for the prompt (`set_image`): cells `cell0..cell0+n`
+    /// take `rows[i]` (f32 `[n, n_embd]` on the first block's device) instead of
+    /// `token_embd`; the prompt carries the PLE stand-in token at those cells.
+    image: Option<(usize, usize, usize, Buf)>, // (cell0, nx, ny, rows)
     /// The merged pass's own counters (reset per measured window with the rest):
     /// host wall seconds of the expert GEMMs and of the fan-in, the dispatches
     /// they recorded, the distinct experts they touched and the expert bytes they
@@ -1341,6 +1348,7 @@ impl<'m> Session<'m> {
             pf_weights: Vec::new(),
             pf_mixed: Vec::new(),
             pf_toks: Vec::new(),
+            image: None,
             pf_gemm_s: 0.0,
             pf_fanin_s: 0.0,
             pf_stream_bytes: 0,
@@ -2096,6 +2104,43 @@ impl<'m> Session<'m> {
     /// | position / token counters (`pos`, `cur_tok`) | `Session` | set by `begin_token` every token |
     /// | staging ring contents | `stagings` | `flush()` below (the ring is drained, and every read is fence-ordered) |
     /// | sampler RNG | `sampler` | **deliberately not reset** — sampling is seeded per draw, so a reset would not be a new sequence, it would be a different one |
+    /// Put one image's embedding rows (`rows` = f32 `[nx*ny, n_embd]`, the vision
+    /// encoder's output) at cells `cell0..cell0+nx*ny` of the next prefill, and
+    /// lay out the IMRoPE positions for it (every QSA layer). The prompt's tokens
+    /// at those cells must be the PLE stand-in (`IMAGE_PLE_TOKEN`). `reset` undoes it.
+    pub fn set_image(&mut self, cell0: usize, nx: usize, ny: usize, rows: &[f32]) -> Result<()> {
+        let m = self.model;
+        let n_embd = m.cfg.n_embd;
+        let n = nx * ny;
+        if n == 0 || rows.len() != n * n_embd {
+            bail!("image rows: {} floats for a {nx}x{ny} grid of {n_embd}-wide rows", rows.len());
+        }
+        self.flush()?;
+        self.clear_image();
+        self.image_positions(cell0, nx, ny)?;
+        let gpu = m.devices[m.device_of(0)].gpu();
+        let bytes: Vec<u8> = rows.iter().flat_map(|x| x.to_le_bytes()).collect();
+        self.image = Some((cell0, nx, ny, breccia_kernels::gemv::upload(gpu, &bytes)?));
+        Ok(())
+    }
+
+    /// The IMRoPE position table of every QSA layer for one image at `cell0`.
+    fn image_positions(&self, cell0: usize, nx: usize, ny: usize) -> Result<()> {
+        let m = self.model;
+        for b in 0..m.cfg.n_layers {
+            if let Some(st) = &self.qsa_state[b] {
+                st.set_image_positions(m.devices[m.device_of(b)].gpu(), &[(cell0, nx, ny)])?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_image(&mut self) {
+        if let Some((_, _, _, buf)) = self.image.take() {
+            self.model.devices[self.model.device_of(0)].gpu().destroy_buf(&buf);
+        }
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         let m = self.model;
         for b in 0..m.cfg.n_layers {
@@ -2110,6 +2155,7 @@ impl<'m> Session<'m> {
             p.reset();
         }
         self.flush()?;
+        self.clear_image();
         self.expert_bytes = 0;
         self.forwards = 0;
         self.head_up = 0;
@@ -2809,6 +2855,18 @@ impl<'m> Session<'m> {
         self.ensure_batch(dev)?;
         for i in 0..t {
             let v = &self.venues[dev];
+            let img = self
+                .image
+                .as_ref()
+                .filter(|(c0, nx, ny, _)| (*c0..c0 + nx * ny).contains(&(pos0 + i)));
+            if let Some((c0, _, _, buf)) = img {
+                // image row: the encoder's embedding replicated over the hc streams, like a token row
+                let row = (mc.n_embd * 4) as u64;
+                for h in 0..mc.hc {
+                    batch_cmd::record_copy(gpu, &v.r_slots[i], h as u64 * row, buf, (pos0 + i - c0) as u64 * row, row)?;
+                }
+                continue;
+            }
             batch_cmd::record_copy(
                 gpu,
                 &v.r_slots[i],
@@ -6497,7 +6555,19 @@ impl<'m> Session<'m> {
         if prompt.is_empty() {
             bail!("the prompt is empty: the n-gram window and the first token both need history");
         }
-        self.reset()?;
+        // reset() undoes set_image; a generate() over the image's prompt keeps it
+        // (only when the prompt still holds it: a --then prompt is text)
+        let mut img = self.image.take();
+        if img.as_ref().is_some_and(|i| prompt.get(i.0) != Some(&IMAGE_PLE_TOKEN)) {
+            self.image = img.take(); // reset() frees it
+        }
+        let r = self.reset();
+        self.image = img;
+        r?;
+        if let Some((c0, nx, ny, _)) = self.image {
+            anyhow::ensure!(self.prefill_chunk > 0, "an image prompt needs chunked prefill");
+            self.image_positions(c0, nx, ny)?;
+        }
         let mut trace = debug;
         let mut pos = 0usize;
         let mut logits = Vec::new();
@@ -6597,6 +6667,7 @@ impl Drop for Session<'_> {
         // this thread — the last session to drop frees them.
         let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
         let _ = breccia_kernels::batch_cmd::wait_all(&gpus);
+        self.clear_image();
         if let Some(mut imp) = self.ship_imp.take() {
             imp.release(&gpus);
         }

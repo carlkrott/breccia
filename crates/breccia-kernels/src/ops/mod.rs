@@ -539,6 +539,8 @@ pub struct Rope<'g> {
     head_dim: usize,
     n_rot: usize,
     max_pos: usize,
+    /// 1 = one int per token; 3 = IMRoPE `(t, h, w)` triples per token.
+    pos_stride: usize,
 }
 
 impl<'g> Rope<'g> {
@@ -569,7 +571,16 @@ impl<'g> Rope<'g> {
             head_dim,
             n_rot,
             max_pos,
+            pos_stride: 1,
         })
+    }
+
+    /// Read IMRoPE `(t, h, w)` triples (`positions[3*tok + s]`) instead of one
+    /// int per token; pair `j` rotates by stream `j % 3`. Text triples `(i, i, i)`
+    /// give the 1-D rotation bit for bit.
+    pub fn triple_positions(mut self) -> Self {
+        self.pos_stride = 3;
+        self
     }
 
     /// The artifact's Q/K rotation: 64 of 256 dims.
@@ -616,7 +627,8 @@ impl<'g> Rope<'g> {
             .u(self.n_rot as u32)
             .u(self.max_pos as u32)
             .i(pos_base)
-            .u(pos_div.max(1) as u32);
+            .u(pos_div.max(1) as u32)
+            .u(self.pos_stride as u32);
         let units = rows * (self.head_dim / 2);
         let (gx, gy) = grid_for(units, 64);
         (bufs, pc, (gx, gy, 1))

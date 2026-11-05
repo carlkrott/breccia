@@ -359,8 +359,9 @@ pub struct QsaState {
     pub idx_tail: Buf,
     /// `(max_blocks, idx_dim)` f32 pooled keys.
     pub idx_pooled: Buf,
-    /// Identity position table for the whole window (`pos[i] = i`), so no call
-    /// ever re-uploads positions.
+    /// IMRoPE `(t, h, w)` triple per cell, identity `(i, i, i)` for text, so no
+    /// call ever re-uploads positions; [`QsaState::set_positions`] rewrites a
+    /// range for an image (and the text after it), [`QsaState::reset`] restores it.
     pub positions: Buf,
     /// Cells the cache can hold (a multiple of `PAGE_CELLS`).
     pub capacity_cells: usize,
@@ -459,6 +460,42 @@ pub mod sizes {
     }
 }
 
+/// `(i, i, i)` for `i < max_pos`: the text position table.
+fn identity_triples(max_pos: usize) -> Vec<u32> {
+    (0..max_pos as u32).flat_map(|i| [i, i, i]).collect()
+}
+
+/// IMRoPE `(t, h, w)` per cell with images at `(cell0, nx, ny)` (mtmd
+/// `MTMD_POS_TYPE_MROPE`): image token `i` at base `p` is `(p, p + i/nx, p + i%nx)`,
+/// the image advances the position by `max(nx, ny)` (`mtmd_input_chunk_get_n_pos`),
+/// so every later cell sits `nx*ny - max(nx, ny)` behind its index.
+pub fn mrope_triples(max_pos: usize, spans: &[(usize, usize, usize)]) -> Result<Vec<u32>> {
+    let mut out = Vec::with_capacity(3 * max_pos);
+    let mut lag = 0usize; // cell index - position
+    let mut c = 0usize;
+    for &(c0, nx, ny) in spans {
+        let n = nx * ny;
+        if c0 < c || nx == 0 || ny == 0 || c0 + n > max_pos {
+            return Err(anyhow!(
+                "image span (cell {c0}, {nx}x{ny}) overlaps an earlier one or leaves the {max_pos}-cell table"
+            ));
+        }
+        out.extend((c..c0).flat_map(|i| {
+            let p = (i - lag) as u32;
+            [p, p, p]
+        }));
+        let p = c0 - lag;
+        out.extend((0..n).flat_map(|i| [p as u32, (p + i / nx) as u32, (p + i % nx) as u32]));
+        lag += n - nx.max(ny);
+        c = c0 + n;
+    }
+    out.extend((c..max_pos).flat_map(|i| {
+        let p = (i - lag) as u32;
+        [p, p, p]
+    }));
+    Ok(out)
+}
+
 impl QsaState {
     /// Allocate for `capacity_cells` cells (rounded up to whole pages) and a rope
     /// table of `max_pos` positions, with the V layout from `BRECCIA_KV_Q8V`.
@@ -518,7 +555,7 @@ impl QsaState {
             (pages as u64 * 4, "kv page_table"),
             (sizes::idx_tail_bytes(), "indexer tail"),
             (sizes::pooled_idx_bytes(max_blocks), "indexer pooled"),
-            (max_pos as u64 * 4, "position table"),
+            (max_pos as u64 * 12, "position table"),
         ];
         assert_eq!(
             sizes.len(),
@@ -558,7 +595,7 @@ impl QsaState {
         // once here, so no call ever re-uploads them (a captured graph cannot
         // freeze a token's position, `qsa.hpp:236-241`).
         let table: Vec<u32> = (0..pages as u32).collect();
-        let pos: Vec<u32> = (0..max_pos as u32).collect();
+        let pos = identity_triples(max_pos);
         let prepared: [(&str, &Buf, Vec<u8>); 2] = [
             (
                 "KV page table",
@@ -643,10 +680,19 @@ impl QsaState {
         let table: Vec<u32> = (0..pages as u32).collect();
         crate::gemv::upload_into(gpu, &self.page_table, &crate::ops::u32_to_bytes(&table))
             .map_err(|e| anyhow!("restoring the KV page table: {e}"))?;
-        let pos: Vec<u32> = (0..self.max_pos as u32).collect();
+        let pos = identity_triples(self.max_pos);
         crate::gemv::upload_into(gpu, &self.positions, &crate::ops::u32_to_bytes(&pos))
             .map_err(|e| anyhow!("restoring the position table: {e}"))?;
         Ok(())
+    }
+
+    /// Rewrite the position table for a prompt holding images, one
+    /// `(cell0, nx, ny)` per image (sorted by cell); `&[]` restores identity.
+    /// The whole table is re-uploaded (`max_pos * 12` bytes, once per request).
+    pub fn set_image_positions(&self, gpu: &Gpu, spans: &[(usize, usize, usize)]) -> Result<()> {
+        let pos = mrope_triples(self.max_pos, spans)?;
+        crate::gemv::upload_into(gpu, &self.positions, &crate::ops::u32_to_bytes(&pos))
+            .map_err(|e| anyhow!("writing the position table: {e}"))
     }
 
     pub fn bytes(&self) -> u64 {
@@ -879,7 +925,7 @@ impl<'g> Qsa<'g> {
         let idx_pool = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_idx_pool.spv")),
-            5,
+            6,
             "qsa indexer pool",
         )?;
         let idx_score = Pipe::new(
@@ -1033,8 +1079,8 @@ impl<'g> Qsa<'g> {
             "qsa attention apply (split reduce)",
         )?;
         let softmax = Softmax::new(gpu)?;
-        let rope_hd = Rope::new(gpu, MODEL_HEAD_DIM, MODEL_N_ROT, max_pos)?;
-        let rope_idx = Rope::new(gpu, IDX_DIM, MODEL_N_ROT, max_pos)?;
+        let rope_hd = Rope::new(gpu, MODEL_HEAD_DIM, MODEL_N_ROT, max_pos)?.triple_positions();
+        let rope_idx = Rope::new(gpu, IDX_DIM, MODEL_N_ROT, max_pos)?.triple_positions();
         let rms_k = RmsNorm::new(gpu, MODEL_HEAD_DIM, 1)?;
         let rms_idx = RmsNorm::new(gpu, IDX_DIM, 1)?;
         let table = RopeTable::model(max_pos)?;
@@ -1404,6 +1450,7 @@ impl<'g> Qsa<'g> {
                 gamma,
                 &self.table_buf,
                 &state.idx_pooled,
+                &state.positions,
             ],
             &pc,
             (gx, gy, 1),
@@ -2101,6 +2148,7 @@ impl Qsa<'_> {
                     w.idx_k_norm,
                     table,
                     &state.idx_pooled,
+                    &state.positions,
                 ],
                 &pc_pool,
                 (pgx, pgy, 1),
@@ -2220,6 +2268,24 @@ impl Qsa<'_> {
 #[cfg(test)]
 mod tests {
     use super::sizes::*;
+
+    /// Text 0..5, a 3x2 image at cell 5, text after: the image tokens are
+    /// `(5, 5 + i/3, 5 + i%3)` (llama.cpp `.pos` dump layout, t y x) and the next
+    /// text position is 5 + max(3, 2) = 8 at cell 11.
+    #[test]
+    fn mrope_triples_follow_mtmd() {
+        let t = super::mrope_triples(14, &[(5, 3, 2)]).unwrap();
+        let cell = |c: usize| [t[3 * c], t[3 * c + 1], t[3 * c + 2]];
+        assert_eq!(cell(4), [4, 4, 4]);
+        assert_eq!(cell(5), [5, 5, 5]);
+        assert_eq!(cell(7), [5, 5, 7]);
+        assert_eq!(cell(8), [5, 6, 5]);
+        assert_eq!(cell(10), [5, 6, 7]);
+        assert_eq!(cell(11), [8, 8, 8]);
+        assert_eq!(cell(13), [10, 10, 10]);
+        assert_eq!(super::mrope_triples(4, &[]).unwrap(), super::identity_triples(4));
+        assert!(super::mrope_triples(8, &[(5, 3, 2)]).is_err());
+    }
 
     /// The capacity argument of §8bf turns on these two numbers, so they are pinned:
     /// a q8_0 **V** pool is ~0.56x the f16 pair's V half, and the pair of pools is

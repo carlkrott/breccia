@@ -61,6 +61,7 @@ layout(push_constant) uniform Params {
     uint max_pos;  // positions in the table
     int  pos_base; // first position of this call (an identity table + a base)
     uint pos_div;  // rows per token (heads per token; 1 = one position per row)
+    uint pos_stride; // 1 = one int per token; 3 = IMRoPE (t, h, w) triples, pair j reads stream j % 3
 } pc;
 
 #define WG_X_MAX 65535u
@@ -80,7 +81,10 @@ void main() {
     if (j < hrot) {
         float a = X[base + j];
         float b = X[base + j + hrot];
-        int p = POS[pc.pos_base + int(row / pc.pos_div)];
+        // IMRoPE sections [11,11,10] over 32 pairs = stream j % 3 for every pair
+        // (ggml `rope_yarn_mrope` is_imrope); text triples are (i, i, i).
+        int tok = pc.pos_base + int(row / pc.pos_div);
+        int p = POS[tok * int(pc.pos_stride) + (pc.pos_stride == 3u ? int(j % 3u) : 0)];
         // Clamp defensively: an out-of-range position must not become an
         // out-of-bounds table read (a fault, not a wrong number).
         uint pi = p < 0 ? 0u : (uint(p) < pc.max_pos ? uint(p) : pc.max_pos - 1u);

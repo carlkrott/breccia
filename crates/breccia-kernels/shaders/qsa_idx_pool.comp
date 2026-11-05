@@ -35,6 +35,9 @@ layout(std430, binding = 1) readonly buffer TailVec { float TAIL[]; }; // [idx_b
 layout(std430, binding = 2) readonly buffer GammaVec { float GAMMA[]; }; // [idx_dim]
 layout(std430, binding = 3) readonly buffer RopeVec { float CS[]; }; // [max_pos, n_rot/2, 2]
 layout(std430, binding = 4) buffer PooledVec { float POOLED[]; }; // [max_blocks+1, idx_dim]
+// IMRoPE (t, h, w) per cell (`QsaState::positions`); the block's first cell's triple
+// is the rotation (llama.cpp `new_pool_pos`). Text cells are (i, i, i).
+layout(std430, binding = 5) readonly buffer Positions { int POS[]; };
 
 layout(push_constant) uniform Params {
     uint n_new;    // blocks completed by this call
@@ -91,7 +94,7 @@ void main() {
     // NEOX pairs (j, j + n_rot/2), rotation at the block's first cell.
     uint pairs = pc.n_rot / 2u;
     if (tid < pairs) {
-        uint tpos = pc.idx_block * block;
+        uint tpos = uint(POS[3u * (pc.idx_block * block) + tid % 3u]);
         float c = CS[(tpos * pairs + tid) * 2u];
         float s = CS[(tpos * pairs + tid) * 2u + 1u];
         float a = s_val[tid];
