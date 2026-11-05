@@ -1871,3 +1871,175 @@ fn qsa_kv_append_octave_matches_the_reference() {
         assert!(err / nrm < 0.04, "mode {mode:#x}: rel-MSE {} above the 3-bit bound", err / nrm);
     }
 }
+
+/// Kernel microbench, not a check: tiled (scores+softmax+apply) vs `flash` on one
+/// prefill chunk at the full sparse budget (every row selects `max_ids` blocks).
+/// `BRECCIA_ATTN_BENCH=rows,cells` (default 1024,8192); run with `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn qsa_attn_bench() {
+    let fx = need_gpu!("qsa_flash");
+    let gpu = fx.dev.gpu();
+    let (t, cells) = std::env::var("BRECCIA_ATTN_BENCH")
+        .ok()
+        .and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .unwrap_or((1024usize, 8192usize));
+    let max_pos = cells.next_power_of_two();
+    let qsa = Qsa::new(gpu, max_pos).expect("qsa");
+    let dim = qsa::MODEL_N_KV_HEAD * qsa::MODEL_HEAD_DIM;
+    let layout = match std::env::var("BRECCIA_KV").as_deref() {
+        Ok("f16") => qsa::VLayout::F16,
+        Ok("q8_0") => qsa::VLayout::Q8_0,
+        _ => qsa::VLayout::Q6_0,
+    };
+    let state = QsaState::with_layout(gpu, cells, max_pos, layout).expect("state");
+    let fill = qsa.workspace(gpu, cells, cells).expect("fill ws");
+    write_f32(gpu, &fill.k_cur, &normalish(0xB1, cells * dim));
+    write_f32(gpu, &fill.v_cur, &normalish(0xB2, cells * dim));
+    qsa.kv_append(&state, &fill, 0).expect("append");
+    qsa.release(gpu, fill);
+
+    let ws = qsa.workspace(gpu, t, cells).expect("ws");
+    assert_eq!(ws.attn_rows, t, "bench needs one tile");
+    let pos0 = cells - t;
+    let (mut ids, mut counts) = (vec![0u32; t * ws.max_ids], vec![0u32; t]);
+    let mut s = 0x5EEDu64;
+    for r in 0..t {
+        let own = (pos0 + r) / qsa::IDX_BLOCK;
+        let mut pool: Vec<u32> = (0..own as u32).collect();
+        let n = (ws.max_ids - 1).min(pool.len());
+        for i in 0..n {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let j = i + (s >> 33) as usize % (pool.len() - i);
+            pool.swap(i, j);
+        }
+        let mut sel = pool[..n].to_vec();
+        sel.push(own as u32);
+        sel.sort_unstable();
+        ids[r * ws.max_ids..r * ws.max_ids + sel.len()].copy_from_slice(&sel);
+        counts[r] = sel.len() as u32;
+    }
+    write_f32(gpu, &ws.q, &normalish(0xB3, t * qsa::MODEL_N_HEAD * qsa::MODEL_HEAD_DIM));
+    write_f32(gpu, &ws.q_full, &normalish(0xB4, t * qsa::QGATE_DIM));
+    gemv::upload_into(gpu, &ws.ids, &breccia_kernels::ops::u32_to_bytes(&ids)).expect("ids");
+    gemv::upload_into(gpu, &ws.counts, &breccia_kernels::ops::u32_to_bytes(&counts)).expect("counts");
+
+    let n_out = t * qsa::ATTN_OUT_DIM;
+    qsa.attend(&state, &ws, pos0).expect("attend");
+    qsa.apply(&state, &ws, pos0).expect("apply");
+    let want = read_f32(gpu, &ws.attn_out, n_out);
+    qsa.flash(&state, &ws, pos0).expect("flash");
+    let got = read_f32(gpu, &ws.attn_out, n_out);
+    let scale = want.iter().fold(0f32, |m, x| m.max(x.abs()));
+    let err = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+
+    let reps: usize = std::env::var("BRECCIA_ATTN_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let time = |f: &dyn Fn()| {
+        f();
+        (0..reps)
+            .map(|_| {
+                let t0 = std::time::Instant::now();
+                f();
+                t0.elapsed().as_secs_f64()
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let tiled = time(&|| {
+        qsa.attend(&state, &ws, pos0).unwrap();
+        qsa.apply(&state, &ws, pos0).unwrap();
+    });
+    let flash = time(&|| qsa.flash(&state, &ws, pos0).unwrap());
+    let us = |s: f64| s * 1e6 / t as f64;
+    println!(
+        "attn bench {layout:?} rows {t} cells {cells} sel {}: tiled {:.2} us/row/layer ({:.1} x12) | flash {:.2} ({:.1} x12) | flash/tiled {:.2} | max err {err:.2e} (scale {scale:.2e})",
+        counts[0],
+        us(tiled),
+        12.0 * us(tiled),
+        us(flash),
+        12.0 * us(flash),
+        flash / tiled
+    );
+    qsa.release(gpu, ws);
+    state.release(gpu);
+}
+
+/// Kernel microbench, not a check: the indexer half of `qsa-aux` on one prefill
+/// chunk — block scores, then top-k by the serial and the rank path (ids compared).
+/// `BRECCIA_ATTN_BENCH=rows,cells` (default 2048,32768); `--ignored --nocapture`.
+#[test]
+#[ignore]
+fn qsa_idx_bench() {
+    let fx = need_gpu!("qsa_flash");
+    let gpu = fx.dev.gpu();
+    let (t, cells) = std::env::var("BRECCIA_ATTN_BENCH")
+        .ok()
+        .and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        })
+        .unwrap_or((2048usize, 32768usize));
+    let max_pos = cells.next_power_of_two();
+    let qsa = Qsa::new(gpu, max_pos).expect("qsa");
+    let state = QsaState::new(gpu, cells, max_pos).expect("state");
+    let ws = qsa.workspace(gpu, t, cells).expect("ws");
+    let pos0 = cells - t;
+    write_f32(gpu, &state.idx_pooled, &normalish(0xC1, ws.n_blocks * qsa::IDX_DIM));
+    write_f32(gpu, &ws.idx_q, &normalish(0xC2, t * qsa::IDX_N_HEAD * qsa::IDX_DIM));
+    let reps: usize = std::env::var("BRECCIA_ATTN_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let time = |f: &dyn Fn()| {
+        f();
+        (0..reps)
+            .map(|_| {
+                let t0 = std::time::Instant::now();
+                f();
+                t0.elapsed().as_secs_f64()
+            })
+            .fold(f64::INFINITY, f64::min)
+    };
+    let score = time(&|| qsa.idx_score(&state, &ws, pos0).unwrap());
+    let read_ids = || {
+        let ids = gemv::download(gpu, &ws.ids, t * ws.max_ids * 4).expect("ids");
+        let counts = gemv::download(gpu, &ws.counts, t * 4).expect("counts");
+        let u = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
+        // Per-row id sets (order and the slots past `count` are not compared).
+        (0..t)
+            .map(|r| {
+                let n = u(&counts, r) as usize;
+                let mut v: Vec<u32> = (0..n).map(|i| u(&ids, r * ws.max_ids + i)).collect();
+                v.sort_unstable();
+                v
+            })
+            .collect::<Vec<_>>()
+    };
+    // The serial kernel destroys the scores, so every top-k run rescores first and
+    // the top-k cell is (score + top-k) - score.
+    let serial = time(&|| {
+        qsa.idx_score(&state, &ws, pos0).unwrap();
+        qsa.topk_with(&ws, pos0, qsa::TopkPath::Serial).unwrap();
+    }) - score;
+    let a = read_ids();
+    let rank = time(&|| {
+        qsa.idx_score(&state, &ws, pos0).unwrap();
+        qsa.topk_with(&ws, pos0, qsa::TopkPath::Rank).unwrap();
+    }) - score;
+    let b = read_ids();
+    let us = |s: f64| s * 1e6 / t as f64;
+    println!(
+        "idx bench rows {t} cells {cells} blocks {}: score {:.2} us/row/layer ({:.1} x12) | topk serial {:.2} ({:.1} x12) | rank {:.2} ({:.1} x12) | same sets {} (counts {} vs {})",
+        ws.n_blocks,
+        us(score),
+        12.0 * us(score),
+        us(serial),
+        12.0 * us(serial),
+        us(rank),
+        12.0 * us(rank),
+        a == b,
+        a[0].len(),
+        b[0].len()
+    );
+    qsa.release(gpu, ws);
+    state.release(gpu);
+}
