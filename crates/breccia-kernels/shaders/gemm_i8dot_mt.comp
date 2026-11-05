@@ -1,0 +1,101 @@
+#version 450
+// Micro-tiled int8-dot GEMM: O[u*rows + r] = sum_k W[r,k] * X[u,k], the int8 twin
+// of `gemm_f16dot_mt.comp` (same BM x BN workgroup tile, RM x RU per thread).
+// W: int8 x4 per word (rows*cols/4) + one f16 scale per (row, 32 cols).
+// X: q8_1 from `ops_q8_quantize` (int8 x4 per word + f16 scale per 32 elements).
+// Per 32-col group: 8 `dotPacked4x8EXT` into an int, then one float fma with
+// the two scales. cols must be a multiple of 64 (KG groups per LDS stage).
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#ifndef BM
+#define BM 64
+#define BN 64
+#define RM 4
+#define RU 4
+#define NT 256
+#endif
+#define TR (BM / RM)
+#define TU (BN / RU)
+#define KG 2u            // 32-col groups per stage
+#define KW (KG * 8u)     // words per stage
+
+layout(local_size_x = NT) in;
+layout(std430, binding = 0) readonly buffer Wb { uint w[]; };
+layout(std430, binding = 1) readonly buffer WDb { uint16_t wd[]; };
+layout(std430, binding = 2) readonly buffer Xb { uint x[]; };
+layout(std430, binding = 3) readonly buffer XDb { uint16_t xd[]; };
+layout(std430, binding = 4) writeonly buffer Ob { float o[]; };
+layout(push_constant) uniform P { uint rows; uint cols; uint users; };
+
+shared uint Ws[KW][BM];
+shared uint Xs[KW][BN];
+shared float Wd[KG][BM];
+shared float Xd[KG][BN];
+
+float h2f(uint16_t h) { return unpackHalf2x16(uint(h)).x; }
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint tr = lid % TR;
+    uint tu = lid / TR;
+    uint r0 = gl_WorkGroupID.x * BM;
+    uint u0 = gl_WorkGroupID.y * BN;
+    uint cw = cols / 4u;
+    uint cg = cols / 32u;
+
+    float acc[RM][RU];
+    for (uint i = 0u; i < RM; i++)
+        for (uint j = 0u; j < RU; j++) acc[i][j] = 0.0;
+
+    for (uint g = 0u; g < cg; g += KG) {
+        uint k = g * 8u;
+        for (uint s = lid; s < BM * KW; s += NT) {
+            uint p = s % KW, rr = s / KW;
+            uint r = min(r0 + rr, rows - 1u);
+            Ws[p][rr] = w[r * cw + k + p];
+        }
+        for (uint s = lid; s < BN * KW; s += NT) {
+            uint p = s % KW, uu = s / KW;
+            uint u = min(u0 + uu, users - 1u);
+            Xs[p][uu] = x[u * cw + k + p];
+        }
+        for (uint s = lid; s < (BM + BN) * KG; s += NT) {
+            uint q = s % KG, i = s / KG;
+            if (i < BM) {
+                Wd[q][i] = h2f(wd[min(r0 + i, rows - 1u) * cg + g + q]);
+            } else {
+                Xd[q][i - BM] = h2f(xd[min(u0 + i - BM, users - 1u) * cg + g + q]);
+            }
+        }
+        barrier();
+        for (uint q = 0u; q < KG; q++) {
+            int ia[RM][RU];
+            for (uint i = 0u; i < RM; i++)
+                for (uint j = 0u; j < RU; j++) ia[i][j] = 0;
+            for (uint p = q * 8u; p < q * 8u + 8u; p++) {
+                int wv[RM];
+                for (uint i = 0u; i < RM; i++) wv[i] = int(Ws[p][tr + i * TR]);
+                for (uint j = 0u; j < RU; j++) {
+                    int xv = int(Xs[p][tu + j * TU]);
+                    for (uint i = 0u; i < RM; i++) ia[i][j] = dotPacked4x8AccSatEXT(wv[i], xv, ia[i][j]);
+                }
+            }
+            for (uint j = 0u; j < RU; j++) {
+                float xs = Xd[q][tu + j * TU];
+                for (uint i = 0u; i < RM; i++)
+                    acc[i][j] = fma(float(ia[i][j]), Wd[q][tr + i * TR] * xs, acc[i][j]);
+            }
+        }
+        barrier();
+    }
+    for (uint j = 0u; j < RU; j++) {
+        uint u = u0 + tu + j * TU;
+        if (u >= users) continue;
+        for (uint i = 0u; i < RM; i++) {
+            uint r = r0 + tr + i * TR;
+            if (r < rows) o[u * rows + r] = acc[i][j];
+        }
+    }
+}

@@ -1918,6 +1918,58 @@ impl<'g> DotGemm<'g> {
     }
 }
 
+/// Micro-tiled **int8-dot** GEMM (`gemm_i8dot_mt.comp`), the int8 twin of
+/// [`DotGemm::new_mt`]: W int8 + f16 scale per (row, 32 cols), X q8_1 from
+/// [`crate::Q8Quantize`]. Prefill-int8 experiment (not wired into the engine).
+pub struct I8DotGemm<'g> {
+    pipe: crate::ops::Pipe<'g>,
+    tile: (usize, usize),
+}
+
+impl<'g> I8DotGemm<'g> {
+    pub fn new_mt(gpu: &'g Gpu, variant: usize) -> Result<Self> {
+        let spv: &'static [u8] = match variant {
+            0 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_i8dot_mt64x64.spv")),
+            1 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_i8dot_mt128x64.spv")),
+            2 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_i8dot_mt64x128.spv")),
+            3 => include_bytes!(concat!(env!("OUT_DIR"), "/gemm_i8dot_mt128x128.spv")),
+            _ => anyhow::bail!("no micro-tiled int8-dot build {variant}"),
+        };
+        Ok(I8DotGemm {
+            pipe: crate::ops::Pipe::new(gpu, spv, 5, "int8-dot GEMM")?,
+            tile: DotGemm::MT_TILES[variant],
+        })
+    }
+
+    /// `o[u*rows + r] = sum_k w[r,k] x[u,k]`; `cols % 64 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        w: &Buf,
+        wd: &Buf,
+        x: &Buf,
+        xd: &Buf,
+        o: &Buf,
+        rows: usize,
+        cols: usize,
+        users: usize,
+    ) -> Result<()> {
+        if rows == 0 || users == 0 || cols == 0 || !cols.is_multiple_of(64) {
+            anyhow::bail!("int8-dot GEMM needs cols a non-zero multiple of 64, got {cols}");
+        }
+        let pc = crate::ops::Pc::new()
+            .u(rows as u32)
+            .u(cols as u32)
+            .u(users as u32);
+        let grid = (
+            rows.div_ceil(self.tile.0) as u32,
+            users.div_ceil(self.tile.1) as u32,
+            1,
+        );
+        self.pipe.run(&[w, wd, x, xd, o], &pc, grid)
+    }
+}
+
 #[cfg(test)]
 mod dot_selection_tests {
     use super::*;

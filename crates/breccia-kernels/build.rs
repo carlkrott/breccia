@@ -242,6 +242,13 @@ fn main() {
             &format!("gemm_f16dot_mt{bm}x{bn}"),
             &defs,
         );
+        compile(
+            &glslc,
+            &out_dir,
+            "gemm_i8dot_mt",
+            &format!("gemm_i8dot_mt{bm}x{bn}"),
+            &defs,
+        );
     }
 
     for name in SHADERS {
