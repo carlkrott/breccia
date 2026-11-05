@@ -13,8 +13,8 @@
 // (token, kv head), so a chunk fans out over `T * 2 * ceil(slots / 256)`
 // workgroups instead of `T * 24` subgroups. K is read once per (token, kv head)
 // for all 12 heads; the score layout, the `-1e30` mask and the causal rule are
-// the per-head kernel's. Only the summation order differs (a plain sequential
-// f32 sum per slot instead of per-lane partials + shuffle tree).
+// the per-head kernel's. Only the summation order differs (four lane partials
+// per slot instead of per-lane partials + shuffle tree).
 //
 // Host contract: `n_head == GROUP * n_kv_head`, `head_dim == 256`.
 
@@ -82,9 +82,12 @@ void main() {
     }
     uint page = PT[uint(cell) / pc.page_cells];
     uint in_page = uint(cell) % pc.page_cells;
-    float acc[GROUP];
+    // Four lane partials per head (one per vec4 component), summed once at the
+    // end: a single sequential f32 sum over 64 steps missed the f32 reference by
+    // 1.9e-5 (attn_conformance qsa_v_q8_0, 1e-5 bar); same FMA count.
+    vec4 acc[GROUP];
     for (uint h = 0u; h < GROUP; ++h) {
-        acc[h] = 0.0;
+        acc[h] = vec4(0.0);
     }
 #ifdef BRECCIA_KV_Q6
     // q6_0 row (`kv_q6.glsl`): 4 superblocks x 2 blocks x 4 nibble words of 8.
@@ -106,7 +109,7 @@ void main() {
                 vec4 k1 = vec4(x[4], x[5], x[6], x[7]);
                 uint i = (sb * 64u + s * 32u + nw * 8u) / 4u;
                 for (uint h = 0u; h < GROUP; ++h) {
-                    acc[h] += dot(sq[h * (HD / 4u) + i], k0) + dot(sq[h * (HD / 4u) + i + 1u], k1);
+                    acc[h] = fma(sq[h * (HD / 4u) + i + 1u], k1, fma(sq[h * (HD / 4u) + i], k0, acc[h]));
                 }
             }
         }
@@ -119,11 +122,12 @@ void main() {
         vec2 k1 = unpackHalf2x16(KP[base + 2u * i + 1u]);
         vec4 k = vec4(k0, k1);
         for (uint h = 0u; h < GROUP; ++h) {
-            acc[h] += dot(sq[h * (HD / 4u) + i], k);
+            acc[h] = fma(sq[h * (HD / 4u) + i], k, acc[h]);
         }
     }
 #endif
     for (uint h = 0u; h < GROUP; ++h) {
-        SC[(row0 + h) * pc.slots + s] = acc[h] * KQ_SCALE;
+        vec4 a = acc[h];
+        SC[(row0 + h) * pc.slots + s] = ((a.x + a.y) + (a.z + a.w)) * KQ_SCALE;
     }
 }
