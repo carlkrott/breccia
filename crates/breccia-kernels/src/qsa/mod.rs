@@ -497,18 +497,25 @@ fn buffer_sizes(capacity_cells: usize, max_pos: usize, v_layout: VLayout) -> [(u
 }
 
 /// Bytes one layer's [`QsaState`] allocates (for VRAM budgeting before any session exists).
-pub fn state_bytes(capacity_cells: usize, max_pos: usize, v_layout: VLayout) -> u64 {
-    // With `BRECCIA_KV_HOST=1` the K/V pools (the first two) live in host memory.
-    let skip = if kv_host() { 2 } else { 0 };
+pub fn state_bytes(capacity_cells: usize, max_pos: usize, v_layout: VLayout, kv_host: bool) -> u64 {
+    // With host K/V ([`kv_host_on`]) the K/V pools (the first two) live in host memory.
+    let skip = if kv_host { 2 } else { 0 };
     buffer_sizes(capacity_cells, max_pos, v_layout).iter().skip(skip).map(|b| b.0).sum()
 }
 
-/// `BRECCIA_KV_HOST=1`: allocate the K/V pools in host memory (GTT) that the GPU
+/// `BRECCIA_KV_HOST`: allocate the K/V pools in host memory (GTT) that the GPU
 /// reads over PCIe. Decode reads only the selected top-k cells per layer, so the
 /// pools need not take VRAM; the indexer, page table and positions stay on the card.
-pub fn kv_host() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BRECCIA_KV_HOST").is_ok_and(|v| v == "1"))
+/// `1` = every card; otherwise a comma list of PCI address suffixes
+/// (`03:00.0`) = only those cards (e.g. the RX, keeping the MI50's KV in VRAM).
+pub fn kv_host_on(pci: &str) -> bool {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    kv_host_matches(V.get_or_init(|| std::env::var("BRECCIA_KV_HOST").unwrap_or_default()), pci)
+}
+
+fn kv_host_matches(spec: &str, pci: &str) -> bool {
+    spec == "1"
+        || spec.split(',').map(str::trim).any(|e| !e.is_empty() && e != "0" && pci.ends_with(e))
 }
 
 fn alloc_host(gpu: &Gpu, size: u64) -> Result<Buf> {
@@ -620,7 +627,7 @@ impl QsaState {
         );
         let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
         for (i, (bytes, what)) in sizes.iter().enumerate() {
-            let a = if i < 2 && kv_host() { alloc_host(gpu, *bytes) } else { alloc(gpu, *bytes) };
+            let a = if i < 2 && kv_host_on(&gpu.pci_address) { alloc_host(gpu, *bytes) } else { alloc(gpu, *bytes) };
             match a {
                 Ok(b) => bufs.push(b),
                 Err(e) => {
@@ -2369,6 +2376,17 @@ impl Qsa<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::kv_host_matches;
+
+    #[test]
+    fn kv_host_spec_matches_cards() {
+        let (rx, mi) = ("0000:03:00.0", "0000:0e:00.0");
+        assert!(kv_host_matches("1", rx) && kv_host_matches("1", mi));
+        assert!(!kv_host_matches("", rx) && !kv_host_matches("0", rx));
+        assert!(kv_host_matches("03:00.0", rx) && !kv_host_matches("03:00.0", mi));
+        assert!(kv_host_matches("03:00.0, 0e:00.0", mi));
+    }
+
     use super::sizes::*;
 
     /// Text 0..5, a 3x2 image at cell 5, text after: the image tokens are

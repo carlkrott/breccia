@@ -791,7 +791,13 @@ impl Model {
             ArenaSpec::Auto(aopts) => {
                 let state: Vec<u64> = (0..devices.len())
                     .map(|i| {
-                        placement::state_bytes(&cfg, &placement.layer_device, i, opts.ctx_capacity)
+                        placement::state_bytes(
+                            &cfg,
+                            &placement.layer_device,
+                            i,
+                            opts.ctx_capacity,
+                            breccia_kernels::qsa::kv_host_on(&devices[i].info.pci_address),
+                        )
                             * aopts.sessions as u64
                     })
                     .collect();
@@ -1020,7 +1026,13 @@ impl Model {
                 .find(|r| r.device == i)
                 .map(|r| r.blocks)
                 .unwrap_or((0, 0));
-            let st = placement::state_bytes(&cfg, &placement.layer_device, i, opts.ctx_capacity);
+            let st = placement::state_bytes(
+                &cfg,
+                &placement.layer_device,
+                i,
+                opts.ctx_capacity,
+                breccia_kernels::qsa::kv_host_on(&dev.info.pci_address),
+            );
             state_total += st;
             let has_head = head_dev == i;
             let mutable = layers

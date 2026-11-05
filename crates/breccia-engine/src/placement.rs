@@ -298,6 +298,7 @@ pub fn state_bytes(
     layer_device: &[usize],
     dev: usize,
     capacity_cells: usize,
+    kv_host: bool,
 ) -> u64 {
     let mut total = 0u64;
     for (block, &d) in layer_device.iter().enumerate() {
@@ -316,6 +317,7 @@ pub fn state_bytes(
                     capacity_cells,
                     capacity_cells.max(8),
                     breccia_kernels::qsa::VLayout::current(),
+                    kv_host,
                 );
             }
         }
