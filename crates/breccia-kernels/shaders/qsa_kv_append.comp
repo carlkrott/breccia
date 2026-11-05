@@ -219,6 +219,35 @@ void oct_roundtrip(uint kmode, uint bits) {
     for (uint d = 0u; d < OCT_D; ++d) { row[d] = row[d] * oct_sign(d); }
 }
 
+// llama.cpp-style reference (bit 8 of the mode): ggml q8_0 / q5_0 / q4_0 per
+// 32-value block with an fp16 scale, no rotation, so Octave can be placed on the
+// familiar `-ctk/-ctv` scale. `bits` 8 = q8_0 (d = amax/127), else q{bits}_0
+// (d = signed max / -2^(bits-1), codes clamped to 2^bits - 1), as in ggml-quants.c.
+float gg_f16(float x) { return breccia_f16_bits_to_f32(breccia_f32_to_f16_bits(x)); }
+void gg_roundtrip(uint bits) {
+    for (uint b = 0u; b < OCT_D; b += 32u) {
+        float amax = 0.0, mx = 0.0;
+        for (uint j = 0u; j < 32u; ++j) {
+            float v = row[b + j];
+            if (abs(v) > amax) { amax = abs(v); mx = v; }
+        }
+        if (bits == 8u) {
+            float d = amax / 127.0, id = d != 0.0 ? 1.0 / d : 0.0;
+            float dh = gg_f16(d);
+            for (uint j = 0u; j < 32u; ++j) { row[b + j] = round(row[b + j] * id) * dh; }
+        } else {
+            float h = float(1u << (bits - 1u));
+            float d = mx / -h, id = d != 0.0 ? 1.0 / d : 0.0;
+            float dh = gg_f16(d);
+            float top = float((1u << bits) - 1u);
+            for (uint j = 0u; j < 32u; ++j) {
+                float q = min(top, floor(row[b + j] * id + h + 0.5));
+                row[b + j] = (q - h) * dh;
+            }
+        }
+    }
+}
+
 void main() {
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
     uint unit = wg * 128u + gl_LocalInvocationID.x;
@@ -238,11 +267,12 @@ void main() {
     uint src = t * (pc.n_kv_head * OCT_D) + kvh * OCT_D;
 
     for (uint d = 0u; d < OCT_D; ++d) { row[d] = KC[src + d]; }
-    if (kmode != 0u) { oct_roundtrip(kmode, 3u); }
+    bool gg = (pc.pad0 & 256u) != 0u;
+    if (kmode != 0u) { if (gg) { gg_roundtrip(kmode); } else { oct_roundtrip(kmode, 3u); } }
     for (uint p = 0u; p < pairs; ++p) { KP[word + p] = breccia_pack_f16x2(row[2u * p], row[2u * p + 1u]); }
 
     for (uint d = 0u; d < OCT_D; ++d) { row[d] = VC[src + d]; }
-    if (vbits != 0u) { oct_roundtrip(0u, vbits); }
+    if (vbits != 0u) { if (gg) { gg_roundtrip(vbits); } else { oct_roundtrip(0u, vbits); } }
     for (uint p = 0u; p < pairs; ++p) { VP[word + p] = breccia_pack_f16x2(row[2u * p], row[2u * p + 1u]); }
 }
 
