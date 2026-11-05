@@ -45,6 +45,10 @@ layout(push_constant) uniform Params {
 #define DEAD 0xffffffffu
 
 #include "f16_storage.glsl"
+#ifdef BRECCIA_KV_Q6
+#include "kv_q6.glsl"
+KV6_DEFINE_LOAD(load_k6, KP)
+#endif
 
 shared uint CB[CHUNK]; // K row base of each staged slot, or DEAD
 
@@ -90,8 +94,12 @@ void main() {
             if (cell <= pos) {
                 uint page = PT[uint(cell) / pc.page_cells];
                 uint in_page = uint(cell) % pc.page_cells;
+#ifdef BRECCIA_KV_Q6
+                base = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page; // q6 row
+#else
                 base = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
                        in_page * pc.head_dim;
+#endif
             }
         }
         CB[gl_LocalInvocationID.x] = base;
@@ -110,7 +118,11 @@ void main() {
             float k[LOCAL_MAX];
             [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
                 uint d = lane + m * sg_size;
+#ifdef BRECCIA_KV_Q6
+                k[m] = m < n_local ? load_k6(b, d) : 0.0;
+#else
                 k[m] = m < n_local ? breccia_load_f16(KP[(b + d) >> 1], b + d) : 0.0;
+#endif
             }
             [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
                 float acc = 0.0;

@@ -50,7 +50,10 @@ layout(push_constant) uniform Params {
 shared uint CB[CHUNK];          // V row/element base of each staged slot, or DEAD
 shared float PS[CHUNK * GROUP]; // [slot][head] probabilities
 
-#ifdef BRECCIA_KV_Q8V
+#ifdef BRECCIA_KV_Q6
+#include "kv_q6.glsl"
+KV6_DEFINE_LOAD(load_v, VP)
+#elif defined(BRECCIA_KV_Q8V)
 // Same q8_0 V layout and decode as `qsa_attn_apply.comp`.
 #define Q8_BLOCK_ELEMS 32u
 #define Q8_BLOCK_WORDS 9u
@@ -97,7 +100,7 @@ void main() {
             if (cell <= pos) {
                 uint page = PT[uint(cell) / pc.page_cells];
                 uint in_page = uint(cell) % pc.page_cells;
-#ifdef BRECCIA_KV_Q8V
+#if defined(BRECCIA_KV_Q8V) || defined(BRECCIA_KV_Q6)
                 base = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
 #else
                 base = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +

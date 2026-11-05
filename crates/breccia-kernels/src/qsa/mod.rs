@@ -266,6 +266,10 @@ pub enum VLayout {
     F16,
     /// q8_0: 32 x i8 + one f32 scale per 32-element block (`36 B` per 32 elements).
     Q8_0,
+    /// q6_0 **K and V** (`shaders/kv_q6.glsl`): 6-bit codes + one fp16 scale per 32
+    /// elements, 208 B per 256-element row (2.46x vs f16). The serving default since
+    /// 2026-11-05 (32k tail gate KL 1.03e-2 / top-1 .984, same class as q8_0).
+    Q6_0,
 }
 
 /// `BRECCIA_KV_OCTAVE_FQ` (quality gate, f16 cache only): round-trip K/V through the
@@ -311,12 +315,27 @@ impl VLayout {
         let _ = V_LAYOUT.set(v);
     }
 
-    /// `BRECCIA_KV_Q8V=1|true|on|yes` selects [`VLayout::Q8_0`]; anything else (and
-    /// unset) keeps the f16 reference path.
+    /// `BRECCIA_KV=f16|q8v|q6` names the layout; else `BRECCIA_KV_Q8V=1` selects
+    /// [`VLayout::Q8_0`]; else the Octave fake-quant gate (which rewrites an f16
+    /// cache) keeps f16; else the default [`VLayout::Q6_0`]. f16 is the exact opt-in.
     pub fn from_env() -> Self {
+        if let Ok(v) = std::env::var("BRECCIA_KV") {
+            return Self::parse(&v).unwrap_or_else(|| panic!("BRECCIA_KV={v}: want f16|q8v|q6"));
+        }
         match std::env::var("BRECCIA_KV_Q8V").ok().as_deref() {
             Some("1") | Some("true") | Some("on") | Some("yes") => VLayout::Q8_0,
-            _ => VLayout::F16,
+            _ if octave_fq_mode() != 0 => VLayout::F16,
+            _ => VLayout::Q6_0,
+        }
+    }
+
+    /// The `--kv` / `BRECCIA_KV` spelling of a layout.
+    pub fn parse(v: &str) -> Option<Self> {
+        match v {
+            "f16" => Some(VLayout::F16),
+            "q8v" | "q8_0" => Some(VLayout::Q8_0),
+            "q6" | "q6_0" => Some(VLayout::Q6_0),
+            _ => None,
         }
     }
 
@@ -325,6 +344,7 @@ impl VLayout {
         match self {
             VLayout::F16 => "f16",
             VLayout::Q8_0 => "q8_0",
+            VLayout::Q6_0 => "q6_0",
         }
     }
 }
@@ -386,6 +406,18 @@ pub mod sizes {
     /// argument in §8bf turns on.
     pub fn q8v_vs_f16() -> f64 {
         q8v_pool_bytes(1) as f64 / f16_pool_bytes(1) as f64
+    }
+
+    /// **Words** of a q6_0 K or V row: `head_dim / 64` superblocks of 13 words
+    /// (`shaders/kv_q6.glsl`) = 52 words = 208 B.
+    pub fn q6_row_words() -> usize {
+        assert_eq!(MODEL_HEAD_DIM % 64, 0, "q6_0 rows are whole 64-element superblocks");
+        MODEL_HEAD_DIM / 64 * 13
+    }
+
+    /// Bytes of one q6_0 K or V pool.
+    pub fn q6_pool_bytes(pages: usize) -> u64 {
+        (pool_rows(pages) * q6_row_words() * 4) as u64
     }
 
     /// Bytes of the indexer's pooled keys, from the block count they are indexed by.
@@ -456,6 +488,12 @@ impl QsaState {
         let v_bytes = match v_layout {
             VLayout::F16 => sizes::f16_pool_bytes(pages),
             VLayout::Q8_0 => sizes::q8v_pool_bytes(pages),
+            VLayout::Q6_0 => sizes::q6_pool_bytes(pages),
+        };
+        // K is f16 except in the q6_0 layout, which quantises both.
+        let k_bytes = match v_layout {
+            VLayout::Q6_0 => sizes::q6_pool_bytes(pages),
+            _ => sizes::f16_pool_bytes(pages),
         };
         assert_eq!(
             sizes::f16_pool_bytes(pages) as usize,
@@ -468,12 +506,14 @@ impl QsaState {
             "the q8_0 V pool must hold cells x n_kv_head rows of q8_blocks_per_row() blocks"
         );
         assert!(
-            v_bytes == sizes::f16_pool_bytes(pages) || v_bytes == sizes::q8v_pool_bytes(pages),
+            v_bytes == sizes::f16_pool_bytes(pages)
+                || v_bytes == sizes::q8v_pool_bytes(pages)
+                || v_bytes == sizes::q6_pool_bytes(pages),
             "the V pool is one of the two layouts the kernels index, not a literal"
         );
 
         let sizes = [
-            (sizes::f16_pool_bytes(pages), "kv k_pool"),
+            (k_bytes, "kv k_pool"),
             (v_bytes, "kv v_pool"),
             (pages as u64 * 4, "kv page_table"),
             (sizes::idx_tail_bytes(), "indexer tail"),
@@ -747,6 +787,7 @@ pub struct QsaProjections<'a, 'g, 'w> {
 pub struct Qsa<'g> {
     q_norm: Pipe<'g>,
     kv_append: Pipe<'g>,
+    kv_append_q6: Pipe<'g>,
     /// `BRECCIA_KV_Q8V`: quantise V on write (`qsa_kv_append.comp` q8_0 build).
     kv_append_q8: Pipe<'g>,
     /// `BRECCIA_KV_OCTAVE_FQ`: Octave round-trip before the f16 store (quality gate).
@@ -760,22 +801,29 @@ pub struct Qsa<'g> {
     topk_pick: Pipe<'g>,
     topk_cand: Pipe<'g>,
     attn_scores: Pipe<'g>,
+    attn_scores_q6: Pipe<'g>,
     attn_scores_gqa: Pipe<'g>,
+    attn_scores_gqa_q6: Pipe<'g>,
     attn_scores_small: Pipe<'g>,
+    attn_scores_small_q6: Pipe<'g>,
     attn_apply: Pipe<'g>,
+    attn_apply_q6: Pipe<'g>,
     /// `BRECCIA_KV_Q8V`: read V as q8_0, dequantise in registers in the dot.
     attn_apply_q8: Pipe<'g>,
     /// Prefill apply: one workgroup per (token, kv head), V loaded once for the
     /// 12 heads that share it (`qsa_attn_apply_gqa.comp`, plan §12 item 3).
     attn_apply_gqa: Pipe<'g>,
+    attn_apply_gqa_q6: Pipe<'g>,
     attn_apply_gqa_q8: Pipe<'g>,
     /// Prefill scores + online softmax + apply in one pass, no score matrix
     /// (`qsa_attn_flash_gqa.comp`).
     attn_flash: Pipe<'g>,
+    attn_flash_q6: Pipe<'g>,
     attn_flash_q8: Pipe<'g>,
     /// Decode/verify apply, split over slot chunks (`qsa_attn_apply_split.comp`)
     /// and summed by `qsa_attn_apply_reduce.comp`.
     attn_apply_split: Pipe<'g>,
+    attn_apply_split_q6: Pipe<'g>,
     attn_apply_split_q8: Pipe<'g>,
     attn_apply_reduce: Pipe<'g>,
     softmax: Softmax<'g>,
@@ -803,6 +851,12 @@ impl<'g> Qsa<'g> {
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_kv_append.spv")),
             5,
             "qsa kv append",
+        )?;
+        let kv_append_q6 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_kv_append_q6.spv")),
+            5,
+            "qsa kv append (q6_0 K+V)",
         )?;
         let kv_append_q8 = Pipe::new(
             gpu,
@@ -870,11 +924,23 @@ impl<'g> Qsa<'g> {
             6,
             "qsa attention scores",
         )?;
+        let attn_scores_q6 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_scores_q6.spv")),
+            6,
+            "qsa attention scores (q6_0 K+V)",
+        )?;
         let attn_scores_gqa = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_scores_gqa.spv")),
             6,
             "qsa attention scores (kv-head groups)",
+        )?;
+        let attn_scores_gqa_q6 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_scores_gqa_q6.spv")),
+            6,
+            "qsa attention scores (kv-head groups) (q6_0 K+V)",
         )?;
         let attn_scores_small = Pipe::new(
             gpu,
@@ -882,11 +948,23 @@ impl<'g> Qsa<'g> {
             6,
             "qsa attention scores (small T)",
         )?;
+        let attn_scores_small_q6 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_scores_small_q6.spv")),
+            6,
+            "qsa attention scores (small T) (q6_0 K+V)",
+        )?;
         let attn_apply = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply.spv")),
             7,
             "qsa attention apply",
+        )?;
+        let attn_apply_q6 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_q6.spv")),
+            7,
+            "qsa attention apply (q6_0 K+V)",
         )?;
         let attn_apply_q8 = Pipe::new(
             gpu,
@@ -900,6 +978,12 @@ impl<'g> Qsa<'g> {
             7,
             "qsa attention apply (kv-head groups)",
         )?;
+        let attn_apply_gqa_q6 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_gqa_q6.spv")),
+            7,
+            "qsa attention apply (kv-head groups) (q6_0 K+V)",
+        )?;
         let attn_apply_gqa_q8 = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_gqa_q8v.spv")),
@@ -912,6 +996,12 @@ impl<'g> Qsa<'g> {
             8,
             "qsa flash attention (kv-head groups)",
         )?;
+        let attn_flash_q6 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_flash_gqa_q6.spv")),
+            8,
+            "qsa flash attention (kv-head groups) (q6_0 K+V)",
+        )?;
         let attn_flash_q8 = Pipe::new(
             gpu,
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_flash_gqa_q8v.spv")),
@@ -923,6 +1013,12 @@ impl<'g> Qsa<'g> {
             include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_split.spv")),
             7,
             "qsa attention apply (split)",
+        )?;
+        let attn_apply_split_q6 = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/qsa_attn_apply_split_q6.spv")),
+            7,
+            "qsa attention apply (split) (q6_0 K+V)",
         )?;
         let attn_apply_split_q8 = Pipe::new(
             gpu,
@@ -946,6 +1042,7 @@ impl<'g> Qsa<'g> {
         Ok(Qsa {
             q_norm,
             kv_append,
+            kv_append_q6,
             kv_append_q8,
             kv_append_oct,
             idx_tail,
@@ -957,15 +1054,22 @@ impl<'g> Qsa<'g> {
             topk_pick,
             topk_cand,
             attn_scores,
+            attn_scores_q6,
             attn_scores_gqa,
+            attn_scores_gqa_q6,
             attn_scores_small,
+            attn_scores_small_q6,
             attn_apply,
+            attn_apply_q6,
             attn_apply_q8,
             attn_apply_gqa,
+            attn_apply_gqa_q6,
             attn_apply_gqa_q8,
             attn_flash,
+            attn_flash_q6,
             attn_flash_q8,
             attn_apply_split,
+            attn_apply_split_q6,
             attn_apply_split_q8,
             attn_apply_reduce,
             softmax,
@@ -1219,6 +1323,10 @@ impl<'g> Qsa<'g> {
     /// one invocation per (token, kv_head, 32-element block) and the f16 build one
     /// per (token, kv_head, d-pair). Same bindings, same push constants.
     fn kv_append_target(&self, state: &QsaState, tokens: usize, oct: u32) -> (&Pipe<'g>, u32, u32) {
+        assert!(
+            oct == 0 || state.v_layout == VLayout::F16,
+            "BRECCIA_KV_OCTAVE_FQ rewrites an f16 cache: run it with BRECCIA_KV=f16"
+        );
         let (pipe, units, wg) = match state.v_layout {
             VLayout::F16 if oct != 0 => (&self.kv_append_oct, tokens * MODEL_N_KV_HEAD, 128),
             VLayout::F16 => (
@@ -1231,6 +1339,11 @@ impl<'g> Qsa<'g> {
                 tokens * MODEL_N_KV_HEAD * sizes::q8_blocks_per_row(),
                 32,
             ),
+            VLayout::Q6_0 => (
+                &self.kv_append_q6,
+                tokens * MODEL_N_KV_HEAD * (MODEL_HEAD_DIM / 64),
+                128,
+            ),
         };
         let (gx, gy) = grid_for(units, wg);
         (pipe, gx, gy)
@@ -1242,6 +1355,16 @@ impl<'g> Qsa<'g> {
         match state.v_layout {
             VLayout::F16 => &self.attn_apply,
             VLayout::Q8_0 => &self.attn_apply_q8,
+            VLayout::Q6_0 => &self.attn_apply_q6,
+        }
+    }
+
+    /// The three K-reading score pipelines (per-head, small, gqa) for this state's
+    /// K layout: f16 unless the layout is q6_0.
+    fn scores_targets(&self, state: &QsaState) -> (&Pipe<'g>, &Pipe<'g>, &Pipe<'g>) {
+        match state.v_layout {
+            VLayout::Q6_0 => (&self.attn_scores_q6, &self.attn_scores_small_q6, &self.attn_scores_gqa_q6),
+            _ => (&self.attn_scores, &self.attn_scores_small, &self.attn_scores_gqa),
         }
     }
 
@@ -1500,7 +1623,7 @@ impl<'g> Qsa<'g> {
                     .u(MODEL_N_KV_HEAD as u32)
                     .u(row0 as u32);
                 let (gx, gy) = grid_for(tile * MODEL_N_KV_HEAD, 1);
-                self.attn_scores_gqa.run(
+                self.scores_targets(state).2.run(
                     &[
                         &ws.q,
                         &state.k_pool,
@@ -1519,11 +1642,11 @@ impl<'g> Qsa<'g> {
         }
         let (pipe, units) = if small_scores(ws.tokens) {
             (
-                &self.attn_scores_small,
+                self.scores_targets(state).1,
                 ws.tokens * MODEL_N_KV_HEAD * ws.slots.div_ceil(256),
             )
         } else {
-            (&self.attn_scores, ws.tokens * MODEL_N_HEAD)
+            (self.scores_targets(state).0, ws.tokens * MODEL_N_HEAD)
         };
         let (gx, gy) = grid_for(units, 1);
         pipe.run(
@@ -1558,6 +1681,7 @@ impl<'g> Qsa<'g> {
         let pipe = match state.v_layout {
             VLayout::F16 => &self.attn_flash,
             VLayout::Q8_0 => &self.attn_flash_q8,
+            VLayout::Q6_0 => &self.attn_flash_q6,
         };
         let (gx, gy) = grid_for(ws.tokens * MODEL_N_KV_HEAD, 1);
         pipe.run(
@@ -1608,6 +1732,7 @@ impl<'g> Qsa<'g> {
             let pipe = match state.v_layout {
                 VLayout::F16 => &self.attn_apply_split,
                 VLayout::Q8_0 => &self.attn_apply_split_q8,
+                VLayout::Q6_0 => &self.attn_apply_split_q6,
             };
             let (gx, gy) = grid_for(ws.tokens * MODEL_N_HEAD * chunks, 1);
             pipe.run(
@@ -1650,6 +1775,7 @@ impl<'g> Qsa<'g> {
                 let pipe = match state.v_layout {
                     VLayout::F16 => &self.attn_apply_gqa,
                     VLayout::Q8_0 => &self.attn_apply_gqa_q8,
+                    VLayout::Q6_0 => &self.attn_apply_gqa_q6,
                 };
                 let (gx, gy) = grid_for(tile * MODEL_N_KV_HEAD, 1);
                 pipe.run(
@@ -1677,6 +1803,7 @@ impl<'g> Qsa<'g> {
         let pipe = match (gqa, state.v_layout) {
             (true, VLayout::F16) => &self.attn_apply_gqa,
             (true, VLayout::Q8_0) => &self.attn_apply_gqa_q8,
+            (true, VLayout::Q6_0) => &self.attn_apply_gqa_q6,
             (false, _) => self.attn_apply_target(state),
         };
         pipe.run(
@@ -2049,7 +2176,7 @@ impl Qsa<'_> {
             .u(PAGE_CELLS as u32)
             .u(MODEL_N_KV_HEAD as u32);
         let (agx, agy) = grid_for(t * MODEL_N_HEAD, 1);
-        let mut attn = self.attn_scores.run_timed(
+        let mut attn = self.scores_targets(state).0.run_timed(
             &[
                 &ws.q,
                 &state.k_pool,
@@ -2125,6 +2252,15 @@ mod tests {
             (167.0..169.0).contains(&(save_mib * 12.0)),
             "per-agent V saving"
         );
+    }
+
+    /// q6_0 K+V (the default): 13 words per 64 elements = 208 B per 256-dim row vs
+    /// 512 B f16, so each pool is 0.40625x and the K+V pair shrinks 2.46x.
+    #[test]
+    fn the_q6_pool_is_0_40625_of_f16() {
+        assert_eq!(q6_row_words(), 52);
+        let pages = 8;
+        assert_eq!(q6_pool_bytes(pages) * 32, f16_pool_bytes(pages) * 13);
     }
 
     /// Positional lists are checked against the index counts they are consumed by.

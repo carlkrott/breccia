@@ -47,7 +47,12 @@ layout(push_constant) uniform Params {
 #include "f16_storage.glsl"
 #include "ops_math.glsl"
 
-#ifdef BRECCIA_KV_Q8V
+#ifdef BRECCIA_KV_Q6
+// q6_0 K+V (`kv_q6.glsl`): same row addressing as q8_0 V, its own decode.
+#include "kv_q6.glsl"
+KV6_DEFINE_LOAD(kv6_v, VP)
+#define load_v_q8(row, elem, blocks) kv6_v(row, elem)
+#elif defined(BRECCIA_KV_Q8V)
 // `BRECCIA_KV_Q8V`: V is q8_0 (`docs/phase-4/01-forward-pass.md` §8bg) and is
 // dequantised **in registers inside the accumulate loop** — `v = i8 * scale` added
 // straight into `acc`. There is deliberately no dequantise-the-cache-to-f16 pass
@@ -121,7 +126,7 @@ void main() {
             }
             uint page = PT[uint(cell) / pc.page_cells];
             uint in_page = uint(cell) % pc.page_cells;
-#ifdef BRECCIA_KV_Q8V
+#if defined(BRECCIA_KV_Q8V) || defined(BRECCIA_KV_Q6)
             // One row of the q8_0 pool, then the block this lane's `d` falls in.
             uint vrow = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
             acc += p * load_v_q8(vrow, d, blocks);

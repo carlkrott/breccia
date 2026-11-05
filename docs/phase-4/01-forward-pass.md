@@ -5818,3 +5818,53 @@ and the next agent must fix the bug first.
 
 **State of the tree at handover**: `git status` clean on branch `gpu-time-table`
 (merge `0fb148e` of main, i.e. everything through §8bh merged). `verify.sh` PASS.
+
+## 8bj. q6_0 K+V cache is the **default** (2026-11-05); f16 is the exact opt-in
+
+**Layout** (`shaders/kv_q6.glsl`): one cache row (head_dim 256) = 4 superblocks x 13 u32 =
+208 B. Each superblock holds two 32-element blocks: word 0 = their two fp16 scales, then
+4 words of low nibbles and 2 words of high 2-bit pairs per block. `value = (q - 32) * d`,
+`d = signed max / -32`, `q = min(63, floor(x/d + 32.5))`. This is the same rule the fake-quant
+gate measured as `q6_0`. One superblock per writer invocation, so no word is shared.
+Pool = **0.40625 x f16** (K+V 2.46x smaller), pinned by `the_q6_pool_is_0_40625_of_f16`.
+
+**Selection**: `VLayout::from_env` reads `BRECCIA_KV=f16|q8v|q6` (or `--kv`) first, then the
+legacy `BRECCIA_KV_Q8V=1`. `BRECCIA_KV_OCTAVE_FQ` forces f16, because the fake-quant gate
+needs an f16 pool. With none of these set, the layout is **Q6_0**. All attention paths
+dequantise in registers: scores (plain, GQA, small), apply (plain, GQA, split) and flash GQA.
+
+**Conformance** (RX and MI50):
+- The pool decodes bit-exact against `cpu::to_q6_0` (0/65 536 elements off).
+- Attention against the q6 CPU reference: 7.6e-5, below the f16 path's own error against
+  its reference (1.7e-4 RX, 1.35e-4 MI50).
+- Flash against the triple path on Q6: 7.6e-6 / 7.9e-6.
+- Pre-existing and unrelated: `qsa_v_q8_0_matches_the_reference_and_the_f16_path` fails
+  its f16 leg at 1.89e-5 against a 1e-5 bar. It also fails on the unchanged tree.
+
+**Quality, 32k teacher-forced tail gate** (K=64, reference = f16):
+
+| run | KL mean | top1 | top10 |
+|---|---|---|---|
+| real q6, RX | 1.28e-2 | 1.000 | .886 |
+| real q6, dual 38/10 | 8.6e-3 | .969 | .900 |
+| fake q6 / q8_0 / q5_0 / q4_0 (earlier) | 1.03e-2 / 9.8e-3 / 1.22e-2 / 2.43e-2 | | |
+
+**The gate's noise floor is ~5e-3 KL**, not ~1e-5. Real q6 on RX against real q6 on dual
+gives 5.0e-3. Fake q6 against fake q8 gives 9.0e-3. Differences under ~5e-3 are not
+resolvable on this gate, most likely because QSA's top-k block selection is discrete. The
+verdict is therefore "q8_0 class", not "better than q8_0".
+
+**Speed** (8k, dual 38/10, ABBA, `BRECCIA_GPU_TIME` off via `run.sh NOGT=1`, 1 stream):
+
+| leg | prefill tok/s | decode tok/s (gen 64) |
+|---|---|---|
+| f16 A | 396.9 | 21.99 |
+| q6 A | 395.8 | 20.77 |
+| q6 B | 394.3 | 21.81 |
+| f16 B | 381.5 | 21.72 |
+| **mean f16 / q6** | **389.2 / 395.1** | **21.86 / 21.29** |
+
+Prefill is unchanged (+1.5 %, inside noise). Decode is -2.6 % on the mean, but that comes
+entirely from the q6 A leg: q6 B and f16 B agree within 0.4 %. At 8k, KV reads are a small
+share of decode time next to expert weights. The win is capacity: K+V takes 2.46x less
+memory, so a card fits more context and more streams.

@@ -82,13 +82,38 @@ void main() {
     }
     uint page = PT[uint(cell) / pc.page_cells];
     uint in_page = uint(cell) % pc.page_cells;
-    // Row base in uint words (head_dim is even, so rows are word aligned).
-    uint base = ((page * pc.n_kv_head + kvh) * pc.page_cells + in_page) * (HD / 2u);
-
     float acc[GROUP];
     for (uint h = 0u; h < GROUP; ++h) {
         acc[h] = 0.0;
     }
+#ifdef BRECCIA_KV_Q6
+    // q6_0 row (`kv_q6.glsl`): 4 superblocks x 2 blocks x 4 nibble words of 8.
+    uint at = ((page * pc.n_kv_head + kvh) * pc.page_cells + in_page) * (HD / 64u) * 13u;
+    for (uint sb = 0u; sb < HD / 64u; ++sb, at += 13u) {
+        vec2 dd = unpackHalf2x16(KP[at]);
+        for (uint s = 0u; s < 2u; ++s) {
+            uint w = at + 1u + s * 6u;
+            float dk = dd[s];
+            for (uint nw = 0u; nw < 4u; ++nw) {
+                uint lo = KP[w + nw];
+                uint hi = KP[w + 4u + (nw >> 1)] >> (16u * (nw & 1u));
+                float x[8];
+                for (uint j = 0u; j < 8u; ++j) {
+                    uint q = ((lo >> (4u * j)) & 15u) | (((hi >> (2u * j)) & 3u) << 4);
+                    x[j] = (float(q) - 32.0) * dk;
+                }
+                vec4 k0 = vec4(x[0], x[1], x[2], x[3]);
+                vec4 k1 = vec4(x[4], x[5], x[6], x[7]);
+                uint i = (sb * 64u + s * 32u + nw * 8u) / 4u;
+                for (uint h = 0u; h < GROUP; ++h) {
+                    acc[h] += dot(sq[h * (HD / 4u) + i], k0) + dot(sq[h * (HD / 4u) + i + 1u], k1);
+                }
+            }
+        }
+    }
+#else
+    // Row base in uint words (head_dim is even, so rows are word aligned).
+    uint base = ((page * pc.n_kv_head + kvh) * pc.page_cells + in_page) * (HD / 2u);
     for (uint i = 0u; i < HD / 4u; ++i) {
         vec2 k0 = unpackHalf2x16(KP[base + 2u * i]);
         vec2 k1 = unpackHalf2x16(KP[base + 2u * i + 1u]);
@@ -97,6 +122,7 @@ void main() {
             acc[h] += dot(sq[h * (HD / 4u) + i], k);
         }
     }
+#endif
     for (uint h = 0u; h < GROUP; ++h) {
         SC[(row0 + h) * pc.slots + s] = acc[h] * KQ_SCALE;
     }

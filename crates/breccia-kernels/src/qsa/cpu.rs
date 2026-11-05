@@ -81,6 +81,32 @@ pub fn to_q8_0(x: &[f32]) -> Vec<f32> {
     out
 }
 
+/// q6_0 round trip of a K or V row, as `qsa_kv_append.comp`'s `BRECCIA_KV_Q6`
+/// store and `kv_q6.glsl`'s load compute it: per 32-element block
+/// `d = (signed max) / -32`, `q = min(63, floor(x / d + 32.5))` (f32, via the
+/// unrounded reciprocal), `d` stored fp16, read back as `(q - 32) * d`.
+pub fn to_q6_0(x: &[f32]) -> Vec<f32> {
+    assert_eq!(x.len() % 32, 0, "a q6_0 row is a whole number of 32-element blocks");
+    let mut out = Vec::with_capacity(x.len());
+    for b in x.chunks_exact(32) {
+        let (mut amax, mut mx) = (0.0f32, 0.0f32);
+        for &v in b {
+            if v.abs() > amax {
+                amax = v.abs();
+                mx = v;
+            }
+        }
+        let d = mx / -32.0;
+        let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+        let dh = to_f16(d);
+        for &v in b {
+            let q = (v * id + 32.5).floor().min(63.0);
+            out.push((q - 32.0) * dh);
+        }
+    }
+    out
+}
+
 /// `qsa_kv_append.comp`'s `BRECCIA_KV_OCTAVE_FQ` round-trip in Rust (vLLM ROCm
 /// Octave, Apache-2.0): sign flips, orthonormal FWHT, Lloyd-Max N(0,1) codebook with
 /// the scale fitted so `x . x_hat = |x|^2` (stored fp16 as `scale * 64`), back out.

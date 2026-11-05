@@ -344,6 +344,10 @@ enum BenchKind {
         /// either way. Same choice as `BRECCIA_KV_Q8V=1`.
         #[arg(long, default_value_t = false)]
         kv_q8v: bool,
+        /// KV cache layout: `q6` (default: K+V q6_0), `f16` (exact), `q8v` (V q8_0).
+        /// Same choice as `BRECCIA_KV`; wins over `--kv-q8v`.
+        #[arg(long, value_name = "f16|q8v|q6")]
+        kv: Option<String>,
         /// Tokens to generate after the prompt (greedy, temperature 0)
         #[arg(long, default_value_t = 32)]
         gen: usize,
@@ -705,6 +709,7 @@ fn run(cli: Cli) -> Result<()> {
             kind:
                 Some(BenchKind::Token {
                     kv_q8v,
+                    kv,
                     prompt,
                     gen,
                     prompt_ids,
@@ -737,8 +742,13 @@ fn run(cli: Cli) -> Result<()> {
                 }),
         } => {
             // Before any `QsaState` exists: the layout is latched on first use.
-            if kv_q8v {
-                breccia_kernels::qsa::VLayout::set_current(breccia_kernels::qsa::VLayout::Q8_0);
+            use breccia_kernels::qsa::VLayout;
+            if let Some(kv) = kv {
+                let l = VLayout::parse(&kv)
+                    .ok_or_else(|| anyhow::anyhow!("--kv {kv}: expected f16, q8v or q6"))?;
+                VLayout::set_current(l);
+            } else if kv_q8v {
+                VLayout::set_current(VLayout::Q8_0);
             }
             let (prefill_chunk, prefill_chunks) =
                 resolve_prefill_chunks(prefill_chunk, prefill_merged, &devices, ctx);

@@ -606,7 +606,7 @@ fn qsa_sequence(chunk: usize, label: &str) {
     };
 
     let mut states: Vec<QsaState> = (0..2)
-        .map(|_| QsaState::new(gpu, max_pos, max_pos).expect("qsa state"))
+        .map(|_| QsaState::with_layout(gpu, max_pos, max_pos, qsa::VLayout::F16).expect("qsa state"))
         .collect();
     let mut ref_states: Vec<qsa::cpu::RefState> =
         (0..2).map(|_| qsa::cpu::RefState::new()).collect();
@@ -791,7 +791,7 @@ fn qsa_indexer_pooling_matches_the_cpu_reference() {
 
     let qsa = Qsa::new(gpu, max_pos).expect("qsa");
     let table = qsa.table().cos_sin().to_vec();
-    let state = QsaState::new(gpu, tokens + 8, max_pos).expect("state");
+    let state = QsaState::with_layout(gpu, tokens + 8, max_pos, qsa::VLayout::F16).expect("state");
     let ws = qsa.workspace(gpu, chunk, 1).expect("ws");
     let raw = normalish(0xD1, tokens * qsa::IDX_DIM);
 
@@ -845,7 +845,7 @@ fn qsa_dense_skip_selects_the_scored_set() {
     let gpu = fx.dev.gpu();
     let max_pos = 4096usize;
     let qsa = Qsa::new(gpu, max_pos).expect("qsa");
-    let state = QsaState::new(gpu, 2048, max_pos).expect("state");
+    let state = QsaState::with_layout(gpu, 2048, max_pos, qsa::VLayout::F16).expect("state");
     let pooled = normalish(0xF2, (2048 / qsa::IDX_BLOCK + 1) * qsa::IDX_DIM);
     breccia_kernels::gemv::upload_into(
         gpu,
@@ -902,7 +902,7 @@ fn qsa_sparse_selection_and_attention_match_at_2062_cells() {
     let cells = 2062usize; // 515 whole blocks + 2 tail cells
     let n_blocks = cells / qsa::IDX_BLOCK;
     let qsa = Qsa::new(gpu, max_pos).expect("qsa");
-    let state = QsaState::new(gpu, cells, max_pos).expect("state");
+    let state = QsaState::with_layout(gpu, cells, max_pos, qsa::VLayout::F16).expect("state");
 
     // Synthetic indexer queries and pooled keys: this test is about the
     // selection + attention contract, and the projections that feed them are
@@ -1175,7 +1175,7 @@ fn qsa_kv_cache_layout_and_f16_precision() {
     let gpu = fx.dev.gpu();
     let cells = 40usize; // three pages: 0..15, 16..31, 32..39
     let qsa = Qsa::new(gpu, 64).expect("qsa");
-    let state = QsaState::new(gpu, cells, 64).expect("state");
+    let state = QsaState::with_layout(gpu, cells, 64, qsa::VLayout::F16).expect("state");
 
     // One token per append, positions 5..37, so the first token lands mid-page
     // and the page boundary (cell 16) is crossed by the sequence.
@@ -1303,6 +1303,7 @@ fn qsa_v_attention(
     let want_bytes = match layout {
         qsa::VLayout::F16 => qsa::sizes::f16_pool_bytes(pages),
         qsa::VLayout::Q8_0 => qsa::sizes::q8v_pool_bytes(pages),
+        qsa::VLayout::Q6_0 => qsa::sizes::q6_pool_bytes(pages),
     };
     assert!(
         state.v_pool.size >= want_bytes,
@@ -1449,6 +1450,128 @@ fn qsa_v_q8_0_matches_the_reference_and_the_f16_path() {
         "qsa v-q8_0          ref {rel_q8:.2e} (f16 path {rel_f16:.2e}), vs f16 {rel_vs_f16:.2e} \
          rel / {max_abs:.2e} abs; pool {bytes_f16} -> {bytes_q8} B",
     );
+}
+
+/// The q6_0 K+V cache (the default layout): held to the CPU reference with the same
+/// quantisation (`qsa::cpu::to_q6_0` on K and V) at the f16 path's bar, so the
+/// 13-word superblock layout and every load path are exact; its distance from
+/// f16 is printed. Single-token `attend` takes the small-scores kernel.
+#[test]
+fn qsa_kv_q6_0_matches_the_reference() {
+    let fx = need_gpu!("q6");
+    let gpu = fx.dev.gpu();
+    let (max_pos, cells) = (4096usize, 64usize);
+    let ids = [0u32, 5, 9, 15];
+    let qsa = Qsa::new(gpu, max_pos).expect("qsa");
+    let dim = qsa::MODEL_N_KV_HEAD * qsa::MODEL_HEAD_DIM;
+    // Spread scales per block so the fp16 scale and the 6-bit range are exercised.
+    let mut k_all = normalish(0xE1, cells * dim);
+    let mut v_all = normalish(0xE2, cells * dim);
+    for (i, x) in k_all.iter_mut().enumerate() {
+        *x *= 0.05 + (i / 32 % 7) as f32 * 2.0;
+    }
+    for (i, x) in v_all.iter_mut().enumerate() {
+        *x *= 0.2 + (i / 32 % 5) as f32;
+    }
+    let q = normalish(0xE3, qsa::MODEL_N_HEAD * qsa::MODEL_HEAD_DIM);
+    let q_full = normalish(0xE4, qsa::MODEL_N_HEAD * 2 * qsa::MODEL_HEAD_DIM);
+    let run = |layout| {
+        qsa_v_attention(gpu, &qsa, layout, max_pos, cells, &ids, &k_all, &v_all, &q, &q_full)
+    };
+    // The pools, element for element: decode every row on the CPU.
+    {
+        let (nkv, hd, pc) = (qsa::MODEL_N_KV_HEAD, qsa::MODEL_HEAD_DIM, qsa::PAGE_CELLS);
+        let state = QsaState::with_layout(gpu, cells, max_pos, qsa::VLayout::Q6_0).expect("state");
+        let fill = qsa.workspace(gpu, cells, cells).expect("ws");
+        write_f32(gpu, &fill.k_cur, &k_all);
+        write_f32(gpu, &fill.v_cur, &v_all);
+        qsa.kv_append(&state, &fill, 0).expect("append");
+        qsa.release(gpu, fill);
+        let word = |b: &[u8], i: usize| u32::from_le_bytes(b[4 * i..4 * i + 4].try_into().unwrap());
+        let f16 = |h: u32| -> f32 {
+            let (sg, e, m) = (h >> 15 & 1, ((h >> 10) & 31) as i32, (h & 1023) as f32);
+            let v = if e == 0 { m * 2f32.powi(-24) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
+            if sg == 1 { -v } else { v }
+        };
+        let pt = gemv::download(gpu, &state.page_table, cells / pc * 4).expect("pt");
+        let rw = hd / 64 * 13;
+        let mut off = 0usize;
+        for (pool, src) in [(&state.k_pool, &k_all), (&state.v_pool, &v_all)] {
+            let b = gemv::download(gpu, pool, pool.size as usize).expect("pool");
+            for cell in 0..cells {
+                let page = word(&pt, cell / pc) as usize;
+                for kvh in 0..nkv {
+                    let want = qsa::cpu::to_q6_0(&src[cell * dim + kvh * hd..][..hd]);
+                    let row = (page * nkv + kvh) * pc + cell % pc;
+                    for (e, w) in want.iter().enumerate() {
+                        let at = row * rw + e / 64 * 13;
+                        let (sb, i) = (e / 32 % 2, e % 32);
+                        let d = f16(word(&b, at) >> (16 * sb));
+                        let wb = at + 1 + sb * 6;
+                        let q = (word(&b, wb + i / 8) >> (4 * (i % 8)) & 15)
+                            | (word(&b, wb + 4 + i / 16) >> (2 * (i % 16)) & 3) << 4;
+                        off += usize::from((q as f32 - 32.0) * d != *w);
+                    }
+                }
+            }
+        }
+        state.release(gpu);
+        let n = 2 * cells * dim;
+        println!("qsa kv-q6_0 pool: {off}/{n} elements off to_q6_0");
+        // f32 floor at a .5 boundary may land one step apart; a layout slip is wholesale.
+        assert!(off * 1000 <= n, "{off}/{n} q6 elements off the CPU reference");
+    }
+    let (out_f16, _, bytes_f16) = run(qsa::VLayout::F16);
+    let (out_q6, _, bytes_q6) = run(qsa::VLayout::Q6_0);
+
+    let mut gate = vec![0.0f32; qsa::MODEL_N_HEAD * qsa::MODEL_HEAD_DIM];
+    for h in 0..qsa::MODEL_N_HEAD {
+        for d in 0..qsa::MODEL_HEAD_DIM {
+            gate[h * qsa::MODEL_HEAD_DIM + d] =
+                q_full[h * 2 * qsa::MODEL_HEAD_DIM + qsa::MODEL_HEAD_DIM + d];
+        }
+    }
+    let cells_sel = qsa::cpu::cells_of(&ids, qsa::IDX_BLOCK);
+    let (kq, vq) = (qsa::cpu::to_q6_0(&k_all), qsa::cpu::to_q6_0(&v_all));
+    let want = qsa::cpu::attend(
+        &q,
+        &kq,
+        &vq,
+        &cells_sel,
+        cells - 1,
+        qsa::MODEL_N_HEAD,
+        qsa::MODEL_N_KV_HEAD,
+        qsa::MODEL_HEAD_DIM,
+        &gate,
+    );
+    let (kf, vf): (Vec<f32>, Vec<f32>) =
+        (k_all.iter().map(|&x| qsa::cpu::to_f16(x)).collect(), v_all.iter().map(|&x| qsa::cpu::to_f16(x)).collect());
+    let want_f16 = qsa::cpu::attend(
+        &q,
+        &kf,
+        &vf,
+        &cells_sel,
+        cells - 1,
+        qsa::MODEL_N_HEAD,
+        qsa::MODEL_N_KV_HEAD,
+        qsa::MODEL_HEAD_DIM,
+        &gate,
+    );
+    let rel = max_rel(&out_q6, &as_f64(&want));
+    let rel_f16 = max_rel(&out_f16, &as_f64(&want_f16));
+    let rel_vs_f16 = max_rel(&out_q6, &as_f64(&out_f16));
+    println!(
+        "qsa kv-q6_0 ref {rel:.2e} (f16 path {rel_f16:.2e}), vs f16 {rel_vs_f16:.2e} rel; \
+         pool {bytes_f16} -> {bytes_q6} B"
+    );
+    // The spread K scales make the softmax sharp, so f32 order alone costs ~1e-5..1e-4
+    // on either path: q6's loads are held to the f16 path's own error on this input.
+    let bar = 1e-5f64.max(4.0 * rel_f16);
+    assert!(
+        rel <= bar,
+        "q6_0 attention max rel {rel:e} (bar {bar:e}): a q6 load does not match to_q6_0"
+    );
+    assert!(bytes_q6 * 2 < bytes_f16, "q6 pool {bytes_q6} B is not smaller than f16 {bytes_f16} B");
 }
 
 /// Top-k with heavy score ties and dead blocks, several tokens per call (the
@@ -1633,7 +1756,7 @@ fn qsa_flash_matches_the_three_kernel_path() {
     let v_all = normalish(0xA2, cells * dim);
     let q = normalish(0xA3, t * qsa::MODEL_N_HEAD * qsa::MODEL_HEAD_DIM);
     let q_full = normalish(0xA4, t * qsa::QGATE_DIM);
-    for layout in [qsa::VLayout::F16, qsa::VLayout::Q8_0] {
+    for layout in [qsa::VLayout::F16, qsa::VLayout::Q8_0, qsa::VLayout::Q6_0] {
         let state = QsaState::with_layout(gpu, cells, max_pos, layout).expect("state");
         let fill = qsa.workspace(gpu, cells, cells).expect("fill ws");
         write_f32(gpu, &fill.k_cur, &k_all);

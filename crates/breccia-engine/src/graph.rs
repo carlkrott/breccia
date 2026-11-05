@@ -2206,7 +2206,7 @@ impl<'m> Session<'m> {
         let pages = (pos + 1).div_ceil(qsa::PAGE_CELLS);
         let gdn_state = gdn::MODEL_S * gdn::MODEL_H_V * gdn::MODEL_S * 4;
         let gdn_conv = (gdn::MODEL_D_CONV - 1) * gdn::CONV_CHANNELS * 4;
-        let k_live = qsa::sizes::f16_pool_bytes(pages) as usize;
+        let f16_live = qsa::sizes::f16_pool_bytes(pages) as usize;
         for b in 0..m.cfg.n_layers {
             let gpu = m.devices[m.device_of(b)].gpu();
             let mut parts: Vec<(&str, &Buf, usize)> = Vec::new();
@@ -2215,11 +2215,15 @@ impl<'m> Session<'m> {
                 parts.push(("gdn_conv", &st.conv, gdn_conv));
             }
             if let Some(st) = &self.qsa_state[b] {
-                let (v_name, v_live) = match st.v_layout {
-                    qsa::VLayout::F16 => ("qsa_v", k_live),
-                    qsa::VLayout::Q8_0 => ("qsa_vq8", qsa::sizes::q8v_pool_bytes(pages) as usize),
+                let q6_live = qsa::sizes::q6_pool_bytes(pages) as usize;
+                let (k_name, k_live, v_name, v_live) = match st.v_layout {
+                    qsa::VLayout::F16 => ("qsa_k", f16_live, "qsa_v", f16_live),
+                    qsa::VLayout::Q8_0 => {
+                        ("qsa_k", f16_live, "qsa_vq8", qsa::sizes::q8v_pool_bytes(pages) as usize)
+                    }
+                    qsa::VLayout::Q6_0 => ("qsa_kq6", q6_live, "qsa_vq6", q6_live),
                 };
-                parts.push(("qsa_k", &st.k_pool, k_live));
+                parts.push((k_name, &st.k_pool, k_live));
                 parts.push((v_name, &st.v_pool, v_live));
             }
             for (name, buf, n) in parts {

@@ -386,6 +386,10 @@ fn main() {
                 &["BRECCIA_KV_Q8V"],
             );
         }
+        // The q6_0 K+V cache build (default layout, `kv_q6.glsl`): same wiring.
+        if KV_Q6_SHADERS.contains(name) {
+            compile(&glslc, &out_dir, name, &format!("{name}_q6"), &["BRECCIA_KV_Q6"]);
+        }
         // Octave KV fake-quant (quality gate only, `BRECCIA_KV_OCTAVE_FQ` env).
         if *name == "qsa_kv_append" {
             compile(&glslc, &out_dir, name, "qsa_kv_append_octfq", &["BRECCIA_KV_OCTAVE_FQ"]);
@@ -432,6 +436,19 @@ fn spirv_hash(out_dir: &Path, var: &str, keep: impl Fn(&str) -> bool) {
 /// accumulate loop). The scores kernel never reads V, so it has no variant.
 const KV_Q8V_SHADERS: &[&str] = &[
     "qsa_kv_append",
+    "qsa_attn_apply",
+    "qsa_attn_apply_gqa",
+    "qsa_attn_flash_gqa",
+    "qsa_attn_apply_split",
+];
+
+/// QSA stems that get the q6_0 **K+V** build (`BRECCIA_KV_Q6`): the append and
+/// every kernel that reads K (scores) or V (apply) from the paged cache.
+const KV_Q6_SHADERS: &[&str] = &[
+    "qsa_kv_append",
+    "qsa_attn_scores",
+    "qsa_attn_scores_small",
+    "qsa_attn_scores_gqa",
     "qsa_attn_apply",
     "qsa_attn_apply_gqa",
     "qsa_attn_flash_gqa",

@@ -61,7 +61,11 @@ shared float M[GROUP];          // running max per head
 shared float L[GROUP];          // running sum per head
 shared float ALPHA[GROUP];      // this chunk's rescale of the accumulators
 
-#ifdef BRECCIA_KV_Q8V
+#ifdef BRECCIA_KV_Q6
+#include "kv_q6.glsl"
+KV6_DEFINE_LOAD(load_v, VP)
+KV6_DEFINE_LOAD(load_k6, KP)
+#elif defined(BRECCIA_KV_Q8V)
 #define Q8_BLOCK_ELEMS 32u
 #define Q8_BLOCK_WORDS 9u
 float load_v(uint row, uint elem) {
@@ -122,9 +126,13 @@ void main() {
             if (cell <= pos) {
                 uint page = PT[uint(cell) / pc.page_cells];
                 uint in_page = uint(cell) % pc.page_cells;
+#ifdef BRECCIA_KV_Q6
+                kb = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page; // q6 K row
+#else
                 kb = (page * pc.n_kv_head + kvh) * pc.page_cells * pc.head_dim +
                      in_page * pc.head_dim;
-#ifdef BRECCIA_KV_Q8V
+#endif
+#if defined(BRECCIA_KV_Q8V) || defined(BRECCIA_KV_Q6)
                 vb = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
 #else
                 vb = kb;
@@ -147,7 +155,11 @@ void main() {
             float k[LOCAL_MAX];
             [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
                 uint e = lane + m * sg_size;
+#ifdef BRECCIA_KV_Q6
+                k[m] = m < n_local ? load_k6(b, e) : 0.0;
+#else
                 k[m] = m < n_local ? breccia_load_f16(KP[(b + e) >> 1], b + e) : 0.0;
+#endif
             }
             [[unroll]] for (uint h = 0u; h < GROUP; ++h) {
                 float a = 0.0;
