@@ -4617,6 +4617,13 @@ fn bench_token(a: TokenArgs) -> Result<()> {
             t.elapsed().as_secs_f64(),
             (io_read_mib() - read0) / 1024.0
         );
+        if a.timers {
+            for (name, ms) in sess.timers.table(fw) {
+                if ms >= 0.05 {
+                    println!("  {name:<20} {ms:>8.3} ms/token");
+                }
+            }
+        }
         let mut bad = 0;
         for (i, g) in gens.iter().enumerate() {
             println!("seq {i}: {:?}", &g.tokens[..g.tokens.len().min(12)]);

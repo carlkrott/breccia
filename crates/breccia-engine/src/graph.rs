@@ -745,6 +745,8 @@ pub struct Session<'m> {
     /// Batched decode ([`Session::decode_seqs`]): chunk row `i` is sequence
     /// `rows_seq[i].0` at cell `rows_seq[i].1`. Empty outside that call.
     rows_seq: Vec<(usize, usize)>,
+    /// Batched decode's one-GEMM head scratch on the head device: (rows, hc ws, logits).
+    rows_head: Option<(usize, HcWorkspace, Buf)>,
     active_seq: usize,
     seq_ctx: usize,
     /// Speculative-verify rollback slots; `None` (the default) leaves every path unchanged.
@@ -1362,6 +1364,7 @@ impl<'m> Session<'m> {
             qsa_state,
             seqs: Vec::new(),
             rows_seq: Vec::new(),
+            rows_head: None,
             active_seq: 0,
             seq_ctx: ctx_capacity,
             spec: None,
@@ -2369,8 +2372,7 @@ impl<'m> Session<'m> {
         let rows = std::mem::take(&mut self.rows_seq);
         (self.pos, self.cur_tok) = (pos_was, tok_was);
         let logits = r?;
-        self.pf_tokens -= ids.len(); // decode, not prompt tokens
-        self.forwards += ids.len();
+        self.pf_tokens -= ids.len(); // decode, not prompt tokens (finish_head already counted the forwards)
         for (&(s, pos), &tok) in rows.iter().zip(&ids) {
             if s == self.active_seq {
                 (self.pos, self.cur_tok) = (pos, tok);
@@ -2421,8 +2423,12 @@ impl<'m> Session<'m> {
             if batched {
                 let mut toks = Vec::with_capacity(k);
                 for i in 0..k {
-                    let next = self
-                        .sampler
+                    // each sequence keeps its own sampler RNG (the active one lives in self)
+                    let sampler = match self.seqs.get_mut(i).and_then(Option::as_mut) {
+                        Some(slot) if i != self.active_seq => &mut slot.sampler,
+                        _ => &mut self.sampler,
+                    };
+                    let next = sampler
                         .sample(&logits[i], &self.sampling)
                         .ok_or_else(|| anyhow!("the sampler produced no token"))?;
                     outs[i].push(next);
@@ -3299,7 +3305,19 @@ impl<'m> Session<'m> {
             self.pf_wall_s += wall0.elapsed().as_secs_f64();
             return Ok(logits);
         }
-        // shortcut: one head submit per row (~7 ms each) outside spec replay.
+        // batched decode: one head GEMM over every row (BRECCIA_ROWS_HEAD=0 = per row)
+        if all_rows
+            && t > 1
+            && !self.rows_seq.is_empty()
+            && self.venues[last].r_chunk.is_some()
+            && self.venues[last].pipes.gemm(m.head.key.ty).is_some()
+            && std::env::var("BRECCIA_ROWS_HEAD").as_deref() != Ok("0")
+        {
+            logits = self.rows_head(last, t)?;
+            self.pf_wall_s += wall0.elapsed().as_secs_f64();
+            return Ok(logits);
+        }
+        // shortcut: one head submit per row (~7 ms each) outside spec replay and batched decode.
         for i in if all_rows { 0..t } else { t - 1..t } {
             self.swap_r_in(last, i);
             self.submit_head()?;
@@ -5636,6 +5654,77 @@ impl<'m> Session<'m> {
 
     /// Swap token `i`'s residual slice into the venue's single-token `r` (and
     /// back), so the per-token dense chain runs verbatim on a chunk.
+    /// Batched decode head: gather the chunk's `t` row residuals on the head device
+    /// `dev`, one final-hc read + one head GEMM over all rows, one readback (the
+    /// per-row path is a submit + fence + readback each, ~7 ms).
+    fn rows_head(&mut self, dev: usize, t: usize) -> Result<Vec<Vec<f32>>> {
+        let m = self.model;
+        let mc = &m.cfg;
+        let gpu = m.devices[dev].gpu();
+        let hb = (mc.hc_dim() * 4) as u64;
+        self.flush()?;
+        self.timers.mark(FINAL_HC);
+        if self.rows_head.as_ref().is_some_and(|h| h.0 != t) {
+            let (_, ws, l) = self.rows_head.take().expect("checked");
+            self.venues[dev].final_hc.release(gpu, ws);
+            gpu.destroy_buf(&l);
+        }
+        if self.rows_head.is_none() {
+            let ws = self.venues[dev].final_hc.workspace(gpu, t)?;
+            let l = breccia_kernels::gemv::alloc(gpu, (t * mc.vocab * 4) as u64)?;
+            self.rows_head = Some((t, ws, l));
+        }
+        self.ensure_batch(dev)?;
+        {
+            let v = &self.venues[dev];
+            let (_, ws, out) = self.rows_head.as_ref().expect("allocated above");
+            let rc = v.r_chunk.as_ref().expect("checked by the caller");
+            let gather: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
+                .map(|i| (rc, i as u64 * hb, &v.r_slots[i], 0, hb))
+                .collect();
+            batch_cmd::record_copies(gpu, &gather)?;
+            let hw = HcWeights {
+                norm: &m.out_hc_norm,
+                down: &m.out_hc_down.buf,
+                up: &m.out_hc_up.buf,
+                inject: None,
+            };
+            v.final_hc.read(ws, rc, &hw)?;
+            self.timers.mark(HEAD);
+            v.pipes.gemm(m.head.key.ty).expect("checked by the caller").run(
+                &m.head.buf,
+                &ws.mixed,
+                out,
+                m.head.key.rows,
+                m.head.key.cols,
+                t,
+            )?;
+        }
+        self.submit_batch()?;
+        self.flush()?;
+        let out = &self.rows_head.as_ref().expect("allocated above").2;
+        let per = ((self.stagings[dev].capacity() as usize) / (mc.vocab * 4)).max(1);
+        let mut raw = Vec::with_capacity(t);
+        for rows in (0..t).collect::<Vec<_>>().chunks(per) {
+            let items: Vec<(&Buf, u64, usize)> = rows
+                .iter()
+                .map(|&i| (out, (i * mc.vocab * 4) as u64, mc.vocab * 4))
+                .collect();
+            raw.extend(self.stagings[dev].read_batch(gpu, &items)?);
+        }
+        self.timers.stop();
+        self.forwards += t;
+        raw.iter()
+            .map(|r| {
+                let values = f32_from_bytes(r);
+                match values.iter().position(|v| !v.is_finite()) {
+                    Some(i) => bail!("logit {i} is not finite ({})", values[i]),
+                    None => Ok(values),
+                }
+            })
+            .collect()
+    }
+
     fn swap_r_in(&mut self, dev: usize, i: usize) {
         let v = &mut self.venues[dev];
         std::mem::swap(&mut v.r, &mut v.r_slots[i]);
@@ -7172,6 +7261,12 @@ impl Drop for Session<'_> {
             }
         }
         self.spec_release();
+        if let Some((_, ws, l)) = self.rows_head.take() {
+            let dev = m.head_device();
+            let gpu = m.devices[dev].gpu();
+            self.venues[dev].final_hc.release(gpu, ws);
+            gpu.destroy_buf(&l);
+        }
         release_seq_state(m, &self.gdn_state, &self.qsa_state);
         for slot in self.seqs.iter_mut().filter_map(Option::take) {
             release_seq_state(m, &slot.gdn_state, &slot.qsa_state);
