@@ -5288,10 +5288,17 @@ impl<'m> Session<'m> {
                 self.dev_up[dev] += (t * n_embd * 4) as u64;
             }
         }
-        self.submit_batch()?;
-        Self::pf_mark(b, "fan-sub", &t_fan);
-        self.flush()?;
-        Self::pf_mark(b, "fan-wait", &t_fan);
+        // Batched decode: the fan-in and pass 2 share one submission (one sync less
+        // per block); `BRECCIA_ROWS_FAN_SYNC=1` keeps the separate wait.
+        if micro
+            || self.rows_seq.is_empty()
+            || std::env::var("BRECCIA_ROWS_FAN_SYNC").as_deref() == Ok("1")
+        {
+            self.submit_batch()?;
+            Self::pf_mark(b, "fan-sub", &t_fan);
+            self.flush()?;
+            Self::pf_mark(b, "fan-wait", &t_fan);
+        }
         let fanin_s = t_fan.elapsed().as_secs_f64();
         {
             let extra = format!(
