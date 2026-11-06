@@ -1101,7 +1101,17 @@ pub fn download_regions(gpu: &Gpu, src: &Buf, regions: &[(u64, u64)]) -> Result<
     let total: u64 = regions.iter().map(|r| r.1).sum();
     anyhow::ensure!(regions.iter().all(|r| r.0 + r.1 <= src.size), "download_regions out of range");
     let mut out = vec![0u8; total as usize];
-    let stage = staging(gpu, total.min(REGION_CHUNK))?;
+    // Host-cached: the CPU copy out of uncached staging runs at ~0.3 GiB/s.
+    let stage = gpu
+        .buf(
+            total.min(REGION_CHUNK).max(4),
+            vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            vk::MemoryPropertyFlags::HOST_VISIBLE
+                | vk::MemoryPropertyFlags::HOST_COHERENT
+                | vk::MemoryPropertyFlags::HOST_CACHED,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
     let r = (|| -> Result<()> {
         for (host, n, copies) in region_batches(regions) {
             gpu.wall_run(breccia_vk::ctx::Qc::X, |d, cmd| unsafe {
