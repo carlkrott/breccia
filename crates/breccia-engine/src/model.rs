@@ -1283,7 +1283,7 @@ impl Drop for PipelineSet<'_> {
 
 impl<'g> PipelineSet<'g> {
     /// Compile one pipeline per distinct `(type, rows, cols)`.
-    pub fn build(gpu: &'g Gpu, keys: &BTreeSet<PipeKey>) -> Result<Self> {
+    pub fn build(gpu: &'g Gpu, keys: &BTreeSet<PipeKey>, head: PipeKey) -> Result<Self> {
         let mut map = std::collections::BTreeMap::new();
         for k in keys {
             let g = Gemv::new(gpu, k.ty, k.rows, k.cols).with_context(|| {
@@ -1361,11 +1361,18 @@ impl<'g> PipelineSet<'g> {
         // Dequant + mixed dot where the calibration chose `dot` (f16 W and X; KL at
         // 8k 2.1e-4 vs f32 activations). Default on; `BRECCIA_DOT=0` is the exact arm.
         // One scratch sized for the largest matrix serves every type on the device.
+        // Not the head: 1212 MiB on every card, and dequantising it per step cost
+        // batched decode ~10 %; no calibrated cell covers it, so it takes the tile path.
         let mut dot_scratch = None;
         if std::env::var("BRECCIA_DOT").map_or(true, |v| v != "0")
             && breccia_kernels::gemm::DotGemm::supported(gpu)
         {
-            let bytes = keys.iter().map(|k| k.rows * k.cols * 2).max().unwrap_or(0) as u64;
+            let bytes = keys
+                .iter()
+                .filter(|k| **k != head)
+                .map(|k| k.rows * k.cols * 2)
+                .max()
+                .unwrap_or(0) as u64;
             if bytes > 0 {
                 match breccia_kernels::gemv::alloc(gpu, bytes) {
                     Ok(b) => {
@@ -1791,6 +1798,15 @@ fn profile_entries(
     // same rule `PrefillVerdict` follows (keyed on the GEMM shaders only; `kcal`
     // re-calibrates a stale table at load). With no table the kernels fall back to
     // their built-in rule, so a fresh machine behaves exactly as before.
+    // 11-05: a stale table ran 22 % slower prefill unnoticed under BRECCIA_AUTO_CALIBRATE=0.
+    for e in entries.iter().flatten() {
+        if e.kernel.as_ref().is_some_and(|k| k.spirv_hash != breccia_kernels::GEMM_SPIRV_HASH) {
+            eprintln!(
+                "breccia: kernels: stale tile table for {} (other GEMM shaders); built-in kernel rule",
+                e.identity.pci_address
+            );
+        }
+    }
     let cells: Vec<breccia_kernels::gemm::TileCell> = entries
         .iter()
         .flatten()

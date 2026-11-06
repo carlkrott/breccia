@@ -407,8 +407,9 @@ fn main() {
 
     // The fake-quant gate module is not on the default path: keep profile verdicts fresh.
     spirv_hash(&out_dir, "BRECCIA_SPIRV_HASH", |n| !n.contains("_octfq"));
+    // The int8-dot GEMM is an unwired experiment: it must not invalidate the tile table.
     spirv_hash(&out_dir, "BRECCIA_GEMM_SPIRV_HASH", |n| {
-        n.starts_with("gemm_") || n.starts_with("dequant_")
+        (n.starts_with("gemm_") || n.starts_with("dequant_")) && !n.starts_with("gemm_i8dot")
     });
 }
 

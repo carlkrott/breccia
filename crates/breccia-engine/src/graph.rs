@@ -984,7 +984,7 @@ impl<'m> Session<'m> {
         let mut stagings = Vec::with_capacity(model.devices.len());
         for (i, dev) in model.devices.iter().enumerate() {
             let gpu = dev.gpu();
-            let pipes = PipelineSet::build(gpu, &model.keys)?;
+            let pipes = PipelineSet::build(gpu, &model.keys, model.head.key)?;
             let hc = HcMixer::new(gpu, QuantType::Bf16, mc.n_embd, mc.hc, mc.hc_lr, true)
                 .context("compiling the hyper-connection mixer")?;
             let final_hc = HcMixer::new(gpu, QuantType::Bf16, mc.n_embd, mc.hc, mc.hc_lr, false)
