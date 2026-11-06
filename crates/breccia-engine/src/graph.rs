@@ -748,6 +748,8 @@ pub struct Session<'m> {
     /// §11j item 5: the dual-card ship's shared host import (default on, `BRECCIA_SHIP_IMPORT=0` opts out),
     /// made on the first ship; `ship_imp_off` once it is off or failed.
     ship_imp: Option<crate::xfer::ShipImport>,
+    /// Rows the current (or next) `ship_imp` covers: see [`ship_rows`].
+    ship_rows: usize,
     ship_imp_off: bool,
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
@@ -1402,6 +1404,7 @@ impl<'m> Session<'m> {
             venues,
             stagings,
             ship_imp: None,
+            ship_rows: SHIP_SMALL_ROWS,
             ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() == Ok("0"),
             gdn_state,
             qsa_state,
@@ -1689,8 +1692,8 @@ impl<'m> Session<'m> {
     /// submit and one fence wait, instead of one per kernel: the ~29 dispatches
     /// of a block collapse to a single round trip.
     /// Whether the dual-card ship `dev` -> `x` goes through the shared host import.
-    /// Made on first use, sized for the largest merged-prefill scratch of either
-    /// card; any failure logs once and leaves the staged path on.
+    /// Made on first use, sized for [`ship_rows`] rows of the largest merged-prefill
+    /// scratch of either card; any failure logs once and leaves the staged path on.
     /// The imported-memory ship of a chunk's helper inputs as `(src, dst, src off, dst
     /// off, bytes)` lists: block card -> host (`down`) and host -> helper (`up`).
     fn ship_lists(
@@ -1744,7 +1747,9 @@ impl<'m> Session<'m> {
                         (pf.mixed.size + pf.w.size + pf.shared.size + pf.gate.size).max(pf.out.size)
                     })
                     .max()
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    .div_ceil(self.prefill_chunk.max(1) as u64)
+                    * self.ship_rows as u64;
                 // The overlapped micro-batch tick keeps the MoE result past the ship regions.
                 self.ship_res_off = ship.div_ceil(4096) * 4096;
                 let cap = self.ship_res_off + ship;
@@ -1760,6 +1765,23 @@ impl<'m> Session<'m> {
             return false;
         }
         true
+    }
+
+    /// Drop an import of the wrong size before a `t`-row forward. The next ship makes
+    /// the right one; a single-token forward never ships, so it just stays gone.
+    fn ship_fit(&mut self, t: usize) -> Result<()> {
+        let rows = ship_rows(t, self.prefill_chunk);
+        if rows != self.ship_rows {
+            if let Some(mut imp) = self.ship_imp.take() {
+                self.micro_upw_wait()?;
+                self.flush()?;
+                let m = self.model;
+                let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
+                imp.release(&gpus);
+            }
+            self.ship_rows = rows;
+        }
+        Ok(())
     }
 
     fn ensure_batch(&mut self, dev: usize) -> Result<()> {
@@ -2992,6 +3014,7 @@ impl<'m> Session<'m> {
             );
         }
         self.vram_watch()?;
+        self.ship_fit(1)?;
         self.pos = pos;
         self.cur_tok = tok;
         // ---- embedding: 4 gathered rows ARE the hc copies of the vector ------
@@ -3334,6 +3357,7 @@ impl<'m> Session<'m> {
             bail!("chunked prefill records into a dispatch batch: it needs --batching");
         }
         self.vram_watch()?;
+        self.ship_fit(t)?;
         let dev = m.device_of(0);
         let gpu = m.devices[dev].gpu();
         let hc_dim = mc.hc_dim();
@@ -8176,9 +8200,31 @@ fn hc_capture() -> Option<&'static (String, Vec<usize>)> {
     .as_ref()
 }
 
+/// A forward this short ships through a small import.
+const SHIP_SMALL_ROWS: usize = 64;
+
+/// Rows the ship import covers for a `t`-row forward, given the session's chunk `cap`.
+/// amdgpu re-faults a userptr BO over its whole range in every CS, whichever ranges the
+/// submit touches, about 41 ns/row at 68 submits/token: a chunk-sized import held through
+/// decode cost 23.2 -> 25.5 tok/s at chunk 1024 and 17 -> 24.4 at 4096 (import off).
+fn ship_rows(t: usize, cap: usize) -> usize {
+    if t <= SHIP_SMALL_ROWS {
+        SHIP_SMALL_ROWS
+    } else {
+        cap
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ship_import_is_small_for_decode_and_full_for_chunks() {
+        assert_eq!(ship_rows(1, 1536), SHIP_SMALL_ROWS);
+        assert_eq!(ship_rows(SHIP_SMALL_ROWS, 1536), SHIP_SMALL_ROWS);
+        assert_eq!(ship_rows(SHIP_SMALL_ROWS + 1, 1536), 1536);
+    }
 
     /// The (G) shared-expert span (graph.rs, `record_dense_prelude`) must switch
     /// the current stage to `wait-gpu` BEFORE the first blocking run
