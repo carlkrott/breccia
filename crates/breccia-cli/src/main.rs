@@ -4592,6 +4592,49 @@ fn bench_token(a: TokenArgs) -> Result<()> {
 
     // ---- A. one token, twice: finite logits and a stable top-1 -------------
     let t_first = std::time::Instant::now();
+    // ---- `BRECCIA_PARK_DIR=dir`: the NVMe tier. Save the state after all but the
+    // last prompt cell, park it in a file (fsync), drop it from the page cache, read
+    // it back cold, restore it onto scrambled (NaN, other) pool pages, and check the
+    // tokens against the unparked run.
+    if let Ok(dir) = std::env::var("BRECCIA_PARK_DIR") {
+        use breccia_engine::{Prefix, PrefixState};
+        let cut = prompt.len() - 1;
+        let (g0, st) = sess.generate_prefix(&prompt, a.gen, None, Prefix::Save(cut))?;
+        let st = st.context("no prefix state saved")?;
+        let gib = st.bytes() as f64 / (1u64 << 30) as f64;
+        let path = std::path::Path::new(&dir).join(format!("park-{}.brpx", std::process::id()));
+        let t = std::time::Instant::now();
+        st.save_file(&path)?;
+        let w = t.elapsed().as_secs_f64();
+        drop(st);
+        {
+            use std::os::fd::AsRawFd;
+            let f = std::fs::File::open(&path)?;
+            // SAFETY: a valid open fd; advice only.
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        }
+        if let Ok(o) = std::process::Command::new("fincore").arg(&path).output() {
+            print!("park cache after drop: {}", String::from_utf8_lossy(&o.stdout));
+        }
+        sess.reset()?;
+        sess.kv_scramble()?;
+        let t = std::time::Instant::now();
+        let st = PrefixState::load_file(&path)?;
+        let r = t.elapsed().as_secs_f64();
+        let (g1, _) = sess.generate_prefix(&prompt, a.gen, None, Prefix::Resume(&st))?;
+        let same = g0.tokens.iter().zip(&g1.tokens).take_while(|(x, y)| x == y).count();
+        println!(
+            "park {cut} cells: {gib:.3} GiB, write+fsync {w:.2} s ({:.2} GiB/s), cold read {r:.2} s ({:.2} GiB/s), parity {same}/{} tokens",
+            gib / w,
+            gib / r,
+            g0.tokens.len()
+        );
+        if std::env::var_os("BRECCIA_PARK_KEEP").is_none() {
+            std::fs::remove_file(&path)?;
+        }
+        anyhow::ensure!(same == g0.tokens.len(), "the parked state diverged from the unparked run");
+        return Ok(());
+    }
     // ---- `BRECCIA_SEQS=N`: N sequences on this one session (shared weights and
     // prefill scratch, own state), prompt i = the prompt rotated by i tokens;
     // `BRECCIA_SEQS_PARITY=1` re-runs each prompt alone and compares the tokens.

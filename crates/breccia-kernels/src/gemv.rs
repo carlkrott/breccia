@@ -1070,6 +1070,97 @@ pub fn download(gpu: &Gpu, src: &Buf, n: usize) -> Result<Vec<u8>> {
     r
 }
 
+/// Staging chunk for [`download_regions`] / [`upload_regions`]: bounds the GTT a
+/// GB-sized state transfer takes.
+const REGION_CHUNK: u64 = 128 << 20;
+
+/// Split `regions` (`(device offset, len)`) into staging batches of at most
+/// [`REGION_CHUNK`]: each batch is `(host offset, copies (device, staging, len))`.
+fn region_batches(regions: &[(u64, u64)]) -> Vec<(u64, u64, Vec<vk::BufferCopy>)> {
+    let mut out: Vec<(u64, u64, Vec<vk::BufferCopy>)> = Vec::new();
+    let mut host = 0u64;
+    for &(mut off, mut len) in regions {
+        while len > 0 {
+            if out.last().is_none_or(|b| b.1 == REGION_CHUNK) {
+                out.push((host, 0, Vec::new()));
+            }
+            let b = out.last_mut().unwrap();
+            let n = len.min(REGION_CHUNK - b.1);
+            b.2.push(vk::BufferCopy { src_offset: off, dst_offset: b.1, size: n });
+            b.1 += n;
+            host += n;
+            off += n;
+            len -= n;
+        }
+    }
+    out
+}
+
+/// Gather byte ranges of a device buffer into one host vector, in `regions` order.
+pub fn download_regions(gpu: &Gpu, src: &Buf, regions: &[(u64, u64)]) -> Result<Vec<u8>> {
+    let total: u64 = regions.iter().map(|r| r.1).sum();
+    anyhow::ensure!(regions.iter().all(|r| r.0 + r.1 <= src.size), "download_regions out of range");
+    let mut out = vec![0u8; total as usize];
+    let stage = staging(gpu, total.min(REGION_CHUNK))?;
+    let r = (|| -> Result<()> {
+        for (host, n, copies) in region_batches(regions) {
+            gpu.wall_run(breccia_vk::ctx::Qc::X, |d, cmd| unsafe {
+                Gpu::barrier_all(d, cmd);
+                d.cmd_copy_buffer(cmd, src.buf, stage.buf, &copies);
+                Gpu::barrier_all(d, cmd);
+            })
+            .map_err(|e| anyhow!("{e}"))?;
+            gpu.read_host(&stage, &mut out[host as usize..(host + n) as usize])
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+        Ok(())
+    })();
+    gpu.destroy_buf(&stage);
+    r.map(|_| out)
+}
+
+/// Scatter `data` into byte ranges of a device buffer, in `regions` order
+/// (the inverse of [`download_regions`]).
+pub fn upload_regions(gpu: &Gpu, dst: &Buf, regions: &[(u64, u64)], data: &[u8]) -> Result<()> {
+    let total: u64 = regions.iter().map(|r| r.1).sum();
+    anyhow::ensure!(total == data.len() as u64, "upload_regions: {total} region bytes for {} data bytes", data.len());
+    anyhow::ensure!(regions.iter().all(|r| r.0 + r.1 <= dst.size), "upload_regions out of range");
+    let stage = staging(gpu, total.min(REGION_CHUNK))?;
+    let r = (|| -> Result<()> {
+        for (host, n, mut copies) in region_batches(regions) {
+            gpu.write_host(&stage, &data[host as usize..(host + n) as usize])
+                .map_err(|e| anyhow!("{e}"))?;
+            for c in &mut copies {
+                std::mem::swap(&mut c.src_offset, &mut c.dst_offset);
+            }
+            gpu.wall_run(breccia_vk::ctx::Qc::X, |d, cmd| unsafe {
+                Gpu::barrier_all(d, cmd);
+                d.cmd_copy_buffer(cmd, stage.buf, dst.buf, &copies);
+                Gpu::barrier_all(d, cmd);
+            })
+            .map_err(|e| anyhow!("{e}"))?;
+        }
+        Ok(())
+    })();
+    gpu.destroy_buf(&stage);
+    r
+}
+
+#[cfg(test)]
+mod region_tests {
+    #[test]
+    fn region_batches_split_at_the_chunk_and_keep_order() {
+        let c = super::REGION_CHUNK;
+        let b = super::region_batches(&[(10, c - 4), (0, 8), (5 * c, 2)]);
+        assert_eq!(b.len(), 2);
+        assert_eq!((b[0].0, b[0].1, b[0].2.len()), (0, c, 2));
+        assert_eq!((b[0].2[1].src_offset, b[0].2[1].dst_offset, b[0].2[1].size), (0, c - 4, 4));
+        assert_eq!((b[1].0, b[1].1), (c, 6));
+        assert_eq!((b[1].2[0].src_offset, b[1].2[0].dst_offset, b[1].2[0].size), (4, 0, 4));
+        assert_eq!((b[1].2[1].src_offset, b[1].2[1].dst_offset), (5 * c, 4));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Embedded SPIR-V
 // ---------------------------------------------------------------------------

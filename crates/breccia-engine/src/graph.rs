@@ -2264,18 +2264,31 @@ impl<'m> Session<'m> {
     /// the byte prefix that covers them: GDN state + conv whole, QSA K/V pool
     /// pages (page-major, identity page table), the indexer tail whole and the
     /// pooled-key blocks. Positions and the page table are not written by kernels.
-    fn prefix_bufs(&self, cells: usize) -> Result<Vec<(usize, &Buf, usize)>> {
+    /// The buffers holding the state after `cells` prompt cells, each with the
+    /// byte ranges to copy in logical order (shared KV pool: the sequence's mapped
+    /// pages, so a restore may land on other physical pages).
+    fn prefix_bufs(&self, cells: usize) -> Result<Vec<(usize, &Buf, Vec<(u64, u64)>)>> {
         use breccia_kernels::qsa::{sizes, VLayout, PAGE_CELLS};
-        // shortcut: prefix save/restore assumes identity pages; the NVMe tier
-        // (item 6) adds page-wise copies for the shared pool.
-        anyhow::ensure!(self.kv_pool.is_empty(), "prefix save/restore does not support BRECCIA_KV_POOL_CELLS yet");
         let m = self.model;
+        let whole = |n: u64| vec![(0u64, n)];
+        let paged = |n: u64, pages: usize| -> Vec<(u64, u64)> {
+            let per = n / pages as u64;
+            let mut r: Vec<(u64, u64)> = Vec::new();
+            for &p in &self.kv_pages[..pages] {
+                let off = p as u64 * per;
+                match r.last_mut() {
+                    Some(l) if l.0 + l.1 == off => l.1 += per,
+                    _ => r.push((off, per)),
+                }
+            }
+            r
+        };
         let mut v = Vec::new();
         for b in 0..m.cfg.n_layers {
             let d = m.device_of(b);
             if let Some(st) = &self.gdn_state[b] {
-                v.push((d, &st.state, st.state.size as usize));
-                v.push((d, &st.conv, st.conv.size as usize));
+                v.push((d, &st.state, whole(st.state.size)));
+                v.push((d, &st.conv, whole(st.conv.size)));
             }
             if let Some(st) = &self.qsa_state[b] {
                 anyhow::ensure!(
@@ -2289,14 +2302,20 @@ impl<'m> Session<'m> {
                     VLayout::Q8_0 => (sizes::f16_pool_bytes(pages), sizes::q8v_pool_bytes(pages)),
                     VLayout::Q6_0 => (sizes::q6_pool_bytes(pages), sizes::q6_pool_bytes(pages)),
                 };
-                v.push((d, &st.k_pool, k as usize));
-                v.push((d, &st.v_pool, vb as usize));
-                v.push((d, &st.idx_tail, sizes::idx_tail_bytes() as usize));
-                v.push((
-                    d,
-                    &st.idx_pooled,
-                    sizes::pooled_idx_bytes(sizes::pooled_blocks(cells)) as usize,
-                ));
+                if self.kv_pool.is_empty() {
+                    v.push((d, &st.k_pool, whole(k)));
+                    v.push((d, &st.v_pool, whole(vb)));
+                } else {
+                    anyhow::ensure!(
+                        pages <= self.kv_pages.len(),
+                        "prefix of {cells} cells over the sequence's {} mapped pages",
+                        self.kv_pages.len()
+                    );
+                    v.push((d, &st.k_pool, paged(k, pages)));
+                    v.push((d, &st.v_pool, paged(vb, pages)));
+                }
+                v.push((d, &st.idx_tail, whole(sizes::idx_tail_bytes())));
+                v.push((d, &st.idx_pooled, whole(sizes::pooled_idx_bytes(sizes::pooled_blocks(cells)))));
             }
         }
         Ok(v)
@@ -2312,7 +2331,7 @@ impl<'m> Session<'m> {
         let bufs = self
             .prefix_bufs(cells)?
             .into_iter()
-            .map(|(d, buf, n)| breccia_kernels::gemv::download(gpus[d], buf, n))
+            .map(|(d, buf, r)| breccia_kernels::gemv::download_regions(gpus[d], buf, &r))
             .collect::<Result<Vec<_>>>()?;
         let st = PrefixState {
             cells,
@@ -2328,6 +2347,28 @@ impl<'m> Session<'m> {
         Ok(st)
     }
 
+    /// Park-test hook (`BRECCIA_PARK_DIR`): with no pool pages held, NaN-fill
+    /// every pool page and reverse the free list, so a restore lands on other,
+    /// dirty pages and parity proves the page-wise K/V copy.
+    pub fn kv_scramble(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.kv_pages.is_empty() && self.seqs.is_empty(),
+            "kv_scramble needs a reset one-sequence session"
+        );
+        self.flush()?;
+        self.kv_free.reverse();
+        for (b, p) in self.kv_pool.iter().enumerate() {
+            if let Some(p) = p {
+                let gpu = self.model.devices[self.model.device_of(b)].gpu();
+                for dst in [&p.k, &p.v] {
+                    let nan = vec![f32::NAN.to_bits(); (dst.size / 4) as usize];
+                    breccia_kernels::gemv::upload_into(gpu, dst, &breccia_kernels::ops::u32_to_bytes(&nan))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Put a [`Self::save_prefix`] state back; the session must be reset with
     /// the same images set (their positions are not part of the state).
     fn restore_prefix(&mut self, s: &PrefixState) -> Result<()> {
@@ -2336,17 +2377,19 @@ impl<'m> Session<'m> {
         let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
         batch_cmd::wait_all(&gpus)?;
         let t = std::time::Instant::now();
+        self.kv_ensure(s.cells)?;
         let bufs = self.prefix_bufs(s.cells)?;
+        let len = |r: &[(u64, u64)]| r.iter().map(|x| x.1).sum::<u64>() as usize;
         anyhow::ensure!(
-            bufs.len() == s.bufs.len() && bufs.iter().zip(&s.bufs).all(|(b, h)| b.2 == h.len()),
+            bufs.len() == s.bufs.len() && bufs.iter().zip(&s.bufs).all(|(b, h)| len(&b.2) == h.len()),
             "the saved prefix does not fit this session's state layout"
         );
         anyhow::ensure!(
             self.ple.is_some() == s.ple.is_some(),
             "the saved prefix's PLE state does not match"
         );
-        for ((d, buf, _), host) in bufs.into_iter().zip(&s.bufs) {
-            breccia_kernels::gemv::upload_into(gpus[d], buf, host)?;
+        for ((d, buf, r), host) in bufs.into_iter().zip(&s.bufs) {
+            breccia_kernels::gemv::upload_regions(gpus[d], buf, &r, host)?;
         }
         if let (Some(p), Some(ps)) = (self.ple.as_mut(), &s.ple) {
             p.restore(ps);
@@ -7593,6 +7636,89 @@ pub struct PrefixState {
 }
 
 impl PrefixState {
+    const MAGIC: &'static [u8; 8] = b"BRPX0001";
+
+    /// Park the state in a file (the NVMe tier): raw buffers behind a small
+    /// header, flushed to the disk before returning.
+    pub fn save_file(&self, path: &std::path::Path) -> Result<()> {
+        use std::io::Write;
+        let f = std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
+        let mut w = std::io::BufWriter::with_capacity(8 << 20, f);
+        let u64b = |x: usize| (x as u64).to_le_bytes();
+        w.write_all(Self::MAGIC)?;
+        w.write_all(&u64b(self.cells))?;
+        w.write_all(&self.cur_tok.to_le_bytes())?;
+        match &self.ple {
+            None => w.write_all(&[0])?,
+            Some(p) => {
+                w.write_all(&[1])?;
+                w.write_all(&u64b(p.hist.len()))?;
+                for x in &p.hist {
+                    w.write_all(&x.to_le_bytes())?;
+                }
+                w.write_all(&u64b(p.recent.len()))?;
+                for x in &p.recent {
+                    w.write_all(&x.to_le_bytes())?;
+                }
+            }
+        }
+        w.write_all(&u64b(self.bufs.len()))?;
+        for b in &self.bufs {
+            w.write_all(&u64b(b.len()))?;
+        }
+        for b in &self.bufs {
+            w.write_all(b)?;
+        }
+        w.into_inner().map_err(|e| anyhow!("{e}"))?.sync_all()?;
+        Ok(())
+    }
+
+    /// Read back a [`Self::save_file`] state (its buffer lengths are checked
+    /// against the session's layout on restore).
+    pub fn load_file(path: &std::path::Path) -> Result<Self> {
+        use std::io::Read;
+        let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut r = std::io::BufReader::with_capacity(8 << 20, f);
+        let mut b8 = [0u8; 8];
+        let mut u64r = |r: &mut std::io::BufReader<std::fs::File>| -> Result<usize> {
+            r.read_exact(&mut b8)?;
+            Ok(u64::from_le_bytes(b8) as usize)
+        };
+        let mut magic = [0u8; 8];
+        r.read_exact(&mut magic)?;
+        anyhow::ensure!(&magic == Self::MAGIC, "{} is not a parked prefix", path.display());
+        let cells = u64r(&mut r)?;
+        let mut b4 = [0u8; 4];
+        r.read_exact(&mut b4)?;
+        let cur_tok = u32::from_le_bytes(b4);
+        let mut flag = [0u8; 1];
+        r.read_exact(&mut flag)?;
+        let ple = if flag[0] == 1 {
+            let words = |r: &mut std::io::BufReader<std::fs::File>, n: usize| -> Result<Vec<[u8; 4]>> {
+                let mut raw = vec![0u8; n * 4];
+                r.read_exact(&mut raw)?;
+                Ok(raw.chunks_exact(4).map(|c| c.try_into().unwrap()).collect())
+            };
+            let n = u64r(&mut r)?;
+            let hist = words(&mut r, n)?.into_iter().map(f32::from_le_bytes).collect();
+            let n = u64r(&mut r)?;
+            let recent = words(&mut r, n)?.into_iter().map(u32::from_le_bytes).collect();
+            Some(PleState { hist, recent })
+        } else {
+            None
+        };
+        let n = u64r(&mut r)?;
+        anyhow::ensure!(n < 4096, "{}: {n} buffers is not a prefix", path.display());
+        let lens = (0..n).map(|_| u64r(&mut r)).collect::<Result<Vec<_>>>()?;
+        let mut bufs = Vec::with_capacity(n);
+        for l in lens {
+            let mut b = vec![0u8; l];
+            r.read_exact(&mut b)?;
+            bufs.push(b);
+        }
+        Ok(PrefixState { cells, cur_tok, ple, bufs })
+    }
+
     pub fn bytes(&self) -> usize {
         self.bufs.iter().map(Vec::len).sum::<usize>()
             + self.ple.as_ref().map_or(0, |p| p.hist.len() * 4)
