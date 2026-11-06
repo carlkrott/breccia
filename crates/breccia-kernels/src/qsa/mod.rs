@@ -387,6 +387,10 @@ pub struct QsaState {
     pub max_pos: usize,
     /// The V layout `v_pool` is sized for and the attention kernels read.
     pub v_layout: VLayout,
+    /// Mapped `page_table` when `k_pool`/`v_pool` alias a session's shared
+    /// [`KvPool`] (the session writes this sequence's pages as cells are used);
+    /// 0 = this state owns its pools and the table is identity.
+    pub pt_map: usize,
 }
 
 /// **Every** byte of QSA state, from a function, because three silent wrong-value
@@ -501,6 +505,72 @@ pub fn state_bytes(capacity_cells: usize, max_pos: usize, v_layout: VLayout, kv_
     // With host K/V ([`kv_host_on`]) the K/V pools (the first two) live in host memory.
     let skip = if kv_host { 2 } else { 0 };
     buffer_sizes(capacity_cells, max_pos, v_layout).iter().skip(skip).map(|b| b.0).sum()
+}
+
+/// `BRECCIA_KV_POOL_CELLS`: K/V cells per QSA layer shared by every sequence
+/// of a session. Pages are handed out as cells are written and returned on
+/// reset, so one long and several short sequences fit the same budget.
+pub fn kv_pool_cells() -> Option<usize> {
+    std::env::var("BRECCIA_KV_POOL_CELLS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n| n > 0)
+}
+
+/// Bytes of one layer's shared K/V pool of `cells` cells.
+pub fn kv_pool_bytes(cells: usize, v_layout: VLayout) -> u64 {
+    let s = buffer_sizes(cells, 8, v_layout);
+    s[0].0 + s[1].0
+}
+
+/// One QSA layer's K/V page pool, shared by a session's sequences (each maps
+/// its logical pages to pool pages through its own page table).
+pub struct KvPool {
+    pub k: Buf,
+    pub v: Buf,
+    pub pages: usize,
+}
+
+impl KvPool {
+    pub fn new(gpu: &Gpu, cells: usize) -> Result<Self> {
+        let pages = cells.div_ceil(PAGE_CELLS);
+        let s = buffer_sizes(pages * PAGE_CELLS, 8, VLayout::current());
+        let host = kv_host_on(&gpu.pci_address);
+        let mk = |n: u64| if host { alloc_host(gpu, n) } else { alloc(gpu, n) };
+        let k = mk(s[0].0).map_err(|e| anyhow!("allocating the shared KV pool (k): {e}"))?;
+        let v = match mk(s[1].0) {
+            Ok(v) => v,
+            Err(e) => {
+                gpu.destroy_buf(&k);
+                return Err(anyhow!("allocating the shared KV pool (v): {e}"));
+            }
+        };
+        // Zeroed once: a page reused from another sequence holds finite stale
+        // values (masked by position like the zeroes of a fresh pool), never NaN.
+        let poison = std::env::var_os("BRECCIA_FAULT_POISON_QSA").is_some();
+        for dst in [&k, &v] {
+            let bytes = if poison {
+                crate::ops::u32_to_bytes(&vec![f32::NAN.to_bits(); (dst.size / 4) as usize])
+            } else {
+                vec![0u8; dst.size as usize]
+            };
+            if let Err(e) = crate::gemv::upload_into(gpu, dst, &bytes) {
+                gpu.destroy_buf(&k);
+                gpu.destroy_buf(&v);
+                return Err(anyhow!("initialising the shared KV pool: {e}"));
+            }
+        }
+        Ok(KvPool { k, v, pages })
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.k.size + self.v.size
+    }
+
+    pub fn release(&self, gpu: &Gpu) {
+        gpu.destroy_buf(&self.k);
+        gpu.destroy_buf(&self.v);
+    }
 }
 
 /// `BRECCIA_KV_HOST`: allocate the K/V pools in host memory (GTT) that the GPU
@@ -712,7 +782,97 @@ impl QsaState {
             capacity_cells: pages * PAGE_CELLS,
             max_pos,
             v_layout,
+            pt_map: 0,
         })
+    }
+
+    /// A state whose K/V cells live in `pool` (shared with other sequences):
+    /// own page table (mapped, all entries 0 until [`Self::map_pages`]),
+    /// indexer tail, pooled keys and positions.
+    pub fn with_pool(gpu: &Gpu, capacity_cells: usize, max_pos: usize, pool: &KvPool) -> Result<Self> {
+        if capacity_cells == 0 || max_pos == 0 {
+            return Err(anyhow!("qsa state needs capacity_cells > 0 and max_pos > 0"));
+        }
+        let pages = capacity_cells.div_ceil(PAGE_CELLS);
+        let sizes = buffer_sizes(capacity_cells, max_pos, VLayout::current());
+        let flags = vk::MemoryPropertyFlags::HOST_COHERENT;
+        let (page_table, map) = gpu
+            .buf_mapped(
+                sizes[2].0 + crate::gemv::TAIL_PAD,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+                flags,
+                flags | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+            .map_err(|e| anyhow!("allocating the KV page table: {e}"))?;
+        // SAFETY: `map` covers the whole table, which no command reads yet.
+        unsafe { std::ptr::write_bytes(map, 0, sizes[2].0 as usize) };
+        let mut bufs = vec![page_table];
+        for (bytes, what) in &sizes[3..] {
+            match alloc(gpu, *bytes) {
+                Ok(b) => bufs.push(b),
+                Err(e) => {
+                    for b in &bufs {
+                        gpu.destroy_buf(b);
+                    }
+                    return Err(anyhow!("allocating the qsa state ({what}): {e}"));
+                }
+            }
+        }
+        let alias = |b: &Buf| Buf { buf: b.buf, mem: b.mem, size: b.size, id: b.id };
+        let mut it = bufs.into_iter();
+        let st = QsaState {
+            k_pool: alias(&pool.k),
+            v_pool: alias(&pool.v),
+            page_table: it.next().unwrap(),
+            idx_tail: it.next().unwrap(),
+            idx_pooled: it.next().unwrap(),
+            positions: it.next().unwrap(),
+            capacity_cells: pages * PAGE_CELLS,
+            max_pos,
+            v_layout: VLayout::current(),
+            pt_map: map as usize,
+        };
+        let pos = identity_triples(max_pos);
+        if let Err(e) = crate::gemv::upload_into(gpu, &st.positions, &crate::ops::u32_to_bytes(&pos)) {
+            st.destroy(gpu);
+            return Err(anyhow!("uploading the position table: {e}"));
+        }
+        if std::env::var_os("BRECCIA_FAULT_POISON_QSA").is_some() {
+            for dst in [&st.idx_tail, &st.idx_pooled] {
+                let poison = vec![f32::NAN.to_bits(); (dst.size / 4) as usize];
+                if let Err(e) = crate::gemv::upload_into(gpu, dst, &crate::ops::u32_to_bytes(&poison)) {
+                    st.destroy(gpu);
+                    return Err(anyhow!("poisoning the QSA state: {e}"));
+                }
+            }
+        }
+        Ok(st)
+    }
+
+    /// Point every logical page back at pool page 0, the sink no sequence owns
+    /// (call with nothing in flight: the write is not queue-ordered).
+    pub fn clear_pages(&self) {
+        if self.pt_map != 0 {
+            let n = self.capacity_cells.div_ceil(PAGE_CELLS) * 4;
+            // SAFETY: the mapping covers the whole table.
+            unsafe { std::ptr::write_bytes(self.pt_map as *mut u8, 0, n) };
+        }
+    }
+
+    /// Point logical pages `first..first + phys.len()` at pool pages `phys`
+    /// (shared-pool states only). Host-coherent: visible to the next submit.
+    pub fn map_pages(&self, first: usize, phys: &[u32]) {
+        assert!(self.pt_map != 0, "map_pages on a state that owns its pools");
+        assert!((first + phys.len()) * PAGE_CELLS <= self.capacity_cells);
+        // SAFETY: in bounds (asserted); in-flight commands read only pages
+        // already mapped, never these.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                phys.as_ptr(),
+                (self.pt_map as *mut u32).add(first),
+                phys.len(),
+            )
+        };
     }
 
     /// Return every **mutable** QSA buffer to its construction-time contents.
@@ -730,20 +890,23 @@ impl QsaState {
     /// the proof that the outputs were already identical), so this closes the gap on
     /// paper without changing a single token.
     pub fn reset(&self, gpu: &Gpu) -> Result<()> {
-        for (what, dst) in [
-            ("KV k_pool", &self.k_pool),
-            ("KV v_pool", &self.v_pool),
+        let own = [("KV k_pool", &self.k_pool), ("KV v_pool", &self.v_pool)];
+        let shared = self.pt_map != 0;
+        for (what, dst) in own.into_iter().filter(|_| !shared).chain([
             ("indexer tail", &self.idx_tail),
             ("indexer pooled", &self.idx_pooled),
-        ] {
+        ]) {
             let zeros = vec![0u8; dst.size as usize];
             crate::gemv::upload_into(gpu, dst, &zeros)
                 .map_err(|e| anyhow!("zeroing the {what} of the QSA state: {e}"))?;
         }
-        let pages = self.capacity_cells.div_ceil(PAGE_CELLS);
-        let table: Vec<u32> = (0..pages as u32).collect();
-        crate::gemv::upload_into(gpu, &self.page_table, &crate::ops::u32_to_bytes(&table))
-            .map_err(|e| anyhow!("restoring the KV page table: {e}"))?;
+        // A shared-pool table is the session's to rewrite as pages are handed out.
+        if !shared {
+            let pages = self.capacity_cells.div_ceil(PAGE_CELLS);
+            let table: Vec<u32> = (0..pages as u32).collect();
+            crate::gemv::upload_into(gpu, &self.page_table, &crate::ops::u32_to_bytes(&table))
+                .map_err(|e| anyhow!("restoring the KV page table: {e}"))?;
+        }
         let pos = identity_triples(self.max_pos);
         crate::gemv::upload_into(gpu, &self.positions, &crate::ops::u32_to_bytes(&pos))
             .map_err(|e| anyhow!("restoring the position table: {e}"))?;
@@ -759,10 +922,10 @@ impl QsaState {
             .map_err(|e| anyhow!("writing the position table: {e}"))
     }
 
+    /// Bytes this state owns (a shared pool is counted once, by its session).
     pub fn bytes(&self) -> u64 {
-        [
-            &self.k_pool,
-            &self.v_pool,
+        let pools = if self.pt_map != 0 { 0 } else { self.k_pool.size + self.v_pool.size };
+        pools + [
             &self.page_table,
             &self.idx_tail,
             &self.idx_pooled,
@@ -770,7 +933,7 @@ impl QsaState {
         ]
         .iter()
         .map(|b| b.size)
-        .sum()
+        .sum::<u64>()
     }
 
     /// Pooled-key rows the state can hold.
@@ -779,14 +942,16 @@ impl QsaState {
     }
 
     pub fn release(self, gpu: &Gpu) {
-        for b in [
-            &self.k_pool,
-            &self.v_pool,
-            &self.page_table,
-            &self.idx_tail,
-            &self.idx_pooled,
-            &self.positions,
-        ] {
+        self.destroy(gpu);
+    }
+
+    /// Free what this state owns (not a shared pool's K/V).
+    pub fn destroy(&self, gpu: &Gpu) {
+        if self.pt_map == 0 {
+            gpu.destroy_buf(&self.k_pool);
+            gpu.destroy_buf(&self.v_pool);
+        }
+        for b in [&self.page_table, &self.idx_tail, &self.idx_pooled, &self.positions] {
             gpu.destroy_buf(b);
         }
     }

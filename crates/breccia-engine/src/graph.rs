@@ -46,6 +46,7 @@ use breccia_kernels::{
     Gdn, GdnProjections, GdnState, GdnTap, GdnWeights, GdnWorkspace, Proj, Qsa, QsaProjections,
     QsaState, QsaWeights, QsaWorkspace, QuantType,
 };
+use breccia_kernels::qsa::KvPool;
 
 use crate::config::LayerKind;
 use crate::model::{HcW, Model, PipelineSet};
@@ -665,7 +666,7 @@ struct SpecSnap {
 /// One sequence's recurrent / KV state, per block on the device that owns it.
 type SeqState = (Vec<Option<GdnState>>, Vec<Option<QsaState>>);
 
-fn alloc_seq_state(model: &Model, ctx_capacity: usize) -> Result<SeqState> {
+fn alloc_seq_state(model: &Model, ctx_capacity: usize, kv_pool: &[Option<KvPool>]) -> Result<SeqState> {
     let mc = &model.cfg;
     let mut gdn_state = Vec::with_capacity(mc.n_layers);
     let mut qsa_state = Vec::with_capacity(mc.n_layers);
@@ -680,7 +681,10 @@ fn alloc_seq_state(model: &Model, ctx_capacity: usize) -> Result<SeqState> {
                 qsa_state.push(None);
             }
             LayerKind::Qsa => {
-                let st = QsaState::new(gpu, ctx_capacity, ctx_capacity.max(8))
+                let st = match kv_pool.get(b).and_then(Option::as_ref) {
+                    Some(p) => QsaState::with_pool(gpu, ctx_capacity, ctx_capacity.max(8), p),
+                    None => QsaState::new(gpu, ctx_capacity, ctx_capacity.max(8)),
+                }
                     .with_context(|| format!("allocating the QSA state of block {b}"))?;
                 gdn_state.push(None);
                 qsa_state.push(Some(st));
@@ -702,16 +706,7 @@ fn release_seq_state(
             gpu.destroy_buf(&st.conv);
         }
         if let Some(st) = &qsa_state[b] {
-            for buf in [
-                &st.k_pool,
-                &st.v_pool,
-                &st.page_table,
-                &st.idx_tail,
-                &st.idx_pooled,
-                &st.positions,
-            ] {
-                gpu.destroy_buf(buf);
-            }
+            st.destroy(gpu);
         }
     }
 }
@@ -735,6 +730,7 @@ fn new_ple(model: &Model) -> Result<Option<PleHost>> {
 struct SeqSlot {
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
+    kv_pages: Vec<u32>,
     ple: Option<PleHost>,
     image: Vec<(usize, usize, usize, Buf)>,
     pos: usize,
@@ -755,6 +751,14 @@ pub struct Session<'m> {
     ship_imp_off: bool,
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
+    /// `BRECCIA_KV_POOL_CELLS`: per QSA layer, the K/V page pool every sequence
+    /// shares (empty = each sequence owns full-capacity pools). One free list
+    /// serves all layers: a sequence's logical page `i` is pool page
+    /// `kv_pages[i]` in every layer.
+    kv_pool: Vec<Option<KvPool>>,
+    kv_free: Vec<u32>,
+    /// The active sequence's pool pages (parked ones keep theirs in `SeqSlot`).
+    kv_pages: Vec<u32>,
     /// Extra sequences sharing this session's weights, pipelines and prefill
     /// scratch (`add_seq`); entry `active_seq` is `None` (its state is the
     /// fields above). Empty for an ordinary one-sequence session.
@@ -1338,7 +1342,29 @@ impl<'m> Session<'m> {
         }
 
         // Per-layer recurrent / KV state, on the device that owns the block.
-        let (gdn_state, qsa_state) = alloc_seq_state(model, ctx_capacity)?;
+        let mut kv_pool: Vec<Option<KvPool>> = Vec::new();
+        let mut kv_free = Vec::new();
+        if let Some(cells) = breccia_kernels::qsa::kv_pool_cells() {
+            for b in 0..mc.n_layers {
+                kv_pool.push(match mc.layer_kind(b) {
+                    LayerKind::Qsa => Some(
+                        KvPool::new(model.devices[model.device_of(b)].gpu(), cells)
+                            .with_context(|| format!("the shared KV pool of block {b}"))?,
+                    ),
+                    LayerKind::Gdn => None,
+                });
+            }
+            let pages = kv_pool.iter().flatten().map(|p| p.pages).min().unwrap_or(0);
+            // page 0 is the sink unmapped table entries point at, never handed
+            // out; popped from the end, pages go out high to low, so no table is
+            // identity (the paged path is exercised from token 0)
+            kv_free = (1..pages as u32).collect();
+            eprintln!(
+                "breccia: shared KV pool {cells} cells/layer ({pages} pages), {} MiB",
+                kv_pool.iter().flatten().map(|p| p.bytes()).sum::<u64>() >> 20
+            );
+        }
+        let (gdn_state, qsa_state) = alloc_seq_state(model, ctx_capacity, &kv_pool)?;
 
         // Hoist the QSA workspaces: capacity-sized once, mutated per call.
         let mut qsa_ws: Vec<Option<QsaWorkspace>> = Vec::with_capacity(mc.n_layers);
@@ -1379,6 +1405,9 @@ impl<'m> Session<'m> {
             ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() == Ok("0"),
             gdn_state,
             qsa_state,
+            kv_pool,
+            kv_free,
+            kv_pages: Vec::new(),
             seqs: Vec::new(),
             rows_seq: Vec::new(),
             rows_head: None,
@@ -2237,6 +2266,9 @@ impl<'m> Session<'m> {
     /// pooled-key blocks. Positions and the page table are not written by kernels.
     fn prefix_bufs(&self, cells: usize) -> Result<Vec<(usize, &Buf, usize)>> {
         use breccia_kernels::qsa::{sizes, VLayout, PAGE_CELLS};
+        // shortcut: prefix save/restore assumes identity pages; the NVMe tier
+        // (item 6) adds page-wise copies for the shared pool.
+        anyhow::ensure!(self.kv_pool.is_empty(), "prefix save/restore does not support BRECCIA_KV_POOL_CELLS yet");
         let m = self.model;
         let mut v = Vec::new();
         for b in 0..m.cfg.n_layers {
@@ -2345,11 +2377,12 @@ impl<'m> Session<'m> {
         if self.seqs.is_empty() {
             self.seqs.push(None); // sequence 0 is the session's own state
         }
-        let (gdn_state, qsa_state) = alloc_seq_state(self.model, self.seq_ctx)?;
+        let (gdn_state, qsa_state) = alloc_seq_state(self.model, self.seq_ctx, &self.kv_pool)?;
         let ple = new_ple(self.model)?;
         self.seqs.push(Some(SeqSlot {
             gdn_state,
             qsa_state,
+            kv_pages: Vec::new(),
             ple,
             image: Vec::new(),
             pos: 0,
@@ -2375,6 +2408,7 @@ impl<'m> Session<'m> {
         let mut slot = self.seqs[i].take().expect("a parked sequence");
         std::mem::swap(&mut self.gdn_state, &mut slot.gdn_state);
         std::mem::swap(&mut self.qsa_state, &mut slot.qsa_state);
+        std::mem::swap(&mut self.kv_pages, &mut slot.kv_pages);
         std::mem::swap(&mut self.ple, &mut slot.ple);
         std::mem::swap(&mut self.image, &mut slot.image);
         std::mem::swap(&mut self.pos, &mut slot.pos);
@@ -2395,7 +2429,37 @@ impl<'m> Session<'m> {
         let slot = self.seqs[s].as_mut().expect("a parked sequence");
         std::mem::swap(&mut self.gdn_state, &mut slot.gdn_state);
         std::mem::swap(&mut self.qsa_state, &mut slot.qsa_state);
+        std::mem::swap(&mut self.kv_pages, &mut slot.kv_pages);
         std::mem::swap(&mut self.ple, &mut slot.ple);
+    }
+
+    /// Shared KV pool: give the active sequence pool pages for cells `0..cells`
+    /// and write them into its page tables. No-op without a pool.
+    fn kv_ensure(&mut self, cells: usize) -> Result<()> {
+        use breccia_kernels::qsa::PAGE_CELLS;
+        if self.kv_pool.is_empty() {
+            return Ok(());
+        }
+        let first = self.kv_pages.len();
+        let need = cells.div_ceil(PAGE_CELLS);
+        if need <= first {
+            return Ok(());
+        }
+        if need - first > self.kv_free.len() {
+            bail!(
+                "shared KV pool exhausted: {cells} cells need {} more pages, {} free (BRECCIA_KV_POOL_CELLS)",
+                need - first,
+                self.kv_free.len()
+            );
+        }
+        let at = self.kv_free.len() - (need - first);
+        let mut got = self.kv_free.split_off(at);
+        got.reverse();
+        self.kv_pages.extend(got);
+        for st in self.qsa_state.iter().flatten() {
+            st.map_pages(first, &self.kv_pages[first..]);
+        }
+        Ok(())
     }
 
     /// One decode step for several sequences as ONE chunk forward: row `i` is
@@ -2555,6 +2619,11 @@ impl<'m> Session<'m> {
             p.reset();
         }
         self.flush()?;
+        // nothing in flight reads them now
+        for st in self.qsa_state.iter().flatten() {
+            st.clear_pages();
+        }
+        self.kv_free.append(&mut self.kv_pages);
         self.clear_image();
         self.expert_bytes = 0;
         self.forwards = 0;
@@ -2800,6 +2869,7 @@ impl<'m> Session<'m> {
             .flatten()
             .map(|s| s.bytes())
             .sum::<u64>();
+        total += self.kv_pool.iter().flatten().map(|p| p.bytes()).sum::<u64>();
         total
     }
 
@@ -6558,6 +6628,9 @@ impl<'m> Session<'m> {
             .as_ref()
             .ok_or_else(|| anyhow!("block {b} has no QSA state"))?
             .capacity_cells;
+        if pos0 + t <= cap {
+            self.kv_ensure(pos0 + t)?;
+        }
         if pos0 + t > cap {
             bail!(
                 "block {b}: a chunk ending at {} needs more than the cache's {cap} KV cells",
@@ -6749,6 +6822,7 @@ impl<'m> Session<'m> {
                 );
             }
         }
+        self.kv_ensure(n_kv_after)?;
         // The workspace is hoisted: rewrite the three shape scalars the forward
         // pass reads (`n_blocks`, `max_ids`, `slots`) and leave the buffers
         // alone. No allocation, no flush — the batch stays open across the block.
@@ -7449,6 +7523,11 @@ impl Drop for Session<'_> {
             release_seq_state(m, &slot.gdn_state, &slot.qsa_state);
             for (_, _, _, buf) in &slot.image {
                 m.devices[m.device_of(0)].gpu().destroy_buf(buf);
+            }
+        }
+        for (b, p) in self.kv_pool.iter().enumerate() {
+            if let Some(p) = p {
+                p.release(m.devices[m.device_of(b)].gpu());
             }
         }
         for (dev, ws) in self.qsa_chunk_ws.iter_mut().enumerate() {

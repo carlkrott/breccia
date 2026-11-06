@@ -797,7 +797,8 @@ impl Model {
                             i,
                             opts.ctx_capacity,
                             breccia_kernels::qsa::kv_host_on(&devices[i].info.pci_address),
-                        ) * aopts.sessions as u64
+                            aopts.sessions,
+                        )
                     })
                     .collect();
                 let budgets = probe_budgets(&devices, *aopts, &state, opts.verbose)?;
@@ -1031,6 +1032,7 @@ impl Model {
                 i,
                 opts.ctx_capacity,
                 breccia_kernels::qsa::kv_host_on(&dev.info.pci_address),
+                1,
             );
             state_total += st;
             let has_head = head_dev == i;

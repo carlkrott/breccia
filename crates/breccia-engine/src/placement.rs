@@ -292,14 +292,17 @@ impl Placement {
     }
 }
 
-/// Session state/KV bytes a device must also hold (one session).
+/// Session state/KV bytes a device must also hold for `sessions` sequences
+/// (with `BRECCIA_KV_POOL_CELLS`, their K/V is one shared pool, counted once).
 pub fn state_bytes(
     cfg: &crate::config::ModelConfig,
     layer_device: &[usize],
     dev: usize,
     capacity_cells: usize,
     kv_host: bool,
+    sessions: usize,
 ) -> u64 {
+    let pool = breccia_kernels::qsa::kv_pool_cells();
     let mut total = 0u64;
     for (block, &d) in layer_device.iter().enumerate() {
         if d != dev {
@@ -308,17 +311,22 @@ pub fn state_bytes(
         match cfg.layer_kind(block) {
             crate::config::LayerKind::Gdn => {
                 // 3 MiB recurrent state + 120 KiB conv history.
-                total += (128 * 48 * 128 * 4 + 3 * 10240 * 4) as u64;
+                total += (128 * 48 * 128 * 4 + 3 * 10240 * 4) as u64 * sessions as u64;
             }
             crate::config::LayerKind::Qsa => {
                 // The bytes `QsaState::new` allocates (graph.rs passes the same args),
                 // in the process's KV layout (q6_0 default: 972 B/cell, f16 2188).
-                total += breccia_kernels::qsa::state_bytes(
-                    capacity_cells,
-                    capacity_cells.max(8),
-                    breccia_kernels::qsa::VLayout::current(),
-                    kv_host,
-                );
+                let layout = breccia_kernels::qsa::VLayout::current();
+                let per_seq = |kv_host| {
+                    breccia_kernels::qsa::state_bytes(capacity_cells, capacity_cells.max(8), layout, kv_host)
+                };
+                total += match pool {
+                    Some(cells) => {
+                        per_seq(true) * sessions as u64
+                            + if kv_host { 0 } else { breccia_kernels::qsa::kv_pool_bytes(cells, layout) }
+                    }
+                    None => per_seq(kv_host) * sessions as u64,
+                };
             }
         }
     }
