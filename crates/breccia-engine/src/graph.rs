@@ -4608,6 +4608,17 @@ impl<'m> Session<'m> {
             if shared_chunk && !defer_shared {
                 self.record_shared_chunk(b, dev, t)?;
             }
+            // Batched decode, resident block: each row runs the decode MoE (GPU-routed
+            // map, no router readback, bucketing or fan-in), one sync for the block.
+            // `BRECCIA_ROWS_GPU_MOE=0` keeps the merged fan-in path.
+            if let Some(pe) = pe.filter(|_| {
+                !self.rows_seq.is_empty()
+                    && std::env::var("BRECCIA_ROWS_GPU_MOE").as_deref() != Ok("0")
+            }) {
+                self.record_rows_moe(b, dev, pe, t, hc_chunk)?;
+                Self::pf_mark(b, "rows-moe", &pf_tp);
+                return self.merged_pass2(b, dev, t, hc_chunk);
+            }
             if split_on {
                 let pf = self.venues[dev].pf();
                 let hx = &pf.split.as_ref().expect("split scratch").0;
@@ -5308,36 +5319,7 @@ impl<'m> Session<'m> {
 
         // ---- pass 2: the ffn HC_WRITE for every token, one submission --------
         if !micro {
-            self.timers.mark(HC_WRITE_F);
-            self.ensure_batch(dev)?;
-            if hc_chunk {
-                // One T-token HC_WRITE (the ffn inject partials are still in the chunk
-                // workspace), then the residual back into the per-token slots.
-                let v = &self.venues[dev];
-                let rc = v.r_chunk.as_ref().expect("checked above");
-                let ws = self.hc_chunk_ws[dev]
-                    .iter()
-                    .find(|w| w.tokens == t)
-                    .expect("made in pass 1");
-                let pf = v.pf_at(b);
-                v.hc.write(ws, rc, &pf.moe, rc)?;
-                let hb = (mc.hc_dim() * 4) as u64;
-                let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
-                    .map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb))
-                    .collect();
-                batch_cmd::record_copies(gpu, &scatter)?;
-            }
-            for i in (0..t).filter(|_| !hc_chunk) {
-                self.swap_r_in(dev, i);
-                self.swap_inject_in(dev, i);
-                let v = &self.venues[dev];
-                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
-                v.hc.write(ws, &v.r, &v.moe_out[i].buf, &v.r)?;
-                self.swap_inject_in(dev, i);
-                self.swap_r_in(dev, i);
-            }
-            self.submit_batch()?;
-            self.flush()?;
+            self.merged_pass2(b, dev, t, hc_chunk)?;
         }
 
         if !host_set.is_empty() && std::env::var_os("BRECCIA_TRACE_MERGED").is_some() {
@@ -6242,6 +6224,93 @@ impl<'m> Session<'m> {
     /// Nothing here touches the host: the router's ids and weights are read by
     /// shaders straight out of their buffers, and the result lands in the
     /// `block_out` the next recorded dispatch already reads.
+    /// Merged pass 2: the ffn `HC_WRITE` for every token from `pf.moe` (chunk) or
+    /// the per-token `moe_out` slots, one submission and wait.
+    fn merged_pass2(&mut self, b: usize, dev: usize, t: usize, hc_chunk: bool) -> Result<()> {
+        let m = self.model;
+        let (mc, gpu) = (&m.cfg, m.devices[dev].gpu());
+        self.timers.mark(HC_WRITE_F);
+        self.ensure_batch(dev)?;
+        if hc_chunk {
+            // One T-token HC_WRITE (the ffn inject partials are still in the chunk
+            // workspace), then the residual back into the per-token slots.
+            let v = &self.venues[dev];
+            let rc = v.r_chunk.as_ref().expect("checked above");
+            let ws = self.hc_chunk_ws[dev]
+                .iter()
+                .find(|w| w.tokens == t)
+                .expect("made in pass 1");
+            let pf = v.pf_at(b);
+            v.hc.write(ws, rc, &pf.moe, rc)?;
+            let hb = (mc.hc_dim() * 4) as u64;
+            let scatter: Vec<(&Buf, u64, &Buf, u64, u64)> = (0..t)
+                .map(|i| (&v.r_slots[i], 0, rc, i as u64 * hb, hb))
+                .collect();
+            batch_cmd::record_copies(gpu, &scatter)?;
+        }
+        for i in (0..t).filter(|_| !hc_chunk) {
+            self.swap_r_in(dev, i);
+            self.swap_inject_in(dev, i);
+            let v = &self.venues[dev];
+            let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+            v.hc.write(ws, &v.r, &v.moe_out[i].buf, &v.r)?;
+            self.swap_inject_in(dev, i);
+            self.swap_r_in(dev, i);
+        }
+        self.submit_batch()?;
+        self.flush()?;
+        Ok(())
+    }
+
+    /// Rows mode, resident block: per row, the pass-1 outputs go back into the
+    /// decode buffers and [`Session::run_placed_moe`] runs on them; the result lands
+    /// where pass 2 reads it (`pf.moe` row with the chunk HC, else `moe_out[i]`).
+    fn record_rows_moe(
+        &mut self,
+        b: usize,
+        dev: usize,
+        pe: &crate::model::PlacedExperts,
+        t: usize,
+        hc_chunk: bool,
+    ) -> Result<()> {
+        self.timers.mark(EXPERTS);
+        let m = self.model;
+        let (n_embd, n_ff, k) = (m.cfg.n_embd, m.cfg.n_ff, m.cfg.n_expert_used);
+        let gpu = m.devices[dev].gpu();
+        let (kb, nb) = ((k * 4) as u64, (n_embd * 4) as u64);
+        for i in 0..t {
+            {
+                let v = &self.venues[dev];
+                let pf = v.pf_at(b);
+                let ws = v.hc_ws.as_ref().expect("the session's hc workspace");
+                let o = i as u64;
+                batch_cmd::record_copies(
+                    gpu,
+                    &[
+                        (&v.router_ids, 0, &pf.ids.buf, o * kb, kb),
+                        (&v.router_w, 0, &pf.w, o * kb, kb),
+                        (&ws.mixed, 0, &pf.mixed, o * nb, nb),
+                        (&v.sh_gate_logit, 0, &pf.gate, o * 4, 4),
+                        (&v.sh, 0, &pf.shared, o * nb, nb),
+                    ],
+                )?;
+            }
+            self.run_placed_moe(b, dev, pe, n_embd, n_ff, k)?;
+            let v = &self.venues[dev];
+            let (dst, off) = if hc_chunk {
+                (&v.pf_at(b).moe, i as u64 * nb)
+            } else {
+                (&v.moe_out[i].buf, 0)
+            };
+            batch_cmd::record_copies(gpu, &[(dst, off, &v.block_out.buf, 0, nb)])?;
+            if batch_cmd::recorded() >= MERGED_BATCH_CAP {
+                self.flush()?;
+                self.ensure_batch(dev)?;
+            }
+        }
+        Ok(())
+    }
+
     fn run_placed_moe(
         &mut self,
         b: usize,
