@@ -4599,7 +4599,7 @@ impl<'m> Session<'m> {
         // path (8k: 116 tok/s at 50 % vs 175 all-GPU, 11-03). Prefill keeps the CPU out.
         let split_on = ((pf_split_host().is_some() && t <= SPLIT_T_MAX)
             || pf_split_tiers()
-            || (pe.is_none() && (pf_host_cold() || !self.rows_seq.is_empty())))
+            || (pe.is_none() && (pf_host_cold() || (!self.rows_seq.is_empty() && !rows_stream()))))
             && streamed
             && xdev.is_none()
             && !micro
@@ -4792,7 +4792,7 @@ impl<'m> Session<'m> {
                     )
                 })
                 .flatten();
-            if pe.is_none() && (pf_host_cold() || !self.rows_seq.is_empty()) {
+            if pe.is_none() && (pf_host_cold() || (!self.rows_seq.is_empty() && !rows_stream())) {
                 // A cold block has no arena: compute it on the host lane instead of
                 // streaming every expert blob over PCIe (item 5). The device loop
                 // skips groups whose expert is in `host_set`, so nothing streams.
@@ -8254,4 +8254,11 @@ mod tests {
             super::Session::imported_role_slices(&arena, 4, 0, EXPERTS, EXPERTS, EXPERTS).is_err()
         );
     }
+}
+
+/// `BRECCIA_ROWS_STREAM=1`: rows mode (batched decode) streams a cold block's
+/// experts over PCIe to the card instead of computing them on the host lane.
+fn rows_stream() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_ROWS_STREAM").as_deref() == Ok("1"))
 }
