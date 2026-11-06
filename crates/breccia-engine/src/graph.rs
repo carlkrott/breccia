@@ -690,7 +690,11 @@ fn alloc_seq_state(model: &Model, ctx_capacity: usize) -> Result<SeqState> {
     Ok((gdn_state, qsa_state))
 }
 
-fn release_seq_state(model: &Model, gdn_state: &[Option<GdnState>], qsa_state: &[Option<QsaState>]) {
+fn release_seq_state(
+    model: &Model,
+    gdn_state: &[Option<GdnState>],
+    qsa_state: &[Option<QsaState>],
+) {
     for b in 0..model.cfg.n_layers {
         let gpu = model.devices[model.device_of(b)].gpu();
         if let Some(st) = &gdn_state[b] {
@@ -698,7 +702,14 @@ fn release_seq_state(model: &Model, gdn_state: &[Option<GdnState>], qsa_state: &
             gpu.destroy_buf(&st.conv);
         }
         if let Some(st) = &qsa_state[b] {
-            for buf in [&st.k_pool, &st.v_pool, &st.page_table, &st.idx_tail, &st.idx_pooled, &st.positions] {
+            for buf in [
+                &st.k_pool,
+                &st.v_pool,
+                &st.page_table,
+                &st.idx_tail,
+                &st.idx_pooled,
+                &st.positions,
+            ] {
                 gpu.destroy_buf(buf);
             }
         }
@@ -707,7 +718,13 @@ fn release_seq_state(model: &Model, gdn_state: &[Option<GdnState>], qsa_state: &
 
 fn new_ple(model: &Model) -> Result<Option<PleHost>> {
     Ok(match &model.ple {
-        Some(p) => Some(PleHost::new(&model.cfg, &p.norm_key, &p.norm_query, &p.norm_conv, &p.conv)?),
+        Some(p) => Some(PleHost::new(
+            &model.cfg,
+            &p.norm_key,
+            &p.norm_query,
+            &p.norm_conv,
+            &p.conv,
+        )?),
         None => None,
     })
 }
@@ -2171,7 +2188,10 @@ impl<'m> Session<'m> {
         for &(_, nx, ny, rows) in imgs {
             let n = nx * ny;
             if n == 0 || rows.len() != n * n_embd {
-                bail!("image rows: {} floats for a {nx}x{ny} grid of {n_embd}-wide rows", rows.len());
+                bail!(
+                    "image rows: {} floats for a {nx}x{ny} grid of {n_embd}-wide rows",
+                    rows.len()
+                );
             }
         }
         self.flush()?;
@@ -2189,7 +2209,11 @@ impl<'m> Session<'m> {
     /// The IMRoPE position table of every QSA layer for the images held.
     fn image_positions(&self) -> Result<()> {
         let m = self.model;
-        let spans: Vec<_> = self.image.iter().map(|&(c0, nx, ny, _)| (c0, nx, ny)).collect();
+        let spans: Vec<_> = self
+            .image
+            .iter()
+            .map(|&(c0, nx, ny, _)| (c0, nx, ny))
+            .collect();
         for b in 0..m.cfg.n_layers {
             if let Some(st) = &self.qsa_state[b] {
                 st.set_image_positions(m.devices[m.device_of(b)].gpu(), &spans)?;
@@ -2201,7 +2225,9 @@ impl<'m> Session<'m> {
     /// Drop the images set by [`Self::set_images`] (also done by `reset`).
     pub fn clear_image(&mut self) {
         for (_, _, _, buf) in std::mem::take(&mut self.image) {
-            self.model.devices[self.model.device_of(0)].gpu().destroy_buf(&buf);
+            self.model.devices[self.model.device_of(0)]
+                .gpu()
+                .destroy_buf(&buf);
         }
     }
 
@@ -2220,7 +2246,11 @@ impl<'m> Session<'m> {
                 v.push((d, &st.conv, st.conv.size as usize));
             }
             if let Some(st) = &self.qsa_state[b] {
-                anyhow::ensure!(cells <= st.capacity_cells, "prefix of {cells} cells over the cache's {}", st.capacity_cells);
+                anyhow::ensure!(
+                    cells <= st.capacity_cells,
+                    "prefix of {cells} cells over the cache's {}",
+                    st.capacity_cells
+                );
                 let pages = cells.div_ceil(PAGE_CELLS);
                 let (k, vb) = match st.v_layout {
                     VLayout::F16 => (sizes::f16_pool_bytes(pages), sizes::f16_pool_bytes(pages)),
@@ -2230,7 +2260,11 @@ impl<'m> Session<'m> {
                 v.push((d, &st.k_pool, k as usize));
                 v.push((d, &st.v_pool, vb as usize));
                 v.push((d, &st.idx_tail, sizes::idx_tail_bytes() as usize));
-                v.push((d, &st.idx_pooled, sizes::pooled_idx_bytes(sizes::pooled_blocks(cells)) as usize));
+                v.push((
+                    d,
+                    &st.idx_pooled,
+                    sizes::pooled_idx_bytes(sizes::pooled_blocks(cells)) as usize,
+                ));
             }
         }
         Ok(v)
@@ -2248,8 +2282,17 @@ impl<'m> Session<'m> {
             .into_iter()
             .map(|(d, buf, n)| breccia_kernels::gemv::download(gpus[d], buf, n))
             .collect::<Result<Vec<_>>>()?;
-        let st = PrefixState { cells, cur_tok: self.cur_tok, ple: self.ple.as_ref().map(|p| p.state()), bufs };
-        eprintln!("breccia: prefix of {cells} cells saved, {} MiB in {:.2} s", st.bytes() >> 20, t.elapsed().as_secs_f64());
+        let st = PrefixState {
+            cells,
+            cur_tok: self.cur_tok,
+            ple: self.ple.as_ref().map(|p| p.state()),
+            bufs,
+        };
+        eprintln!(
+            "breccia: prefix of {cells} cells saved, {} MiB in {:.2} s",
+            st.bytes() >> 20,
+            t.elapsed().as_secs_f64()
+        );
         Ok(st)
     }
 
@@ -2266,7 +2309,10 @@ impl<'m> Session<'m> {
             bufs.len() == s.bufs.len() && bufs.iter().zip(&s.bufs).all(|(b, h)| b.2 == h.len()),
             "the saved prefix does not fit this session's state layout"
         );
-        anyhow::ensure!(self.ple.is_some() == s.ple.is_some(), "the saved prefix's PLE state does not match");
+        anyhow::ensure!(
+            self.ple.is_some() == s.ple.is_some(),
+            "the saved prefix's PLE state does not match"
+        );
         for ((d, buf, _), host) in bufs.into_iter().zip(&s.bufs) {
             breccia_kernels::gemv::upload_into(gpus[d], buf, host)?;
         }
@@ -2275,7 +2321,11 @@ impl<'m> Session<'m> {
         }
         self.pos = s.cells - 1;
         self.cur_tok = s.cur_tok;
-        eprintln!("breccia: prefix of {} cells restored in {:.2} s", s.cells, t.elapsed().as_secs_f64());
+        eprintln!(
+            "breccia: prefix of {} cells restored in {:.2} s",
+            s.cells,
+            t.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 
@@ -2288,7 +2338,10 @@ impl<'m> Session<'m> {
     /// scratch and has its own recurrent / KV state (same context capacity).
     /// Returns its index; [`Self::use_seq`] makes it the one the forwards run on.
     pub fn add_seq(&mut self) -> Result<usize> {
-        anyhow::ensure!(self.spec.is_none(), "sequence slots do not support speculative decoding");
+        anyhow::ensure!(
+            self.spec.is_none(),
+            "sequence slots do not support speculative decoding"
+        );
         if self.seqs.is_empty() {
             self.seqs.push(None); // sequence 0 is the session's own state
         }
@@ -2313,7 +2366,11 @@ impl<'m> Session<'m> {
         if i == self.active_seq {
             return Ok(());
         }
-        anyhow::ensure!(i < self.seqs.len(), "no sequence {i} (have {})", self.n_seqs());
+        anyhow::ensure!(
+            i < self.seqs.len(),
+            "no sequence {i} (have {})",
+            self.n_seqs()
+        );
         self.flush()?;
         let mut slot = self.seqs[i].take().expect("a parked sequence");
         std::mem::swap(&mut self.gdn_state, &mut slot.gdn_state);
@@ -2348,11 +2405,17 @@ impl<'m> Session<'m> {
     pub fn decode_seqs(&mut self, toks: &[(usize, u32)]) -> Result<Vec<Vec<f32>>> {
         anyhow::ensure!(self.prefill_merged, "batched decode needs --prefill-merged");
         // prefill_rows embeds image rows by cell and pos0 is 0 here
-        anyhow::ensure!(self.image.is_empty(), "batched decode does not take image sequences");
+        anyhow::ensure!(
+            self.image.is_empty(),
+            "batched decode does not take image sequences"
+        );
         let mut rows = Vec::with_capacity(toks.len());
         for (i, &(s, _)) in toks.iter().enumerate() {
             anyhow::ensure!(s < self.n_seqs(), "no sequence {s}");
-            anyhow::ensure!(toks[..i].iter().all(|x| x.0 != s), "sequence {s} twice in one step");
+            anyhow::ensure!(
+                toks[..i].iter().all(|x| x.0 != s),
+                "sequence {s} twice in one step"
+            );
             let (pos, img) = if s == self.active_seq {
                 (self.pos, !self.image.is_empty())
             } else {
@@ -2360,14 +2423,17 @@ impl<'m> Session<'m> {
                 (sl.pos, !sl.image.is_empty())
             };
             anyhow::ensure!(!img, "batched decode does not take image sequences");
-            anyhow::ensure!(pos + 1 < self.seq_ctx, "sequence {s} is at its context limit");
+            anyhow::ensure!(
+                pos + 1 < self.seq_ctx,
+                "sequence {s} is at its context limit"
+            );
             rows.push((s, pos + 1));
         }
         let ids: Vec<u32> = toks.iter().map(|x| x.1).collect();
         self.rows_seq = rows;
         let (pos_was, tok_was) = (self.pos, self.cur_tok); // prefill_rows overwrites the active pos
-        // pos0 0: row i's mixer reads its own cell from `rows_seq`, and the
-        // per-token prelude addresses `pf.out` row `pos - pos0 = i`.
+                                                           // pos0 0: row i's mixer reads its own cell from `rows_seq`, and the
+                                                           // per-token prelude addresses `pf.out` row `pos - pos0 = i`.
         let r = self.prefill_rows(&ids, 0, true);
         let rows = std::mem::take(&mut self.rows_seq);
         (self.pos, self.cur_tok) = (pos_was, tok_was);
@@ -2390,7 +2456,10 @@ impl<'m> Session<'m> {
     /// `decode_seconds` is the shared decode wall time, so the aggregate rate is
     /// `Σ forwards / decode_seconds`.
     pub fn generate_seqs(&mut self, prompts: &[Vec<u32>], n: usize) -> Result<Vec<Generation>> {
-        anyhow::ensure!(self.prefill_chunk > 0, "sequence slots need chunked prefill");
+        anyhow::ensure!(
+            self.prefill_chunk > 0,
+            "sequence slots need chunked prefill"
+        );
         anyhow::ensure!(prompts.iter().all(|p| !p.is_empty()), "a prompt is empty");
         while self.n_seqs() < prompts.len() {
             self.add_seq()?;
@@ -2595,9 +2664,12 @@ impl<'m> Session<'m> {
                 let q6_live = qsa::sizes::q6_pool_bytes(pages) as usize;
                 let (k_name, k_live, v_name, v_live) = match st.v_layout {
                     qsa::VLayout::F16 => ("qsa_k", f16_live, "qsa_v", f16_live),
-                    qsa::VLayout::Q8_0 => {
-                        ("qsa_k", f16_live, "qsa_vq8", qsa::sizes::q8v_pool_bytes(pages) as usize)
-                    }
+                    qsa::VLayout::Q8_0 => (
+                        "qsa_k",
+                        f16_live,
+                        "qsa_vq8",
+                        qsa::sizes::q8v_pool_bytes(pages) as usize,
+                    ),
                     qsa::VLayout::Q6_0 => ("qsa_kq6", q6_live, "qsa_vq6", q6_live),
                 };
                 parts.push((k_name, &st.k_pool, k_live));
@@ -3194,7 +3266,14 @@ impl<'m> Session<'m> {
                 // image row: the encoder's embedding replicated over the hc streams, like a token row
                 let row = (mc.n_embd * 4) as u64;
                 for h in 0..mc.hc {
-                    batch_cmd::record_copy(gpu, &v.r_slots[i], h as u64 * row, buf, (pos0 + i - c0) as u64 * row, row)?;
+                    batch_cmd::record_copy(
+                        gpu,
+                        &v.r_slots[i],
+                        h as u64 * row,
+                        buf,
+                        (pos0 + i - c0) as u64 * row,
+                        row,
+                    )?;
                 }
                 continue;
             }
@@ -4277,10 +4356,15 @@ impl<'m> Session<'m> {
         // the expert device too: the RX's streamed GEMM beats the MI50's arena GEMM
         // ~2.5x (KL 1.6e-5 vs the arena, top-1 same). Only when the arena holds the
         // file types; `BRECCIA_PF_EXPERT_ALL=0` keeps them on the arena.
-        let to_x = std::env::var("BRECCIA_PF_EXPERT_DEVICE")
+        // Batched decode (rows mode, t = a few rows) keeps experts on their own
+        // card: streaming ~30 MiB per block to the expert device cost ~3.5 ms/block
+        // vs ~1.4 ms on the resident arena (11-06 ptr2 trace).
+        let x_env = std::env::var("BRECCIA_PF_EXPERT_DEVICE")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .is_some_and(|x| x != dev && x < m.devices.len() && self.venues[x].pf.is_some());
+            .filter(|_| self.rows_seq.is_empty())
+            .and_then(|v| v.parse::<usize>().ok());
+        let to_x =
+            x_env.is_some_and(|x| x != dev && x < m.devices.len() && self.venues[x].pf.is_some());
         let pe = pe.filter(|p| {
             !to_x
                 || std::env::var("BRECCIA_PF_EXPERT_ALL").as_deref() == Ok("0")
@@ -4299,12 +4383,9 @@ impl<'m> Session<'m> {
         // streamed block's expert GEMMs and fan-in on that device instead (the RX
         // streams experts over x16, the MI50 over x4). Host-staged both ways: the
         // fan-in's inputs go out, `pf.out` comes back — no GPU-to-GPU copy.
-        let xdev = std::env::var("BRECCIA_PF_EXPERT_DEVICE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&x| {
-                streamed && x != dev && x < m.devices.len() && self.venues[x].pf.is_some()
-            });
+        let xdev = x_env.filter(|&x| {
+            streamed && x != dev && x < m.devices.len() && self.venues[x].pf.is_some()
+        });
         // The chunk-level shared expert needs a multi-user GEMM for all three roles.
         let shared_chunk = self.pf[dev][PF_SHCHUNK] && {
             let moe = &m.layers[b].moe;
@@ -5691,14 +5772,17 @@ impl<'m> Session<'m> {
             };
             v.final_hc.read(ws, rc, &hw)?;
             self.timers.mark(HEAD);
-            v.pipes.gemm(m.head.key.ty).expect("checked by the caller").run(
-                &m.head.buf,
-                &ws.mixed,
-                out,
-                m.head.key.rows,
-                m.head.key.cols,
-                t,
-            )?;
+            v.pipes
+                .gemm(m.head.key.ty)
+                .expect("checked by the caller")
+                .run(
+                    &m.head.buf,
+                    &ws.mixed,
+                    out,
+                    m.head.key.rows,
+                    m.head.key.cols,
+                    t,
+                )?;
         }
         self.submit_batch()?;
         self.flush()?;
@@ -6486,7 +6570,10 @@ impl<'m> Session<'m> {
             {
                 let v = &self.venues[dev];
                 let hc = v.hc_ws.as_ref().expect("the session's hc workspace");
-                batch_cmd::record_copies(gpu, &[(&hc.mixed, 0, &v.pf_at(b).mixed, i as u64 * nb, nb)])?;
+                batch_cmd::record_copies(
+                    gpu,
+                    &[(&hc.mixed, 0, &v.pf_at(b).mixed, i as u64 * nb, nb)],
+                )?;
             }
             self.swap_seq_state(s);
             let r = match m.layers[b].kind {
@@ -6496,7 +6583,10 @@ impl<'m> Session<'m> {
             self.swap_seq_state(s);
             r?;
             let v = &self.venues[dev];
-            batch_cmd::record_copies(gpu, &[(&v.pf_at(b).out, i as u64 * nb, &v.block_out.buf, 0, nb)])?;
+            batch_cmd::record_copies(
+                gpu,
+                &[(&v.pf_at(b).out, i as u64 * nb, &v.block_out.buf, 0, nb)],
+            )?;
         }
         Ok(())
     }
@@ -7043,7 +7133,9 @@ impl<'m> Session<'m> {
         // reset() undoes set_images; a generate() over the images' prompt keeps them
         // (only when the prompt still holds every one: a --then prompt is text)
         let held = |&(c0, nx, ny, _): &(usize, usize, usize, Buf)| {
-            prompt.get(c0..c0 + nx * ny).is_some_and(|c| c.iter().all(|&t| t == IMAGE_PLE_TOKEN))
+            prompt
+                .get(c0..c0 + nx * ny)
+                .is_some_and(|c| c.iter().all(|&t| t == IMAGE_PLE_TOKEN))
         };
         let mut img = std::mem::take(&mut self.image);
         if !img.iter().all(held) {
@@ -7053,7 +7145,10 @@ impl<'m> Session<'m> {
         self.image = img;
         r?;
         if !self.image.is_empty() {
-            anyhow::ensure!(self.prefill_chunk > 0, "an image prompt needs chunked prefill");
+            anyhow::ensure!(
+                self.prefill_chunk > 0,
+                "an image prompt needs chunked prefill"
+            );
             self.image_positions()?;
         }
         let mut trace = debug;
@@ -7066,8 +7161,14 @@ impl<'m> Session<'m> {
             Prefix::Resume(st) => st.cells,
         };
         if cut > 0 {
-            anyhow::ensure!(self.prefill_chunk > 0, "a saved prefix needs chunked prefill");
-            anyhow::ensure!(cut < prompt.len(), "the prefix ({cut} cells) must leave prompt to run");
+            anyhow::ensure!(
+                self.prefill_chunk > 0,
+                "a saved prefix needs chunked prefill"
+            );
+            anyhow::ensure!(
+                cut < prompt.len(),
+                "the prefix ({cut} cells) must leave prompt to run"
+            );
         }
         if let Prefix::Resume(st) = prefix {
             self.restore_prefix(st)?;

@@ -797,8 +797,7 @@ impl Model {
                             i,
                             opts.ctx_capacity,
                             breccia_kernels::qsa::kv_host_on(&devices[i].info.pci_address),
-                        )
-                            * aopts.sessions as u64
+                        ) * aopts.sessions as u64
                     })
                     .collect();
                 let budgets = probe_budgets(&devices, *aopts, &state, opts.verbose)?;
@@ -1991,7 +1990,11 @@ fn probe_budgets(
         // State is charged in full on both kinds of card: the old 512 MiB display
         // discount was measured at RES 2560; at the 768 default a 100k context (RX
         // state 944 MiB) left 295 MiB free and tripped the VRAM guard (rv2, 11-05).
-        let reserve = if display { opts.display_reserve } else { opts.headroom } + st;
+        let reserve = if display {
+            opts.display_reserve
+        } else {
+            opts.headroom
+        } + st;
         if verbose {
             eprintln!(
                 "breccia: arena: device {i} {} free {} MiB ({}) - {} {} MiB = {} MiB",
