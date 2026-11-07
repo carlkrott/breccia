@@ -203,6 +203,16 @@ pub(crate) fn argmax(v: &[f32]) -> u32 {
     b as u32
 }
 
+/// Bench diagnostic: `BRECCIA_MTP_TOP2_AT=g` prints the two best logits of generated token `g`.
+fn top2_at(g: usize, v: &[f32]) {
+    if std::env::var("BRECCIA_MTP_TOP2_AT").ok().and_then(|x| x.parse().ok()) != Some(g) {
+        return;
+    }
+    let a = argmax(v) as usize;
+    let b = (0..v.len()).filter(|&i| i != a).max_by(|&x, &y| v[x].total_cmp(&v[y])).unwrap_or(a);
+    println!("mtp-top2 g={g} {a}:{:.6} {b}:{:.6} margin {:.3e}", v[a], v[b], v[a] - v[b]);
+}
+
 /// `ln softmax(v)[id]`.
 pub(crate) fn log_p(v: &[f32], id: u32) -> f64 {
     let m = v.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -293,6 +303,7 @@ pub fn generate(
             if want_r {
                 r_store.push(sess.final_r_decode()?);
             }
+            top2_at(toks.len() - prompt.len(), &l);
             toks.push(argmax(&l));
             st.nll -= log_p(&l, toks[toks.len() - 1]);
             st.rounds[0] += 1;
@@ -341,6 +352,9 @@ pub fn generate(
                 st.nll -= log_p(&rows[a], d);
             }
             a += 1;
+        }
+        for (j, r) in rows[..=a].iter().enumerate() {
+            top2_at(toks.len() - prompt.len() + j, r);
         }
         let bonus = argmax(&rows[a]);
         st.nll -= log_p(&rows[a], bonus);

@@ -3100,7 +3100,12 @@ fn mtp_spec_bench(
     let (gen, reps) = (env_n("BRECCIA_MTP_GEN", 64), env_n("BRECCIA_MTP_REPS", 2));
     let dir = std::env::var("BRECCIA_MTP_DIR").unwrap_or_else(|_| "/srv/strata-data/mtp/rt".into());
     sess.spec_enable(MAX_K + 1).context("spec_enable")?;
-    let mut d = breccia_engine::mtp_draft::MtpDraft::open(model, 0, &dir, prompt.len() + gen + 16)?;
+    let mut d = breccia_engine::mtp_draft::MtpDraft::open(
+        model,
+        env_n("BRECCIA_MTP_DEVICE", 0),
+        &dir,
+        prompt.len() + gen + 16,
+    )?;
     println!(
         "mtp-spec  draft {} MiB device, prompt {} gen {gen} reps {reps}",
         d.bytes >> 20,
@@ -3222,7 +3227,11 @@ fn mtp_draft_bench(
 ) -> Result<()> {
     let dir = std::env::var("BRECCIA_MTP_DIR").unwrap_or_else(|_| "/srv/strata-data/mtp/rt".into());
     let t0 = std::time::Instant::now();
-    let mut d = breccia_engine::mtp_draft::MtpDraft::open(model, 0, &dir, prompt_len + 64)?;
+    let dev = std::env::var("BRECCIA_MTP_DEVICE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut d = breccia_engine::mtp_draft::MtpDraft::open(model, dev, &dir, prompt_len + 64)?;
     println!(
         "mtp-draft  built in {:.1} s, {} MiB device",
         t0.elapsed().as_secs_f64(),
@@ -3331,6 +3340,15 @@ fn spec_verify_bench(
             decode_ms * 1e3,
             verify_ms * 1e3
         );
+    }
+    println!(
+        "spec-verify host stages sum {:.2} of wall {verify_ms:.2} ms per call:",
+        sess.timers.total_s() * 1e3 / REPS as f64
+    );
+    for (name, ms) in sess.timers.table(REPS) {
+        if ms >= 0.05 {
+            println!("  host {name:<16} {ms:>8.3}");
+        }
     }
     let top1 = (0..t)
         .filter(|&i| argmax(&rows[i]) as u32 == g[i + 1])

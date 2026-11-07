@@ -988,3 +988,137 @@ fn out_fill(gpu: &Gpu, out: &breccia_vk::ctx::Buf, n: usize) {
     gpu.copy_once(&b, out, (n * 4) as u64).expect("copy");
     gpu.destroy_buf(&b);
 }
+
+/// The dense projections a spec-verify window runs through `GemmMany`, timed
+/// against the decode `Gemv`: does T rows cost what the chunk stage trace says?
+#[test]
+fn dense_gemm_vs_gemv_times() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("dense_gemm: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else {
+        eprintln!("dense_gemm: no device for {selector}");
+        return;
+    };
+    let Ok(set) = ShardSet::open_glob(MODEL_GLOB) else {
+        eprintln!("dense_gemm: skipping, no model");
+        return;
+    };
+    let gpu = &dev.gpu;
+    let mut seen = Vec::new();
+    for t in set.tensors() {
+        let n = t.name();
+        if !["attn_qkv", "ssm_out", "ssm_gate", "ffn_gate.weight", "ssm_beta"]
+            .iter()
+            .any(|s| n.contains(s))
+            || t.ne1() < 2
+        {
+            continue;
+        }
+        let Some(ty) = QuantType::from_ggml(t.ty()) else {
+            continue;
+        };
+        let (rows, cols) = (t.ne1() as usize, t.ne0() as usize);
+        if seen.contains(&(ty, rows, cols)) {
+            continue;
+        }
+        seen.push((ty, rows, cols));
+        let Ok(gemm) = GemmMany::new(gpu, ty) else {
+            continue;
+        };
+        let Ok(gemv) = Gemv::new(gpu, ty, rows, cols) else {
+            continue;
+        };
+        let w = breccia_kernels::gemv::upload(gpu, t.as_slice()).expect("weights");
+        let pad = gemm.padded_cols(cols);
+        let mut seed = 0x1234_5678u32;
+        let xs: Vec<f32> = (0..8 * pad)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((seed >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+            })
+            .collect();
+        let x = breccia_kernels::ops::upload_f32(gpu, &xs).expect("x");
+        let out = alloc(gpu, (8 * rows * 4) as u64).expect("out");
+        let single = gemv.run_timed(&w, &x, &out, 0.2).expect("gemv").per_iter_s * 1e6;
+        let mut line = format!("{n} {} {rows}x{cols} gemv {single:.0} us;", ty.name());
+        for m in [1usize, 2, 4, 8] {
+            let us = gemm.run_timed(&w, &x, &out, rows, cols, m, 0.2).expect("gemm").per_iter_s * 1e6;
+            line += &format!(" m{m} {us:.0}");
+        }
+        println!("{line}");
+        for b in [&w, &x, &out] {
+            gpu.destroy_buf(b);
+        }
+    }
+    drop(guard);
+}
+
+/// Cold sweep: every GDN/QSA dense matrix once per pass in one batch, as the
+/// engine does it, so a matrix is never still in the GPU caches when read again.
+#[test]
+fn dense_gemm_cold_sweep() {
+    let Ok(selector) = std::env::var("BRECCIA_KERNEL_DEVICE") else {
+        eprintln!("cold_sweep: SKIPPED - set BRECCIA_KERNEL_DEVICE");
+        return;
+    };
+    let guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(dev) = open(&selector) else { return };
+    let Ok(set) = ShardSet::open_glob(MODEL_GLOB) else { return };
+    let gpu = &dev.gpu;
+    let mut pipes = std::collections::BTreeMap::new();
+    let mut mats = Vec::new();
+    let mut bytes = 0u64;
+    for t in set.tensors() {
+        let n = t.name();
+        if !["attn_qkv", "ssm_out"].iter().any(|s| n.contains(s)) || t.ne1() < 2 {
+            continue;
+        }
+        let Some(ty) = QuantType::from_ggml(t.ty()) else { continue };
+        let (rows, cols) = (t.ne1() as usize, t.ne0() as usize);
+        let Ok(gemv) = Gemv::new(gpu, ty, rows, cols) else { continue };
+        if !pipes.contains_key(&ty) {
+            let Ok(g) = GemmMany::new(gpu, ty) else { continue };
+            pipes.insert(ty, g);
+        }
+        bytes += t.as_slice().len() as u64;
+        let w = breccia_kernels::gemv::upload(gpu, t.as_slice()).expect("weights");
+        mats.push((ty, rows, cols, gemv, w));
+    }
+    let xs: Vec<f32> = (0..8 * 7000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 8) as f32 / (1u32 << 24) as f32 - 0.5)
+        .collect();
+    let x = breccia_kernels::ops::upload_f32(gpu, &xs).expect("x");
+    let out = alloc(gpu, (8 * 12288 * 4) as u64).expect("out");
+    let sweep = |users: usize| {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t0 = std::time::Instant::now();
+            breccia_kernels::dispatch_batch::begin(gpu).expect("begin");
+            for (ty, rows, cols, gemv, w) in &mats {
+                if users == 0 {
+                    gemv.run(w, &x, &out).expect("gemv");
+                } else {
+                    pipes[ty].run(w, &x, &out, *rows, *cols, users).expect("gemm");
+                }
+            }
+            breccia_kernels::dispatch_batch::end(gpu).expect("end");
+            best = best.min(t0.elapsed().as_secs_f64());
+        }
+        best
+    };
+    println!("cold sweep: {} matrices, {:.1} MiB", mats.len(), bytes as f64 / 1048576.0);
+    for users in [0usize, 1, 2, 4, 8] {
+        let s = sweep(users);
+        println!(
+            "  {} wall {:.2} ms, {:.0} us/matrix, {:.1} GB/s of weights",
+            if users == 0 { "gemv".to_string() } else { format!("m{users}") },
+            s * 1e3,
+            s * 1e6 / mats.len() as f64,
+            bytes as f64 / s / 1e9
+        );
+    }
+    drop(guard);
+}
