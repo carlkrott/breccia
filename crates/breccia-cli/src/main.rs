@@ -5567,6 +5567,8 @@ fn serve_http(a: ServeArgs) -> Result<()> {
         tok.bos,
         tok.eos
     );
+    // stop at the same EOS the server trims at (`EngineBackend::eos`), so the reply text is unchanged
+    sess.stop_token = tok.eos;
     let name = "breccia".to_string();
     let n_embd = model.cfg.n_embd;
     let vision = match a.mmproj {

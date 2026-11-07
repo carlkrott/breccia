@@ -790,6 +790,9 @@ pub struct Session<'m> {
     /// Forward passes run since the last reset (the decode denominator).
     pub forwards: usize,
     pub expert_bytes: u64,
+    /// Decode stops after emitting this token (serve sets it to the tokenizer EOS). `None`
+    /// (the default) keeps every bench at exactly `n` tokens.
+    pub stop_token: Option<u32>,
     /// `BRECCIA_DUMP_STATE` snapshots written so far (`dump_state`).
     dumps: usize,
     /// Device whose dispatch batch is currently open (`None` = none). At most
@@ -1435,6 +1438,7 @@ impl<'m> Session<'m> {
             forwards: 0,
             dumps: 0,
             expert_bytes: 0,
+            stop_token: None,
             pending_batch: None,
             pending_seg: None,
             pending_dev: None,
@@ -7469,7 +7473,7 @@ impl<'m> Session<'m> {
                 next = (next + 1) % self.model.cfg.vocab.max(1) as u32;
             }
             out.push(next);
-            if i + 1 == n {
+            if i + 1 == n || self.stop_token == Some(next) {
                 break;
             }
             let dbg = if i == 0 { trace.take() } else { None };
