@@ -75,6 +75,42 @@ impl<'g> MoeMap<'g> {
     }
 }
 
+/// D1: router ids -> slot ids of a block's expert slot pool (`moe_remap.comp`).
+/// Misses map to `miss_slot` (a zero blob) with weight 0.
+pub struct MoeRemap<'g> {
+    pipe: Pipe<'g>,
+}
+
+impl<'g> MoeRemap<'g> {
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Ok(MoeRemap {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/moe_remap.spv")),
+                5,
+                "moe remap",
+            )?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        ids: &Buf,
+        weights: &Buf,
+        table: &Buf,
+        slots: &Buf,
+        hit_weights: &Buf,
+        experts: usize,
+        miss_slot: u32,
+        n_expert: usize,
+    ) -> Result<()> {
+        let pc = Pc::new().u(experts as u32).u(miss_slot).u(n_expert as u32).u(0);
+        self.pipe
+            .run(&[ids, weights, table, slots, hit_weights], &pc, (experts.div_ceil(64) as u32, 1, 1))
+    }
+}
+
 /// `out = Σ_j w_j · in_j + shared · sigmoid(gate_logit)`.
 pub struct MoeCombine<'g> {
     pipe: Pipe<'g>,

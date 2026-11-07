@@ -1,0 +1,31 @@
+#version 450
+// D1 per-expert VRAM cache: turn the router's top-k expert ids into slot ids of a
+// block's slot pool. A hit keeps its weight; a miss points at the pool's zero blob
+// (`miss_slot`) with weight 0, so the resident kernels compute exactly the hit
+// sum and the host lane adds the misses.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Ids { uint IDS[]; };     // [experts]
+layout(std430, binding = 1) readonly buffer Wt { float W[]; };       // [experts]
+layout(std430, binding = 2) readonly buffer Tab { uint TABLE[]; };   // [n_expert], 0xffffffff = miss
+layout(std430, binding = 3) writeonly buffer Slot { uint SLOT[]; };  // [experts]
+layout(std430, binding = 4) writeonly buffer Wh { float WH[]; };     // [experts]
+
+layout(push_constant) uniform Params {
+    uint experts;
+    uint miss_slot;
+    uint n_expert;
+    uint pad0;
+} pc;
+
+void main() {
+    uint j = gl_GlobalInvocationID.x;
+    if (j >= pc.experts) {
+        return;
+    }
+    uint id = IDS[j];
+    uint s = id < pc.n_expert ? TABLE[id] : 0xffffffffu;
+    bool hit = s != 0xffffffffu;
+    SLOT[j] = hit ? s : pc.miss_slot;
+    WH[j] = hit ? W[j] : 0.0;
+}

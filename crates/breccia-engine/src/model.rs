@@ -42,7 +42,7 @@ pub struct PipeKey {
 }
 
 impl PipeKey {
-    fn of(t: &breccia_format::gguf::TensorView<'_>) -> Result<Self> {
+    pub(crate) fn of(t: &breccia_format::gguf::TensorView<'_>) -> Result<Self> {
         let ty = QuantType::from_ggml(t.ty())
             .ok_or_else(|| anyhow!("{}: ggml type {} has no kernel", t.name(), t.ty().id()))?;
         Ok(PipeKey {
@@ -308,6 +308,8 @@ pub struct Model {
     pub pf_verdicts: Vec<Option<breccia_profile::schema::PrefillVerdict>>,
     /// Distinct pipelines the graph will need, discovered at load.
     pub keys: BTreeSet<PipeKey>,
+    /// D1: per-expert VRAM slot pools of host-lane blocks (empty unless `BRECCIA_D1_GIB`).
+    pub d1: std::collections::BTreeMap<usize, crate::d1::Pool>,
 }
 
 /// How to load.
@@ -1011,6 +1013,27 @@ impl Model {
         }
         let imported_experts = imported_experts.map(|(a, _)| a);
 
+        // D1 pools for the blocks left on the host lane, on each block's own device.
+        let d1 = {
+            let mut plans = Vec::new();
+            for l in layers.iter().filter(|l| !placed.contains_key(&l.block)) {
+                let b = l.block;
+                let key = |r: &str| -> Result<PipeKey> {
+                    let n = format!("blk.{b}.ffn_{r}_exps.weight");
+                    PipeKey::of(&shards.tensor(&n).ok_or_else(|| anyhow!("D1: {n} missing"))?)
+                };
+                plans.push((b, l.device, l.experts, [key("gate")?, key("up")?, key("down")?]));
+            }
+            let gpus: Vec<&Gpu> = devices.iter().map(|d| d.gpu()).collect();
+            let d1 = crate::d1::build(&gpus, &shards, &plans, cfg.n_expert_used)?;
+            for p in d1.values() {
+                for w in [&p.gate, &p.up, &p.down] {
+                    keys.insert(w.key);
+                }
+            }
+            d1
+        };
+
         let dense_bytes: u64 = layers.iter().map(|l| l.bytes).sum::<u64>()
             + out_hc_norm.size
             + out_hc_down.buf.size
@@ -1190,6 +1213,7 @@ impl Model {
             stats,
             pf_verdicts,
             keys,
+            d1,
         })
     }
 
@@ -1253,6 +1277,9 @@ impl Drop for Model {
             for w in [&pe.gate, &pe.up, &pe.down] {
                 gpu.destroy_buf(&w.buf);
             }
+        }
+        for p in self.d1.values() {
+            p.release(self.devices[p.device].gpu());
         }
         if let Some(p) = &self.ple {
             let dev = self.placement.device_of(self.cfg.ple.layers[0]);

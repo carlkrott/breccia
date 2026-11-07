@@ -1020,7 +1020,7 @@ pub fn alloc(gpu: &Gpu, size: u64) -> Result<Buf> {
     .map_err(|e| anyhow!("{e}"))
 }
 
-fn staging(gpu: &Gpu, size: u64) -> Result<Buf> {
+pub fn staging(gpu: &Gpu, size: u64) -> Result<Buf> {
     gpu.buf(
         size.max(4),
         vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1053,6 +1053,26 @@ pub fn upload_into(gpu: &Gpu, dst: &Buf, data: &[u8]) -> Result<()> {
     })();
     gpu.destroy_buf(&stage);
     r
+}
+
+/// Scatter `data` into several device buffers through a caller-owned `stage`
+/// (one host write, one submit): `parts` are `(dst, dst offset, len)`, consecutive in `data`.
+pub fn upload_scatter(gpu: &Gpu, stage: &Buf, parts: &[(&Buf, u64, u64)], data: &[u8]) -> Result<()> {
+    let total: u64 = parts.iter().map(|p| p.2).sum();
+    anyhow::ensure!(total == data.len() as u64 && total <= stage.size, "upload_scatter: {total} part bytes, {} data, stage {}", data.len(), stage.size);
+    anyhow::ensure!(parts.iter().all(|p| p.1 + p.2 <= p.0.size), "upload_scatter out of range");
+    gpu.write_host(stage, data).map_err(|e| anyhow!("{e}"))?;
+    gpu.wall_run(breccia_vk::ctx::Qc::X, |d, cmd| unsafe {
+        Gpu::barrier_all(d, cmd);
+        let mut src = 0;
+        for &(dst, off, n) in parts {
+            d.cmd_copy_buffer(cmd, stage.buf, dst.buf, &[vk::BufferCopy { src_offset: src, dst_offset: off, size: n }]);
+            src += n;
+        }
+        Gpu::barrier_all(d, cmd);
+    })
+    .map_err(|e| anyhow!("{e}"))?;
+    Ok(())
 }
 
 /// Read `n` bytes back from a device-local buffer.

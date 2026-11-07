@@ -45,6 +45,7 @@
 
 pub mod arena;
 pub mod config;
+pub mod d1;
 pub mod graph;
 pub mod head;
 pub mod host_arena;

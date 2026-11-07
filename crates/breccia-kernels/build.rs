@@ -137,6 +137,8 @@ const SHADERS: &[&str] = &[
     // Host-free MoE: device-side expert indirection + the routed combine.
     "moe_map",
     "moe_combine",
+    // D1 per-expert VRAM cache (opt-in, BRECCIA_D1_MIB).
+    "moe_remap",
 ];
 
 /// GEMV stems that get the `silu_div` epilogue build (`_hcact`), i.e. the ones
@@ -405,8 +407,9 @@ fn main() {
         }
     }
 
-    // The fake-quant gate module is not on the default path: keep profile verdicts fresh.
-    spirv_hash(&out_dir, "BRECCIA_SPIRV_HASH", |n| !n.contains("_octfq"));
+    // The fake-quant gate module and the opt-in D1 remap are not on the default
+    // path: keep profile verdicts fresh.
+    spirv_hash(&out_dir, "BRECCIA_SPIRV_HASH", |n| !n.contains("_octfq") && !n.contains("moe_remap"));
     // The int8-dot GEMM is an unwired experiment: it must not invalidate the tile table.
     spirv_hash(&out_dir, "BRECCIA_GEMM_SPIRV_HASH", |n| {
         (n.starts_with("gemm_") || n.starts_with("dequant_")) && !n.starts_with("gemm_i8dot")
