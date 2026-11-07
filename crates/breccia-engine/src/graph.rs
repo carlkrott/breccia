@@ -1239,7 +1239,13 @@ impl<'m> Session<'m> {
                         None
                     };
                     Ok(PfChunk {
-                        ids: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
+                        // Host-read in bulk each block: cached host memory, not the BAR (an
+                        // uncached VRAM read). `BRECCIA_PF_OLD_BUCKET=1` keeps the old placement.
+                        ids: if pf_old_bucket() {
+                            Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?
+                        } else {
+                            Mailbox::new_cached(gpu, chunk as u64 * k as u64 * 4)?
+                        },
                         w: alloc(chunk as u64 * k as u64 * 4, "prefill router weights")?,
                         mixed: alloc(chunk as u64 * nb, "prefill chunk mixed")?,
                         shared: alloc(chunk as u64 * nb, "prefill chunk shared")?,
@@ -4804,24 +4810,15 @@ impl<'m> Session<'m> {
         let bucket_t0 = std::time::Instant::now();
         let mut raw = vec![0u8; t * k * 4];
         self.venues[dev].pf_at(b).ids.read(&mut raw)?;
-        let mut pairs: Vec<(usize, usize, usize)> = Vec::with_capacity(t * k);
-        for i in 0..t {
-            for j in 0..k {
-                let o = (i * k + j) * 4;
-                let e = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
-                if e >= mc.n_expert {
-                    bail!(
-                        "router id {e} is outside the model's {} experts",
-                        mc.n_expert
-                    );
-                }
-                pairs.push((e, i, j));
-            }
-        }
+        let bk_read = bucket_t0.elapsed().as_secs_f64();
         // Router order within a token, expert order across: the slot map keeps
         // each distinct expert's users contiguous, which is exactly the GEMM's
         // `O[u * rows + row]` output layout.
-        pairs.sort_unstable();
+        let pairs = if pf_old_bucket() {
+            pf_pairs_sorted(&raw, t, k, mc.n_expert)?
+        } else {
+            pf_pairs_by_expert(&raw, t, k, mc.n_expert)?
+        };
         let mut slots = vec![0u32; t * k];
         let mut groups: Vec<(usize, u32, Vec<usize>)> = Vec::new();
         let mut slot = 0u32;
@@ -4849,6 +4846,7 @@ impl<'m> Session<'m> {
             }
             at = end;
         }
+        let bk_sort = bucket_t0.elapsed().as_secs_f64();
         // The host's share: the last `n` distinct experts (expert-id order). Their
         // pairs point at the scratch's zero row, so the fan-in adds nothing for them
         // and the host partial lands after it.
@@ -4946,9 +4944,19 @@ impl<'m> Session<'m> {
                 Ok::<_, anyhow::Error>((out, bytes, t0.elapsed().as_secs_f64()))
             }));
         }
+        let bk_w0 = bucket_t0.elapsed().as_secs_f64();
         let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
         self.venues[dev].pf_at(b).slots.write(&slot_bytes)?;
         let bucket_s = bucket_t0.elapsed().as_secs_f64();
+        if std::env::var_os("BRECCIA_PF_PHASES").is_some() {
+            eprintln!(
+                "pf-phase blk {b:>2} bucket-split read {:.2} sort {:.2} host {:.2} write {:.2} ms",
+                bk_read * 1e3,
+                (bk_sort - bk_read) * 1e3,
+                (bk_w0 - bk_sort) * 1e3,
+                (bucket_s - bk_w0) * 1e3
+            );
+        }
         Self::pf_mark(b, "bucket", &pf_tp);
         pf_tp = std::time::Instant::now();
         let (fill0, wait0) = (self.pf_stream_fill_s, self.pf_stream_wait_s);
@@ -8020,6 +8028,66 @@ fn pf_inplace() -> bool {
     *ON.get_or_init(|| std::env::var("BRECCIA_PF_INPLACE").map_or(true, |v| v != "0"))
 }
 
+/// `BRECCIA_PF_OLD_BUCKET=1`: the old bucket placement (device-local ids) and sort.
+fn pf_old_bucket() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("BRECCIA_PF_OLD_BUCKET").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
+/// Old bucket order: `(expert, token, slot)` triples in router order, then `sort_unstable`.
+fn pf_pairs_sorted(
+    raw: &[u8],
+    t: usize,
+    k: usize,
+    n_expert: usize,
+) -> Result<Vec<(usize, usize, usize)>> {
+    let mut pairs = Vec::with_capacity(t * k);
+    for i in 0..t {
+        for j in 0..k {
+            let o = (i * k + j) * 4;
+            let e = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
+            if e >= n_expert {
+                bail!("router id {e} is outside the model's {n_expert} experts");
+            }
+            pairs.push((e, i, j));
+        }
+    }
+    pairs.sort_unstable();
+    Ok(pairs)
+}
+
+/// The same triples in the same order as `pf_pairs_sorted`, by a stable counting sort
+/// over the expert id. The walk is (i, j) ascending, so stable-by-expert is (e, i, j)
+/// lexicographic, which is what `sort_unstable` gives on distinct triples.
+fn pf_pairs_by_expert(
+    raw: &[u8],
+    t: usize,
+    k: usize,
+    n_expert: usize,
+) -> Result<Vec<(usize, usize, usize)>> {
+    let mut start = vec![0usize; n_expert + 1];
+    let mut ids = Vec::with_capacity(t * k);
+    for c in raw[..t * k * 4].chunks_exact(4) {
+        let e = u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize;
+        if e >= n_expert {
+            bail!("router id {e} is outside the model's {n_expert} experts");
+        }
+        start[e + 1] += 1;
+        ids.push(e);
+    }
+    for e in 0..n_expert {
+        start[e + 1] += start[e];
+    }
+    let mut pairs = vec![(0usize, 0usize, 0usize); t * k];
+    for (p, &e) in ids.iter().enumerate() {
+        pairs[start[e]] = (e, p / k, p % k);
+        start[e] += 1;
+    }
+    Ok(pairs)
+}
+
 fn pf_group_users() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
@@ -8441,4 +8509,46 @@ mod tests {
 fn rows_stream() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("BRECCIA_ROWS_STREAM").as_deref() == Ok("1"))
+}
+
+#[cfg(test)]
+mod pf_bucket_tests {
+    use super::*;
+
+    fn ids_bytes(v: &[u32]) -> Vec<u8> {
+        v.iter().flat_map(|e| e.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn pf_counting_sort_matches_sort_unstable() {
+        let (n, k) = (512usize, 8usize);
+        let mut s = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 33) as u32
+        };
+        let mut cases: Vec<Vec<u32>> = Vec::new();
+        for t in [1usize, 7, 512] {
+            cases.push((0..t * k).map(|_| next() % n as u32).collect());
+            cases.push(vec![3; t * k]);
+        }
+        let mut perm: Vec<u32> = (0..n as u32).collect();
+        for i in (1..perm.len()).rev() {
+            perm.swap(i, next() as usize % (i + 1));
+        }
+        cases.push(perm);
+        cases.push(Vec::new());
+        for c in &cases {
+            let t = c.len() / k;
+            let raw = ids_bytes(c);
+            let old = pf_pairs_sorted(&raw, t, k, n).unwrap();
+            let new = pf_pairs_by_expert(&raw, t, k, n).unwrap();
+            assert_eq!(old, new, "t={t}");
+        }
+        let bad = ids_bytes(&[1, 2, n as u32, 0, 0, 0, 0, 0]);
+        assert!(pf_pairs_by_expert(&bad, 1, k, n).is_err());
+        assert!(pf_pairs_sorted(&bad, 1, k, n).is_err());
+    }
 }
