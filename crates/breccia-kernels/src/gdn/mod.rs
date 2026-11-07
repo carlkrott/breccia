@@ -479,8 +479,10 @@ impl<'g> Gdn<'g> {
     }
 
     /// `out = rmsnorm_128(step, ssm_norm) * sigmoid(z)`.
-    pub fn norm_gate(&self, step: &Buf, gamma: &Buf, z: &Buf, out: &Buf) -> Result<()> {
-        let rows = (out.size as usize / 4) / MODEL_S;
+    /// `tokens`, not `out.size`: the chunk workspace outlives its size (verify runs
+    /// T rows in a 1024-token buffer, and would normalise all of them).
+    pub fn norm_gate(&self, step: &Buf, gamma: &Buf, z: &Buf, out: &Buf, tokens: usize) -> Result<()> {
+        let rows = tokens * MODEL_H_V;
         let pc = Pc::new()
             .u(rows as u32)
             .f(crate::ops::MODEL_RMS_EPS)
@@ -571,7 +573,7 @@ impl<'g> Gdn<'g> {
             crate::batch_cmd::record_copy(gpu, &tap.beta, 0, &ws.beta, 0, n)?;
         }
         self.delta_step(state, ws, &ws.step)?;
-        self.norm_gate(&ws.step, w.ssm_norm, &ws.z, &ws.normed)?;
+        self.norm_gate(&ws.step, w.ssm_norm, &ws.z, &ws.normed, t)?;
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::GDN_OUT);
         proj.out.run(proj.w_out, &ws.normed, out, t)?;
         crate::batch_cmd::probe::enter(gpu, crate::batch_cmd::probe::AFTER_MIXER);

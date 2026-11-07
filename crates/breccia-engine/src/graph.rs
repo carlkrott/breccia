@@ -3545,6 +3545,14 @@ impl<'m> Session<'m> {
         Ok(logits)
     }
 
+    /// A few rows (batched decode, spec verify): every expert of a cold block on the
+    /// host lane. The 50 % split costs the same or more here and mixes approximate
+    /// host and GPU results (spec T=4 logit diff 1.1e-3 vs 1.1e-5, 11-06).
+    fn cold_on_host(&self) -> bool {
+        let few_rows = !self.rows_seq.is_empty() || self.spec.as_ref().is_some_and(|sp| sp.active);
+        pf_host_cold() || (few_rows && !rows_stream())
+    }
+
     /// Inside a rows-mode verify: the per-row hooks apply and the mixers run per row.
     fn spec_rows_active(&self) -> bool {
         self.spec.as_ref().is_some_and(|sp| sp.active && !sp.replay)
@@ -4666,7 +4674,7 @@ impl<'m> Session<'m> {
         // path (8k: 116 tok/s at 50 % vs 175 all-GPU, 11-03). Prefill keeps the CPU out.
         let split_on = ((pf_split_host().is_some() && t <= SPLIT_T_MAX)
             || pf_split_tiers()
-            || (pe.is_none() && (pf_host_cold() || (!self.rows_seq.is_empty() && !rows_stream()))))
+            || (pe.is_none() && self.cold_on_host()))
             && streamed
             && xdev.is_none()
             && !micro
@@ -4859,7 +4867,7 @@ impl<'m> Session<'m> {
                     )
                 })
                 .flatten();
-            if pe.is_none() && (pf_host_cold() || (!self.rows_seq.is_empty() && !rows_stream())) {
+            if pe.is_none() && self.cold_on_host() {
                 // A cold block has no arena: compute it on the host lane instead of
                 // streaming every expert blob over PCIe (item 5). The device loop
                 // skips groups whose expert is in `host_set`, so nothing streams.

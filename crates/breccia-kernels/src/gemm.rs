@@ -453,6 +453,14 @@ fn choice_from_table(
 ) -> Option<Choice> {
     let t = tile_table().read().ok()?;
     let want = ty.name();
+    // No `dot` below the table's range: nearest-neighbour would borrow a 256+ user
+    // cell, and the per-dispatch dequant can't pay at small T (spec verify 131 -> 76 ms).
+    let lowest = t
+        .iter()
+        .filter(|c| c.ty == want && (c.dev.is_empty() || c.dev == dev))
+        .map(|c| c.users)
+        .min();
+    let skip_dot = skip_dot || lowest.is_some_and(|m| users < m);
     let l = |v: usize| (v.max(1) as f64).ln();
     let (lr, lc, lu) = (l(rows), l(cols), l(users));
     let d = |c: &TileCell| {
@@ -2002,6 +2010,11 @@ mod dot_selection_tests {
         );
         assert_eq!(
             choice_from_table("", QuantType::Iq3S, 640, 0, 1024, false),
+            Some(Choice::Tile((4, 4)))
+        );
+        // Below the table's users range a dot cell is never borrowed (spec verify).
+        assert_eq!(
+            choice_from_table("", QuantType::Iq3S, 640, 0, 2, false),
             Some(Choice::Tile((4, 4)))
         );
         // `tile_for` ignores the dot cell and answers with the nearest real tile.
