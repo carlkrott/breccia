@@ -878,7 +878,11 @@ impl Model {
         let upload_seconds: f64 = per_device_upload.iter().sum();
 
         // R29-1: hint the page cache now that the arena bytes are on the device.
-        if opts.page_hint_trim {
+        let host_bytes: u64 = (0..cfg.n_layers)
+            .filter(|b| !placed.contains_key(b))
+            .map(|b| arena_sizes[b])
+            .sum();
+        if opts.page_hint_trim || low_ram(host_bytes, opts.verbose) {
             page_hint_experts(&shards, &placed, cfg.n_layers);
         }
 
@@ -1437,6 +1441,37 @@ impl<'g> PipelineSet<'g> {
     pub fn shape_bytes(&self) -> u64 {
         self.map.keys().map(|k| k.weight_bytes()).sum()
     }
+}
+
+/// Room the rest of the machine keeps on top of the host-lane experts (Strata's
+/// low-RAM rule uses about 10 GB).
+const LOW_RAM_HEADROOM: u64 = 10 << 30;
+
+/// Low-RAM policy (planner, `BRECCIA_AUTO=0` turns it off): page-hint trim turns on when the
+/// host-lane experts plus headroom do not fit MemAvailable, so the uploaded
+/// experts' page cache is dropped and the host ones are read ahead. Hints only,
+/// output is unchanged. `BRECCIA_LOW_RAM=0|1` forces it.
+fn low_ram(host_bytes: u64, verbose: bool) -> bool {
+    let avail = breccia_profile::system::meminfo().1;
+    let (low, why) = match std::env::var("BRECCIA_LOW_RAM").as_deref() {
+        Ok("0") => (false, "BRECCIA_LOW_RAM=0"),
+        Ok("1") => (true, "BRECCIA_LOW_RAM=1"),
+        _ if !crate::auto_on() => return false,
+        _ => (low_ram_rule(avail, host_bytes), "MemAvailable"),
+    };
+    if verbose {
+        eprintln!(
+            "breccia: auto: RAM {:.1} GiB available, host-lane experts {:.1} GiB -> {} ({why}; BRECCIA_AUTO=0 turns the planner off)",
+            avail as f64 / (1u64 << 30) as f64,
+            host_bytes as f64 / (1u64 << 30) as f64,
+            if low { "low-RAM: page-hint trim on" } else { "normal" },
+        );
+    }
+    low
+}
+
+fn low_ram_rule(avail: u64, host_bytes: u64) -> bool {
+    avail > 0 && avail < host_bytes + LOW_RAM_HEADROOM
 }
 
 /// R29-1 (`--page-hint-trim`): after the arena upload, drop the page-cache pages
@@ -2127,6 +2162,15 @@ pub fn check_placement(p: &Placement, caps: &[u64]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn low_ram_rule_needs_host_experts_plus_headroom() {
+        let g = 1u64 << 30;
+        assert!(!low_ram_rule(49 * g, 30 * g)); // this machine at 38/10
+        assert!(low_ram_rule(28 * g, 30 * g)); // 32 GB box
+        assert!(low_ram_rule(39 * g, 30 * g));
+        assert!(!low_ram_rule(0, 30 * g)); // unreadable meminfo: leave it alone
+    }
 
     #[test]
     fn a_pipe_key_orders_by_type_then_shape() {

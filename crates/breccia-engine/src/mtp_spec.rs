@@ -8,10 +8,10 @@
 //! trunk's final residual stack after token `c`. Cells beyond the confirmed
 //! prefix (the draft's own chain) are overwritten on the next round.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, ensure, Result};
 
-use crate::graph::{prefill_plan, Session};
-use crate::mtp_draft::MtpDraft;
+use crate::graph::{prefill_plan, PrefixState, Session};
+use crate::mtp_draft::{DraftPrefix, MtpDraft};
 
 /// Draft-depth policy.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -78,9 +78,10 @@ pub const MAX_K: usize = 5;
 
 /// Depth chooser. `cost(k) = verify(k+1) + draft(k)` in ms, `tokens(k) = 1 + sum_j
 /// prod_{i<=j} p_i`; picks the best tokens/ms and probes one deeper every 16 picks.
-/// Priors measured 10-31 on the RX (split 50%, spec margin): verify T=2..6 = 88/104/118/
-/// 142/159 ms + ~4 ms/draft step, plain 47 ms; every number is replaced by an EMA of
-/// what this run measures.
+/// Priors from q36/q37 (11-06, RX-only 48/0, chunk 1024, after the dot/norm_gate/
+/// cold_on_host fixes): plain 40 ms, verify T=2..4 = 70/82/95 ms (T=5, 6 extrapolated
+/// +13 ms/row), draft ~3.3 ms/step; every number is replaced by an EMA of what this
+/// run measures.
 struct Gate {
     num: [f64; MAX_K],
     den: [f64; MAX_K],
@@ -97,7 +98,7 @@ impl Gate {
             // k=1 never beats plain and the gate never leaves k=0 (10-31 gt-job)
             num: [6.4; MAX_K],
             den: [8.0; MAX_K],
-            round_ms: [47.0, 92.0, 112.0, 130.0, 158.0, 179.0],
+            round_ms: [40.0, 73.0, 89.0, 105.0, 121.0, 137.0],
             seen: [false; MAX_K + 1],
             picks: 0,
         }
@@ -220,10 +221,44 @@ pub(crate) fn log_p(v: &[f32], id: u32) -> f64 {
     (v[id as usize] - m) as f64 - z.ln()
 }
 
+/// A prompt prefix for spec decode (serve's prefix cache): the trunk state after
+/// `cells` prompt cells, the draft KV of cells `[0, cells - 1)` and `R_{cells-1}`
+/// (draft cell `cells - 1` also needs the next prompt token, which is past the cut).
+pub struct SpecPrefix {
+    pub trunk: PrefixState,
+    draft: DraftPrefix,
+    r_last: Vec<f32>,
+}
+
+impl SpecPrefix {
+    pub fn cells(&self) -> usize {
+        self.trunk.cells
+    }
+    pub fn bytes(&self) -> usize {
+        self.trunk.bytes() + self.draft.bytes() + self.r_last.len() * 4
+    }
+}
+
 /// Greedy-generate `n_gen` tokens after `prompt` (the first comes from the
 /// prefill logits). `draft` is required unless `policy` is `Plain`.
 /// Needs `sess.spec_enable(k + 1)` for any policy but `Plain`.
 pub fn generate(
+    sess: &mut Session<'_>,
+    draft: Option<&mut MtpDraft<'_>>,
+    prompt: &[u32],
+    chunk: usize,
+    n_gen: usize,
+    policy: Policy,
+    acc: Accept,
+) -> Result<(Vec<u32>, SpecStats)> {
+    generate_prefix(sess, draft, prompt, chunk, n_gen, policy, acc, None, 0).map(|(t, s, _)| (t, s))
+}
+
+/// [`generate`] that resumes from `resume` and/or saves the state after `save` prompt
+/// cells (0 = no save), as `Session::generate_prefix` does for plain decode. A prefix
+/// carries draft state, so it needs a draft policy. Stops after `sess.stop_token`.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_prefix(
     sess: &mut Session<'_>,
     mut draft: Option<&mut MtpDraft<'_>>,
     prompt: &[u32],
@@ -231,12 +266,23 @@ pub fn generate(
     n_gen: usize,
     policy: Policy,
     acc: Accept,
-) -> Result<(Vec<u32>, SpecStats)> {
+    resume: Option<&SpecPrefix>,
+    save: usize,
+) -> Result<(Vec<u32>, SpecStats, Option<SpecPrefix>)> {
     if policy != Policy::Plain && draft.is_none() {
         bail!("{policy:?} needs a draft");
     }
-    let mut st = SpecStats::default();
     let want_r = policy != Policy::Plain;
+    let cut = save.max(resume.map_or(0, |st| st.cells()));
+    if cut > 0 {
+        ensure!(want_r, "a spec prefix needs a draft policy");
+        ensure!(chunk > 0, "a saved prefix needs chunked prefill");
+        ensure!(cut < prompt.len(), "the prefix ({cut} cells) must leave prompt to run");
+    }
+    if let (Some(st), true) = (resume, save > 0) {
+        ensure!(save > st.cells(), "the save cut ({save}) must lie past the resumed prefix ({})", st.cells());
+    }
+    let mut st = SpecStats::default();
     let t0 = std::time::Instant::now();
     sess.reset()?;
     if let Some(d) = draft.as_deref_mut() {
@@ -245,21 +291,35 @@ pub fn generate(
     // r_store[c] = R_c for c >= r_base (positions whose draft cell is not built yet).
     let mut r_store: Vec<Vec<f32>> = Vec::new();
     let mut r_base = 0usize;
+    let mut cells_done = 0usize; // draft cells [0, cells_done) are built from true R
     let mut logits = Vec::new();
     let mut pos = 0usize;
-    for len in prefill_plan(prompt.len(), chunk) {
-        logits = sess.prefill(&prompt[pos..pos + len], pos)?;
-        if want_r {
-            r_store.extend(sess.final_r_slots(len)?);
+    if let Some(p) = resume {
+        sess.restore_prefix(&p.trunk)?;
+        draft.as_deref_mut().expect("checked above").restore_prefix(&p.draft)?;
+        pos = p.cells();
+        r_base = pos - 1;
+        cells_done = pos - 1;
+        r_store.push(p.r_last.clone());
+    }
+    let mut trunk_saved = None;
+    for end in [cut, prompt.len()] {
+        for len in prefill_plan(end.saturating_sub(pos), chunk) {
+            logits = sess.prefill(&prompt[pos..pos + len], pos)?;
+            if want_r {
+                r_store.extend(sess.final_r_slots(len)?);
+            }
+            pos += len;
         }
-        pos += len;
+        if end == cut && save > 0 {
+            trunk_saved = Some(sess.save_prefix(cut)?);
+        }
     }
     st.prefill_s = t0.elapsed().as_secs_f64();
 
     let mut toks: Vec<u32> = prompt.to_vec();
     toks.push(argmax(&logits));
     st.nll -= log_p(&logits, toks[toks.len() - 1]);
-    let mut cells_done = 0usize; // draft cells [0, cells_done) are built from true R
 
     // Catch the draft up over the prompt before the decode clock starts.
     let sync = |d: &mut MtpDraft<'_>,
@@ -280,9 +340,16 @@ pub fn generate(
         *r_base = *cells_done;
         Ok(())
     };
+    let mut saved = None;
     if let Some(d) = draft.as_deref_mut().filter(|_| want_r) {
         let t = std::time::Instant::now();
         let n = toks.len() - 1;
+        if let Some(trunk) = trunk_saved {
+            // the draft KV is saved at the cut, before later cells touch its indexer tail
+            sync(d, &mut r_store, &mut r_base, &mut cells_done, &toks, cut - 1)?;
+            let r_last = r_store[cut - 1 - r_base].clone();
+            saved = Some(SpecPrefix { trunk, draft: d.save_prefix(cut - 1)?, r_last });
+        }
         sync(d, &mut r_store, &mut r_base, &mut cells_done, &toks, n - 1)?;
         st.prompt_catchup_s = t.elapsed().as_secs_f64();
     }
@@ -290,6 +357,10 @@ pub fn generate(
     let mut gate = Gate::new();
     let t_dec = std::time::Instant::now();
     while toks.len() - prompt.len() < n_gen {
+        if let Some(i) = sess.stop_token.and_then(|s| toks[prompt.len()..].iter().position(|&t| t == s)) {
+            toks.truncate(prompt.len() + i + 1);
+            break;
+        }
         let n = toks.len() - 1; // positions 0..n are in the trunk; toks[n] is next to feed
         let cur = toks[n];
         let k = match policy {
@@ -377,7 +448,7 @@ pub fn generate(
     st.decode_s = t_dec.elapsed().as_secs_f64();
     toks.drain(..prompt.len());
     toks.truncate(n_gen);
-    Ok((toks, st))
+    Ok((toks, st, saved))
 }
 
 #[cfg(test)]

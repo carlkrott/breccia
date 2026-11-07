@@ -638,6 +638,30 @@ pub fn mrope_triples(max_pos: usize, spans: &[(usize, usize, usize)]) -> Result<
 }
 
 impl QsaState {
+    /// Bytes of the K and V pools that hold the first `pages` pages in this layout.
+    pub fn pool_bytes(&self, pages: usize) -> (u64, u64) {
+        match self.v_layout {
+            VLayout::F16 => (sizes::f16_pool_bytes(pages), sizes::f16_pool_bytes(pages)),
+            VLayout::Q8_0 => (sizes::f16_pool_bytes(pages), sizes::q8v_pool_bytes(pages)),
+            VLayout::Q6_0 => (sizes::q6_pool_bytes(pages), sizes::q6_pool_bytes(pages)),
+        }
+    }
+
+    /// The buffers that hold the state after `cells` cells, as `(buf, bytes)` prefixes,
+    /// for a state that owns its pools (identity page table). Positions and the page
+    /// table are not written by kernels, so they are not state.
+    pub fn prefix_regions(&self, cells: usize) -> Result<Vec<(&Buf, u64)>> {
+        anyhow::ensure!(self.pt_map == 0, "prefix_regions needs a state that owns its pools");
+        anyhow::ensure!(cells <= self.capacity_cells, "prefix of {cells} cells over the cache's {}", self.capacity_cells);
+        let (k, v) = self.pool_bytes(cells.div_ceil(PAGE_CELLS));
+        Ok(vec![
+            (&self.k_pool, k),
+            (&self.v_pool, v),
+            (&self.idx_tail, sizes::idx_tail_bytes()),
+            (&self.idx_pooled, sizes::pooled_idx_bytes(sizes::pooled_blocks(cells))),
+        ])
+    }
+
     /// Allocate for `capacity_cells` cells (rounded up to whole pages) and a rope
     /// table of `max_pos` positions, with the V layout from `BRECCIA_KV_Q8V`.
     pub fn new(gpu: &Gpu, capacity_cells: usize, max_pos: usize) -> Result<Self> {

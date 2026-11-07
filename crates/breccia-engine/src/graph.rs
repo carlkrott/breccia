@@ -833,7 +833,7 @@ pub struct Session<'m> {
     /// ([`prefill_cap`]); the planner uses the target to split a prompt.
     pub prefill_chunk: usize,
     /// The `--prefill-chunk` target the cap came from ([`prefill_plan`]).
-    pub(crate) prefill_target: usize,
+    pub prefill_target: usize,
     /// See [`SessionCfg::prefill_merged`].
     pub prefill_merged: bool,
     /// Host-side per-token routing for the chunk's grouped lane, and the chunk's
@@ -2300,7 +2300,7 @@ impl<'m> Session<'m> {
     /// byte ranges to copy in logical order (shared KV pool: the sequence's mapped
     /// pages, so a restore may land on other physical pages).
     fn prefix_bufs(&self, cells: usize) -> Result<Vec<(usize, &Buf, Vec<(u64, u64)>)>> {
-        use breccia_kernels::qsa::{sizes, VLayout, PAGE_CELLS};
+        use breccia_kernels::qsa::{sizes, PAGE_CELLS};
         let m = self.model;
         let whole = |n: u64| vec![(0u64, n)];
         let paged = |n: u64, pages: usize| -> Vec<(u64, u64)> {
@@ -2329,11 +2329,7 @@ impl<'m> Session<'m> {
                     st.capacity_cells
                 );
                 let pages = cells.div_ceil(PAGE_CELLS);
-                let (k, vb) = match st.v_layout {
-                    VLayout::F16 => (sizes::f16_pool_bytes(pages), sizes::f16_pool_bytes(pages)),
-                    VLayout::Q8_0 => (sizes::f16_pool_bytes(pages), sizes::q8v_pool_bytes(pages)),
-                    VLayout::Q6_0 => (sizes::q6_pool_bytes(pages), sizes::q6_pool_bytes(pages)),
-                };
+                let (k, vb) = st.pool_bytes(pages);
                 if self.kv_pool.is_empty() {
                     v.push((d, &st.k_pool, whole(k)));
                     v.push((d, &st.v_pool, whole(vb)));
@@ -2403,7 +2399,7 @@ impl<'m> Session<'m> {
 
     /// Put a [`Self::save_prefix`] state back; the session must be reset with
     /// the same images set (their positions are not part of the state).
-    fn restore_prefix(&mut self, s: &PrefixState) -> Result<()> {
+    pub fn restore_prefix(&mut self, s: &PrefixState) -> Result<()> {
         self.flush()?;
         let m = self.model;
         let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
@@ -3691,7 +3687,8 @@ impl<'m> Session<'m> {
         made
     }
 
-    fn spec_release(&mut self) {
+    /// Free the spec slots (rollback state); plain decode needs none.
+    pub fn spec_release(&mut self) {
         if let Some(mut sp) = self.spec.take() {
             let gpu = self.model.devices[0].gpu();
             for g in sp.gdn.drain(..).flatten() {
@@ -7392,11 +7389,16 @@ impl<'m> Session<'m> {
         let mut pos = 0usize;
         let mut logits = Vec::new();
         let mut saved = None;
-        let cut = match prefix {
-            Prefix::None => 0,
-            Prefix::Save(c) => c,
-            Prefix::Resume(st) => st.cells,
+        let (resume, save) = match prefix {
+            Prefix::None => (None, 0),
+            Prefix::Save(c) => (None, c),
+            Prefix::Resume(st) => (Some(st), 0),
+            Prefix::ResumeSave(st, c) => (Some(st), c),
         };
+        let cut = save.max(resume.map_or(0, |st| st.cells));
+        if let (Some(st), true) = (resume, save > 0) {
+            anyhow::ensure!(save > st.cells, "the save cut ({save}) must lie past the resumed prefix ({})", st.cells);
+        }
         if cut > 0 {
             anyhow::ensure!(
                 self.prefill_chunk > 0,
@@ -7407,9 +7409,9 @@ impl<'m> Session<'m> {
                 "the prefix ({cut} cells) must leave prompt to run"
             );
         }
-        if let Prefix::Resume(st) = prefix {
+        if let Some(st) = resume {
             self.restore_prefix(st)?;
-            pos = cut;
+            pos = st.cells;
         }
         if self.prefill_chunk > 0 {
             // Chunked prompt pass (§8s): same tokens, same arithmetic, grouped
@@ -7421,7 +7423,7 @@ impl<'m> Session<'m> {
                     logits = self.prefill(&prompt[pos..pos + len], pos)?;
                     pos += len;
                 }
-                if end == cut && matches!(prefix, Prefix::Save(_)) && cut > 0 {
+                if end == cut && save > 0 {
                     saved = Some(self.save_prefix(cut)?);
                 }
             }
@@ -7669,6 +7671,8 @@ pub enum Prefix<'a> {
     None,
     Save(usize),
     Resume(&'a PrefixState),
+    /// Resume from the state, then save again at a later cut (a conversation's next turn).
+    ResumeSave(&'a PrefixState, usize),
 }
 
 /// The sequence state after a prompt's first `cells` cells, in host RAM.

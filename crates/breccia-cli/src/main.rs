@@ -111,8 +111,8 @@ enum Command {
         /// Model shard glob
         #[arg(long, value_name = "GLOB", default_value = DEFAULT_MODEL_GLOB)]
         gguf: String,
-        /// Device plan (repeatable PCI address / index); empty = the profile's choice
-        #[arg(long, value_name = "PCI")]
+        /// Device plan (PCI address / index, comma list or repeated); empty = the profile's choice
+        #[arg(long, value_name = "PCI[,PCI]", value_delimiter = ',')]
         devices: Vec<String>,
         /// Context capacity in tokens
         #[arg(long, default_value_t = 8192)]
@@ -138,7 +138,7 @@ enum Command {
         /// Encoded-image cache dir (sharded by content hash); default $XDG_CACHE_HOME/breccia/vision
         #[arg(long, value_name = "DIR")]
         image_cache: Option<String>,
-        /// Minutes an unused cached image is kept (each hit restarts the clock)
+        /// Minutes an unused cached image or prompt prefix is kept (each hit restarts the clock)
         #[arg(long, default_value_t = 30)]
         image_ttl_min: u64,
         /// Resolve and print the backend/device/placement plan, launch nothing
@@ -5391,7 +5391,39 @@ struct EngineBackend<'a, 'm> {
     images: Vec<(usize, usize, Vec<f32>, blake3::Hash)>,
     /// state after an image prompt's last image, keyed by its tokens + images; last use, held in RAM
     prefixes: Vec<(blake3::Hash, std::time::Instant, breccia_engine::PrefixState)>,
+    /// state after a text prompt's first `len - 1` tokens, keyed by those tokens; a later
+    /// request that starts with them (the next chat turn, a retry) resumes from the longest
+    text_prefixes: Vec<(Vec<u32>, std::time::Instant, TextPrefix)>,
+    prefix_ttl: std::time::Duration,
+    /// MTP draft for spec decode of text prompts (single-card serve, `BRECCIA_MTP=0` turns it off)
+    draft: Option<breccia_engine::mtp_draft::MtpDraft<'m>>,
 }
+
+/// A saved text prompt state: plain, or with the MTP draft's state when spec decode is on.
+enum TextPrefix {
+    Plain(breccia_engine::PrefixState),
+    Spec(breccia_engine::mtp_spec::SpecPrefix),
+}
+
+impl TextPrefix {
+    fn cells(&self) -> usize {
+        match self {
+            Self::Plain(s) => s.cells,
+            Self::Spec(s) => s.cells(),
+        }
+    }
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Plain(s) => s.bytes(),
+            Self::Spec(s) => s.bytes(),
+        }
+    }
+}
+
+/// shortcut: fixed cap and floor; make them flags once a box needs other values.
+const TEXT_PREFIX_CAP_BYTES: usize = 2 << 30;
+/// Prompts shorter than this re-prefill in well under a second, so they are not saved.
+const TEXT_PREFIX_MIN: usize = 512;
 
 /// shortcut: a fixed RAM cap (~7 images' prompt state at ~135 MB each); make it a flag if a box needs more.
 const PREFIX_CAP_BYTES: usize = 1 << 30;
@@ -5425,6 +5457,62 @@ fn prefix_prune_ttl_then_lru() {
     assert_eq!(v.iter().map(|e| e.0).collect::<Vec<_>>(), ["d", "b"]);
 }
 
+impl EngineBackend<'_, '_> {
+    /// A text prompt through the prefix cache. GDN state is recurrent, so a request
+    /// can resume only at a saved cut: the longest saved prompt it starts with.
+    /// The cut is `len - 1` so the next turn's re-tokenised text still matches.
+    /// With the MTP draft on, every text prompt comes here (short ones are not saved).
+    fn complete_text(&mut self, prompt: &[u32], n: usize) -> Result<Vec<u32>, String> {
+        use breccia_engine::mtp_spec::{generate_prefix, Accept, Policy};
+        use breccia_engine::Prefix;
+        let now = std::time::Instant::now();
+        prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+        let chunk = self.sess.prefill_target; // the planner target, not the cap
+        let cut = if chunk > 0 && prompt.len() > TEXT_PREFIX_MIN { prompt.len() - 1 } else { 0 };
+        let hit = self
+            .text_prefixes
+            .iter_mut()
+            .filter(|e| cut > 0 && e.0.len() <= cut && prompt.starts_with(&e.0))
+            .max_by_key(|e| e.0.len());
+        if let Some(e) = &hit {
+            println!("prefix   {} of {} cells from RAM", e.2.cells(), prompt.len());
+        }
+        let hit = hit.map(|e| {
+            e.1 = now;
+            &e.2
+        });
+        let save = |c: usize| if c < cut { cut } else { 0 };
+        let (toks, saved) = if let Some(d) = self.draft.as_mut() {
+            let resume = match hit {
+                Some(TextPrefix::Spec(st)) => Some(st),
+                _ => None,
+            };
+            // exact greedy: ids from EOS up are special and accepted only exactly
+            let acc = Accept { special_from: self.sess.model.cfg.ple.eos, ..Accept::default() };
+            let s0 = save(resume.map_or(0, |st| st.cells()));
+            let (toks, st, saved) =
+                generate_prefix(self.sess, Some(d), prompt, chunk, n, Policy::Gate, acc, resume, s0).map_err(|e| e.to_string())?;
+            println!("mtp      {st}");
+            (toks, saved.map(TextPrefix::Spec))
+        } else {
+            let p = match hit {
+                Some(TextPrefix::Plain(st)) if st.cells < cut => Prefix::ResumeSave(st, cut),
+                Some(TextPrefix::Plain(st)) => Prefix::Resume(st),
+                _ if cut > 0 => Prefix::Save(cut),
+                _ => Prefix::None,
+            };
+            let (g, saved) = self.sess.generate_prefix(prompt, n, None, p).map_err(|e| e.to_string())?;
+            (g.tokens, saved.map(TextPrefix::Plain))
+        };
+        if let Some(st) = saved {
+            println!("prefix   {} cells kept ({} MiB), request {:.2} s", st.cells(), st.bytes() >> 20, now.elapsed().as_secs_f64());
+            self.text_prefixes.push((prompt[..cut].to_vec(), now, st));
+            prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+        }
+        Ok(toks)
+    }
+}
+
 impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn model_name(&self) -> String {
         self.name.clone()
@@ -5450,6 +5538,9 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         if runs.is_empty() {
             // a text prompt; images left by a failed request are dropped
             self.sess.clear_image();
+            if self.draft.is_some() || (self.sess.prefill_chunk > 0 && prompt.len() > TEXT_PREFIX_MIN) {
+                return self.complete_text(prompt, n);
+            }
         } else {
             let fits = runs.len() == images.len() && runs.iter().zip(&images).all(|(r, i)| r.1 == i.0 * i.1);
             if !fits {
@@ -5517,11 +5608,68 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
 }
 
-fn serve_http(a: ServeArgs) -> Result<()> {
+/// shortcut: one-stream RX-only is measured at 8k only (G1 11-07: 26.09 vs dual 25.32 tok/s);
+/// raise the cap once a long real-text RX-only run exists.
+const SERVE_RX_ONLY_CTX: usize = 32768;
+
+/// Option 5, split by load: serve runs one request at a time, so with two cards and a
+/// context up to [`SERVE_RX_ONLY_CTX`] it runs on the fast card alone (one stream decodes
+/// at least as fast there, prefill is faster, and MTP needs every block on one card).
+/// Longer contexts keep both. `BRECCIA_AUTO=0` keeps the devices as given.
+fn serve_devices(devs: &[String], ctx: usize) -> Vec<String> {
+    if devs.len() != 2 || !breccia_engine::auto_on() || ctx > SERVE_RX_ONLY_CTX {
+        return devs.to_vec();
+    }
+    let fast = placement_default(devs).map_or(0, |(_, f)| f);
+    println!(
+        "auto: serve is one stream at ctx {ctx} -> {} alone (BRECCIA_AUTO=0 keeps both cards)",
+        devs[fast]
+    );
+    vec![devs[fast].clone()]
+}
+
+/// Spec slots + the MTP draft for serve; on failure serve runs plain decode.
+fn open_serve_draft<'m>(
+    model: &'m breccia_engine::Model,
+    sess: &mut breccia_engine::Session<'m>,
+    ctx: usize,
+) -> Option<breccia_engine::mtp_draft::MtpDraft<'m>> {
+    use breccia_engine::mtp_spec::MAX_K;
+    let dir = std::env::var("BRECCIA_MTP_DIR").unwrap_or_else(|_| "/srv/strata-data/mtp/rt".into());
+    let used = || model.devices[0].gpu().mem_budget().map_or(0, |b| b.usage);
+    let u0 = used();
+    let r = sess.spec_enable(MAX_K + 1);
+    let u1 = used();
+    let r = r.and_then(|_| breccia_engine::mtp_draft::MtpDraft::open(model, 0, &dir, ctx + MAX_K + 2));
+    match r {
+        Ok(d) => {
+            println!(
+                "mtp      draft {} MiB from {dir}, spec slots {} MiB, both {} MiB of VRAM; adaptive depth (BRECCIA_MTP=0 turns it off)",
+                d.bytes >> 20,
+                u1.saturating_sub(u0) >> 20,
+                used().saturating_sub(u0) >> 20
+            );
+            Some(d)
+        }
+        Err(e) => {
+            sess.spec_release();
+            println!("mtp      not available: {e:#}");
+            None
+        }
+    }
+}
+
+fn serve_http(mut a: ServeArgs) -> Result<()> {
+    a.devices = serve_devices(&a.devices, a.ctx);
+    // MTP spec decode needs every block on one card (`Session::spec_enable`)
+    let mtp = std::env::var("BRECCIA_MTP").map_or(true, |v| v != "0") && a.devices.len() <= 1;
+    // shortcut: fixed margin for the draft (~1 GiB) + 6 spec slots (~0.7 GiB), as the bench;
+    // size it from the draft's bytes at `ctx` once long-context serve with MTP is measured.
+    let spec_margin: u64 = if mtp { 2048 << 20 } else { 0 };
     let arena = if a.gpu_experts == "auto" {
         breccia_engine::ArenaSpec::Auto(
             breccia_engine::ArenaOpts {
-                display_reserve: 2560 << 20,
+                display_reserve: (2560 << 20) + spec_margin,
                 ..Default::default()
             }
             .with_prefill_chunk(a.prefill_chunk, a.ctx),
@@ -5569,6 +5717,10 @@ fn serve_http(a: ServeArgs) -> Result<()> {
     );
     // stop at the same EOS the server trims at (`EngineBackend::eos`), so the reply text is unchanged
     sess.stop_token = tok.eos;
+    let draft = if mtp { open_serve_draft(&model, &mut sess, a.ctx) } else { None };
+    if draft.is_none() {
+        println!("mtp      off ({})", if mtp { "draft did not open" } else if a.devices.len() > 1 { "two cards" } else { "BRECCIA_MTP=0" });
+    }
     let name = "breccia".to_string();
     let n_embd = model.cfg.n_embd;
     let vision = match a.mmproj {
@@ -5600,6 +5752,9 @@ fn serve_http(a: ServeArgs) -> Result<()> {
         ctx: a.ctx,
         images: Vec::new(),
         prefixes: Vec::new(),
+        text_prefixes: Vec::new(),
+        prefix_ttl: std::time::Duration::from_secs(a.image_ttl_min * 60),
+        draft,
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))

@@ -128,6 +128,18 @@ struct P<'g> {
     g: Gemv<'g>,
 }
 
+/// The draft KV after its first `cells` cells, in host RAM.
+pub struct DraftPrefix {
+    pub cells: usize,
+    bufs: Vec<Vec<u8>>,
+}
+
+impl DraftPrefix {
+    pub fn bytes(&self) -> usize {
+        self.bufs.iter().map(Vec::len).sum()
+    }
+}
+
 pub struct MtpDraft<'g> {
     gpu: &'g Gpu,
     model: &'g Model,
@@ -624,6 +636,34 @@ impl<'g> MtpDraft<'g> {
     pub fn reset(&mut self) -> Result<()> {
         self.len = 0;
         self.qsa_state.reset(self.gpu)
+    }
+
+    /// Copy the draft KV of its first `cells` cells to host RAM (a serve prefix entry).
+    pub fn save_prefix(&self, cells: usize) -> Result<DraftPrefix> {
+        anyhow::ensure!(cells <= self.len, "draft prefix of {cells} cells past the {} built", self.len);
+        batch_cmd::wait_all(&[self.gpu])?;
+        let bufs = self
+            .qsa_state
+            .prefix_regions(cells)?
+            .into_iter()
+            .map(|(b, n)| breccia_kernels::gemv::download_regions(self.gpu, b, &[(0, n)]))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(DraftPrefix { cells, bufs })
+    }
+
+    /// Put a [`Self::save_prefix`] state back after [`Self::reset`].
+    pub fn restore_prefix(&mut self, s: &DraftPrefix) -> Result<()> {
+        batch_cmd::wait_all(&[self.gpu])?;
+        let regs = self.qsa_state.prefix_regions(s.cells)?;
+        anyhow::ensure!(
+            regs.len() == s.bufs.len() && regs.iter().zip(&s.bufs).all(|(r, h)| r.1 == h.len() as u64),
+            "the saved draft prefix does not fit this draft's KV layout"
+        );
+        for ((b, n), h) in regs.into_iter().zip(&s.bufs) {
+            breccia_kernels::gemv::upload_regions(self.gpu, b, &[(0, n)], h)?;
+        }
+        self.len = s.cells;
+        Ok(())
     }
 
     /// Front only (K/V of cell `pos` from host `r` and `tok`), no prediction:

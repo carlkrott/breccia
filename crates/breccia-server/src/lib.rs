@@ -227,7 +227,10 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
     let t0 = std::time::Instant::now();
     let ids = match b.complete(&prompt_ids, max_tokens) {
         Ok(ids) => ids,
-        Err(e) => return Response::json(500, json!({"error": {"message": e}})),
+        Err(e) => {
+            eprintln!("breccia-server: request failed: {e}");
+            return Response::json(500, json!({"error": {"message": e}}));
+        }
     };
     let seconds = t0.elapsed().as_secs_f64();
     let (ids, finish) = match b.eos().and_then(|eos| ids.iter().position(|&t| t == eos)) {

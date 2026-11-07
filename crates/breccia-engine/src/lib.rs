@@ -78,6 +78,13 @@ pub use report::{
 pub use sampler::{Sampler, Sampling};
 pub use stats::{Checksum, LayerTrace};
 
+/// The startup planner's master switch (`BRECCIA_AUTO=0` turns it off). It gates
+/// only the planner's own choices (low-RAM, split by load, spec in serve); the
+/// profile split and chunk predate it and stay. Explicit env knobs still win.
+pub fn auto_on() -> bool {
+    std::env::var("BRECCIA_AUTO").as_deref() != Ok("0")
+}
+
 /// The parity baseline this milestone is judged against: 48.1 ms/token, i.e.
 /// 20.79 tok/s decode (`docs/phase-0/01`, `docs/phase-3/05` §1).
 pub const PARITY_TOKENS_PER_S: f64 = 20.79;
