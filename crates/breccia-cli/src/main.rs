@@ -5395,7 +5395,7 @@ struct EngineBackend<'a, 'm> {
     /// request that starts with them (the next chat turn, a retry) resumes from the longest
     text_prefixes: Vec<(Vec<u32>, std::time::Instant, TextPrefix)>,
     prefix_ttl: std::time::Duration,
-    /// MTP draft for spec decode of text prompts (single-card serve, `BRECCIA_MTP=0` turns it off)
+    /// MTP draft for spec decode of text prompts (one card or dual, `BRECCIA_MTP=0` turns it off)
     draft: Option<breccia_engine::mtp_draft::MtpDraft<'m>>,
 }
 
@@ -5612,19 +5612,17 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
 /// raise the cap once a long real-text RX-only run exists.
 const SERVE_RX_ONLY_CTX: usize = 32768;
 
-/// Option 5, split by load: serve runs one request at a time, so with two cards and a
-/// context up to [`SERVE_RX_ONLY_CTX`] it runs on the fast card alone (one stream decodes
-/// at least as fast there, prefill is faster, and MTP needs every block on one card).
-/// Longer contexts keep both. `BRECCIA_AUTO=0` keeps the devices as given.
+/// Option 5, split by load, opt-in (`BRECCIA_SERVE_RX_ONLY=1`): with two cards and a
+/// context up to [`SERVE_RX_ONLY_CTX`] serve runs on the fast card alone (one stream decodes
+/// at least as fast there, prefill is faster). Off by default: Carl 11-08 keeps both cards
+/// for long context and parallel workers.
 fn serve_devices(devs: &[String], ctx: usize) -> Vec<String> {
-    if devs.len() != 2 || !breccia_engine::auto_on() || ctx > SERVE_RX_ONLY_CTX {
+    let opt_in = std::env::var("BRECCIA_SERVE_RX_ONLY").is_ok_and(|v| v == "1");
+    if !opt_in || devs.len() != 2 || ctx > SERVE_RX_ONLY_CTX {
         return devs.to_vec();
     }
     let fast = placement_default(devs).map_or(0, |(_, f)| f);
-    println!(
-        "auto: serve is one stream at ctx {ctx} -> {} alone (BRECCIA_AUTO=0 keeps both cards)",
-        devs[fast]
-    );
+    println!("serve: BRECCIA_SERVE_RX_ONLY=1, ctx {ctx} -> {} alone", devs[fast]);
     vec![devs[fast].clone()]
 }
 
@@ -5661,8 +5659,8 @@ fn open_serve_draft<'m>(
 
 fn serve_http(mut a: ServeArgs) -> Result<()> {
     a.devices = serve_devices(&a.devices, a.ctx);
-    // MTP spec decode needs every block on one card (`Session::spec_enable`)
-    let mtp = std::env::var("BRECCIA_MTP").map_or(true, |v| v != "0") && a.devices.len() <= 1;
+    // MTP spec decode runs on one card or the dual split (replay verify, `Session::spec_enable`)
+    let mtp = std::env::var("BRECCIA_MTP").map_or(true, |v| v != "0");
     // shortcut: fixed margin for the draft (~1 GiB) + 6 spec slots (~0.7 GiB), as the bench;
     // size it from the draft's bytes at `ctx` once long-context serve with MTP is measured.
     let spec_margin: u64 = if mtp { 2048 << 20 } else { 0 };
@@ -5719,7 +5717,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
     sess.stop_token = tok.eos;
     let draft = if mtp { open_serve_draft(&model, &mut sess, a.ctx) } else { None };
     if draft.is_none() {
-        println!("mtp      off ({})", if mtp { "draft did not open" } else if a.devices.len() > 1 { "two cards" } else { "BRECCIA_MTP=0" });
+        println!("mtp      off ({})", if mtp { "draft did not open" } else { "BRECCIA_MTP=0" });
     }
     let name = "breccia".to_string();
     let n_embd = model.cfg.n_embd;

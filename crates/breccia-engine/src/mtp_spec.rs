@@ -168,6 +168,8 @@ pub struct SpecStats {
     pub decode_s: f64,
     pub draft_s: f64,
     pub verify_s: f64,
+    /// Part of `verify_s` spent in `rollback_to` (the replay of the accepted rows).
+    pub rollback_s: f64,
 }
 
 impl std::fmt::Display for SpecStats {
@@ -184,12 +186,12 @@ impl std::fmt::Display for SpecStats {
         }
         write!(
             f,
-            " | drafted {} ({:.2} ms/step) relaxed {} nll/tok {:.4} | decode {:.3} s (draft {:.3} verify {:.3}) prefill {:.2} s prompt-catchup {:.2} s",
+            " | drafted {} ({:.2} ms/step) relaxed {} nll/tok {:.4} | decode {:.3} s (draft {:.3} verify {:.3}, rollback {:.3} of it) prefill {:.2} s prompt-catchup {:.2} s",
             self.drafted,
             self.draft_s * 1e3 / self.drafted.max(1) as f64,
             self.relaxed,
             self.nll / self.tokens.max(1) as f64,
-            self.decode_s, self.draft_s, self.verify_s, self.prefill_s, self.prompt_catchup_s
+            self.decode_s, self.draft_s, self.verify_s, self.rollback_s, self.prefill_s, self.prompt_catchup_s
         )
     }
 }
@@ -429,7 +431,9 @@ pub fn generate_prefix(
         }
         let bonus = argmax(&rows[a]);
         st.nll -= log_p(&rows[a], bonus);
+        let trb = std::time::Instant::now();
         sess.rollback_to(a)?;
+        st.rollback_s += trb.elapsed().as_secs_f64();
         st.verify_s += tv.elapsed().as_secs_f64();
         // R_{n..=n+a} are true; cell n-1 is built (the step above).
         cells_done = n;

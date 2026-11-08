@@ -3580,34 +3580,34 @@ impl<'m> Session<'m> {
     /// expert types have a multi-user GEMM, and so does the head.
     fn spec_replay_ok(&self) -> bool {
         let m = self.model;
-        let v = &self.venues[0];
-        let pipes = &v.pipes;
+        // The head runs on the last block's card (§8aw); each block on its own card.
+        let hv = &self.venues[m.device_of(m.cfg.n_layers - 1)];
         std::env::var("BRECCIA_SPEC_VERIFY_ROWS").as_deref() != Ok("1")
             && self.prefill_merged
-            && v.pf.is_some()
-            && v.r_chunk.is_some()
-            && v.logits.is_some()
-            && pipes.gemm(m.head.key.ty).is_some()
+            && hv.r_chunk.is_some()
+            && hv.logits.is_some()
+            && hv.pipes.gemm(m.head.key.ty).is_some()
             && m.head.key.rows == m.cfg.vocab
             && (0..m.cfg.n_layers).all(|b| {
+                let dev = m.device_of(b);
+                let v = &self.venues[dev];
                 let plan = &m.layers[b].experts;
                 let (gt, ut, dt) = match m.placed.get(&b) {
                     Some(pe) => (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty),
                     None => (plan.gate.ty, plan.up.ty, plan.down.ty),
                 };
-                self.mixer_chunked(b, 0) && [gt, ut, dt].iter().all(|ty| pipes.gemm(*ty).is_some())
+                v.pf.is_some()
+                    && v.r_chunk.is_some()
+                    && self.mixer_chunked(b, dev)
+                    && [gt, ut, dt].iter().all(|ty| v.pipes.gemm(*ty).is_some())
             })
     }
 
     /// Allocate rollback slots for verifying up to `max_t` rows (~112 MiB of GDN
-    /// state per slot). Greedy, blocks + head on device 0, `--batching` only.
+    /// state per slot). Greedy, `--batching` only. Each block's rollback state and
+    /// taps live on that block's card, the head output on the last block's card.
     pub fn spec_enable(&mut self, max_t: usize) -> Result<()> {
         let m = self.model;
-        // Spec state (rollback slots, head, staging) lives on device 0; other devices
-        // may only serve as expert helpers (`--split-blocks N,0` + BRECCIA_PF_EXPERT_DEVICE).
-        if m.head_device() != 0 || (0..m.cfg.n_layers).any(|b| m.device_of(b) != 0) {
-            bail!("speculative verify needs every block and the head on device 0 (--split-blocks N,0)");
-        }
         if !self.batching {
             bail!("speculative verify records into a dispatch batch: it needs --batching");
         }
@@ -3615,8 +3615,18 @@ impl<'m> Session<'m> {
             bail!("a verify chunk is at least 2 rows");
         }
         self.spec_release();
-        let gpu = m.devices[0].gpu();
         let replay = self.spec_replay_ok();
+        let n = m.cfg.n_layers;
+        // shortcut: rows-mode verify (per-row hooks) stays single-card; upgrade if a model without replay GEMMs needs dual.
+        if !replay && ((0..n).any(|b| m.device_of(b) != 0) || m.head_device() != 0) {
+            bail!(
+                "speculative verify across cards needs replay mode (merged prefill and \
+                 multi-user GEMMs on every card); rows mode needs --split-blocks N,0"
+            );
+        }
+        let gpu_of = |b: usize| m.devices[m.device_of(b)].gpu();
+        let hd = m.device_of(n - 1);
+        let gpu = m.devices[hd].gpu();
         let mut sp = Box::new(SpecSnap {
             gdn: Vec::new(),
             tail: Vec::new(),
@@ -3637,7 +3647,8 @@ impl<'m> Session<'m> {
         });
         let mut made = Ok(());
         'slots: for _ in 0..if replay { 1 } else { max_t } {
-            for b in 0..m.cfg.n_layers {
+            for b in 0..n {
+                let gpu = gpu_of(b);
                 let g = match &self.gdn_state[b] {
                     Some(_) => GdnState::new(gpu).map(Some),
                     None => Ok(None),
@@ -3669,14 +3680,14 @@ impl<'m> Session<'m> {
         }
         if made.is_ok() && replay {
             made = (|| -> Result<()> {
-                for b in 0..m.cfg.n_layers {
+                for b in 0..n {
                     sp.gdn_tap.push(match &self.gdn_state[b] {
-                        Some(_) => Some(GdnTap::new(gpu, max_t)?),
+                        Some(_) => Some(GdnTap::new(gpu_of(b), max_t)?),
                         None => None,
                     });
                     sp.idx_k_tap.push(match &self.qsa_state[b] {
                         Some(_) => Some(breccia_kernels::gemv::alloc(
-                            gpu,
+                            gpu_of(b),
                             (max_t * breccia_kernels::qsa::IDX_DIM * 4) as u64,
                         )?),
                         None => None,
@@ -3687,7 +3698,7 @@ impl<'m> Session<'m> {
                     (max_t * m.cfg.vocab * 4) as u64,
                 )?);
                 for t in 2..=max_t {
-                    sp.head_ws.push(self.venues[0].final_hc.workspace(gpu, t)?);
+                    sp.head_ws.push(self.venues[hd].final_hc.workspace(gpu, t)?);
                 }
                 Ok(())
             })();
@@ -3702,24 +3713,37 @@ impl<'m> Session<'m> {
     /// Free the spec slots (rollback state); plain decode needs none.
     pub fn spec_release(&mut self) {
         if let Some(mut sp) = self.spec.take() {
-            let gpu = self.model.devices[0].gpu();
-            for g in sp.gdn.drain(..).flatten() {
-                g.release(gpu);
+            let m = self.model;
+            let n = m.cfg.n_layers;
+            // Slot vectors are slot-major (`slot * n + b`), taps are per block.
+            let gpu_of = |at: usize| m.devices[m.device_of(at % n)].gpu();
+            for (at, g) in sp.gdn.drain(..).enumerate() {
+                if let Some(g) = g {
+                    g.release(gpu_of(at));
+                }
             }
-            for t in sp.tail.drain(..).flatten() {
-                gpu.destroy_buf(&t);
+            for (at, t) in sp.tail.drain(..).enumerate() {
+                if let Some(t) = t {
+                    gpu_of(at).destroy_buf(&t);
+                }
             }
-            for g in sp.gdn_tap.drain(..).flatten() {
-                g.release(gpu);
+            for (b, g) in sp.gdn_tap.drain(..).enumerate() {
+                if let Some(g) = g {
+                    g.release(gpu_of(b));
+                }
             }
-            for k in sp.idx_k_tap.drain(..).flatten() {
-                gpu.destroy_buf(&k);
+            for (b, k) in sp.idx_k_tap.drain(..).enumerate() {
+                if let Some(k) = k {
+                    gpu_of(b).destroy_buf(&k);
+                }
             }
+            let hd = m.device_of(n - 1);
+            let gpu = m.devices[hd].gpu();
             if let Some(l) = sp.head_logits.take() {
                 gpu.destroy_buf(&l);
             }
             for ws in sp.head_ws.drain(..) {
-                self.venues[0].final_hc.release(gpu, ws);
+                self.venues[hd].final_hc.release(gpu, ws);
             }
         }
     }
@@ -3731,7 +3755,7 @@ impl<'m> Session<'m> {
             .spec
             .as_ref()
             .ok_or_else(|| anyhow!("no speculative rollback slots: call spec_enable"))?;
-        let gpu = self.model.devices[0].gpu();
+        let gpu = self.model.devices[self.model.device_of(b)].gpu();
         let at = slot * self.model.cfg.n_layers + b;
         let copy = |live: &Buf, snap: &Buf, len: u64| {
             let (dst, src) = if save { (snap, live) } else { (live, snap) };
@@ -3773,8 +3797,9 @@ impl<'m> Session<'m> {
     /// Copy every block's state between the live state and `slot`, as one batch.
     fn spec_sweep(&mut self, slot: usize, save: bool) -> Result<()> {
         self.flush()?;
-        self.ensure_batch(0)?;
         for b in 0..self.model.cfg.n_layers {
+            // one batch per card: ensure_batch closes the previous card's batch
+            self.ensure_batch(self.model.device_of(b))?;
             self.spec_copy_block(b, slot, save)?;
         }
         self.submit_batch()?;
@@ -3876,8 +3901,8 @@ impl<'m> Session<'m> {
 
     /// The final-layer residual stack (`hc_dim` floats) of the first `n` rows of
     /// the last [`Self::prefill`] / [`Self::verify`] chunk, read back from the
-    /// per-token slots. The MTP draft conditions on these.
-    /// shortcut: single card holding the last block (the draft runs there too).
+    /// per-token slots (on the last block's card). The MTP draft conditions on these;
+    /// they come back through the host, so the draft may run on any card.
     pub fn final_r_slots(&mut self, n: usize) -> Result<Vec<Vec<f32>>> {
         let m = self.model;
         let dev = m.device_of(m.cfg.n_layers - 1);
@@ -3921,20 +3946,22 @@ impl<'m> Session<'m> {
         let m = self.model;
         let pos0 = self.spec.as_ref().map_or(0, |sp| sp.pos0);
         self.flush()?;
-        self.ensure_batch(0)?;
-        self.gdn_chunk_ws[0]
-            .as_mut()
-            .ok_or_else(|| anyhow!("no GDN chunk workspace: nothing was verified"))?
-            .tokens = n;
+        for ws in self.gdn_chunk_ws.iter_mut().flatten() {
+            ws.tokens = n;
+        }
         for b in 0..m.cfg.n_layers {
+            let dev = m.device_of(b);
+            self.ensure_batch(dev)?;
             self.spec_copy_block(b, 0, false)?;
             let sp = self.spec.as_ref().expect("replay needs spec_enable");
-            let v = &self.venues[0];
+            let v = &self.venues[dev];
             if let (Some(state), Some(tap), Some(gw)) =
                 (&self.gdn_state[b], &sp.gdn_tap[b], &m.layers[b].gdn)
             {
                 let gdn = v.gdn.as_ref().ok_or_else(|| anyhow!("no GDN pipelines"))?;
-                let ws = self.gdn_chunk_ws[0].as_ref().expect("checked above");
+                let ws = self.gdn_chunk_ws[dev]
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("no GDN chunk workspace: nothing was verified"))?;
                 gdn.replay(state, ws, &gw.conv, tap)?;
             }
             if let (Some(state), Some(tap)) = (&self.qsa_state[b], &sp.idx_k_tap[b]) {
@@ -3951,14 +3978,16 @@ impl<'m> Session<'m> {
     fn spec_head(&mut self, t: usize) -> Result<Vec<Vec<f32>>> {
         let m = self.model;
         let mc = &m.cfg;
-        let gpu = m.devices[0].gpu();
+        // the head and the chunk's final residual slots are on the last block's card
+        let hd = m.device_of(mc.n_layers - 1);
+        let gpu = m.devices[hd].gpu();
         let hb = (mc.hc_dim() * 4) as u64;
         self.flush()?;
         self.timers.mark(FINAL_HC);
-        self.ensure_batch(0)?;
+        self.ensure_batch(hd)?;
         {
             let sp = self.spec.as_ref().expect("replay needs spec_enable");
-            let v = &self.venues[0];
+            let v = &self.venues[hd];
             let rc = v.r_chunk.as_ref().expect("checked by spec_replay_ok");
             let ws = &sp.head_ws[t - 2];
             let out = sp
@@ -3999,14 +4028,14 @@ impl<'m> Session<'m> {
                 .expect("replay allocates the head output");
             // As many rows per readback as the staging buffer holds (a small
             // `--prefill-chunk` sizes it for one or two rows).
-            let per = ((self.stagings[0].capacity() as usize) / (mc.vocab * 4)).max(1);
+            let per = ((self.stagings[hd].capacity() as usize) / (mc.vocab * 4)).max(1);
             let mut raw = Vec::with_capacity(t);
             for rows in (0..t).collect::<Vec<_>>().chunks(per) {
                 let items: Vec<(&Buf, u64, usize)> = rows
                     .iter()
                     .map(|&i| (out, (i * mc.vocab * 4) as u64, mc.vocab * 4))
                     .collect();
-                raw.extend(self.stagings[0].read_batch(gpu, &items)?);
+                raw.extend(self.stagings[hd].read_batch(gpu, &items)?);
             }
             raw
         };
