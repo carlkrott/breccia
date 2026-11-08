@@ -294,7 +294,8 @@ impl<'g> MtpDraft<'g> {
         let qsa = Qsa::new(gpu, max_pos)?;
         let qsa_state = QsaState::new(gpu, cells, max_pos)?;
         qsa_state.reset(gpu)?;
-        let qsa_ws = qsa.workspace(gpu, 1, cells)?;
+        // Dense over every cell seen (as strata's draft), not the trunk's 2048-cell budget.
+        let qsa_ws = qsa.workspace_capped(gpu, 1, cells, usize::MAX)?;
         let q_norm = up(dense("self_attn.q_norm.weight")?)?;
         let k_norm = up(dense("self_attn.k_norm.weight")?)?;
 
@@ -528,7 +529,8 @@ impl<'g> MtpDraft<'g> {
         {
             let ws = &mut self.qsa_ws;
             ws.n_blocks = n_kv_after / 4;
-            ws.max_ids = ws.n_blocks.min(512) + 1;
+            // Every visible block: a 512 cap kept only the FIRST 2048 cells past 2051 (11-08 acceptance bug).
+            ws.max_ids = ws.n_blocks + 1;
             ws.slots = 4 * ws.max_ids;
         }
         let ws = &self.qsa_ws;

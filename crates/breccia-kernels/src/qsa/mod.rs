@@ -1412,12 +1412,24 @@ impl<'g> Qsa<'g> {
     /// from that one number, which keeps a short context cheap: 64 tokens allocate
     /// a 17-block, 72-slot matrix rather than the 2052-slot worst case.
     pub fn workspace(&self, gpu: &Gpu, tokens: usize, n_kv_after: usize) -> Result<QsaWorkspace> {
+        self.workspace_capped(gpu, tokens, n_kv_after, idx_topk_blocks())
+    }
+
+    /// [`Qsa::workspace`] with the id row sized for `cap_blocks` selected blocks
+    /// (`usize::MAX`: every block, for dense attention over the whole context).
+    pub fn workspace_capped(
+        &self,
+        gpu: &Gpu,
+        tokens: usize,
+        n_kv_after: usize,
+        cap_blocks: usize,
+    ) -> Result<QsaWorkspace> {
         if tokens == 0 {
             return Err(anyhow!("qsa workspace needs tokens >= 1"));
         }
         let n_blocks = n_kv_after / IDX_BLOCK;
         let topk_blocks = idx_topk_blocks();
-        let max_ids = n_blocks.min(topk_blocks) + 1;
+        let max_ids = n_blocks.min(cap_blocks) + 1;
         let slots = 4 * max_ids;
         // The prefill attention is tiled over rows; a call that does not use both
         // GQA kernels keeps a full-size score matrix.
