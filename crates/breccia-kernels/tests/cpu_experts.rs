@@ -549,3 +549,39 @@ fn expert_slices_are_mmap_windows() {
     assert_eq!(slices.len(), plan.expert_bytes());
     assert_eq!(plan.expert_bytes(), plan.expert_kernel_bytes());
 }
+
+/// Tier-2 gate, host side: the pool's grouped lane for E distinct experts x T rows
+/// (every row routes to all E), rotating blocks and experts so weights come from DRAM,
+/// not L3. Compare with `handoff_rt tier2` at the same E, T.
+/// `cargo test --release -p breccia-kernels --test cpu_experts tier2 -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn tier2_host_lane() {
+    let Some(set) = open_model() else { return };
+    let layout = set.layout().expect("layout");
+    let plans: Vec<LayerPlan> = (0..40)
+        .map(|b| LayerPlan::from_block(&set, layout.block(b).expect("blk")).expect("plan"))
+        .collect();
+    let n_embd = plans[0].n_embd;
+    let mut pool = ExpertPool::new(Arc::clone(&set), 30, Path::Avx2);
+    for t in [1usize, 4, 8] {
+        let x = vec![0.01f32; t * n_embd];
+        let mut out = vec![0f32; t * n_embd];
+        for e in [1usize, 2, 4, 8, 16] {
+            let w = vec![1.0 / e as f32; e];
+            let mut times = Vec::new();
+            for it in 0..240 {
+                let base = (it * 37) % (512 - e);
+                let ids: Vec<usize> = (base..base + e).collect();
+                let routes: Vec<ChunkRoute<'_>> = (0..t).map(|_| ChunkRoute { ids: &ids, weights: &w }).collect();
+                let s = Instant::now();
+                pool.moe_topk_chunk(&plans[it % 40], &routes, &x, &mut out).expect("chunk");
+                if it >= 40 {
+                    times.push(s.elapsed().as_secs_f64());
+                }
+            }
+            times.sort_by(f64::total_cmp);
+            println!("TIER2 host T={t} E={e:>2}: {:7.1} us median", times[times.len() / 2] * 1e6);
+        }
+    }
+}

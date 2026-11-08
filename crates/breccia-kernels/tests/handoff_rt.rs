@@ -71,3 +71,91 @@ fn handoff_round_trip() {
         gpu.destroy_buf(b);
     }
 }
+
+/// Tier-2 gate: the helper's real work for one layer of a T-row window. `E` distinct
+/// IQ3_XXS experts (gate/up 640x2560, down 2560x640) applied to `T` rows each (E*T
+/// expert-row pairs sharing E weight blobs), recorded as one segment, plus the
+/// hand-off copies (T x 2560 f32 in, T x 2560 f32 partial sums out, one submit).
+/// Tier 2 pays only if this beats the host lane's time for the same E experts x T rows.
+/// `BRECCIA_TEST_DEVICE=0000:0e:00.0 cargo test --release -p breccia-kernels --test handoff_rt tier2 -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn tier2_helper_layer() {
+    use breccia_kernels::batch::map_to_bytes;
+    use breccia_kernels::{dispatch_batch, GemvBatch, XLayout};
+    let want = std::env::var("BRECCIA_TEST_DEVICE").unwrap_or_default();
+    let host = Host::new().expect("host");
+    let devs = host.devices().expect("devices");
+    let idx = devs.iter().position(|d| d.pci_address == want.trim()).unwrap_or(0);
+    let gpu = Gpu::create(&host, &devs[idx], 1).expect("device");
+    let ty = QuantType::Iq3Xxs;
+    let gu = GemvBatch::new(&gpu, ty, 640, 2560).unwrap();
+    let dn = GemvBatch::new(&gpu, ty, 2560, 640).unwrap();
+    let emax = 16usize;
+    // Zero blocks are valid IQ3_XXS (scale 0): the timing is the bytes and the grid.
+    let wg = upload(&gpu, &vec![0u8; (gu.blob_bytes() as usize) * emax]).unwrap();
+    let wu = upload(&gpu, &vec![0u8; (gu.blob_bytes() as usize) * emax]).unwrap();
+    let wd = upload(&gpu, &vec![0u8; (dn.blob_bytes() as usize) * emax]).unwrap();
+    let n = 200;
+    let time = |f: &mut dyn FnMut()| -> f64 {
+        for _ in 0..10 {
+            f();
+        }
+        median_us((0..n).map(|_| { let t = Instant::now(); f(); t.elapsed().as_secs_f64() }).collect())
+    };
+    let hv = ash::vk::MemoryPropertyFlags::HOST_VISIBLE | ash::vk::MemoryPropertyFlags::HOST_COHERENT;
+    for t in [1usize, 4, 8] {
+        let io = (t * 2560 * 4) as u64;
+        let stage_in = staging(&gpu, io).unwrap();
+        let stage_out = gpu
+            .buf(io, ash::vk::BufferUsageFlags::TRANSFER_DST, hv, hv | ash::vk::MemoryPropertyFlags::HOST_CACHED)
+            .unwrap();
+        let (xin, xout) = (alloc(&gpu, io).unwrap(), alloc(&gpu, io).unwrap());
+        let (act, mut back) = (vec![1u8; io as usize], vec![0u8; io as usize]);
+        let copies = time(&mut || {
+            gpu.write_host(&stage_in, &act).unwrap();
+            gpu.wall_run(Qc::C, |d, cmd| unsafe {
+                Gpu::barrier_all(d, cmd);
+                d.cmd_copy_buffer(cmd, stage_in.buf, xin.buf, &[ash::vk::BufferCopy { src_offset: 0, dst_offset: 0, size: io }]);
+                Gpu::barrier_all(d, cmd);
+                d.cmd_copy_buffer(cmd, xout.buf, stage_out.buf, &[ash::vk::BufferCopy { src_offset: 0, dst_offset: 0, size: io }]);
+                Gpu::barrier_all(d, cmd);
+            })
+            .unwrap();
+            gpu.read_host(&stage_out, &mut back).unwrap();
+        });
+        for e in [1usize, 2, 4, 8, 16] {
+            let pairs = e * t;
+            // pair p = (expert p % e, row p / e): rows share their expert's blob.
+            let words = |b: &GemvBatch| (0..pairs).map(|p| (p % e) as u32 * b.blob_words()).collect::<Vec<_>>();
+            let mg = upload(&gpu, &map_to_bytes(&gu.map_for_blobs(&words(&gu), XLayout::PerExpert))).unwrap();
+            let md = upload(&gpu, &map_to_bytes(&dn.map_for_blobs(&words(&dn), XLayout::PerExpert))).unwrap();
+            let x = alloc(&gpu, gu.x_bytes(pairs, XLayout::PerExpert)).unwrap();
+            let (g, u) = (alloc(&gpu, (pairs * 640 * 4) as u64).unwrap(), alloc(&gpu, (pairs * 640 * 4) as u64).unwrap());
+            let d = alloc(&gpu, (pairs * 2560 * 4) as u64).unwrap();
+            let work = time(&mut || {
+                dispatch_batch::begin(&gpu).unwrap();
+                gu.run(&wg, &x, &g, &mg, pairs).unwrap();
+                gu.run(&wu, &x, &u, &mg, pairs).unwrap();
+                dn.run(&wd, &g, &d, &md, pairs).unwrap();
+                dispatch_batch::end_submit(&gpu, None).unwrap();
+                dispatch_batch::wait_all(&[&gpu]).unwrap();
+            });
+            eprintln!(
+                "TIER2 {} T={t} E={e:>2}: experts segment {work:7.1} us | copies {copies:6.1} us | layer total ~ {:7.1} us | weight MiB {:.1}",
+                devs[idx].pci_address,
+                work + copies,
+                (2 * gu.blob_bytes() + dn.blob_bytes()) as f64 * e as f64 / (1 << 20) as f64
+            );
+            for b in [&mg, &md, &x, &g, &u, &d] {
+                gpu.destroy_buf(b);
+            }
+        }
+        for b in [&stage_in, &stage_out, &xin, &xout] {
+            gpu.destroy_buf(b);
+        }
+    }
+    for b in [&wg, &wu, &wd] {
+        gpu.destroy_buf(b);
+    }
+}
