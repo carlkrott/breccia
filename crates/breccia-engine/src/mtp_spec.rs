@@ -89,6 +89,8 @@ struct Gate {
     round_ms: [f64; MAX_K + 1],
     seen: [bool; MAX_K + 1],
     picks: u64,
+    /// Probes from plain since plain last lost the argmax (each one lost).
+    lost: u32,
 }
 
 impl Gate {
@@ -101,6 +103,7 @@ impl Gate {
             round_ms: [40.0, 73.0, 89.0, 105.0, 121.0, 137.0],
             seen: [false; MAX_K + 1],
             picks: 0,
+            lost: 0,
         }
     }
 
@@ -115,16 +118,23 @@ impl Gate {
 
     fn pick(&mut self) -> usize {
         self.picks += 1;
-        let rate = |k: usize| self.tokens(k) / self.round_ms[k];
+        let rates: [f64; MAX_K + 1] = std::array::from_fn(|k| self.tokens(k) / self.round_ms[k]);
+        let rate = |k: usize| rates[k];
         let argmax = |r: std::ops::RangeInclusive<usize>| {
             r.max_by(|&a, &b| rate(a).total_cmp(&rate(b))).unwrap_or(0)
         };
         let best = argmax(0..=MAX_K);
-        // probe 4x as often from plain: acceptance is bursty and plain rounds teach nothing
-        let period = if best == 0 { 4 } else { 16 };
+        if best != 0 {
+            self.lost = 0;
+        }
+        // probe 4x as often from plain: acceptance is bursty and plain rounds teach nothing.
+        // Each probe that leaves plain on top doubles the gap (4, 8, 16): on the dual split
+        // a losing probe costs a ~2.5x verify, and period 4 alone held the gate at ~0.9x (11-08)
+        let period = if best == 0 { 4 << self.lost.min(2) } else { 16 };
         if !self.picks.is_multiple_of(period) || best == MAX_K {
             best
         } else if best == 0 {
+            self.lost += 1;
             // from plain, probe the best spec depth: a k=1 probe never beats plain and never
             // re-learns positions 2+, so one early miss used to pin the gate at k=0 (10-31 rk-mc)
             argmax(1..=MAX_K)
@@ -141,6 +151,12 @@ impl Gate {
             ms
         };
         self.seen[k] = true;
+        // a probe round that beat plain's tokens/ms means acceptance is bursting: back to
+        // period 4 (no reset: code sat on plain 98 rounds at 0.98x; reset on any accepted
+        // draft: R1k fell 0.93x -> 0.85x, 11-08 gb/gr jobs)
+        if k > 0 && (accepted + 1) as f64 * self.round_ms[0] > ms {
+            self.lost = 0;
+        }
         // position j was offered iff j <= accepted (the prefix before it all passed)
         for j in 0..k.min(accepted + 1) {
             self.num[j] = self.num[j] * 0.97 + (j < accepted) as u8 as f64;
@@ -491,10 +507,24 @@ mod tests {
         for _ in 0..200 {
             g.observe(1, 0, 118.0);
         }
-        let picks: Vec<usize> = (0..32).map(|_| g.pick()).collect();
-        assert_eq!(picks.iter().filter(|&&k| k == 0).count(), 24);
-        assert_ne!(picks[3], 0); // from plain, every 4th pick probes a spec depth
-                                 // always-accepting draft with cheap verify: deepest wins
+        let picks: Vec<usize> = (0..64).map(|_| g.pick()).collect();
+        assert_ne!(picks[3], 0); // from plain, the 4th pick probes a spec depth
+        let probes: Vec<usize> = (0..64).filter(|&i| picks[i] != 0).map(|i| i + 1).collect();
+        assert_eq!(probes, [4, 8, 16, 32, 48, 64]); // losing probes back off to every 16th
+        assert_eq!(g.lost, 6); // one per losing probe; the shift caps at 2
+        // a probe that beat plain's rate (3 tokens in 100 ms vs 1 in 118) resets the backoff;
+        // one that accepted but lost (2 in 300 ms) does not
+        g.observe(2, 1, 300.0);
+        assert_eq!(g.lost, 6);
+        g.observe(2, 2, 100.0);
+        assert_eq!(g.lost, 0);
+        assert_eq!(g.pick(), 0);
+        for _ in 0..200 {
+            g.observe(1, 1, 30.0);
+        }
+        assert_ne!(g.pick(), 0);
+        assert_eq!(g.lost, 0);
+        // always-accepting draft with cheap verify: deepest wins
         let mut g = Gate::new();
         for _ in 0..200 {
             g.observe(3, 3, 100.0);

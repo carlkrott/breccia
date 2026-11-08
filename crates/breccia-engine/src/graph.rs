@@ -4552,10 +4552,12 @@ impl<'m> Session<'m> {
         // file types; `BRECCIA_PF_EXPERT_ALL=0` keeps them on the arena.
         // Batched decode (rows mode, t = a few rows) keeps experts on their own
         // card: streaming ~30 MiB per block to the expert device cost ~3.5 ms/block
-        // vs ~1.4 ms on the resident arena (11-06 ptr2 trace).
+        // vs ~1.4 ms on the resident arena (11-06 ptr2 trace). Spec verify (t = 2..6
+        // rows) is the same shape, and the arena is what decode itself uses.
+        let spec_rows = self.spec.as_ref().is_some_and(|s| s.active);
         let x_env = std::env::var("BRECCIA_PF_EXPERT_DEVICE")
             .ok()
-            .filter(|_| self.rows_seq.is_empty())
+            .filter(|_| self.rows_seq.is_empty() && !spec_rows)
             .and_then(|v| v.parse::<usize>().ok());
         let to_x =
             x_env.is_some_and(|x| x != dev && x < m.devices.len() && self.venues[x].pf.is_some());
