@@ -4552,7 +4552,7 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                     breccia_engine::ArenaOpts {
                         display_reserve: (a.arena_display_reserve_mib + margin) << 20,
                         headroom: a.arena_headroom_mib << 20,
-                        sessions: bench_seqs(),
+                        sessions: bench_seqs().max(shared_streams()),
                         ..Default::default()
                     }
                     .with_prefill_chunk(a.prefill_chunk, a.ctx),
@@ -4593,6 +4593,41 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         probe: false,
         pool: None,
     };
+    // `BRECCIA_SHARED_STREAMS=N`: N free-running sessions (one thread each, no block lockstep)
+    // over this one model, e.g. 48/0 + tier-2 with every stream on the RX. Each stream keeps
+    // firing its own blocks, so one stream's host lane runs under another's GPU work. Needs
+    // `BRECCIA_SHARED_DEVICE=1`; prompt i = the prompt rotated by i tokens (as `BRECCIA_SEQS`).
+    let shared = shared_streams();
+    if shared > 1 {
+        anyhow::ensure!(
+            breccia_vk::ctx::shared_device() && a.prefill_chunk > 0,
+            "BRECCIA_SHARED_STREAMS needs BRECCIA_SHARED_DEVICE=1 and --prefill-chunk > 0"
+        );
+        std::env::set_var("BRECCIA_MULTI_DECODE_CONCURRENT", "1");
+        let refs = vec![&model; shared];
+        let mut multi = breccia_engine::Multi::new(&refs, &cfg).context("building the shared streams")?;
+        let prompts: Vec<Vec<u32>> = (0..shared)
+            .map(|i| {
+                let mut p = prompt.clone();
+                let l = p.len();
+                p.rotate_left(i % l);
+                p
+            })
+            .collect();
+        let g = multi.generate_each(&prompts, a.gen).context("shared-stream generation")?;
+        println!(
+            "shared-streams {shared}: aggregate {:.2} tok/s ({:.2} per stream), lane {:.1} ms/step, fence {:.1} ms/step, prefill {:.1} s",
+            g.aggregate_tokens_per_s(),
+            g.stream_tokens_per_s(),
+            g.lane_ms_per_step(),
+            g.fence_ms_per_step(),
+            g.prefill_seconds
+        );
+        for (i, st) in g.streams.iter().enumerate() {
+            println!("stream {i}: {:?}", &st.tokens[..st.tokens.len().min(12)]);
+        }
+        return Ok(());
+    }
     let mut sess = breccia_engine::Session::new(&model, &cfg).context("building the session")?;
     sess.sampling = breccia_engine::Sampling {
         temperature: a.temperature,
@@ -5903,4 +5938,9 @@ mod image_cache_tests {
 /// `BRECCIA_SEQS`: sequences the single-session bench runs (default 1).
 fn bench_seqs() -> usize {
     std::env::var("BRECCIA_SEQS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
+}
+
+/// `BRECCIA_SHARED_STREAMS`: free-running sessions over the bench's one model (default 1).
+fn shared_streams() -> usize {
+    std::env::var("BRECCIA_SHARED_STREAMS").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
 }
