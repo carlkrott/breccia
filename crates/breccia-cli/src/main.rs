@@ -5631,6 +5631,7 @@ fn open_serve_draft<'m>(
     model: &'m breccia_engine::Model,
     sess: &mut breccia_engine::Session<'m>,
     ctx: usize,
+    dev: usize,
 ) -> Option<breccia_engine::mtp_draft::MtpDraft<'m>> {
     use breccia_engine::mtp_spec::MAX_K;
     let dir = std::env::var("BRECCIA_MTP_DIR").unwrap_or_else(|_| "/srv/strata-data/mtp/rt".into());
@@ -5638,14 +5639,13 @@ fn open_serve_draft<'m>(
     let u0 = used();
     let r = sess.spec_enable(MAX_K + 1);
     let u1 = used();
-    let r = r.and_then(|_| breccia_engine::mtp_draft::MtpDraft::open(model, 0, &dir, ctx + MAX_K + 2));
+    let r = r.and_then(|_| breccia_engine::mtp_draft::MtpDraft::open(model, dev, &dir, ctx + MAX_K + 2));
     match r {
         Ok(d) => {
             println!(
-                "mtp      draft {} MiB from {dir}, spec slots {} MiB, both {} MiB of VRAM; adaptive depth (BRECCIA_MTP=0 turns it off)",
+                "mtp      draft {} MiB on device {dev} from {dir}, spec slots {} MiB of device 0 VRAM; adaptive depth (BRECCIA_MTP=0 turns it off)",
                 d.bytes >> 20,
                 u1.saturating_sub(u0) >> 20,
-                used().saturating_sub(u0) >> 20
             );
             Some(d)
         }
@@ -5661,14 +5661,27 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
     a.devices = serve_devices(&a.devices, a.ctx);
     // MTP spec decode runs on one card or the dual split (replay verify, `Session::spec_enable`)
     let mtp = std::env::var("BRECCIA_MTP").map_or(true, |v| v != "0");
-    // shortcut: fixed margin for the draft (~1 GiB) + 6 spec slots (~0.7 GiB), as the bench;
-    // size it from the draft's bytes at `ctx` once long-context serve with MTP is measured.
-    let spec_margin: u64 = if mtp { 2048 << 20 } else { 0 };
+    // Draft card: BRECCIA_MTP_DEVICE (index into the serve devices), default 0.
+    let mtp_dev = std::env::var("BRECCIA_MTP_DEVICE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(a.devices.len().saturating_sub(1));
+    // shortcut: fixed margins for the draft (~1 GiB + its KV) and 6 spec slots (~0.7 GiB on
+    // device 0); the draft's share moves to the headless reserve when it sits on device >0
+    // (assumes that card is headless, as the MI50). Size from the draft's bytes at `ctx` later.
+    let (spec_margin, draft_headroom): (u64, u64) = match (mtp, mtp_dev) {
+        (false, _) => (0, 0),
+        (true, 0) => (2048 << 20, 0),
+        (true, _) => (1024 << 20, 1536 << 20),
+    };
     let arena = if a.gpu_experts == "auto" {
+        let d = breccia_engine::ArenaOpts::default();
         breccia_engine::ArenaSpec::Auto(
             breccia_engine::ArenaOpts {
                 display_reserve: (2560 << 20) + spec_margin,
-                ..Default::default()
+                headroom: d.headroom + draft_headroom,
+                ..d
             }
             .with_prefill_chunk(a.prefill_chunk, a.ctx),
         )
@@ -5715,7 +5728,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
     );
     // stop at the same EOS the server trims at (`EngineBackend::eos`), so the reply text is unchanged
     sess.stop_token = tok.eos;
-    let draft = if mtp { open_serve_draft(&model, &mut sess, a.ctx) } else { None };
+    let draft = if mtp { open_serve_draft(&model, &mut sess, a.ctx, mtp_dev) } else { None };
     if draft.is_none() {
         println!("mtp      off ({})", if mtp { "draft did not open" } else { "BRECCIA_MTP=0" });
     }
