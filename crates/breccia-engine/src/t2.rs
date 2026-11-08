@@ -8,6 +8,8 @@
 //! * `BRECCIA_T2_GIB=<total>`: helper VRAM for the pools, split evenly by block.
 //! * `BRECCIA_T2_DEVICE=<ordinal>`: the helper card (default 1).
 //! * `BRECCIA_D1_PROFILE` / `BRECCIA_D1_FREEZE` / `BRECCIA_D1_EVERY..` as for D1.
+//! * `BRECCIA_T2_DECODE=0`: keep plain (t=1) decode on the host lane. Default on; without
+//!   `BRECCIA_D1_FREEZE=1` its swaps are synchronous on every decode token.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

@@ -104,6 +104,12 @@ fn defer_placed_waits() -> bool {
     *ON.get_or_init(|| std::env::var_os("BRECCIA_NO_DEFER_PLACED").is_none())
 }
 
+/// Tier 2 on plain (t=1) decode, on whenever `BRECCIA_T2_GIB` is; `BRECCIA_T2_DECODE=0` off.
+fn t2_decode() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_T2_DECODE").map_or(true, |v| v != "0"))
+}
+
 /// Depth-2 submit (default on; `BRECCIA_SUBMIT_DEPTH2=0` turns it off): when the next
 /// block opens a batch on the device whose deferred segment is still running, keep
 /// that segment in flight (wait only the one before it) instead of draining the
@@ -817,6 +823,11 @@ pub struct Session<'m> {
     /// **another stream's** GPU work was in flight — the overlap efficiency.
     pub lane_s: f64,
     pub lane_covered_s: f64,
+    /// Tier 2 at t=1: helper rows run and seconds waited on the helper after the lane.
+    t2_hits: u64,
+    t2_wait_s: f64,
+    t2_launch_s: f64,
+    t2_checks: u32,
     /// `BRECCIA_LANE_STATS=1`: seconds waiting to acquire the shared expert
     /// pool, and per device the seconds and count of batch submits.
     pub lock_wait_s: f64,
@@ -1451,6 +1462,10 @@ impl<'m> Session<'m> {
             cur_tok: 0,
             lane_s: 0.0,
             lane_covered_s: 0.0,
+            t2_hits: 0,
+            t2_wait_s: 0.0,
+            t2_launch_s: 0.0,
+            t2_checks: 0,
             submits: 0,
             dispatches: 0,
             batching: cfg.batching,
@@ -1962,6 +1977,9 @@ impl<'m> Session<'m> {
         self.expert_bytes = 0;
         self.lane_s = 0.0;
         self.lane_covered_s = 0.0;
+        self.t2_hits = 0;
+        self.t2_wait_s = 0.0;
+        self.t2_launch_s = 0.0;
         self.reset_lane_stats();
         self.dev_wait_s.iter_mut().for_each(|x| *x = 0.0);
         self.dev_down.iter_mut().for_each(|x| *x = 0);
@@ -6328,6 +6346,41 @@ impl<'m> Session<'m> {
         // ---- host expert lane -------------------------------------------------
         self.timers.mark(EXPERTS);
         let mut out = vec![0f32; mc.n_embd];
+        // D1: the lane runs only the experts the pool missed.
+        let d1 = m.d1.get(&b);
+        // Tier 2 at t=1: the helper card runs this block's pool hits while the lane
+        // runs the misses (`BRECCIA_T2_DECODE=0` keeps plain decode on the lane).
+        let t2 = m
+            .t2
+            .as_ref()
+            .filter(|h| d1.is_none() && h.dev != dev && t2_decode())
+            .and_then(|h| h.pools.get(&b).map(|p| (h, p)));
+        let mut misses = d1.map(|p| p.misses(&ids, &weights));
+        let mut t2_job = None;
+        if let Some((h, p)) = t2 {
+            let (mut hits, mut mi, mut mw) = (Vec::new(), Vec::new(), Vec::new());
+            {
+                let st = p.state.lock().expect("t2 pool state");
+                for (&e, &w) in ids.iter().zip(&weights) {
+                    match st.slot_of[e] {
+                        crate::d1::MISS => (mi.push(e), mw.push(w)),
+                        s => (hits.push((s, 0usize, w)), ()),
+                    };
+                }
+            }
+            let tl = std::time::Instant::now();
+            let sc = h.scratch.lock().expect("t2 scratch");
+            let seg = if hits.is_empty() {
+                None
+            } else {
+                let hv = &self.venues[h.dev];
+                Some(crate::t2::launch(m.devices[h.dev].gpu(), &hv.pipes, &hv.swiglu, &hv.moe_map, p, &sc, &hits, &mixed, mc.n_embd)?)
+            };
+            self.t2_launch_s += tl.elapsed().as_secs_f64();
+            misses = Some((mi, mw));
+            t2_job = Some((h, p, sc, seg, hits));
+        }
+        // The helper's launch stays outside the shared pool's lock (other streams wait on it).
         let t_lane = std::time::Instant::now();
         let mut pool = self.pool.lock().expect("the expert pool's lock");
         let waited = if lane_stats_on() {
@@ -6335,14 +6388,32 @@ impl<'m> Session<'m> {
         } else {
             0.0
         };
-        // D1: the lane runs only the experts the pool missed.
-        let d1 = m.d1.get(&b);
-        let misses = d1.map(|p| p.misses(&ids, &weights));
         let (lane_ids, lane_w) = misses.as_ref().map_or((&ids[..], &weights[..]), |(i, w)| (&i[..], &w[..]));
         let bytes = pool
             .moe_topk(&m.layers[b].experts, lane_ids, lane_w, &mixed, &mut out)
             .with_context(|| format!("the expert lane on block {b}"))?;
         drop(pool);
+        if let Some((h, p, sc, seg, hits)) = t2_job {
+            let hg = m.devices[h.dev].gpu();
+            if let Some(seg) = seg {
+                self.t2_wait_s += crate::t2::finish(hg, seg, &sc, &hits, &mut out, mc.n_embd)?;
+                self.t2_hits += hits.len() as u64;
+            }
+            drop(sc);
+            p.observe(hg, &m.shards, &m.layers[b].experts, &ids)?;
+            if std::env::var_os("BRECCIA_T2_CHECK").is_some() && self.t2_checks < 64 {
+                // Diagnostic: the host's full top-k against lane misses + helper hits.
+                self.t2_checks += 1;
+                let mut r = vec![0f32; mc.n_embd];
+                self.pool.lock().expect("the expert pool's lock").moe_topk(&m.layers[b].experts, &ids, &weights, &mixed, &mut r)?;
+                let (mut d, mut n) = (0f32, 0f32);
+                for (a, c) in out.iter().zip(&r) {
+                    d = d.max((a - c).abs());
+                    n = n.max(c.abs());
+                }
+                eprintln!("t2 check blk {b} pos {} rows {}: max abs diff {d:.3e} of max {n:.3e} (rel {:.2e})", self.pos, ids.len(), d / n.max(1e-30));
+            }
+        }
         self.lock_wait_s += waited;
         let lane = t_lane.elapsed().as_secs_f64();
         self.lane_s += lane;
@@ -7678,6 +7749,9 @@ impl Drop for Session<'_> {
         let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
         let _ = breccia_kernels::batch_cmd::wait_all(&gpus);
         self.clear_image();
+        if self.t2_hits > 0 {
+            eprintln!("breccia: t2 decode: {} helper rows since reset, launch {:.1} ms, {:.1} ms waited after the lane", self.t2_hits, self.t2_launch_s * 1e3, self.t2_wait_s * 1e3);
+        }
         if let Some(mut imp) = self.ship_imp.take() {
             imp.release(&gpus);
         }
