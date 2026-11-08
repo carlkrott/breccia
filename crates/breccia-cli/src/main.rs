@@ -1258,7 +1258,9 @@ fn placement_split(
 /// expert helper at the fast card unless `BRECCIA_PF_EXPERT_DEVICE` is set).
 fn split_or_placement(split: Option<&str>, devs: &[String]) -> Option<Vec<usize>> {
     if let Some(s) = split {
-        return Some(s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect());
+        let blocks: Vec<usize> = s.split(',').filter_map(|t| t.trim().parse::<usize>().ok()).collect();
+        println!("split-blocks {blocks:?} (override)");
+        return Some(blocks);
     }
     let (blocks, fast) = placement_default(devs)?;
     if std::env::var_os("BRECCIA_PF_EXPERT_DEVICE").is_none() {
@@ -5752,7 +5754,8 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         &breccia_engine::LoadOptions {
             devices: a.devices.clone(),
             ctx_capacity: a.ctx,
-            blocks: split_or_placement(None, &a.devices),
+            // `BRECCIA_SPLIT_BLOCKS=48,0`: serve's override of the profile verdict.
+            blocks: split_or_placement(std::env::var("BRECCIA_SPLIT_BLOCKS").ok().as_deref(), &a.devices),
             head_device: breccia_engine::HeadSpec::Auto,
             arena,
             verbose: true,
