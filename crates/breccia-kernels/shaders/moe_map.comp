@@ -26,6 +26,7 @@ layout(push_constant) uniform Params {
     uint rows_total;
     uint bpr;            // blocks per row
     uint block_words;     // u16 words per quant block
+    uint pairs;          // 1 = IDS holds (id, activation row) pairs (tier 2)
 } pc;
 
 #define WG_X_MAX 65535u
@@ -41,6 +42,8 @@ void main() {
         return;
     }
     uint r = row - j * pc.rows_per_expert;
-    MAP[row] = pc.base_words + IDS[j] * pc.blob_words + r * pc.bpr * pc.block_words;
-    MAP[pc.rows_total + row] = pc.per_expert_pc4 == 0u ? 0u : j * pc.per_expert_pc4;
+    uint id = pc.pairs != 0u ? IDS[2u * j] : IDS[j];
+    uint xrow = pc.pairs != 0u ? IDS[2u * j + 1u] : j;
+    MAP[row] = pc.base_words + id * pc.blob_words + r * pc.bpr * pc.block_words;
+    MAP[pc.rows_total + row] = pc.per_expert_pc4 == 0u ? 0u : xrow * pc.per_expert_pc4;
 }

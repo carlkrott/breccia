@@ -85,7 +85,7 @@ pub fn freeze() -> bool {
     std::env::var("BRECCIA_D1_FREEZE").is_ok_and(|v| v == "1")
 }
 
-fn total_bytes() -> Option<u64> {
+pub fn total_bytes() -> Option<u64> {
     let g: f64 = std::env::var("BRECCIA_D1_GIB").ok()?.parse().ok()?;
     (g > 0.0).then(|| (g * (1u64 << 30) as f64) as u64)
 }
@@ -122,9 +122,11 @@ pub fn build(
     shards: &ShardSet,
     plans: &[(usize, usize, LayerPlan, [PipeKey; 3])],
     k: usize,
+    total: Option<u64>,
+    name: &str,
 ) -> Result<std::collections::BTreeMap<usize, Pool>> {
     let mut out = std::collections::BTreeMap::new();
-    let Some(total) = total_bytes() else { return Ok(out) };
+    let Some(total) = total else { return Ok(out) };
     if plans.is_empty() {
         return Ok(out);
     }
@@ -199,7 +201,7 @@ pub fn build(
     }
     let bytes: u64 = out.values().map(|p| p.gate.buf.size + p.up.buf.size + p.down.buf.size).sum();
     eprintln!(
-        "d1: {} host-lane blocks, {} MiB of expert slots ({} slots, {seeded} seeded from {}){}",
+        "{name}: {} host-lane blocks, {} MiB of expert slots ({} slots, {seeded} seeded from {}){}",
         out.len(),
         bytes >> 20,
         out.values().map(|p| p.slots).sum::<usize>(),
@@ -299,14 +301,14 @@ impl Pool {
 }
 
 /// Hit stats, printed when the last session drops (the model may outlive it).
-pub fn report(pools: &std::collections::BTreeMap<usize, Pool>) {
+pub fn report(name: &str, pools: &std::collections::BTreeMap<usize, Pool>) {
     let (mut hits, mut routed, mut swaps) = (0, 0, 0);
     for p in pools.values() {
         let (h, r, s) = p.counts();
         (hits, routed, swaps) = (hits + h, routed + r, swaps + s);
     }
     if routed > 0 {
-        eprintln!("d1: {hits} of {routed} routed host-lane experts hit the VRAM pools ({:.1} %), {swaps} swaps", 100.0 * hits as f64 / routed as f64);
+        eprintln!("{name}: {hits} of {routed} routed host-lane experts hit the VRAM pools ({:.1} %), {swaps} swaps", 100.0 * hits as f64 / routed as f64);
     }
 }
 

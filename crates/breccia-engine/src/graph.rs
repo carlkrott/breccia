@@ -4924,6 +4924,9 @@ impl<'m> Session<'m> {
         // and the host partial lands after it.
         let mut host_set: Vec<usize> = Vec::new();
         let mut host_job = None;
+        let mut t2_job = None;
+        let (mut t2_launch_s, mut t2_fin_s) = (0.0f64, 0.0f64);
+        let mut t2_hits = 0usize;
         let mut host_t0 = std::time::Instant::now();
         if split_on && distinct > 1 {
             // Item 3: when the tier table is present, the host's share of *this
@@ -4937,7 +4940,14 @@ impl<'m> Session<'m> {
                     )
                 })
                 .flatten();
-            if pe.is_none() && self.cold_on_host() {
+            let cold = pe.is_none() && self.cold_on_host();
+            // Tier 2: the helper card's pool takes this cold block's hits.
+            let t2 = m
+                .t2
+                .as_ref()
+                .filter(|h| cold && h.dev != dev && t <= crate::t2::MAX_ROWS)
+                .and_then(|h| h.pools.get(&b).map(|p| (h, p)));
+            if cold {
                 // A cold block has no arena: compute it on the host lane instead of
                 // streaming every expert blob over PCIe (item 5). The device loop
                 // skips groups whose expert is in `host_set`, so nothing streams.
@@ -4987,15 +4997,28 @@ impl<'m> Session<'m> {
                     slots[ti * k + j] = (t * k) as u32;
                 }
             }
-            // Router order inside a token, as the lane expects.
-            for ti in 0..t {
-                for j in 0..k {
-                    let o = (ti * k + j) * 4;
-                    let e =
-                        u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]) as usize;
-                    if host_set.contains(&e) {
-                        routes[ti].0.push(e);
-                        routes[ti].1.push(w[ti * k + j]);
+            // Router order inside a token, as the lane expects. Tier-2 hits
+            // `(slot, token, weight)` leave the lane for the helper card.
+            let mut hits: Vec<(u32, usize, f32)> = Vec::new();
+            let mut tok_ids: Vec<Vec<usize>> = vec![Vec::new(); if t2.is_some() { t } else { 0 }];
+            {
+                let st = t2.map(|(_, p)| p.state.lock().expect("t2 pool state"));
+                for ti in 0..t {
+                    for j in 0..k {
+                        let o = (ti * k + j) * 4;
+                        let e = u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]])
+                            as usize;
+                        if host_set.contains(&e) {
+                            if let Some(st) = &st {
+                                tok_ids[ti].push(e);
+                                if st.slot_of[e] != crate::d1::MISS {
+                                    hits.push((st.slot_of[e], ti, w[ti * k + j]));
+                                    continue;
+                                }
+                            }
+                            routes[ti].0.push(e);
+                            routes[ti].1.push(w[ti * k + j]);
+                        }
                     }
                 }
             }
@@ -5015,6 +5038,10 @@ impl<'m> Session<'m> {
                     .moe_topk_chunk(&plan, &rs, &x, &mut out)?;
                 Ok::<_, anyhow::Error>((out, bytes, t0.elapsed().as_secs_f64()))
             }));
+            if let Some((h, p)) = t2 {
+                t2_hits = hits.len();
+                t2_job = Some((h, p, hits, tok_ids, hf[..t * n_embd].to_vec()));
+            }
         }
         let bk_w0 = bucket_t0.elapsed().as_secs_f64();
         let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -5348,6 +5375,24 @@ impl<'m> Session<'m> {
         }
         self.submit_batch()?;
         self.flush()?;
+        // Tier 2 records after the block card's submit, so the helper's host-side
+        // record/map writes overlap the block card's GPU time, not delay it.
+        let mut t2_job = match t2_job {
+            Some((h, p, hits, ids, hx)) => {
+                let tl = std::time::Instant::now();
+                let sc = h.scratch.lock().expect("t2 scratch");
+                let seg = if hits.is_empty() {
+                    None
+                } else {
+                    let hv = &self.venues[h.dev];
+                    let gpu = m.devices[h.dev].gpu();
+                    Some(crate::t2::launch(gpu, &hv.pipes, &hv.swiglu, &hv.moe_map, p, &sc, &hits, &hx, n_embd)?)
+                };
+                t2_launch_s = tl.elapsed().as_secs_f64();
+                Some((sc, seg, hits, ids, p, h.dev))
+            }
+            None => None,
+        };
         let gemm_s = t_gemm.elapsed().as_secs_f64();
         if let Some(x) = xdev.filter(|_| defer_shared) {
             let t0 = std::time::Instant::now();
@@ -5431,9 +5476,22 @@ impl<'m> Session<'m> {
         let mut host_s = 0.0f64;
         if let Some(job) = host_job.take() {
             let tw = std::time::Instant::now();
-            let (part, bytes, busy) = job
+            let (mut part, bytes, busy) = job
                 .join()
                 .map_err(|_| anyhow!("the host split thread panicked on block {b}"))??;
+            if let Some((sc, seg, hits, ids, p, hd)) = t2_job.take() {
+                let hg = m.devices[hd].gpu();
+                let tf = std::time::Instant::now();
+                if let Some(seg) = seg {
+                    crate::t2::finish(hg, seg, &sc, &hits, &mut part, n_embd)?;
+                }
+                drop(sc);
+                t2_fin_s = tf.elapsed().as_secs_f64();
+                // The helper's segment is done: nothing in flight reads the pool.
+                for ids in &ids {
+                    p.observe(hg, &m.shards, &m.layers[b].experts, ids)?;
+                }
+            }
             host_wait_s = tw.elapsed().as_secs_f64();
             host_s = busy;
             self.expert_bytes += bytes as u64;
@@ -5556,9 +5614,12 @@ impl<'m> Session<'m> {
 
         if !host_set.is_empty() && std::env::var_os("BRECCIA_TRACE_MERGED").is_some() {
             eprintln!(
-                "split blk {b:>2} t={t} host={}/{distinct} experts: host lane {:.2} ms (since spawn {:.2} ms), \
+                "split blk {b:>2} t={t} host={}/{distinct} experts (t2 hits {t2_hits}/{} launch {:.2} finish {:.2} ms): host lane {:.2} ms (since spawn {:.2} ms), \
                  join wait {:.2} ms, stream fill(cum) {:.1} ms",
                 host_set.len(),
+                t * k,
+                t2_launch_s * 1e3,
+                t2_fin_s * 1e3,
                 host_s * 1e3,
                 host_t0.elapsed().as_secs_f64() * 1e3,
                 host_wait_s * 1e3,
@@ -7622,7 +7683,10 @@ impl Drop for Session<'_> {
         }
         if LIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
             let _ = breccia_kernels::batch_cmd::shutdown();
-            crate::d1::report(&m.d1);
+            crate::d1::report("d1", &m.d1);
+            if let Some(t) = &m.t2 {
+                crate::d1::report("t2", &t.pools);
+            }
         }
         for (i, v) in self.venues.iter_mut().enumerate() {
             let gpu = m.devices[i].gpu();

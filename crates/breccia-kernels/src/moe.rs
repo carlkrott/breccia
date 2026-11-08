@@ -69,7 +69,26 @@ impl<'g> MoeMap<'g> {
             })
             .u(rows as u32)
             .u(batch.blocks_per_row() as u32)
-            .u(crate::batch::block_words(batch.ty()));
+            .u(crate::batch::block_words(batch.ty()))
+            .u(0);
+        let (gx, gy) = grid_for(rows, 64);
+        self.pipe.run(&[ids, map], &pc, (gx, gy, 1))
+    }
+
+    /// As [`run`](Self::run) with `ids` holding `(id, activation row)` u32 pairs:
+    /// pair `j`'s rows read activation row `ids[2j+1]` (in `padded_cols` units).
+    pub fn run_pairs(&self, ids: &Buf, map: &Buf, batch: &crate::GemvBatch<'_>, pairs: usize) -> Result<()> {
+        let rows = batch.rows(pairs);
+        let pc = Pc::new()
+            .u(pairs as u32)
+            .u(batch.rows_per_expert() as u32)
+            .u(batch.blob_words())
+            .u(0)
+            .u((batch.padded_cols() / 4) as u32)
+            .u(rows as u32)
+            .u(batch.blocks_per_row() as u32)
+            .u(crate::batch::block_words(batch.ty()))
+            .u(1);
         let (gx, gy) = grid_for(rows, 64);
         self.pipe.run(&[ids, map], &pc, (gx, gy, 1))
     }

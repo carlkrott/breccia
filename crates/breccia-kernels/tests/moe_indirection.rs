@@ -131,3 +131,31 @@ fn device_combine_equals_the_host_expression() -> Result<()> {
     }
     Ok(())
 }
+
+/// Tier 2: `run_pairs` = the host map with each pair's activation row taken from the pair.
+#[test]
+fn device_pair_map_equals_the_host_map() -> Result<()> {
+    let Some(dev) = device() else { return Ok(()) };
+    let gpu = dev.gpu();
+    let map_pipe = MoeMap::new(gpu)?;
+    let pairs: Vec<(u32, u32)> = vec![(7, 2), (0, 0), (511, 3), (3, 1), (129, 2)];
+    let flat: Vec<u32> = pairs.iter().flat_map(|&(s, x)| [s, x]).collect();
+    let ids_buf = breccia_kernels::gemv::upload(gpu, &breccia_kernels::ops::u32_to_bytes(&flat))?;
+    for (rows_per_expert, cols) in [(640, 2560), (2560, 640)] {
+        let batch = GemvBatch::new(gpu, QuantType::Iq2Xs, rows_per_expert, cols)?;
+        let rows = batch.rows(pairs.len());
+        let map = breccia_kernels::gemv::alloc(gpu, batch.map_bytes(pairs.len()))?;
+        map_pipe.run_pairs(&ids_buf, &map, &batch, pairs.len())?;
+        let blobs: Vec<u32> = pairs.iter().map(|&(s, _)| s * batch.blob_words()).collect();
+        let mut want = batch.map_for_blobs(&blobs, XLayout::PerExpert);
+        let st = (batch.padded_cols() / 4) as u32;
+        for i in 0..rows {
+            want[rows + i] = st * pairs[i / rows_per_expert].1;
+        }
+        let got = breccia_kernels::ops::download_u32(gpu, &map, rows * 2)?;
+        assert_eq!(got, want, "pair map {rows_per_expert}x{cols}");
+        gpu.destroy_buf(&map);
+    }
+    gpu.destroy_buf(&ids_buf);
+    Ok(())
+}

@@ -310,6 +310,8 @@ pub struct Model {
     pub keys: BTreeSet<PipeKey>,
     /// D1: per-expert VRAM slot pools of host-lane blocks (empty unless `BRECCIA_D1_GIB`).
     pub d1: std::collections::BTreeMap<usize, crate::d1::Pool>,
+    /// Tier 2: the same pools on a helper card, for the merged cold branch (`BRECCIA_T2_GIB`).
+    pub t2: Option<crate::t2::Tier2>,
 }
 
 /// How to load.
@@ -1014,7 +1016,7 @@ impl Model {
         let imported_experts = imported_experts.map(|(a, _)| a);
 
         // D1 pools for the blocks left on the host lane, on each block's own device.
-        let d1 = {
+        let (d1, t2) = {
             let mut plans = Vec::new();
             for l in layers.iter().filter(|l| !placed.contains_key(&l.block)) {
                 let b = l.block;
@@ -1025,13 +1027,29 @@ impl Model {
                 plans.push((b, l.device, l.experts, [key("gate")?, key("up")?, key("down")?]));
             }
             let gpus: Vec<&Gpu> = devices.iter().map(|d| d.gpu()).collect();
-            let d1 = crate::d1::build(&gpus, &shards, &plans, cfg.n_expert_used)?;
+            let d1 = crate::d1::build(&gpus, &shards, &plans, cfg.n_expert_used, crate::d1::total_bytes(), "d1")?;
             for p in d1.values() {
                 for w in [&p.gate, &p.up, &p.down] {
                     keys.insert(w.key);
                 }
             }
-            d1
+            // shortcut: pools cover every non-placed block, so arena-resident ones waste their share; size by the arena plan if VRAM gets tight.
+            let hd = crate::t2::device();
+            let t2 = match crate::t2::bytes() {
+                Some(total) if hd < gpus.len() => {
+                    let plans: Vec<_> = plans.iter().map(|(b, _, p, k)| (*b, hd, *p, *k)).collect();
+                    let pools = crate::d1::build(&gpus, &shards, &plans, cfg.n_expert_used, Some(total), "t2")?;
+                    for p in pools.values() {
+                        for w in [&p.gate, &p.up, &p.down] {
+                            keys.insert(w.key);
+                        }
+                    }
+                    let scratch = crate::t2::Scratch::new(gpus[hd], cfg.n_expert_used, cfg.n_embd, cfg.n_ff)?;
+                    Some(crate::t2::Tier2 { dev: hd, pools, scratch: std::sync::Mutex::new(scratch) })
+                }
+                _ => None,
+            };
+            (d1, t2)
         };
 
         let dense_bytes: u64 = layers.iter().map(|l| l.bytes).sum::<u64>()
@@ -1214,6 +1232,7 @@ impl Model {
             pf_verdicts,
             keys,
             d1,
+            t2,
         })
     }
 
@@ -1280,6 +1299,15 @@ impl Drop for Model {
         }
         for p in self.d1.values() {
             p.release(self.devices[p.device].gpu());
+        }
+        if let Some(t) = &self.t2 {
+            let gpu = self.devices[t.dev].gpu();
+            for p in t.pools.values() {
+                p.release(gpu);
+            }
+            if let Ok(sc) = t.scratch.lock() {
+                sc.release(gpu);
+            }
         }
         if let Some(p) = &self.ple {
             let dev = self.placement.device_of(self.cfg.ple.layers[0]);

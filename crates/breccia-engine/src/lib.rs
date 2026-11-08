@@ -60,6 +60,7 @@ pub mod ple;
 pub mod report;
 pub mod sampler;
 pub mod stats;
+pub mod t2;
 pub mod xfer;
 
 pub use arena::{ArenaChoice, ArenaOpts, ArenaReport, ArenaSpec};
