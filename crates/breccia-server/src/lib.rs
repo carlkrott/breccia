@@ -1,9 +1,10 @@
 //! `breccia-server` — an OpenAI-compatible HTTP surface over one generation session.
 //!
-//! The engine is one session that decodes one request at a time, so the server is a
-//! single-threaded HTTP/1.1 loop: accept, read one request, generate, respond. That
-//! is the honest shape for this backend (a thread pool would only queue on the same
-//! session), and it keeps the crate dependency-free apart from `serde_json`.
+//! With one sequence slot ([`Backend::slots`] = 1) the server is a single-threaded
+//! HTTP/1.1 loop: accept, read one request, generate, respond. With more, connection
+//! threads hand requests to the engine thread, which decodes every admitted request
+//! in one batched step per token ([`serve`]). The crate stays dependency-free apart
+//! from `serde_json`.
 //!
 //! Routes:
 //!   `GET  /health`              liveness + loaded model
@@ -15,8 +16,10 @@
 //! (which owns the model, session and tokenizer), so this crate never links the
 //! engine.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
 
 use serde_json::{json, Value};
 
@@ -48,8 +51,30 @@ pub trait Backend {
     fn clear_images(&mut self) {}
     /// Speculative-decoding hint for the next `complete`: `explicit` is the request's
     /// `"mtp"` field, `code` whether its last user turn asks for code ([`wants_code`]).
-    fn spec_hint(&mut self, explicit: Option<bool>, code: bool) {
+    /// Returns whether that `complete` will spec-decode (it then runs alone).
+    fn spec_hint(&mut self, explicit: Option<bool>, code: bool) -> bool {
         let _ = (explicit, code);
+        false
+    }
+    /// Sequence slots that decode together (1 = one request at a time via `complete`).
+    fn slots(&self) -> usize {
+        1
+    }
+    /// Start a text request on free slot `slot`: prefill `prompt` (plain decode) and
+    /// return `(first token, tokens allowed)`, or `None` when it does not fit beside
+    /// the running slots yet (it is retried after one finishes).
+    fn admit(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
+        let _ = (slot, prompt, max_tokens);
+        Err("this backend has no sequence slots".into())
+    }
+    /// One decode step: feed `rows[i] = (slot, token)`, return each row's next token.
+    fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
+        let _ = rows;
+        Err("this backend has no sequence slots".into())
+    }
+    /// Slot `slot`'s request is done: free what it holds.
+    fn release(&mut self, slot: usize) {
+        let _ = slot;
     }
     /// Prompt + generation cells the backend holds, if bounded.
     fn context(&self) -> Option<usize> {
@@ -75,9 +100,13 @@ impl Response {
 pub fn serve<B: Backend>(addr: &str, mut backend: B) -> Result<(), String> {
     let listener = TcpListener::bind(addr).map_err(|e| format!("binding {addr}: {e}"))?;
     eprintln!(
-        "breccia-server: listening on http://{addr} (model {})",
-        backend.model_name()
+        "breccia-server: listening on http://{addr} (model {}, {} slot(s))",
+        backend.model_name(),
+        backend.slots()
     );
+    if backend.slots() > 1 {
+        return serve_slots(listener, backend);
+    }
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
@@ -92,6 +121,15 @@ pub fn serve<B: Backend>(addr: &str, mut backend: B) -> Result<(), String> {
 }
 
 fn handle<B: Backend>(mut stream: TcpStream, backend: &mut B) -> Result<(), String> {
+    let Some((method, path, body)) = read_request(&mut stream)? else {
+        return Ok(());
+    };
+    let resp = dispatch(&method, &path, &body, backend);
+    write_response(&mut stream, &resp)
+}
+
+/// One HTTP/1.1 request: `(method, path, body)`, or `None` on an empty connection.
+fn read_request(stream: &mut TcpStream) -> Result<Option<(String, String, Vec<u8>)>, String> {
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(30)))
         .ok();
@@ -99,7 +137,7 @@ fn handle<B: Backend>(mut stream: TcpStream, backend: &mut B) -> Result<(), Stri
 
     let mut line = String::new();
     if reader.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or("").to_string();
@@ -136,8 +174,10 @@ fn handle<B: Backend>(mut stream: TcpStream, backend: &mut B) -> Result<(), Stri
     if len > 0 {
         reader.read_exact(&mut body).map_err(|e| e.to_string())?;
     }
+    Ok(Some((method, path, body)))
+}
 
-    let resp = dispatch(&method, &path, &body, backend);
+fn write_response(stream: &mut TcpStream, resp: &Response) -> Result<(), String> {
     let reason = match resp.status {
         200 => "OK",
         400 => "Bad Request",
@@ -155,25 +195,230 @@ fn handle<B: Backend>(mut stream: TcpStream, backend: &mut B) -> Result<(), Stri
         .write_all(head.as_bytes())
         .and_then(|_| stream.write_all(&resp.body))
         .and_then(|_| stream.flush())
-        .map_err(|e| e.to_string())?;
-    Ok(())
+        .map_err(|e| e.to_string())
+}
+
+/// A request a connection thread read, for the engine thread to answer.
+struct Job {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+    reply: mpsc::Sender<Response>,
+}
+
+/// A completion request waiting for a slot (prepared once, on its first try).
+struct Pending {
+    reply: mpsc::Sender<Response>,
+    chat: bool,
+    req: Value,
+    image: bool,
+    p: Option<Prepared>,
+}
+
+/// A completion request decoding in a slot.
+struct Live {
+    reply: mpsc::Sender<Response>,
+    p: Prepared,
+    ids: Vec<u32>,
+    allowed: usize,
+    t0: std::time::Instant,
+}
+
+/// Several sequence slots: connection threads read requests and answer `/health` and
+/// `/v1/models` themselves; the engine stays on this thread, admits completions into
+/// free slots and decodes every live slot in one step per token. A request that
+/// spec-decodes or carries images runs alone through `complete`, when no slot is live.
+/// shortcut: requests that arrive during a spec or image request wait for it to end
+/// (up to its max_tokens); upgrade to a lazy draft catch-up if that wait matters.
+fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel::<Job>();
+    let name = b.model_name();
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            match conn {
+                Ok(stream) => {
+                    let (tx, name) = (tx.clone(), name.clone());
+                    std::thread::spawn(move || {
+                        if let Err(e) = handle_conn(stream, &name, &tx) {
+                            eprintln!("breccia-server: {e}");
+                        }
+                    });
+                }
+                Err(e) => eprintln!("breccia-server: accept: {e}"),
+            }
+        }
+    });
+    let ctx = b.context().unwrap_or(usize::MAX);
+    let mut queue: VecDeque<Pending> = VecDeque::new();
+    let mut live: Vec<Option<Live>> = (0..b.slots()).map(|_| None).collect();
+    loop {
+        let busy = live.iter().any(Option::is_some);
+        let mut jobs: Vec<Job> = Vec::new();
+        if !busy && queue.is_empty() {
+            jobs.push(rx.recv().map_err(|_| "the listener thread is gone".to_string())?);
+        }
+        jobs.extend(rx.try_iter());
+        for job in jobs {
+            if let Some(p) = intake(job, &mut b) {
+                queue.push_back(p);
+            }
+        }
+        // admit in arrival order; what cannot start yet keeps its place
+        let mut wait = VecDeque::new();
+        while let Some(mut q) = queue.pop_front() {
+            let busy = live.iter().any(Option::is_some);
+            let Some(slot) = live.iter().position(Option::is_none) else {
+                wait.push_back(q);
+                continue;
+            };
+            if q.image && busy {
+                wait.push_back(q);
+                continue;
+            }
+            let p = match q.p.take() {
+                Some(p) => p,
+                None => match prepare(&q.req, &mut b, q.chat) {
+                    Ok(p) => p,
+                    Err(r) => {
+                        let _ = q.reply.send(r);
+                        continue;
+                    }
+                },
+            };
+            let spec = b.spec_hint(p.mtp, p.code);
+            if !busy && (q.image || spec) {
+                let _ = q.reply.send(run_alone(&mut b, &p));
+                continue;
+            }
+            match b.admit(slot, &p.prompt, p.max_tokens) {
+                Ok(Some((tok, allowed))) => {
+                    live[slot] = Some(Live { reply: q.reply, p, ids: vec![tok], allowed, t0: std::time::Instant::now() });
+                }
+                Ok(None) => {
+                    q.p = Some(p);
+                    wait.push_back(q);
+                }
+                Err(e) => {
+                    b.release(slot);
+                    eprintln!("breccia-server: request failed: {e}");
+                    let _ = q.reply.send(Response::json(500, json!({"error": {"message": e}})));
+                }
+            }
+        }
+        queue = wait;
+        retire(&mut live, &mut b, ctx);
+        let rows: Vec<(usize, u32)> = live
+            .iter()
+            .enumerate()
+            .filter_map(|(s, l)| Some((s, *l.as_ref()?.ids.last()?)))
+            .collect();
+        if rows.is_empty() {
+            continue;
+        }
+        match b.step(&rows) {
+            Ok(next) => {
+                for (&(s, _), t) in rows.iter().zip(next) {
+                    live[s].as_mut().expect("a live slot").ids.push(t);
+                }
+                retire(&mut live, &mut b, ctx);
+            }
+            Err(e) => {
+                eprintln!("breccia-server: batched step failed: {e}");
+                for (s, l) in live.iter_mut().enumerate() {
+                    if let Some(l) = l.take() {
+                        b.release(s);
+                        let _ = l.reply.send(Response::json(500, json!({"error": {"message": e.clone()}})));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Answer and free the slots that are done: max tokens, EOS, or the context's end.
+fn retire<B: Backend>(live: &mut [Option<Live>], b: &mut B, ctx: usize) {
+    let eos = b.eos();
+    for (s, slot) in live.iter_mut().enumerate() {
+        let done = slot.as_ref().is_some_and(|l| {
+            l.ids.len() >= l.allowed
+                || eos.is_some_and(|e| l.ids.last() == Some(&e))
+                || l.p.prompt.len() + l.ids.len() >= ctx
+        });
+        if let Some(l) = slot.take_if(|_| done) {
+            b.release(s);
+            let secs = l.t0.elapsed().as_secs_f64();
+            let _ = l.reply.send(finish(b, &l.p, l.ids, secs));
+        }
+    }
+}
+
+/// The engine thread's first look at a request: non-completion routes are answered
+/// here, a completion becomes [`Pending`] (or a 400 for bad JSON).
+fn intake<B: Backend>(job: Job, b: &mut B) -> Option<Pending> {
+    let path = job.path.split('?').next().unwrap_or(&job.path);
+    let chat = match (job.method.as_str(), path) {
+        ("POST", "/v1/chat/completions") => true,
+        ("POST", "/v1/completions") => false,
+        _ => {
+            let _ = job.reply.send(dispatch(&job.method, &job.path, &job.body, b));
+            return None;
+        }
+    };
+    match serde_json::from_slice::<Value>(&job.body) {
+        Ok(req) => {
+            let image = req.get("messages").and_then(|m| m.as_array()).is_some_and(|msgs| {
+                msgs.iter().any(|m| {
+                    m.get("content").and_then(|c| c.as_array()).is_some_and(|parts| {
+                        parts.iter().any(|p| p.get("type").and_then(|t| t.as_str()) == Some("image_url"))
+                    })
+                })
+            });
+            Some(Pending { reply: job.reply, chat, req, image, p: None })
+        }
+        Err(e) => {
+            let _ = job.reply.send(Response::json(400, json!({"error": {"message": format!("invalid JSON: {e}")}})));
+            None
+        }
+    }
+}
+
+fn handle_conn(mut stream: TcpStream, name: &str, tx: &mpsc::Sender<Job>) -> Result<(), String> {
+    let Some((method, path, body)) = read_request(&mut stream)? else {
+        return Ok(());
+    };
+    let resp = match info_route(&method, path.split('?').next().unwrap_or(&path), name) {
+        Some(r) => r,
+        None => {
+            let (reply, done) = mpsc::channel();
+            tx.send(Job { method, path, body, reply }).map_err(|_| "the engine thread is gone")?;
+            done.recv().map_err(|_| "the engine dropped the request")?
+        }
+    };
+    write_response(&mut stream, &resp)
+}
+
+/// `/health` and `/v1/models`: answered without the engine.
+fn info_route(method: &str, path: &str, name: &str) -> Option<Response> {
+    match (method, path) {
+        ("GET", "/health") => Some(Response::json(
+            200,
+            json!({"status": "ok", "model": name, "backend": "breccia"}),
+        )),
+        ("GET", "/v1/models") => Some(Response::json(
+            200,
+            json!({"object": "list", "data": [{"id": name, "object": "model", "owned_by": "local"}]}),
+        )),
+        _ => None,
+    }
 }
 
 /// Route one request (exposed so the HTTP surface is testable without a model).
 pub fn dispatch<B: Backend>(method: &str, path: &str, body: &[u8], b: &mut B) -> Response {
     let path = path.split('?').next().unwrap_or(path);
+    if let Some(r) = info_route(method, path, &b.model_name()) {
+        return r;
+    }
     match (method, path) {
-        ("GET", "/health") => Response::json(
-            200,
-            json!({"status": "ok", "model": b.model_name(), "backend": "breccia"}),
-        ),
-        ("GET", "/v1/models") => {
-            let id = b.model_name();
-            Response::json(
-                200,
-                json!({"object": "list", "data": [{"id": id, "object": "model", "owned_by": "local"}]}),
-            )
-        }
         ("POST", "/v1/completions") => completions(body, b, false),
         ("POST", "/v1/chat/completions") => completions(body, b, true),
         (_, "/v1/completions") | (_, "/v1/chat/completions") => {
@@ -196,55 +441,80 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
             )
         }
     };
+    let p = match prepare(&req, b, chat) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    b.spec_hint(p.mtp, p.code);
+    run_alone(b, &p)
+}
+
+/// A completion request, tokenized (its images set on the backend) and ready to run.
+struct Prepared {
+    chat: bool,
+    prompt: Vec<u32>,
+    max_tokens: usize,
+    mtp: Option<bool>,
+    code: bool,
+}
+
+fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, Response> {
     let max_tokens = req
         .get("max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(128) as usize;
 
-    let prompt_ids = if chat {
-        match chat_prompt(&req, b).and_then(|(ids, imgs)| with_images(ids, imgs, b)) {
+    let prompt = if chat {
+        match chat_prompt(req, b).and_then(|(ids, imgs)| with_images(ids, imgs, b)) {
             Ok(ids) => ids,
-            Err(e) => return Response::json(400, json!({"error": {"message": e}})),
+            Err(e) => return Err(Response::json(400, json!({"error": {"message": e}}))),
         }
     } else {
         b.clear_images(); // images only ever come with the chat request that sent them
         match req.get("prompt") {
             Some(Value::String(s)) => match b.tokenize(s) {
                 Ok(ids) => ids,
-                Err(e) => return Response::json(500, json!({"error": {"message": e}})),
+                Err(e) => return Err(Response::json(500, json!({"error": {"message": e}}))),
             },
             Some(Value::Array(a)) => a
                 .iter()
                 .filter_map(|v| v.as_u64().map(|x| x as u32))
                 .collect(),
             _ => {
-                return Response::json(
+                return Err(Response::json(
                     400,
                     json!({"error": {"message": "prompt must be a string or an id array"}}),
-                )
+                ))
             }
         }
     };
-    if prompt_ids.is_empty() {
-        return Response::json(400, json!({"error": {"message": "empty prompt"}}));
+    if prompt.is_empty() {
+        return Err(Response::json(400, json!({"error": {"message": "empty prompt"}})));
     }
-
     let code = if chat {
-        last_user_text(&req).is_some_and(|t| wants_code(&t))
+        last_user_text(req).is_some_and(|t| wants_code(&t))
     } else {
         req.get("prompt").and_then(|v| v.as_str()).is_some_and(wants_code)
     };
-    b.spec_hint(req.get("mtp").and_then(|v| v.as_bool()), code);
+    Ok(Prepared { chat, prompt, max_tokens, mtp: req.get("mtp").and_then(|v| v.as_bool()), code })
+}
+
+/// Run one prepared request on its own through [`Backend::complete`].
+fn run_alone<B: Backend>(b: &mut B, p: &Prepared) -> Response {
     let t0 = std::time::Instant::now();
-    let ids = match b.complete(&prompt_ids, max_tokens) {
-        Ok(ids) => ids,
+    match b.complete(&p.prompt, p.max_tokens) {
+        Ok(ids) => finish(b, p, ids, t0.elapsed().as_secs_f64()),
         Err(e) => {
             eprintln!("breccia-server: request failed: {e}");
-            return Response::json(500, json!({"error": {"message": e}}));
+            Response::json(500, json!({"error": {"message": e}}))
         }
-    };
-    let seconds = t0.elapsed().as_secs_f64();
-    let (ids, finish) = match b.eos().and_then(|eos| ids.iter().position(|&t| t == eos)) {
+    }
+}
+
+/// The OpenAI-shaped reply for generated `ids` (cut at EOS).
+fn finish<B: Backend>(b: &mut B, p: &Prepared, ids: Vec<u32>, seconds: f64) -> Response {
+    let (chat, prompt_ids) = (p.chat, &p.prompt);
+    let (ids, finish_reason) = match b.eos().and_then(|eos| ids.iter().position(|&t| t == eos)) {
         Some(i) => (ids[..i].to_vec(), "stop"),
         None => (ids, "length"),
     };
@@ -267,7 +537,7 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
                 "choices": [{
                     "index": 0,
                     "message": {"role": "assistant", "content": text},
-                    "finish_reason": finish,
+                    "finish_reason": finish_reason,
                 }],
                 "usage": usage,
                 "breccia": {"seconds": seconds, "tokens_per_s": ids.len() as f64 / secs},
@@ -281,7 +551,7 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
                 "object": "text_completion",
                 "created": now_secs(),
                 "model": model,
-                "choices": [{"index": 0, "text": text, "finish_reason": finish}],
+                "choices": [{"index": 0, "text": text, "finish_reason": finish_reason}],
                 "usage": usage,
                 "breccia": {"seconds": seconds, "tokens_per_s": ids.len() as f64 / secs},
             }),
@@ -454,6 +724,7 @@ fn last_user_text(req: &Value) -> Option<String> {
 /// same text. The MTP draft accepts ~88 % of code tokens but ~48 % of prose (11-08),
 /// so speculative decoding only pays on code. Reading code to explain it is prose.
 pub fn wants_code(text: &str) -> bool {
+    let text = instruction(text);
     const VERBS: &[&str] = &[
         "write", "implement", "refactor", "fix", "create", "generate", "complete", "add", "rewrite",
         "port", "convert",
@@ -469,6 +740,27 @@ pub fn wants_code(text: &str) -> bool {
     let lower = text.to_lowercase();
     let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| !w.is_empty()).collect();
     words.iter().any(|w| VERBS.contains(w)) && words.iter().any(|w| NOUNS.contains(w))
+}
+
+/// The part of a user message that says what to do: all of a short message, else its
+/// last paragraph when that reads as an ask, else its first (cut to 400 chars), so a pasted document or source
+/// file does not make a "summarise this" request look like a code request (11-08 smoke).
+fn instruction(text: &str) -> String {
+    const SHORT: usize = 1200;
+    if text.len() <= SHORT {
+        return text.to_string();
+    }
+    let paras: Vec<&str> = text.split("\n\n").map(str::trim).filter(|p| !p.is_empty()).collect();
+    let cut = |p: &str| p.chars().take(400).collect::<String>();
+    match paras.as_slice() {
+        [] => String::new(),
+        [one] => cut(one),
+        [first, .., last] => {
+            // a fenced block or code-like line at the end is material, not the instruction
+            let last_is_ask = last.len() <= 400 && !last.contains("```") && !last.contains(';') && !last.contains('{');
+            if last_is_ask { last.to_string() } else { cut(first) }
+        }
+    }
 }
 
 fn now_secs() -> u64 {
@@ -498,5 +790,11 @@ mod wants_code_tests {
         assert!(!wants_code("Here is a Python test file. Explain step by step what these tests check."));
         assert!(!wants_code("Summarize the key findings in a short bullet list for a busy engineer."));
         assert!(!wants_code("Explain this code to me."));
+        // 11-08 smoke: a pasted source document must not turn "summarise" into code
+        let doc = "fn add(a: u32) -> u32 { a + 1 }\n```rust\nfn x() {}\n```\nWrite the function; create a class.\n\n".repeat(60);
+        assert!(!wants_code(&format!("Read the text below, then summarise its main argument.\n\n{doc}")));
+        assert!(!wants_code(&format!("{doc}Summarise the text above in three sentences.")));
+        assert!(wants_code(&format!("{doc}Now write a Rust function that does the same with a HashMap.")));
+        assert!(wants_code(&format!("Implement a Python script that parses this log.\n\n{doc}")));
     }
 }

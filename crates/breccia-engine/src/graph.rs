@@ -2589,6 +2589,40 @@ impl<'m> Session<'m> {
         Ok(logits)
     }
 
+    /// Sample sequence `s`'s next token with its own sampler RNG (the active
+    /// sequence's lives in `self`).
+    fn sample_seq(&mut self, s: usize, logits: &[f32]) -> Result<u32> {
+        let sampler = match self.seqs.get_mut(s).and_then(Option::as_mut) {
+            Some(slot) if s != self.active_seq => &mut slot.sampler,
+            _ => &mut self.sampler,
+        };
+        sampler
+            .sample(logits, &self.sampling)
+            .ok_or_else(|| anyhow!("the sampler produced no token"))
+    }
+
+    /// One serve step: feed `toks[i] = (sequence, token)` at each sequence's next
+    /// cell and return each one's sampled next token. One row runs as a plain
+    /// decode step on that sequence, several as one [`Self::decode_seqs`] forward.
+    pub fn step_seqs(&mut self, toks: &[(usize, u32)]) -> Result<Vec<u32>> {
+        let logits = match toks {
+            [] => return Ok(Vec::new()),
+            &[(s, t)] => {
+                self.use_seq(s)?;
+                let pos = self.pos + 1; // token() leaves self.pos at the cell it ran
+                vec![self.token(t, pos, None)?]
+            }
+            _ => {
+                // decode_seqs refuses an active sequence with images, so make a row's active
+                if !toks.iter().any(|x| x.0 == self.active_seq) {
+                    self.use_seq(toks[0].0)?;
+                }
+                self.decode_seqs(toks)?
+            }
+        };
+        toks.iter().zip(&logits).map(|(&(s, _), l)| self.sample_seq(s, l)).collect()
+    }
+
     /// Run `prompts[i]` on sequence `i` (adding sequences as needed): each prompt's
     /// chunked prefill in turn, then `n` tokens per sequence decoded round-robin,
     /// one token per sequence per round. Returns one [`Generation`] per prompt;
@@ -2631,14 +2665,7 @@ impl<'m> Session<'m> {
             if batched {
                 let mut toks = Vec::with_capacity(k);
                 for i in 0..k {
-                    // each sequence keeps its own sampler RNG (the active one lives in self)
-                    let sampler = match self.seqs.get_mut(i).and_then(Option::as_mut) {
-                        Some(slot) if i != self.active_seq => &mut slot.sampler,
-                        _ => &mut self.sampler,
-                    };
-                    let next = sampler
-                        .sample(&logits[i], &self.sampling)
-                        .ok_or_else(|| anyhow!("the sampler produced no token"))?;
+                    let next = self.sample_seq(i, &logits[i])?;
                     outs[i].push(next);
                     toks.push((i, next));
                 }

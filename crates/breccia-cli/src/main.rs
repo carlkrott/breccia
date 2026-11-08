@@ -5401,6 +5401,8 @@ struct EngineBackend<'a, 'm> {
     mtp_always: bool,
     /// spec decode for the next request (set by `spec_hint`)
     spec_now: bool,
+    /// shared KV pool cells held by each sequence slot's request (0 = free slot)
+    reserved: Vec<usize>,
 }
 
 /// A saved text prompt state: plain, or with the MTP draft's state when spec decode is on.
@@ -5610,11 +5612,47 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn clear_images(&mut self) {
         self.images.clear();
     }
-    fn spec_hint(&mut self, explicit: Option<bool>, code: bool) {
+    fn spec_hint(&mut self, explicit: Option<bool>, code: bool) -> bool {
         self.spec_now = explicit.unwrap_or(self.mtp_always || code);
         if self.draft.is_some() {
             let why = if explicit.is_some() { "request" } else if self.mtp_always { "BRECCIA_MTP=1" } else if code { "code request" } else { "prose request" };
             println!("mtp      {} ({why})", if self.spec_now { "on" } else { "off" });
+        }
+        self.spec_now && self.draft.is_some()
+    }
+    fn slots(&self) -> usize {
+        self.sess.n_seqs()
+    }
+    fn admit(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
+        let n = max_tokens.min(self.max_tokens).max(1);
+        // a pool request holds its cells (rounded to pages) until release, so decode never runs the pool dry
+        let need = (prompt.len() + n).min(self.ctx).div_ceil(breccia_kernels::qsa::PAGE_CELLS);
+        if let Some(cells) = breccia_kernels::qsa::kv_pool_cells() {
+            let pages = (cells / breccia_kernels::qsa::PAGE_CELLS).saturating_sub(1); // page 0 is the sink
+            if need > pages {
+                return Err(format!(
+                    "{} prompt + {n} new tokens need more than the shared KV pool ({cells} cells, BRECCIA_KV_POOL_CELLS)",
+                    prompt.len()
+                ));
+            }
+            if self.reserved.iter().sum::<usize>() + need > pages {
+                return Ok(None);
+            }
+        }
+        self.sess.use_seq(slot).map_err(|e| e.to_string())?;
+        self.spec_now = false; // spec decode runs only alone (`spec_hint`)
+        self.reserved[slot] = need;
+        let ids = self.complete(prompt, 1)?;
+        let &tok = ids.first().ok_or("the prompt pass gave no token")?;
+        Ok(Some((tok, n)))
+    }
+    fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
+        self.sess.step_seqs(rows).map_err(|e| format!("{e:#}"))
+    }
+    fn release(&mut self, slot: usize) {
+        self.reserved[slot] = 0;
+        if let Err(e) = self.sess.use_seq(slot).and_then(|_| self.sess.reset()) {
+            eprintln!("breccia-server: releasing slot {slot}: {e:#}");
         }
     }
     fn context(&self) -> Option<usize> {
@@ -5686,6 +5724,10 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
     // shortcut: fixed margins for the draft (~1 GiB + its KV) and 6 spec slots (~0.7 GiB on
     // device 0); the draft's share moves to the headless reserve when it sits on device >0
     // (assumes that card is headless, as the MI50). Size from the draft's bytes at `ctx` later.
+    // BRECCIA_SERVE_SEQS=N: N sequence slots decoded in one batched step (default 1 = the
+    // single-stream path). Spec decode then runs only when one request is live.
+    let seqs = std::env::var("BRECCIA_SERVE_SEQS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+    anyhow::ensure!(seqs == 1 || a.prefill_chunk > 0, "BRECCIA_SERVE_SEQS > 1 needs chunked prefill");
     let (spec_margin, draft_headroom): (u64, u64) = match (mtp, mtp_dev) {
         (false, _) => (0, 0),
         (true, 0) => (2048 << 20, 0),
@@ -5697,6 +5739,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
             breccia_engine::ArenaOpts {
                 display_reserve: (2560 << 20) + spec_margin,
                 headroom: d.headroom + draft_headroom,
+                sessions: seqs,
                 ..d
             }
             .with_prefill_chunk(a.prefill_chunk, a.ctx),
@@ -5744,6 +5787,16 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
     );
     // stop at the same EOS the server trims at (`EngineBackend::eos`), so the reply text is unchanged
     sess.stop_token = tok.eos;
+    // the slots exist before spec_enable (add_seq refuses a spec session)
+    for _ in 1..seqs {
+        sess.add_seq()?;
+    }
+    if seqs > 1 {
+        match breccia_kernels::qsa::kv_pool_cells() {
+            Some(c) => println!("serve    {seqs} sequence slots sharing a {c}-cell KV pool"),
+            None => println!("serve    {seqs} sequence slots, each with its own {}-cell KV (BRECCIA_KV_POOL_CELLS shares one pool)", a.ctx),
+        }
+    }
     let draft = if mtp { open_serve_draft(&model, &mut sess, a.ctx, mtp_dev) } else { None };
     if draft.is_none() {
         println!("mtp      off ({})", if mtp { "draft did not open" } else { "BRECCIA_MTP=0" });
@@ -5784,6 +5837,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         draft,
         mtp_always: mtp_env == "1",
         spec_now: false,
+        reserved: vec![0; seqs],
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))
