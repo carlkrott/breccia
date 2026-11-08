@@ -46,6 +46,11 @@ pub trait Backend {
     }
     /// Drop encoded images that no `complete` will use (a request failed).
     fn clear_images(&mut self) {}
+    /// Speculative-decoding hint for the next `complete`: `explicit` is the request's
+    /// `"mtp"` field, `code` whether its last user turn asks for code ([`wants_code`]).
+    fn spec_hint(&mut self, explicit: Option<bool>, code: bool) {
+        let _ = (explicit, code);
+    }
     /// Prompt + generation cells the backend holds, if bounded.
     fn context(&self) -> Option<usize> {
         None
@@ -224,6 +229,12 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
         return Response::json(400, json!({"error": {"message": "empty prompt"}}));
     }
 
+    let code = if chat {
+        last_user_text(&req).is_some_and(|t| wants_code(&t))
+    } else {
+        req.get("prompt").and_then(|v| v.as_str()).is_some_and(wants_code)
+    };
+    b.spec_hint(req.get("mtp").and_then(|v| v.as_bool()), code);
     let t0 = std::time::Instant::now();
     let ids = match b.complete(&prompt_ids, max_tokens) {
         Ok(ids) => ids,
@@ -422,6 +433,44 @@ fn chat_prompt<B: Backend>(req: &Value, b: &B) -> Result<(Vec<u32>, Vec<Vec<u8>>
     Ok((out, images))
 }
 
+/// The text of the last `user` message (string content or its text parts).
+fn last_user_text(req: &Value) -> Option<String> {
+    let msgs = req.get("messages")?.as_array()?;
+    let m = msgs.iter().rev().find(|m| m.get("role").and_then(|r| r.as_str()) == Some("user"))?;
+    match m.get("content")? {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(parts) => Some(
+            parts
+                .iter()
+                .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    }
+}
+
+/// Whether a request asks for code: a fence, or a make-verb plus a code noun in the
+/// same text. The MTP draft accepts ~88 % of code tokens but ~48 % of prose (11-08),
+/// so speculative decoding only pays on code. Reading code to explain it is prose.
+pub fn wants_code(text: &str) -> bool {
+    const VERBS: &[&str] = &[
+        "write", "implement", "refactor", "fix", "create", "generate", "complete", "add", "rewrite",
+        "port", "convert",
+    ];
+    const NOUNS: &[&str] = &[
+        "function", "code", "script", "class", "method", "program", "snippet", "regex", "query", "patch",
+        "diff", "module", "struct", "endpoint", "sql", "json", "yaml", "python", "rust", "javascript",
+        "typescript", "bash", "shell", "cli", "test", "tests", "unittest", "api",
+    ];
+    if text.contains("```") {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| !w.is_empty()).collect();
+    words.iter().any(|w| VERBS.contains(w)) && words.iter().any(|w| NOUNS.contains(w))
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -434,4 +483,20 @@ fn now_id() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod wants_code_tests {
+    use super::wants_code;
+
+    #[test]
+    fn code_requests_and_prose_requests() {
+        assert!(wants_code("Write a Python function `merge_intervals(intervals)` that merges overlapping intervals."));
+        assert!(wants_code("Fix this:\n```rust\nfn main() {}\n```"));
+        assert!(wants_code("implement the endpoint in Rust"));
+        assert!(!wants_code("Explain in plain English why the sky looks blue during the day."));
+        assert!(!wants_code("Here is a Python test file. Explain step by step what these tests check."));
+        assert!(!wants_code("Summarize the key findings in a short bullet list for a busy engineer."));
+        assert!(!wants_code("Explain this code to me."));
+    }
 }

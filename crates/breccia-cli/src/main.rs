@@ -5397,6 +5397,10 @@ struct EngineBackend<'a, 'm> {
     prefix_ttl: std::time::Duration,
     /// MTP draft for spec decode of text prompts (one card or dual, `BRECCIA_MTP=0` turns it off)
     draft: Option<breccia_engine::mtp_draft::MtpDraft<'m>>,
+    /// `BRECCIA_MTP=1`: spec on every text request; default auto (code requests only)
+    mtp_always: bool,
+    /// spec decode for the next request (set by `spec_hint`)
+    spec_now: bool,
 }
 
 /// A saved text prompt state: plain, or with the MTP draft's state when spec decode is on.
@@ -5473,6 +5477,8 @@ impl EngineBackend<'_, '_> {
             .text_prefixes
             .iter_mut()
             .filter(|e| cut > 0 && e.0.len() <= cut && prompt.starts_with(&e.0))
+            // a spec prefix also carries the draft's state; resume only the same kind
+            .filter(|e| matches!(e.2, TextPrefix::Spec(_)) == (self.spec_now && self.draft.is_some()))
             .max_by_key(|e| e.0.len());
         if let Some(e) = &hit {
             println!("prefix   {} of {} cells from RAM", e.2.cells(), prompt.len());
@@ -5482,7 +5488,8 @@ impl EngineBackend<'_, '_> {
             &e.2
         });
         let save = |c: usize| if c < cut { cut } else { 0 };
-        let (toks, saved) = if let Some(d) = self.draft.as_mut() {
+        let draft = if self.spec_now { self.draft.as_mut() } else { None };
+        let (toks, saved) = if let Some(d) = draft {
             let resume = match hit {
                 Some(TextPrefix::Spec(st)) => Some(st),
                 _ => None,
@@ -5538,7 +5545,7 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         if runs.is_empty() {
             // a text prompt; images left by a failed request are dropped
             self.sess.clear_image();
-            if self.draft.is_some() || (self.sess.prefill_chunk > 0 && prompt.len() > TEXT_PREFIX_MIN) {
+            if (self.spec_now && self.draft.is_some()) || (self.sess.prefill_chunk > 0 && prompt.len() > TEXT_PREFIX_MIN) {
                 return self.complete_text(prompt, n);
             }
         } else {
@@ -5603,6 +5610,13 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn clear_images(&mut self) {
         self.images.clear();
     }
+    fn spec_hint(&mut self, explicit: Option<bool>, code: bool) {
+        self.spec_now = explicit.unwrap_or(self.mtp_always || code);
+        if self.draft.is_some() {
+            let why = if explicit.is_some() { "request" } else if self.mtp_always { "BRECCIA_MTP=1" } else if code { "code request" } else { "prose request" };
+            println!("mtp      {} ({why})", if self.spec_now { "on" } else { "off" });
+        }
+    }
     fn context(&self) -> Option<usize> {
         Some(self.ctx)
     }
@@ -5660,7 +5674,9 @@ fn open_serve_draft<'m>(
 fn serve_http(mut a: ServeArgs) -> Result<()> {
     a.devices = serve_devices(&a.devices, a.ctx);
     // MTP spec decode runs on one card or the dual split (replay verify, `Session::spec_enable`)
-    let mtp = std::env::var("BRECCIA_MTP").map_or(true, |v| v != "0");
+    // BRECCIA_MTP=0 off, =1 every text request, default auto: code requests only (`wants_code`)
+    let mtp_env = std::env::var("BRECCIA_MTP").unwrap_or_default();
+    let mtp = mtp_env != "0";
     // Draft card: BRECCIA_MTP_DEVICE (index into the serve devices), default 0.
     let mtp_dev = std::env::var("BRECCIA_MTP_DEVICE")
         .ok()
@@ -5766,6 +5782,8 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         text_prefixes: Vec::new(),
         prefix_ttl: std::time::Duration::from_secs(a.image_ttl_min * 60),
         draft,
+        mtp_always: mtp_env == "1",
+        spec_now: false,
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))
