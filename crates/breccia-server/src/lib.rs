@@ -80,6 +80,14 @@ pub trait Backend {
         let _ = (slot, others);
         Err("this backend has no chunked admission".into())
     }
+    /// [`Self::feed`] for every slot still feeding (oldest first): a backend may put
+    /// several prompts' chunks through one pass. One result per slot. Default: only
+    /// the oldest slot gets a chunk.
+    fn feed_many(&mut self, slots: &[usize], others: bool) -> Vec<Result<Option<u32>, String>> {
+        let mut r = vec![self.feed(slots[0], others)];
+        r.resize_with(slots.len(), || Ok(None));
+        r
+    }
     /// One decode step: feed `rows[i] = (slot, token)`, return each row's next token.
     fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
         let _ = rows;
@@ -326,16 +334,18 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
         }
         queue = wait;
         retire(&mut live, &mut b, ctx);
-        // one prompt chunk (oldest admission first) per decode step
-        let feeding = live
+        // one prompt pass (oldest admission first) per decode step
+        let mut feeding: Vec<_> = live
             .iter()
             .enumerate()
             .filter_map(|(s, l)| l.as_ref().filter(|l| l.ids.is_empty()).map(|l| (l.t0, s)))
-            .min()
-            .map(|x| x.1);
-        if let Some(s) = feeding {
-            let others = live.iter().any(|l| l.as_ref().is_some_and(|l| !l.ids.is_empty()));
-            match b.feed(s, others) {
+            .collect();
+        feeding.sort();
+        let feeding: Vec<usize> = feeding.into_iter().map(|x| x.1).collect();
+        let others = live.iter().any(|l| l.as_ref().is_some_and(|l| !l.ids.is_empty()));
+        let fed = if feeding.is_empty() { Vec::new() } else { b.feed_many(&feeding, others) };
+        for (s, r) in feeding.into_iter().zip(fed) {
+            match r {
                 Ok(Some(tok)) => {
                     let l = live[s].as_mut().expect("a live slot");
                     l.ids.push(tok);

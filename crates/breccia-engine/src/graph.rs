@@ -324,6 +324,9 @@ pub struct PfChunk {
     /// replaces the lane's per-token dequantisation (§8x). The slot is copied to
     /// the device inside the batch; eight experts ride one submit.
     stream: Mailbox,
+    /// `BRECCIA_PF_PREFETCH` slots (same layout as `stream`), filled during the
+    /// block's dense flush with the experts the block is predicted to use.
+    pre: Option<Mailbox>,
     /// One expert's three blobs on the device, for the streamed path.
     sf_gate: Buf,
     sf_up: Buf,
@@ -776,6 +779,9 @@ pub struct Session<'m> {
     /// Batched decode ([`Session::decode_seqs`]): chunk row `i` is sequence
     /// `rows_seq[i].0` at cell `rows_seq[i].1`. Empty outside that call.
     rows_seq: Vec<(usize, usize)>,
+    /// Merged prompts ([`Session::prefill_segs`]): `(seq, pos0, row0, len)` per
+    /// segment of the chunk. Empty outside that call.
+    segs: Vec<(usize, usize, usize, usize)>,
     /// Residual slots `0..pf_hold` hold a prompt chunk paused between blocks
     /// ([`Session::feed_step`] with `groups`); batched decode runs on the slots after them.
     pf_hold: usize,
@@ -873,6 +879,9 @@ pub struct Session<'m> {
     pf_stream_bytes: u64,
     pf_stream_fill_s: f64,
     pf_stream_wait_s: f64,
+    /// `BRECCIA_PF_PREFETCH`: per block, the experts to prefetch next time (the last
+    /// chunk's, most users first; seeded from `BRECCIA_D1_PROFILE`).
+    pf_pre_pred: Vec<Vec<u32>>,
     /// Merged pass 1 only: the prelude leaves the shared expert's gate/up/SwiGLU/
     /// down out, and the pass runs them once over the chunk (`BRECCIA_PF_SHCHUNK`).
     shared_deferred: bool,
@@ -1288,6 +1297,9 @@ impl<'m> Session<'m> {
                         )?,
                         // Two halves, so the host fills one while the GPU copies the other.
                         stream: Mailbox::new(gpu, 2 * STREAM_SLOTS as u64 * slot_stride)?,
+                        pre: (pf_prefetch() > 0 && model.placed.len() < mc.n_layers)
+                            .then(|| Mailbox::new(gpu, pf_prefetch() as u64 * slot_stride))
+                            .transpose()?,
                         sf_gate: alloc(gb.max(16), "streamed expert gate")?,
                         sf_up: alloc(ub.max(16), "streamed expert up")?,
                         sf_down: alloc(db.max(16), "streamed expert down")?,
@@ -1440,6 +1452,7 @@ impl<'m> Session<'m> {
             kv_pages: Vec::new(),
             seqs: Vec::new(),
             rows_seq: Vec::new(),
+            segs: Vec::new(),
             pf_hold: 0,
             rows_head: None,
             active_seq: 0,
@@ -1487,6 +1500,7 @@ impl<'m> Session<'m> {
             pf_stream_bytes: 0,
             pf_stream_fill_s: 0.0,
             pf_stream_wait_s: 0.0,
+            pf_pre_pred: Vec::new(),
             shared_deferred: false,
             qsa_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
             gdn_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
@@ -3409,6 +3423,72 @@ impl<'m> Session<'m> {
             .expect("the head ran on at least one row"))
     }
 
+    /// Several prompts' chunks, one per sequence, as one prefill pass: `(seq, toks,
+    /// pos0)` each. The dense chain, router and expert phase run once over every
+    /// row, so N short prompts pay the per-block expert pass once instead of N
+    /// times; only the mixer runs per segment ([`Self::record_mixer_segs`]).
+    /// Returns each segment's last-row logits and leaves each sequence at its last
+    /// prompt cell. Needs the chunk HC pass on every block; no PLE, images, spec
+    /// or paused chunk.
+    pub fn prefill_segs(&mut self, segs: &[(usize, &[u32], usize)]) -> Result<Vec<Vec<f32>>> {
+        let m = self.model;
+        anyhow::ensure!(!segs.is_empty(), "no prompt segments");
+        anyhow::ensure!(
+            self.spec.is_none() && self.pf_hold == 0 && self.rows_seq.is_empty(),
+            "merged prompts need no speculative decoding and no paused chunk"
+        );
+        let mut toks = Vec::new();
+        let mut plan = Vec::with_capacity(segs.len());
+        for (i, &(s, tk, pos0)) in segs.iter().enumerate() {
+            anyhow::ensure!(s < self.n_seqs(), "no sequence {s}");
+            anyhow::ensure!(segs[..i].iter().all(|x| x.0 != s), "sequence {s} twice in one pass");
+            anyhow::ensure!(!tk.is_empty(), "an empty prompt segment");
+            let img = if s == self.active_seq {
+                !self.image.is_empty()
+            } else {
+                !self.seqs[s].as_ref().expect("a parked sequence").image.is_empty()
+            };
+            anyhow::ensure!(!img, "merged prompts do not take image sequences");
+            anyhow::ensure!(pos0 + tk.len() <= m.cfg.n_ctx_max, "segment at {pos0}+{} is past the context limit", tk.len());
+            plan.push((s, pos0, toks.len(), tk.len()));
+            toks.extend_from_slice(tk);
+        }
+        // the pass writes the active sequence's pos/cur_tok (pf_embed), so make a segment's sequence active
+        if !plan.iter().any(|x| x.0 == self.active_seq) {
+            self.use_seq(plan[0].0)?;
+        }
+        self.pf_check(&toks, 0)?;
+        self.segs = plan;
+        let r = (|| -> Result<Vec<Vec<f32>>> {
+            let t = toks.len();
+            self.pf_embed(&toks, 0)?;
+            self.pf_blocks(t, 0, 0, m.cfg.n_layers)?;
+            self.timers.mark(FINAL_HC);
+            let last = m.device_of(m.cfg.n_layers - 1);
+            let ends: Vec<usize> = self.segs.iter().map(|x| x.2 + x.3 - 1).collect();
+            let mut out = Vec::with_capacity(ends.len());
+            for i in ends {
+                self.swap_r_in(last, i);
+                let r = self.submit_head().and_then(|_| self.finish_head());
+                self.swap_r_in(last, i);
+                out.push(r?);
+            }
+            Ok(out)
+        })();
+        self.timers.stop();
+        let plan = std::mem::take(&mut self.segs);
+        let logits = r?;
+        for (&(s, pos0, _, len), tk) in plan.iter().zip(segs.iter().map(|x| x.1)) {
+            if s == self.active_seq {
+                (self.pos, self.cur_tok) = (pos0 + len - 1, tk[len - 1]);
+            } else {
+                let sl = self.seqs[s].as_mut().expect("a parked sequence");
+                (sl.pos, sl.cur_tok) = (pos0 + len - 1, tk[len - 1]);
+            }
+        }
+        Ok(logits)
+    }
+
     /// [`Self::prefill_rows`]'s chunk checks and per-chunk VRAM fit.
     fn pf_check(&mut self, toks: &[u32], pos0: usize) -> Result<()> {
         let t = toks.len();
@@ -4203,6 +4283,7 @@ impl<'m> Session<'m> {
                 // serialising per token (`docs/research/03`: 65 µs per cold row,
                 // 48x extent over-read). The host blocks stay sequential — the
                 // rolling context and the conv state are per token by definition.
+                anyhow::ensure!(self.segs.is_empty(), "block {b}: merged prompts need the batched PLE phase");
                 let table = self.model.ple_table()?;
                 let row_bytes = self.model.ple_row_bytes();
                 let mut per: Vec<Vec<u32>> = Vec::with_capacity(t);
@@ -4273,6 +4354,7 @@ impl<'m> Session<'m> {
         }
 
         // ---- pass 1: the whole chunk's dense chain, one submission -----------
+        anyhow::ensure!(self.segs.is_empty(), "block {b}: merged prompts need the merged expert pass");
         if !self.rows_seq.is_empty() {
             bail!("block {b}: batched decode needs the merged expert pass (a multi-user GEMM per expert type)");
         }
@@ -4507,6 +4589,12 @@ impl<'m> Session<'m> {
     /// mmap drop by that factor too — which matters because the lane is I/O-bound
     /// on this box (§8x).
     fn fill_stream_slot(&mut self, dev: usize, b: usize, expert: usize, slot: usize) -> Result<()> {
+        self.fill_slot(dev, b, expert, slot, false)
+    }
+
+    /// [`Self::fill_stream_slot`] into the ring (`pre == false`) or slot `slot` of
+    /// the block's prefetch region.
+    fn fill_slot(&mut self, dev: usize, b: usize, expert: usize, slot: usize, pre: bool) -> Result<()> {
         let m = self.model;
         let t0 = std::time::Instant::now();
         let slices = m.layers[b]
@@ -4551,9 +4639,10 @@ impl<'m> Session<'m> {
                 })
         };
         let total = {
-            let pf = self.venues[dev].pf();
+            let pf = if pre { self.venues[dev].pf_at(b) } else { self.venues[dev].pf() };
             let off = slot as u64 * pf.slot_stride;
             let (g, u, d) = (pf.g_bytes, pf.u_bytes, pf.d_bytes);
+            let dst = if pre { pf.pre.as_ref().expect("the prefetch slots") } else { &pf.stream };
             if (slices.gate.len() as u64) > g
                 || (slices.up.len() as u64) > u
                 || (slices.down.len() as u64) > d
@@ -4568,15 +4657,15 @@ impl<'m> Session<'m> {
             }
             match &imported {
                 Some(Ok([g_s, u_s, d_s])) => {
-                    pf.stream.write_at(off, g_s)?;
-                    pf.stream.write_at(off + g, u_s)?;
-                    pf.stream.write_at(off + g + u, d_s)?;
+                    dst.write_at(off, g_s)?;
+                    dst.write_at(off + g, u_s)?;
+                    dst.write_at(off + g + u, d_s)?;
                 }
                 Some(Err(e)) => bail!("imported expert read: {e}"),
                 None => {
-                    pf.stream.write_at(off, slices.gate)?;
-                    pf.stream.write_at(off + g, slices.up)?;
-                    pf.stream.write_at(off + g + u, slices.down)?;
+                    dst.write_at(off, slices.gate)?;
+                    dst.write_at(off + g, slices.up)?;
+                    dst.write_at(off + g + u, slices.down)?;
                 }
             }
             slices.gate.len() + slices.up.len() + slices.down.len()
@@ -4731,6 +4820,27 @@ impl<'m> Session<'m> {
         }
     }
 
+    /// The experts to prefetch for block `b` (`BRECCIA_PF_PREFETCH`): the last chunk's
+    /// for this block, else the `BRECCIA_D1_PROFILE` rank; empty when off.
+    fn pf_pre_list(&mut self, b: usize, dev: usize) -> Result<Vec<u32>> {
+        let n = pf_prefetch();
+        let n_layers = self.model.cfg.n_layers;
+        if n == 0 || self.venues[dev].pf_at(b).pre.is_none() {
+            return Ok(Vec::new());
+        }
+        if self.pf_pre_pred.is_empty() {
+            self.pf_pre_pred = vec![Vec::new(); n_layers];
+            if let Some(p) = std::env::var_os("BRECCIA_D1_PROFILE") {
+                for (l, e) in crate::d1::read_strp(std::path::Path::new(&p))? {
+                    if l < n_layers && self.pf_pre_pred[l].len() < n && e < self.model.cfg.n_expert {
+                        self.pf_pre_pred[l].push(e as u32);
+                    }
+                }
+            }
+        }
+        Ok(self.pf_pre_pred[b].clone())
+    }
+
     fn pf_readback(&mut self, gpu: &breccia_vk::ctx::Gpu, b: usize, t: usize) -> Result<()> {
         batch_cmd::record_barrier_to_host(gpu)?;
         let t_rb = std::time::Instant::now();
@@ -4833,6 +4943,8 @@ impl<'m> Session<'m> {
                     && pf.scratch.size >= ((t * k + 1) * n_embd * 4) as u64
             });
 
+        // `BRECCIA_PF_PREFETCH`: expert -> prefetch slot for this block (MAX = not there).
+        let mut pre_slot = vec![u32::MAX; if streamed { mc.n_expert } else { 0 }];
         // ---- pass 1: the dense chain per token, the MoE inputs saved ---------
         if !micro {
             self.ensure_batch(dev)?;
@@ -4843,6 +4955,7 @@ impl<'m> Session<'m> {
             if hc_chunk {
                 self.record_hc_chunk(b, dev, t, pos0)?;
             } else {
+                anyhow::ensure!(self.segs.is_empty(), "block {b}: merged prompts need the chunk HC pass");
                 if self.mixer_chunked(b, dev) {
                     self.record_mixer_chunk(b, dev, t, pos0, false)?;
                     self.mixer_from_chunk = Some(pos0);
@@ -4926,7 +5039,35 @@ impl<'m> Session<'m> {
             }
             Self::pf_mark(b, "dense", &pf_tp);
             pf_tp = std::time::Instant::now();
-            self.pf_readback(gpu, b, t)?;
+            let list = if streamed && xdev.is_none() && !split_on && pf_inplace() && !pf_micro() && !self.pf[dev][PF_OVERLAP] {
+                self.pf_pre_list(b, dev)?
+            } else {
+                Vec::new()
+            };
+            if list.is_empty() {
+                self.pf_readback(gpu, b, t)?;
+            } else {
+                // The dense chain runs while the host fills the predicted experts over
+                // the otherwise idle PCIe link. The slots' last reader (the previous
+                // block's GEMMs) was flushed at the end of its expert pass.
+                batch_cmd::record_barrier_to_host(gpu)?;
+                self.submit_batch()?;
+                let t_pre = std::time::Instant::now();
+                for (s, &e) in list.iter().enumerate() {
+                    self.fill_slot(dev, b, e as usize, s, true)?;
+                    pre_slot[e as usize] = s as u32;
+                }
+                let t_fill = t_pre.elapsed().as_secs_f64();
+                self.flush()?;
+                if std::env::var_os("BRECCIA_PF_STALL").is_some() {
+                    eprintln!(
+                        "pf-prefetch blk {b:>2} t={t:>4}: {} experts in {:.3} ms, dense done {:.3} ms",
+                        list.len(),
+                        t_fill * 1e3,
+                        t_pre.elapsed().as_secs_f64() * 1e3
+                    );
+                }
+            }
             Self::pf_mark(b, "readback", &pf_tp);
             pf_tp = std::time::Instant::now();
         }
@@ -4987,6 +5128,19 @@ impl<'m> Session<'m> {
                 u = g_end;
             }
             at = end;
+        }
+        if streamed && pf_prefetch() > 0 {
+            let mut users = vec![0u32; mc.n_expert];
+            for (e, _, u) in &groups {
+                users[*e] += u.len() as u32;
+            }
+            let mut ids: Vec<u32> = (0..mc.n_expert as u32).filter(|&e| users[e as usize] > 0).collect();
+            ids.sort_by_key(|&e| std::cmp::Reverse(users[e as usize]));
+            ids.truncate(pf_prefetch());
+            if self.pf_pre_pred.len() < mc.n_layers {
+                self.pf_pre_pred.resize(mc.n_layers, Vec::new());
+            }
+            self.pf_pre_pred[b] = ids;
         }
         let bk_sort = bucket_t0.elapsed().as_secs_f64();
         // The host's share: the last `n` distinct experts (expert-id order). Their
@@ -5215,6 +5369,8 @@ impl<'m> Session<'m> {
             && m.layers[b].experts.gate.bytes() as u64 == gx
             && m.layers[b].experts.up.bytes() as u64 == ux;
         let mut prev_expert: Option<usize> = None;
+        // The current expert's prefetch slot.
+        let mut pre_hit: Option<u64> = None;
         // One copy packet per expert: the **previous** expert's down result, this
         // expert's activation gather, and (when it starts a new streamed expert)
         // its weight blobs. `record_copies` closes a compute -> copy -> compute
@@ -5266,7 +5422,12 @@ impl<'m> Session<'m> {
             let mu = users.len();
             // First group of a new distinct expert: stream it (once per chunk).
             let new_expert = Some(*e) != prev_expert;
-            if streamed && new_expert {
+            if streamed && new_expert && pre_slot.get(*e).is_some_and(|&s| s != u32::MAX) {
+                // Already in the prefetch slots: no ring fill.
+                prev_expert = Some(*e);
+                pre_hit = Some(pre_slot[*e] as u64);
+            } else if streamed && new_expert {
+                pre_hit = None;
                 prev_expert = Some(*e);
                 // Refill a slot; when the slots are exhausted, drain first so the
                 // in-flight copies never see the next expert's bytes.
@@ -5315,8 +5476,13 @@ impl<'m> Session<'m> {
                         (*e as u32) * wdown,
                     ),
                     None => {
-                        let off = ((expert_index - 1) % (2 * STREAM_SLOTS)) as u64 * pf.slot_stride;
-                        let sb = &pf.stream.buf;
+                        let (sb, off) = match (pre_hit, pf.pre.as_ref()) {
+                            (Some(s), Some(pre)) => (&pre.buf, s * pf.slot_stride),
+                            _ => (
+                                &pf.stream.buf,
+                                ((expert_index - 1) % (2 * STREAM_SLOTS)) as u64 * pf.slot_stride,
+                            ),
+                        };
                         (
                             sb,
                             sb,
@@ -6992,6 +7158,9 @@ impl<'m> Session<'m> {
         if !self.rows_seq.is_empty() {
             return self.record_mixer_rows(b, dev);
         }
+        if !self.segs.is_empty() {
+            return self.record_mixer_segs(b, dev, t);
+        }
         if m.layers[b].kind == LayerKind::Gdn {
             return self.record_gdn_chunk(b, dev, t, chunk);
         }
@@ -7078,6 +7247,56 @@ impl<'m> Session<'m> {
             batch_cmd::record_copy(gpu, tap, 0, &ws.idx_k, 0, len)?;
         }
         Ok(())
+    }
+
+    /// [`Session::prefill_segs`]'s mixer. Per segment, last first: its attn-mixed
+    /// rows from the chunk HC workspace into `pf.mixed[0..len]`, the chunk mixer on
+    /// its sequence's state at its own position into `pf.out[0..len]`, and (segment
+    /// > 0) that output parked in the workspace's already-read `mixed` rows; then
+    /// the parked rows into place. Last first, so `pf.out[0..len]` never overwrites
+    /// a later segment's rows, and segment 0 finishes in place. Nothing else in the
+    /// block depends on which sequence a row belongs to.
+    fn record_mixer_segs(&mut self, b: usize, dev: usize, t: usize) -> Result<()> {
+        let m = self.model;
+        let gpu = m.devices[dev].gpu();
+        let nb = (m.cfg.n_embd * 4) as u64;
+        let wi = self.hc_chunk_ws[dev]
+            .iter()
+            .position(|w| w.tokens == t)
+            .ok_or_else(|| anyhow!("block {b}: merged prompts need the chunk HC pass"))?;
+        let segs = std::mem::take(&mut self.segs);
+        let run = |me: &mut Self| -> Result<()> {
+            for &(s, pos0, r0, len) in segs.iter().rev() {
+                {
+                    let v = &me.venues[dev];
+                    let ws = &me.hc_chunk_ws[dev][wi];
+                    let pf = v.pf_at(b);
+                    batch_cmd::record_copies(gpu, &[(&pf.mixed, 0, &ws.mixed, r0 as u64 * nb, len as u64 * nb)])?;
+                }
+                // every sequence's state is allocated at the same `ctx_capacity`, so
+                // the QSA chunk workspace (sized by the first caller's cap) fits all
+                me.swap_seq_state(s);
+                let r = me.record_mixer_chunk(b, dev, len, pos0, true);
+                me.swap_seq_state(s);
+                r?;
+                if r0 > 0 {
+                    let v = &me.venues[dev];
+                    let ws = &me.hc_chunk_ws[dev][wi];
+                    batch_cmd::record_copies(gpu, &[(&ws.mixed, r0 as u64 * nb, &v.pf_at(b).out, 0, len as u64 * nb)])?;
+                }
+            }
+            let t0 = segs[0].3;
+            if t > t0 {
+                let v = &me.venues[dev];
+                let ws = &me.hc_chunk_ws[dev][wi];
+                let n = (t - t0) as u64 * nb;
+                batch_cmd::record_copies(gpu, &[(&v.pf_at(b).out, t0 as u64 * nb, &ws.mixed, t0 as u64 * nb, n)])?;
+            }
+            Ok(())
+        };
+        let r = run(self);
+        self.segs = segs;
+        r
     }
 
     /// Batched decode's mixer: row `i` of `pf.mixed` through the single-token
@@ -7376,15 +7595,23 @@ impl<'m> Session<'m> {
         // table rows it produces can. One `prefetch_rows` over `t*16` rows keeps
         // the 90-byte-within-a-4-KiB-page reads of the 28.8 GiB table from
         // serialising per token (`docs/research/03`, §8z).
+        // Merged prompts: each segment hashes (and below, blocks) on its own
+        // sequence's PLE state; one whole-chunk span otherwise.
+        let spans: Vec<(usize, usize, usize)> = if self.segs.is_empty() {
+            vec![(self.active_seq, 0, t)]
+        } else {
+            self.segs.iter().map(|&(s, _, r0, len)| (s, r0, len)).collect()
+        };
         let mut rows: Vec<u32> = Vec::with_capacity(t * n_head);
-        {
-            let ple = self
-                .ple
-                .as_mut()
-                .ok_or_else(|| anyhow!("no PLE host state"))?;
-            for &tok in self.pf_toks.iter().take(t) {
-                rows.extend_from_slice(&ple.rows_for(tok));
-            }
+        for &(s, r0, len) in &spans {
+            self.swap_seq_state(s);
+            let ple = self.ple.as_mut().map(|ple| {
+                for &tok in &self.pf_toks[r0..r0 + len] {
+                    rows.extend_from_slice(&ple.rows_for(tok));
+                }
+            });
+            self.swap_seq_state(s);
+            ple.ok_or_else(|| anyhow!("no PLE host state"))?;
         }
         let t_prefetch = std::time::Instant::now();
         prefetch_rows(table, &rows, row_bytes);
@@ -7523,13 +7750,28 @@ impl<'m> Session<'m> {
                         sp.ple_rows[i + 1] = ple.state().hist;
                     }
                 }
-            } else {
+            } else if spans.len() == 1 {
                 let rs: Vec<Vec<f32>> = (0..t).map(|i| f32_from_bytes(&parts[3 * i])).collect();
                 let keys: Vec<Vec<f32>> =
                     (0..t).map(|i| f32_from_bytes(&parts[3 * i + 1])).collect();
                 let vals: Vec<Vec<f32>> =
                     (0..t).map(|i| f32_from_bytes(&parts[3 * i + 2])).collect();
                 ple.block_chunk(&rs, &keys, &vals, &mut out)?;
+            }
+        }
+        if spans.len() > 1 {
+            for &(s, r0, len) in &spans {
+                let rows = r0..r0 + len;
+                let rs: Vec<Vec<f32>> = rows.clone().map(|i| f32_from_bytes(&parts[3 * i])).collect();
+                let keys: Vec<Vec<f32>> = rows.clone().map(|i| f32_from_bytes(&parts[3 * i + 1])).collect();
+                let vals: Vec<Vec<f32>> = rows.map(|i| f32_from_bytes(&parts[3 * i + 2])).collect();
+                self.swap_seq_state(s);
+                let r = match self.ple.as_mut() {
+                    Some(ple) => ple.block_chunk(&rs, &keys, &vals, &mut out[r0 * hc_dim..(r0 + len) * hc_dim]),
+                    None => Err(anyhow!("no PLE host state")),
+                };
+                self.swap_seq_state(s);
+                r?;
             }
         }
         let ple_t4 = ple_t0.elapsed();
@@ -7842,6 +8084,62 @@ impl<'m> Session<'m> {
         Ok(f.chunks.is_empty())
     }
 
+    /// Option 4: the next chunk of several sequences' prompt passes in **one**
+    /// merged pass ([`Self::prefill_segs`]), so the fixed expert pass is paid once.
+    /// `feeds[i] = (seq, feed)`, oldest first; chunks are taken while their sum
+    /// fits the prefill chunk (`max` > 0 caps each). Returns each feed's "prompt
+    /// is in" flag; a feed that did not fit keeps its chunk for the next call.
+    /// Ends with sequence `feeds[0].0` active.
+    pub fn feed_steps(&mut self, feeds: &mut [(usize, &mut PromptFeed)], max: usize) -> Result<Vec<bool>> {
+        anyhow::ensure!(self.prefill_chunk > 0 && self.image.is_empty(), "merged prompt chunks need chunked text prefill");
+        let mut take = Vec::new(); // (feed index, len, save)
+        let mut sum = 0;
+        for (i, (_, f)) in feeds.iter().enumerate() {
+            anyhow::ensure!(f.part.is_none(), "a paused chunk cannot merge");
+            let Some(&(len, save)) = f.chunks.front() else { continue };
+            let cap = if max > 0 { max.min(self.prefill_chunk) } else { self.prefill_chunk };
+            let (len, save) = if len > cap { (cap, false) } else { (len, save) };
+            if sum + len > self.prefill_chunk {
+                break;
+            }
+            sum += len;
+            take.push((i, len, save));
+        }
+        anyhow::ensure!(!take.is_empty(), "no prompt chunk queued");
+        let t = std::time::Instant::now();
+        let segs: Vec<(usize, &[u32], usize)> = take
+            .iter()
+            .map(|&(i, len, _)| {
+                let (s, f) = (&feeds[i].0, &feeds[i].1);
+                (*s, &f.prompt[f.pos..f.pos + len], f.pos)
+            })
+            .collect();
+        let logits = if let [(s, toks, pos)] = segs[..] {
+            self.use_seq(s)?; // one chunk fits: the plain pass
+            vec![self.prefill(toks, pos)?]
+        } else {
+            self.prefill_segs(&segs)?
+        };
+        if std::env::var_os("BRECCIA_FEED_TRACE").is_some() {
+            eprintln!("feed     merged {} chunks, {sum} tokens in {:.0} ms", take.len(), t.elapsed().as_secs_f64() * 1e3);
+        }
+        for (&(i, len, save), lg) in take.iter().zip(logits) {
+            let (s, f) = (feeds[i].0, &mut *feeds[i].1);
+            let (l0, s0) = f.chunks.pop_front().expect("a queued chunk");
+            if l0 > len {
+                f.chunks.push_front((l0 - len, s0));
+            }
+            f.logits = lg;
+            f.pos += len;
+            if save {
+                self.use_seq(s)?;
+                f.saved = Some(self.save_prefix(f.cut)?);
+            }
+        }
+        self.use_seq(feeds[0].0)?;
+        Ok(feeds.iter().map(|(_, f)| f.chunks.is_empty() && f.part.is_none()).collect())
+    }
+
     /// Blocks `b0..b0 + groups` of the paused chunk at `f.pos`; the head and the
     /// bookkeeping once the last block ran.
     fn feed_part(&mut self, f: &mut PromptFeed, len: usize, save: bool, b0: usize, groups: usize) -> Result<bool> {
@@ -8077,6 +8375,13 @@ pub struct PromptFeed {
     pub saved: Option<PrefixState>,
     /// A chunk paused between blocks: `(length, save after it, next block)`.
     part: Option<(usize, bool, usize)>,
+}
+
+impl PromptFeed {
+    /// A chunk is paused between blocks (it must finish before another pass).
+    pub fn paused(&self) -> bool {
+        self.part.is_some()
+    }
 }
 
 /// The sequence state after a prompt's first `cells` cells, in host RAM.
@@ -8435,6 +8740,15 @@ fn pf_split_host() -> Option<(usize, bool)> {
 /// Past 8 the GEMM rides z slices, replacing serialized gather/GEMM/scatter rounds;
 /// per-user arithmetic unchanged (1k logits byte-identical, prefill -7.6 %, §11l).
 /// §6 in-place expert loop, on unless `BRECCIA_PF_INPLACE=0`.
+/// `BRECCIA_PF_PREFETCH=<n>` (default 0 = off): VRAM slots per prefill scratch set for
+/// streamed experts, filled while the block's dense chain runs (§ expert-pass option 5).
+pub fn pf_prefetch() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BRECCIA_PF_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
+    })
+}
+
 fn pf_inplace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("BRECCIA_PF_INPLACE").map_or(true, |v| v != "0"))

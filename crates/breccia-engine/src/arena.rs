@@ -124,7 +124,10 @@ impl ArenaOpts {
     /// 356 tok/s); chunk 4096 with a 32k prompt misses the MI50 floor by 1 MiB. Discovered
     /// chunks stay within ctx. Add margin here if a larger chunk becomes a default.
     pub fn with_prefill_chunk(self, chunk: usize, ctx: usize) -> Self {
-        let extra = prefill_scratch_bytes(crate::graph::prefill_cap(chunk).min(ctx));
+        // shortcut: `BRECCIA_PF_PREFETCH` slots at 2 MiB each (this model's streamed slot
+        // is ~1.8 MiB); derive from the slot stride if another model is run with it.
+        let pre = crate::graph::pf_prefetch() as u64 * (2 << 20);
+        let extra = prefill_scratch_bytes(crate::graph::prefill_cap(chunk).min(ctx)) + pre;
         ArenaOpts {
             display_reserve: self.display_reserve + extra,
             headroom: self.headroom + extra,

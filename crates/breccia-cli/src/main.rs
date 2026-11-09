@@ -123,9 +123,10 @@ enum Command {
         /// Upper bound on `max_tokens` a request may ask for
         #[arg(long, default_value_t = 1024)]
         max_tokens: usize,
-        /// Merged prefill chunk
-        #[arg(long, default_value_t = 1024)]
-        prefill_chunk: usize,
+        /// Merged prefill chunk. Absent: `BRECCIA_PREFILL_CHUNK_FLOOR` (default 4096,
+        /// 0 = the old 1024): prefill +23 %, decode -3.7 % (Carl 11-09)
+        #[arg(long)]
+        prefill_chunk: Option<usize>,
         /// Vision projector GGUF: enables image input (chat `image_url` data URLs)
         #[arg(long, value_name = "GGUF")]
         mmproj: Option<String>,
@@ -567,7 +568,13 @@ fn run(cli: Cli) -> Result<()> {
                     ctx,
                     gpu_experts,
                     max_tokens,
-                    prefill_chunk,
+                    prefill_chunk: prefill_chunk.unwrap_or_else(|| {
+                        match std::env::var("BRECCIA_PREFILL_CHUNK_FLOOR").ok().and_then(|v| v.parse().ok()) {
+                            Some(0) => 1024,
+                            Some(f) => f,
+                            None => 4096,
+                        }
+                    }),
                     mmproj,
                     vision_encoder,
                     image_tokens,
@@ -1319,13 +1326,17 @@ fn resolve_prefill_chunks(
     let prof = breccia_profile::load_profile(&breccia_profile::default_profile_path())
         .ok()
         .flatten();
+    // Discovered chunks are raised to `BRECCIA_PREFILL_CHUNK_FLOOR` (default 4096, 0 = the
+    // profile's own): 48/0+T2 R8k 4096 vs 1024 = prefill +23 %, decode -3.7 % (Carl 11-09).
+    let floor = std::env::var("BRECCIA_PREFILL_CHUNK_FLOOR").ok().and_then(|v| v.parse().ok()).unwrap_or(4096usize);
     let (chunks, src) = prefill_chunks_for(flag, merged, devs, ctx, |d| {
         let e = prof
             .as_ref()?
             .devices
             .iter()
             .find(|e| same_pci(&e.identity.pci_address, d))?;
-        Some(e.prefill.as_ref()?.best_chunk)
+        let c = e.prefill.as_ref()?.best_chunk;
+        Some(if c > 0 { c.max(floor) } else { c })
     });
     if flag.is_none() && merged {
         println!("prefill chunk {chunks:?} ({src})");
@@ -4394,6 +4405,130 @@ fn reference_parity(ours: &[u32]) -> String {
     format!("{ok}/{n}")
 }
 
+/// `BRECCIA_SEGS_TEST=N` (`BRECCIA_SEGS_LEN=L`, default 512): N sequences each get
+/// their own L-token slice of the prompt; ABBA of N separate prefills vs one
+/// `prefill_segs` pass. Prints wall times and the merged-vs-separate last-row
+/// logit gap per segment (the exactness check).
+fn segs_test(sess: &mut breccia_engine::Session<'_>, prompt: &[u32], n: usize) -> Result<()> {
+    let l: usize = std::env::var("BRECCIA_SEGS_LEN").ok().and_then(|v| v.parse().ok()).unwrap_or(512);
+    anyhow::ensure!(n >= 1 && n * l <= prompt.len(), "{n} x {l} tokens needs a longer prompt ({})", prompt.len());
+    while sess.n_seqs() < n {
+        sess.add_seq()?;
+    }
+    // BRECCIA_SEGS_MIX=k: serve-shaped pass instead. Seqs 0..k hold their slice minus
+    // its last token, then send that 1-token tail at pos > 0; the rest are fresh
+    // prompts of unequal lengths (l - 37 i). Merged pass vs the same segments one by one.
+    if let Some(k) = std::env::var("BRECCIA_SEGS_MIX").ok().and_then(|v| v.parse::<usize>().ok()) {
+        let segs: Vec<&[u32]> = (0..n).map(|i| &prompt[i * l..i * l + l - 37 * i]).collect();
+        let run = |sess: &mut breccia_engine::Session<'_>, merge: bool| -> Result<Vec<Vec<f32>>> {
+            for i in 0..n {
+                sess.use_seq(i)?;
+                sess.reset()?;
+                if i < k {
+                    sess.prefill(&segs[i][..segs[i].len() - 1], 0)?;
+                }
+            }
+            let args: Vec<(usize, &[u32], usize)> = segs
+                .iter()
+                .enumerate()
+                .map(|(i, s)| if i < k { (i, &s[s.len() - 1..], s.len() - 1) } else { (i, *s, 0) })
+                .collect();
+            let out = if merge {
+                sess.prefill_segs(&args)?
+            } else {
+                let mut o = Vec::new();
+                for &(i, t, p) in &args {
+                    sess.use_seq(i)?;
+                    o.push(sess.prefill(t, p)?);
+                }
+                o
+            };
+            sess.use_seq(0)?;
+            // serve-shaped decode after the pass: 8 batched greedy steps over all seqs
+            let top = |v: &[f32]| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).map_or(0, |p| p.0 as u32);
+            let mut cur: Vec<u32> = out.iter().map(|l| top(l)).collect();
+            let mut gen: Vec<Vec<u32>> = cur.iter().map(|&t| vec![t]).collect();
+            for _ in 0..8 {
+                let rows: Vec<(usize, u32)> = cur.iter().copied().enumerate().collect();
+                cur = sess.step_seqs(&rows)?;
+                for (g, &t) in gen.iter_mut().zip(&cur) {
+                    g.push(t);
+                }
+            }
+            sess.use_seq(0)?;
+            println!("  gen {}: {gen:?}", if merge { "merged" } else { "sep" });
+            Ok(out)
+        };
+        let la = run(sess, false)?;
+        let lb = run(sess, true)?;
+        let la2 = run(sess, false)?;
+        let gap = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+        let top = |v: &[f32]| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).map(|p| p.0);
+        println!("segs mix N={n} tails={k} L={l}");
+        for i in 0..n {
+            println!(
+                "  seg {i} ({}): max |dlogit| merged {:.3e} · repeat {:.3e} · top-1 sep {:?} merged {:?}",
+                if i < k { "tail" } else { "full" }, gap(&la[i], &lb[i]), gap(&la[i], &la2[i]), top(&la[i]), top(&lb[i])
+            );
+        }
+        return Ok(());
+    }
+    let segs: Vec<&[u32]> = (0..n).map(|i| &prompt[i * l..(i + 1) * l]).collect();
+    let fresh = |sess: &mut breccia_engine::Session<'_>| -> Result<()> {
+        for i in 0..n {
+            sess.use_seq(i)?;
+            sess.reset()?;
+        }
+        sess.use_seq(0)
+    };
+    let sep = |sess: &mut breccia_engine::Session<'_>| -> Result<(f64, Vec<Vec<f32>>)> {
+        fresh(sess)?;
+        let t0 = std::time::Instant::now();
+        let mut out = Vec::new();
+        for (i, s) in segs.iter().enumerate() {
+            sess.use_seq(i)?;
+            out.push(sess.prefill(s, 0)?);
+        }
+        sess.use_seq(0)?;
+        Ok((t0.elapsed().as_secs_f64(), out))
+    };
+    let merged = |sess: &mut breccia_engine::Session<'_>| -> Result<(f64, Vec<Vec<f32>>)> {
+        fresh(sess)?;
+        let t0 = std::time::Instant::now();
+        let args: Vec<(usize, &[u32], usize)> = segs.iter().enumerate().map(|(i, s)| (i, *s, 0)).collect();
+        let out = sess.prefill_segs(&args)?;
+        Ok((t0.elapsed().as_secs_f64(), out))
+    };
+    // Noise floor: the same math in a different batch composition (each prompt in two chunks).
+    let halves = |sess: &mut breccia_engine::Session<'_>| -> Result<Vec<Vec<f32>>> {
+        fresh(sess)?;
+        let mut out = Vec::new();
+        for (i, s) in segs.iter().enumerate() {
+            sess.use_seq(i)?;
+            sess.prefill(&s[..l / 2], 0)?;
+            out.push(sess.prefill(&s[l / 2..], l / 2)?);
+        }
+        sess.use_seq(0)?;
+        Ok(out)
+    };
+    sep(sess).context("the warm pass")?;
+    let (a1, la) = sep(sess)?;
+    let (b1, lb) = merged(sess)?;
+    let (b2, _) = merged(sess)?;
+    let (a2, la2) = sep(sess)?;
+    let lh = halves(sess)?;
+    println!("segs N={n} L={l}: separate {a1:.3} / {a2:.3} s · merged {b1:.3} / {b2:.3} s");
+    let gap = |x: &[f32], y: &[f32]| x.iter().zip(y).map(|(p, q)| (p - q).abs()).fold(0.0f32, f32::max);
+    let top = |v: &[f32]| v.iter().enumerate().max_by(|p, q| p.1.total_cmp(q.1)).map(|p| p.0);
+    for i in 0..n {
+        println!(
+            "  seg {i}: max |dlogit| merged {:.3e} · halves {:.3e} · repeat {:.3e} · top-1 sep {:?} merged {:?} halves {:?}",
+            gap(&la[i], &lb[i]), gap(&la[i], &lh[i]), gap(&la[i], &la2[i]), top(&la[i]), top(&lb[i]), top(&lh[i])
+        );
+    }
+    Ok(())
+}
+
 /// `BRECCIA_PREFILL_ONLY=1`: one warm prompt pass, then `--runs` measured passes;
 /// prints prefill seconds, the GPU stage table per prompt token (with
 /// `BRECCIA_GPU_TIME=1`) and, with `--dump-logits PATH`, writes the last pass's
@@ -4634,6 +4769,9 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         top_k: 0,
         seed: 0x9e37_79b9_7f4a_7c15,
     };
+    if let Some(n) = std::env::var("BRECCIA_SEGS_TEST").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return segs_test(&mut sess, &prompt, n);
+    }
     if std::env::var_os("BRECCIA_PREFILL_ONLY").is_some() {
         return prefill_only(&a, &mut sess, &prompt);
     }
@@ -5709,14 +5847,45 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
             self.feeds[slot] = Some((f, key));
             return Ok(None);
         }
-        let tok = self.sess.feed_sample(&f).map_err(|e| e.to_string())?;
-        if let Some(st) = f.saved.take() {
-            let now = std::time::Instant::now();
-            println!("prefix   {} cells kept ({} MiB)", st.cells, st.bytes() >> 20);
-            self.text_prefixes.push((key, now, TextPrefix::Plain(st)));
-            prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+        self.feed_done(f, key)
+    }
+    fn feed_many(&mut self, slots: &[usize], others: bool) -> Vec<Result<Option<u32>, String>> {
+        // option 4: several prompts' next chunks through one pass (`BRECCIA_SERVE_MERGE=0` off);
+        // paused chunks (FEED_BLOCKS) keep the one-slot path
+        let merge = slots.len() > 1
+            && std::env::var("BRECCIA_SERVE_MERGE").map_or(true, |v| v != "0")
+            && !(others && std::env::var("BRECCIA_SERVE_FEED_BLOCKS").is_ok_and(|v| v.parse::<usize>().unwrap_or(0) > 0))
+            && self.sess.prefill_chunk > 0
+            && slots.iter().all(|&s| self.feeds[s].as_ref().is_some_and(|(f, _)| !f.paused()));
+        if !merge {
+            let mut r = vec![self.feed(slots[0], others)];
+            r.resize_with(slots.len(), || Ok(None));
+            return r;
         }
-        Ok(Some(tok))
+        let max = if others { std::env::var("BRECCIA_SERVE_FEED_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
+        let mut taken: Vec<_> = slots.iter().map(|&s| self.feeds[s].take().expect("a feeding slot")).collect();
+        let mut refs: Vec<(usize, &mut breccia_engine::PromptFeed)> = slots.iter().copied().zip(taken.iter_mut().map(|t| &mut t.0)).collect();
+        let done = match self.sess.feed_steps(&mut refs, max) {
+            Ok(d) => d,
+            Err(e) => {
+                let e = format!("{e:#}");
+                for (&s, t) in slots.iter().zip(taken) {
+                    self.feeds[s] = Some(t);
+                }
+                return slots.iter().map(|_| Err(e.clone())).collect();
+            }
+        };
+        let mut out = Vec::with_capacity(slots.len());
+        for ((&s, (f, key)), d) in slots.iter().zip(taken).zip(done) {
+            if !d {
+                self.feeds[s] = Some((f, key));
+                out.push(Ok(None));
+                continue;
+            }
+            // feed_sample uses the active sequence's sampler
+            out.push(self.sess.use_seq(s).map_err(|e| e.to_string()).and_then(|_| self.feed_done(f, key)));
+        }
+        out
     }
     fn admit(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
         let Some(n) = self.reserve(slot, prompt.len(), max_tokens)? else {
@@ -5744,6 +5913,17 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
 }
 
 impl EngineBackend<'_, '_> {
+    /// A prompt pass is in: its first token, and keep its saved text prefix.
+    fn feed_done(&mut self, mut f: breccia_engine::PromptFeed, key: Vec<u32>) -> Result<Option<u32>, String> {
+        let tok = self.sess.feed_sample(&f).map_err(|e| e.to_string())?;
+        if let Some(st) = f.saved.take() {
+            let now = std::time::Instant::now();
+            println!("prefix   {} cells kept ({} MiB)", st.cells, st.bytes() >> 20);
+            self.text_prefixes.push((key, now, TextPrefix::Plain(st)));
+            prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+        }
+        Ok(Some(tok))
+    }
     /// Hold slot `slot`'s KV pool pages and make it the active sequence; the tokens
     /// allowed, or `None` when the pool cannot hold it beside the running slots yet.
     fn reserve(&mut self, slot: usize, prompt_len: usize, max_tokens: usize) -> Result<Option<usize>, String> {
