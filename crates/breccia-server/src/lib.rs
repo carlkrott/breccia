@@ -238,6 +238,8 @@ struct Live {
     /// When the last token came, and the worst wait between two (the stall a long admit causes).
     last: std::time::Instant,
     gap: f64,
+    /// When the first token came (prompt pass done).
+    first: std::time::Instant,
 }
 
 /// Several sequence slots: connection threads read requests and answer `/health` and
@@ -309,7 +311,7 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             match b.admit_start(slot, &p.prompt, p.max_tokens) {
                 // a slot still feeding its prompt holds no ids: it joins the steps once fed
                 Ok(Some((tok, allowed))) => {
-                    live[slot] = Some(Live { reply: q.reply, p, ids: tok.into_iter().collect(), allowed, t0: std::time::Instant::now(), last: std::time::Instant::now(), gap: 0.0 });
+                    live[slot] = Some(Live { reply: q.reply, p, ids: tok.into_iter().collect(), allowed, t0: std::time::Instant::now(), last: std::time::Instant::now(), gap: 0.0, first: std::time::Instant::now() });
                 }
                 Ok(None) => {
                     q.p = Some(p);
@@ -338,6 +340,7 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
                     let l = live[s].as_mut().expect("a live slot");
                     l.ids.push(tok);
                     l.last = std::time::Instant::now();
+                    l.first = l.last;
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -392,7 +395,9 @@ fn retire<B: Backend>(live: &mut [Option<Live>], b: &mut B, ctx: usize) {
         if let Some(l) = slot.take_if(|_| done) {
             b.release(s);
             let secs = l.t0.elapsed().as_secs_f64();
-            eprintln!("breccia-server: slot {s} done: {} tokens in {secs:.2} s, worst token gap {:.0} ms", l.ids.len(), l.gap * 1e3);
+            let ttft = (l.first - l.t0).as_secs_f64();
+            let dec = l.ids.len().saturating_sub(1) as f64 / l.first.elapsed().as_secs_f64().max(1e-9);
+            eprintln!("breccia-server: slot {s} done: {} tokens in {secs:.2} s, worst token gap {:.0} ms, first token {ttft:.2} s, decode {dec:.1} tok/s", l.ids.len(), l.gap * 1e3);
             let _ = l.reply.send(finish(b, &l.p, l.ids, secs));
         }
     }
