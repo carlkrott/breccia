@@ -776,6 +776,9 @@ pub struct Session<'m> {
     /// Batched decode ([`Session::decode_seqs`]): chunk row `i` is sequence
     /// `rows_seq[i].0` at cell `rows_seq[i].1`. Empty outside that call.
     rows_seq: Vec<(usize, usize)>,
+    /// Residual slots `0..pf_hold` hold a prompt chunk paused between blocks
+    /// ([`Session::feed_step`] with `groups`); batched decode runs on the slots after them.
+    pf_hold: usize,
     /// Batched decode's one-GEMM head scratch on the head device: (rows, hc ws, logits).
     rows_head: Option<(usize, HcWorkspace, Buf)>,
     active_seq: usize,
@@ -1437,6 +1440,7 @@ impl<'m> Session<'m> {
             kv_pages: Vec::new(),
             seqs: Vec::new(),
             rows_seq: Vec::new(),
+            pf_hold: 0,
             rows_head: None,
             active_seq: 0,
             seq_ctx: ctx_capacity,
@@ -2591,7 +2595,18 @@ impl<'m> Session<'m> {
         let (pos_was, tok_was) = (self.pos, self.cur_tok); // prefill_rows overwrites the active pos
                                                            // pos0 0: row i's mixer reads its own cell from `rows_seq`, and the
                                                            // per-token prelude addresses `pf.out` row `pos - pos0 = i`.
+        let hold = self.pf_hold;
+        let fits = self.venues.iter().all(|v| v.r_slots.is_empty() || v.r_slots.len() >= hold + ids.len());
+        anyhow::ensure!(fits, "a paused prompt chunk holds {hold} residual slots: no room for {} rows", ids.len());
+        self.venues.iter_mut().for_each(|v| {
+            let n = hold.min(v.r_slots.len());
+            v.r_slots.rotate_left(n)
+        });
         let r = self.prefill_rows(&ids, 0, true);
+        self.venues.iter_mut().for_each(|v| {
+            let n = hold.min(v.r_slots.len());
+            v.r_slots.rotate_right(n)
+        });
         let rows = std::mem::take(&mut self.rows_seq);
         (self.pos, self.cur_tok) = (pos_was, tok_was);
         let logits = r?;
@@ -3394,9 +3409,8 @@ impl<'m> Session<'m> {
             .expect("the head ran on at least one row"))
     }
 
-    /// [`Self::prefill`], with the head on every row when `all_rows` (one logits
-    /// vector per token) instead of the last one only.
-    fn prefill_rows(&mut self, toks: &[u32], pos0: usize, all_rows: bool) -> Result<Vec<Vec<f32>>> {
+    /// [`Self::prefill_rows`]'s chunk checks and per-chunk VRAM fit.
+    fn pf_check(&mut self, toks: &[u32], pos0: usize) -> Result<()> {
         let t = toks.len();
         if t == 0 {
             bail!("an empty prefill chunk");
@@ -3421,15 +3435,17 @@ impl<'m> Session<'m> {
         }
         self.vram_watch()?;
         self.ship_fit(t)?;
+        Ok(())
+    }
+
+    /// Embed a chunk into its per-token residual slots (`r_slots[0..t]` on block 0's card).
+    fn pf_embed(&mut self, toks: &[u32], pos0: usize) -> Result<()> {
+        let t = toks.len();
+        let m = self.model;
+        let mc = &m.cfg;
         let dev = m.device_of(0);
         let gpu = m.devices[dev].gpu();
         let hc_dim = mc.hc_dim();
-        let wall0 = std::time::Instant::now();
-        let subs0 = self.submits;
-        // Every queue submission, not just the batch ring's: the staging
-        // readbacks and the one-shot uploads are what PLE batching removes, and a
-        // batch-level counter cannot see them (§8aj).
-        let q0 = breccia_vk::ctx::submits();
         self.pf_toks.clear();
         self.pf_toks.extend_from_slice(toks);
         self.pf_tokens += t;
@@ -3489,6 +3505,47 @@ impl<'m> Session<'m> {
         self.submit_batch()?;
         self.flush()?;
         self.timers.mark(PLE);
+        Ok(())
+    }
+
+    /// Blocks `b0..b1` of an embedded chunk, per block (no micro-batch pipeline),
+    /// with the slot hand-off where the card changes; drained on return, so the
+    /// chunk can pause here with its state in `r_slots[0..t]` only.
+    fn pf_blocks(&mut self, t: usize, pos0: usize, b0: usize, b1: usize) -> Result<()> {
+        let m = self.model;
+        for b in b0..b1 {
+            if b > 0 && m.device_of(b - 1) != m.device_of(b) {
+                self.handoff_slots(m.device_of(b - 1), m.device_of(b), t)?;
+            }
+            self.prefill_block(b, t, pos0)?;
+        }
+        self.flush()
+    }
+
+    /// The head on a finished chunk's last row (the per-row head of [`Self::prefill_rows`]).
+    fn pf_head_last(&mut self, t: usize) -> Result<Vec<f32>> {
+        let last = self.model.device_of(self.model.cfg.n_layers - 1);
+        self.swap_r_in(last, t - 1);
+        let r = self.submit_head().and_then(|_| self.finish_head());
+        self.swap_r_in(last, t - 1);
+        self.timers.stop();
+        r
+    }
+
+    /// [`Self::prefill`], with the head on every row when `all_rows` (one logits
+    /// vector per token) instead of the last one only.
+    fn prefill_rows(&mut self, toks: &[u32], pos0: usize, all_rows: bool) -> Result<Vec<Vec<f32>>> {
+        let t = toks.len();
+        self.pf_check(toks, pos0)?;
+        let m = self.model;
+        let mc = &m.cfg;
+        let wall0 = std::time::Instant::now();
+        let subs0 = self.submits;
+        // Every queue submission, not just the batch ring's: the staging
+        // readbacks and the one-shot uploads are what PLE batching removes, and a
+        // batch-level counter cannot see them (§8aj).
+        let q0 = breccia_vk::ctx::submits();
+        self.pf_embed(toks, pos0)?;
 
         let micro_blocked = if pf_micro() && self.rows_seq.is_empty() {
             self.micro_blocker(t, pos0)
@@ -3508,12 +3565,7 @@ impl<'m> Session<'m> {
         if micro_blocked.is_none() {
             self.prefill_micro(t, pos0)?;
         } else {
-            for b in 0..mc.n_layers {
-                if b > 0 && m.device_of(b - 1) != m.device_of(b) {
-                    self.handoff_slots(m.device_of(b - 1), m.device_of(b), t)?;
-                }
-                self.prefill_block(b, t, pos0)?;
-            }
+            self.pf_blocks(t, pos0, 0, mc.n_layers)?;
         }
         // `BRECCIA_TRACE_PREFILL=1`: the chunk's own stage split, ms per prompt
         // token, so "the dense chain" and "the expert lane" are numbers and not
@@ -6843,12 +6895,16 @@ impl<'m> Session<'m> {
                 // first, so a prompt switches once (one flush), and the arena reserve
                 // (`prefill_scratch_bytes`) only counts one. Keeping two spilled the
                 // second past the RX floor at 2x100k. Drain the GPU, then drop it.
-                if !self.hc_chunk_ws[dev].is_empty() {
+                // Decode-row sizes (a few rows, ~78 KiB/row) stay beside it, so a chunk
+                // paused for batched decode keeps its workspace (`feed_step` groups).
+                let big = |n: usize| n > 64;
+                let old = self.hc_chunk_ws[dev].iter().position(|w| big(w.tokens)).filter(|_| big(t));
+                if let Some(i) = old {
                     batch_cmd::record_barrier_to_host(gpu)?;
                     self.submit_batch()?;
                     self.flush()?;
                     self.ensure_batch(dev)?;
-                    let old = self.hc_chunk_ws[dev].remove(0);
+                    let old = self.hc_chunk_ws[dev].remove(i);
                     self.venues[dev].hc.release(gpu, old);
                 }
                 let ws = self.venues[dev].hc.workspace(gpu, t)?;
@@ -7593,7 +7649,7 @@ impl<'m> Session<'m> {
         prefix: Prefix<'_>,
     ) -> Result<(Generation, Option<PrefixState>)> {
         let mut feed = self.feed_start(prompt, prefix)?;
-        while !self.feed_step(&mut feed, 0)? {}
+        while !self.feed_step(&mut feed, 0, 0)? {}
         let PromptFeed { mut pos, mut logits, saved, .. } = feed;
         let mut trace = debug;
         // The prompt is not part of the decode measurement.
@@ -7736,14 +7792,22 @@ impl<'m> Session<'m> {
             // unchunked: one token per step
             chunks.extend(std::iter::repeat((1, false)).take(prompt.len()));
         }
-        Ok(PromptFeed { prompt: prompt.to_vec(), pos, chunks, cut, logits: Vec::new(), saved: None })
+        Ok(PromptFeed { prompt: prompt.to_vec(), pos, chunks, cut, logits: Vec::new(), saved: None, part: None })
     }
 
     /// Run the next chunk of `f` on the active sequence; true once the prompt is in
     /// (`f.logits` then holds the last cell's logits, `f.saved` the prefix if asked).
     /// `max` > 0 caps this chunk (the rest stays queued, keeping its prefix save), so
     /// live slots wait less per step.
-    pub fn feed_step(&mut self, f: &mut PromptFeed, max: usize) -> Result<bool> {
+    ///
+    /// `groups` > 0 runs at most that many blocks per call (option 1, block-group
+    /// pause): the chunk's state waits in its residual slots and batched decode
+    /// runs on the slots after them ([`Self::decode_seqs`]). Exact: the same
+    /// blocks run on the same rows, only drained in between.
+    pub fn feed_step(&mut self, f: &mut PromptFeed, max: usize, groups: usize) -> Result<bool> {
+        if let Some((len, save, b0)) = f.part {
+            return self.feed_part(f, len, save, b0, groups);
+        }
         let Some((mut len, mut save)) = f.chunks.pop_front() else {
             return Ok(true);
         };
@@ -7752,6 +7816,16 @@ impl<'m> Session<'m> {
             (len, save) = (max, false);
         }
         let pos = f.pos;
+        // room for every sequence's decode row beside the paused chunk
+        let room = self.venues[self.model.device_of(0)].r_slots.len() >= len + self.n_seqs().max(1);
+        if groups > 0 && groups < self.model.cfg.n_layers && self.prefill_chunk > 0 && self.image.is_empty() && room {
+            let toks = &f.prompt[pos..pos + len];
+            self.pf_check(toks, pos)?;
+            self.flush()?;
+            self.timers.start();
+            self.pf_embed(toks, pos)?;
+            return self.feed_part(f, len, save, 0, groups);
+        }
         let t = std::time::Instant::now();
         f.logits = if self.prefill_chunk > 0 {
             self.prefill(&f.prompt[pos..pos + len], pos)?
@@ -7768,9 +7842,45 @@ impl<'m> Session<'m> {
         Ok(f.chunks.is_empty())
     }
 
+    /// Blocks `b0..b0 + groups` of the paused chunk at `f.pos`; the head and the
+    /// bookkeeping once the last block ran.
+    fn feed_part(&mut self, f: &mut PromptFeed, len: usize, save: bool, b0: usize, groups: usize) -> Result<bool> {
+        let n = self.model.cfg.n_layers;
+        let b1 = if groups == 0 { n } else { (b0 + groups).min(n) };
+        let pos = f.pos;
+        // decode rows in between overwrote it (the PLE prelude reads it per row)
+        self.pf_toks.clear();
+        self.pf_toks.extend_from_slice(&f.prompt[pos..pos + len]);
+        self.pos = pos + len - 1;
+        let t = std::time::Instant::now();
+        f.part = None;
+        self.pf_hold = 0;
+        self.pf_blocks(len, pos, b0, b1)?;
+        if std::env::var_os("BRECCIA_FEED_TRACE").is_some() {
+            eprintln!("feed     chunk {pos}+{len} blocks {b0}..{b1} in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+        if b1 < n {
+            (f.part, self.pf_hold) = (Some((len, save, b1)), len);
+            return Ok(false);
+        }
+        f.logits = self.pf_head_last(len)?;
+        f.pos += len;
+        if save {
+            f.saved = Some(self.save_prefix(f.cut)?);
+        }
+        Ok(f.chunks.is_empty())
+    }
+
+    /// Drop a paused chunk's hold on the residual slots (its slot was released).
+    pub fn feed_abort(&mut self, f: &PromptFeed) {
+        if f.part.is_some() {
+            self.pf_hold = 0;
+        }
+    }
+
     /// Sample the first token after a finished [`PromptFeed`] (the active sequence's sampler).
     pub fn feed_sample(&mut self, f: &PromptFeed) -> Result<u32> {
-        anyhow::ensure!(f.chunks.is_empty() && !f.logits.is_empty(), "the prompt pass is not done");
+        anyhow::ensure!(f.chunks.is_empty() && f.part.is_none() && !f.logits.is_empty(), "the prompt pass is not done");
         self.sampler.sample(&f.logits, &self.sampling).ok_or_else(|| anyhow!("the sampler produced no token"))
     }
 }
@@ -7965,6 +8075,8 @@ pub struct PromptFeed {
     cut: usize,
     pub logits: Vec<f32>,
     pub saved: Option<PrefixState>,
+    /// A chunk paused between blocks: `(length, save after it, next block)`.
+    part: Option<(usize, bool, usize)>,
 }
 
 /// The sequence state after a prompt's first `cells` cells, in host RAM.

@@ -5703,7 +5703,9 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         self.sess.use_seq(slot).map_err(|e| e.to_string())?;
         // `BRECCIA_SERVE_FEED_CHUNK=n`: cap a chunk at n tokens while other slots decode
         let max = if others { std::env::var("BRECCIA_SERVE_FEED_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
-        if !self.sess.feed_step(&mut f, max).map_err(|e| format!("{e:#}"))? {
+        // `BRECCIA_SERVE_FEED_BLOCKS=n`: while other slots decode, pause a chunk every n blocks
+        let groups = if others { std::env::var("BRECCIA_SERVE_FEED_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
+        if !self.sess.feed_step(&mut f, max, groups).map_err(|e| format!("{e:#}"))? {
             self.feeds[slot] = Some((f, key));
             return Ok(None);
         }
@@ -5729,7 +5731,9 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
     fn release(&mut self, slot: usize) {
         self.reserved[slot] = 0;
-        self.feeds[slot] = None;
+        if let Some((f, _)) = self.feeds[slot].take() {
+            self.sess.feed_abort(&f);
+        }
         if let Err(e) = self.sess.use_seq(slot).and_then(|_| self.sess.reset()) {
             eprintln!("breccia-server: releasing slot {slot}: {e:#}");
         }
