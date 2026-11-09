@@ -89,6 +89,9 @@ pub struct ArenaOpts {
     /// Sessions whose KV/recurrent state each device must also hold (allocated
     /// after the arena, so it is reserved here): one, or the streams on a card.
     pub sessions: usize,
+    /// The part of both reserves that is chunk scratch (`with_prefill_chunk`). A device
+    /// that owns no layers allocates none (`Session::new`), so the budget gives it back.
+    pub prefill_scratch: u64,
 }
 
 /// VRAM the chunked prefill scratch needs for a `tokens`-row chunk (merged-pass
@@ -131,6 +134,7 @@ impl ArenaOpts {
         ArenaOpts {
             display_reserve: self.display_reserve + extra,
             headroom: self.headroom + extra,
+            prefill_scratch: self.prefill_scratch + extra,
             ..self
         }
     }
@@ -142,6 +146,7 @@ impl Default for ArenaOpts {
             display_reserve: 768 << 20,
             headroom: 256 << 20,
             sessions: 1,
+            prefill_scratch: 0,
         }
     }
 }

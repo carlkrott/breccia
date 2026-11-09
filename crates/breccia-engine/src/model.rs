@@ -805,7 +805,8 @@ impl Model {
                         )
                     })
                     .collect();
-                let budgets = probe_budgets(&devices, *aopts, &state, opts.verbose)?;
+                let owns: Vec<bool> = (0..devices.len()).map(|i| placement.layer_device.contains(&i)).collect();
+                let budgets = probe_budgets(&devices, *aopts, &state, &owns, opts.verbose)?;
                 // The arena follows `placement.device_of(b)`: the measured tier
                 // decision lives in `Placement` (rate-weighted counts), so the arena
                 // device and the execution device cannot disagree. Overriding the
@@ -2073,6 +2074,7 @@ fn probe_budgets(
     devices: &[Device],
     opts: ArenaOpts,
     state: &[u64],
+    owns: &[bool],
     verbose: bool,
 ) -> Result<Vec<DeviceBudget>> {
     let mut out = Vec::with_capacity(devices.len());
@@ -2102,7 +2104,8 @@ fn probe_budgets(
             opts.display_reserve
         } else {
             opts.headroom
-        } + st;
+        } + st
+            - if owns.get(i).copied().unwrap_or(true) { 0 } else { opts.prefill_scratch };
         if verbose {
             eprintln!(
                 "breccia: arena: device {i} {} free {} MiB ({}) - {} {} MiB = {} MiB",

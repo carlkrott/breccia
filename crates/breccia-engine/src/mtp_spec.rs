@@ -186,6 +186,9 @@ pub struct SpecStats {
     pub verify_s: f64,
     /// Part of `verify_s` spent in `rollback_to` (the replay of the accepted rows).
     pub rollback_s: f64,
+    /// Stopped early for `Session::preempt`: the trunk holds every returned token but the
+    /// last, at `self.pos`, so plain decode continues by feeding the last one.
+    pub yielded: bool,
 }
 
 impl std::fmt::Display for SpecStats {
@@ -377,6 +380,10 @@ pub fn generate_prefix(
     while toks.len() - prompt.len() < n_gen {
         if let Some(i) = sess.stop_token.and_then(|s| toks[prompt.len()..].iter().position(|&t| t == s)) {
             toks.truncate(prompt.len() + i + 1);
+            break;
+        }
+        if sess.preempt.as_ref().is_some_and(|p| p.load(std::sync::atomic::Ordering::Relaxed)) {
+            st.yielded = true;
             break;
         }
         let n = toks.len() - 1; // positions 0..n are in the trunk; toks[n] is next to feed

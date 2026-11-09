@@ -19,7 +19,8 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 use serde_json::{json, Value};
 
@@ -74,17 +75,17 @@ pub trait Backend {
         Ok(self.admit(slot, prompt, max_tokens)?.map(|(t, n)| (Some(t), n)))
     }
     /// The next prompt chunk of slot `slot` (after `admit_start` gave `None`); the first
-    /// generated token once the prompt is in. `others` = other slots are decoding (a
-    /// backend may run a smaller chunk then).
-    fn feed(&mut self, slot: usize, others: bool) -> Result<Option<u32>, String> {
-        let _ = (slot, others);
+    /// generated token once the prompt is in. `decoding` = how many other slots are
+    /// decoding (a backend may run a smaller chunk then).
+    fn feed(&mut self, slot: usize, decoding: usize) -> Result<Option<u32>, String> {
+        let _ = (slot, decoding);
         Err("this backend has no chunked admission".into())
     }
     /// [`Self::feed`] for every slot still feeding (oldest first): a backend may put
     /// several prompts' chunks through one pass. One result per slot. Default: only
     /// the oldest slot gets a chunk.
-    fn feed_many(&mut self, slots: &[usize], others: bool) -> Vec<Result<Option<u32>, String>> {
-        let mut r = vec![self.feed(slots[0], others)];
+    fn feed_many(&mut self, slots: &[usize], decoding: usize) -> Vec<Result<Option<u32>, String>> {
+        let mut r = vec![self.feed(slots[0], decoding)];
         r.resize_with(slots.len(), || Ok(None));
         r
     }
@@ -92,6 +93,15 @@ pub trait Backend {
     fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
         let _ = rows;
         Err("this backend has no sequence slots".into())
+    }
+    /// Run a request alone on free slot `slot` (spec decode or images, nothing else live).
+    /// `waiting` turns true when another request arrives: a backend may then stop at a
+    /// token boundary and say `yielded`; the slot holds the prompt and every id but the
+    /// last, and continues in [`Self::step`]. Returns `(ids, tokens allowed, yielded)`;
+    /// the server releases a slot that did not yield.
+    fn complete_alone(&mut self, slot: usize, prompt: &[u32], max_tokens: usize, waiting: &Arc<AtomicBool>) -> Result<(Vec<u32>, usize, bool), String> {
+        let _ = (slot, waiting);
+        Ok((self.complete(prompt, max_tokens)?, max_tokens, false))
     }
     /// Slot `slot`'s request is done: free what it holds.
     fn release(&mut self, slot: usize) {
@@ -253,19 +263,21 @@ struct Live {
 /// Several sequence slots: connection threads read requests and answer `/health` and
 /// `/v1/models` themselves; the engine stays on this thread, admits completions into
 /// free slots and decodes every live slot in one step per token. A request that
-/// spec-decodes or carries images runs alone through `complete`, when no slot is live.
-/// shortcut: requests that arrive during a spec or image request wait for it to end
-/// (up to its max_tokens); upgrade to a lazy draft catch-up if that wait matters.
+/// spec-decodes or carries images runs alone through `complete_alone`, when no slot is
+/// live and nothing else is queued; a spec run hands over to batched decode as soon as
+/// another request arrives (`waiting`). shortcut: an image request still runs to its end.
 fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String> {
     let (tx, rx) = mpsc::channel::<Job>();
     let name = b.model_name();
+    let waiting = Arc::new(AtomicBool::new(false));
+    let arrived = waiting.clone();
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
-                    let (tx, name) = (tx.clone(), name.clone());
+                    let (tx, name, arrived) = (tx.clone(), name.clone(), arrived.clone());
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_conn(stream, &name, &tx) {
+                        if let Err(e) = handle_conn(stream, &name, &tx, &arrived) {
                             eprintln!("breccia-server: {e}");
                         }
                     });
@@ -313,7 +325,33 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             };
             let spec = b.spec_hint(p.mtp, p.code);
             if !busy && (q.image || spec) {
-                let _ = q.reply.send(run_alone(&mut b, &p));
+                // clear, then drain: a request sent after this load sets `waiting` again
+                waiting.store(false, Ordering::SeqCst);
+                for job in rx.try_iter() {
+                    if let Some(p) = intake(job, &mut b) {
+                        queue.push_back(p);
+                    }
+                }
+            }
+            // spec only with nothing else waiting; otherwise it joins the batch (plain decode)
+            if !busy && (q.image || (spec && queue.is_empty())) {
+                let t0 = std::time::Instant::now();
+                match b.complete_alone(slot, &p.prompt, p.max_tokens, &waiting) {
+                    Ok((ids, allowed, true)) => {
+                        let now = std::time::Instant::now();
+                        eprintln!("breccia-server: slot {slot}: spec run handed over after {} tokens ({:.2} s)", ids.len(), (now - t0).as_secs_f64());
+                        live[slot] = Some(Live { reply: q.reply, p, ids, allowed, t0, last: now, gap: 0.0, first: now });
+                    }
+                    Ok((ids, _, false)) => {
+                        b.release(slot);
+                        let _ = q.reply.send(finish(&mut b, &p, ids, t0.elapsed().as_secs_f64()));
+                    }
+                    Err(e) => {
+                        b.release(slot);
+                        eprintln!("breccia-server: request failed: {e}");
+                        let _ = q.reply.send(Response::json(500, json!({"error": {"message": e}})));
+                    }
+                }
                 continue;
             }
             match b.admit_start(slot, &p.prompt, p.max_tokens) {
@@ -342,8 +380,8 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             .collect();
         feeding.sort();
         let feeding: Vec<usize> = feeding.into_iter().map(|x| x.1).collect();
-        let others = live.iter().any(|l| l.as_ref().is_some_and(|l| !l.ids.is_empty()));
-        let fed = if feeding.is_empty() { Vec::new() } else { b.feed_many(&feeding, others) };
+        let decoding = live.iter().filter(|l| l.as_ref().is_some_and(|l| !l.ids.is_empty())).count();
+        let fed = if feeding.is_empty() { Vec::new() } else { b.feed_many(&feeding, decoding) };
         for (s, r) in feeding.into_iter().zip(fed) {
             match r {
                 Ok(Some(tok)) => {
@@ -443,7 +481,7 @@ fn intake<B: Backend>(job: Job, b: &mut B) -> Option<Pending> {
     }
 }
 
-fn handle_conn(mut stream: TcpStream, name: &str, tx: &mpsc::Sender<Job>) -> Result<(), String> {
+fn handle_conn(mut stream: TcpStream, name: &str, tx: &mpsc::Sender<Job>, arrived: &AtomicBool) -> Result<(), String> {
     let Some((method, path, body)) = read_request(&mut stream)? else {
         return Ok(());
     };
@@ -451,6 +489,9 @@ fn handle_conn(mut stream: TcpStream, name: &str, tx: &mpsc::Sender<Job>) -> Res
         Some(r) => r,
         None => {
             let (reply, done) = mpsc::channel();
+            if method == "POST" && path.contains("completions") {
+                arrived.store(true, Ordering::SeqCst); // a running spec request hands over
+            }
             tx.send(Job { method, path, body, reply }).map_err(|_| "the engine thread is gone")?;
             done.recv().map_err(|_| "the engine dropped the request")?
         }

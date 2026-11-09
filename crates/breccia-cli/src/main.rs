@@ -5580,6 +5580,8 @@ struct EngineBackend<'a, 'm> {
     reserved: Vec<usize>,
     /// a slot's prompt pass in progress (`admit_start`), with the text prefix key to save under
     feeds: Vec<Option<(breccia_engine::PromptFeed, Vec<u32>)>>,
+    /// the last spec run stopped early for `Session::preempt` (`complete_alone`)
+    yielded: bool,
 }
 
 /// A saved text prompt state: plain, or with the MTP draft's state when spec decode is on.
@@ -5679,6 +5681,7 @@ impl EngineBackend<'_, '_> {
             let (toks, st, saved) =
                 generate_prefix(self.sess, Some(d), prompt, chunk, n, Policy::Gate, acc, resume, s0).map_err(|e| e.to_string())?;
             println!("mtp      {st}");
+            self.yielded = st.yielded;
             (toks, saved.map(TextPrefix::Spec))
         } else {
             let p = match hit {
@@ -5836,33 +5839,32 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         self.feeds[slot] = Some((f, prompt[..cut].to_vec()));
         Ok(Some((None, n)))
     }
-    fn feed(&mut self, slot: usize, others: bool) -> Result<Option<u32>, String> {
+    fn feed(&mut self, slot: usize, decoding: usize) -> Result<Option<u32>, String> {
         let (mut f, key) = self.feeds[slot].take().ok_or("no prompt pass on this slot")?;
         self.sess.use_seq(slot).map_err(|e| e.to_string())?;
-        // `BRECCIA_SERVE_FEED_CHUNK=n`: cap a chunk at n tokens while other slots decode
-        let max = if others { std::env::var("BRECCIA_SERVE_FEED_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
-        // `BRECCIA_SERVE_FEED_BLOCKS=n`: while other slots decode, pause a chunk every n blocks
-        let groups = if others { std::env::var("BRECCIA_SERVE_FEED_BLOCKS").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
+        // cap a chunk at n tokens / pause it every n blocks while other slots decode
+        let max = feed_knob("BRECCIA_SERVE_FEED_CHUNK", decoding, SERVE_FEED_CHUNK);
+        let groups = feed_knob("BRECCIA_SERVE_FEED_BLOCKS", decoding, "");
         if !self.sess.feed_step(&mut f, max, groups).map_err(|e| format!("{e:#}"))? {
             self.feeds[slot] = Some((f, key));
             return Ok(None);
         }
         self.feed_done(f, key)
     }
-    fn feed_many(&mut self, slots: &[usize], others: bool) -> Vec<Result<Option<u32>, String>> {
+    fn feed_many(&mut self, slots: &[usize], decoding: usize) -> Vec<Result<Option<u32>, String>> {
         // option 4: several prompts' next chunks through one pass (`BRECCIA_SERVE_MERGE=0` off);
         // paused chunks (FEED_BLOCKS) keep the one-slot path
         let merge = slots.len() > 1
             && std::env::var("BRECCIA_SERVE_MERGE").map_or(true, |v| v != "0")
-            && !(others && std::env::var("BRECCIA_SERVE_FEED_BLOCKS").is_ok_and(|v| v.parse::<usize>().unwrap_or(0) > 0))
+            && feed_knob("BRECCIA_SERVE_FEED_BLOCKS", decoding, "") == 0
             && self.sess.can_merge()
             && slots.iter().all(|&s| self.feeds[s].as_ref().is_some_and(|(f, _)| !f.paused()));
         if !merge {
-            let mut r = vec![self.feed(slots[0], others)];
+            let mut r = vec![self.feed(slots[0], decoding)];
             r.resize_with(slots.len(), || Ok(None));
             return r;
         }
-        let max = if others { std::env::var("BRECCIA_SERVE_FEED_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
+        let max = feed_knob("BRECCIA_SERVE_FEED_CHUNK", decoding, SERVE_FEED_CHUNK);
         let mut taken: Vec<_> = slots.iter().map(|&s| self.feeds[s].take().expect("a feeding slot")).collect();
         let mut refs: Vec<(usize, &mut breccia_engine::PromptFeed)> = slots.iter().copied().zip(taken.iter_mut().map(|t| &mut t.0)).collect();
         let done = match self.sess.feed_steps(&mut refs, max) {
@@ -5897,6 +5899,17 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
     fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
         self.sess.step_seqs(rows).map_err(|e| format!("{e:#}"))
+    }
+    fn complete_alone(&mut self, slot: usize, prompt: &[u32], max_tokens: usize, waiting: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<(Vec<u32>, usize, bool), String> {
+        let spec = self.spec_now; // reserve() clears it
+        // nothing is live, so the pool has room unless this request alone is too big (Err)
+        let n = self.reserve(slot, prompt.len(), max_tokens)?.ok_or("the shared KV pool is full")?;
+        self.spec_now = spec;
+        self.yielded = false;
+        self.sess.preempt = Some(waiting.clone());
+        let r = self.complete(prompt, n);
+        self.sess.preempt = None;
+        Ok((r?, n, std::mem::take(&mut self.yielded)))
     }
     fn release(&mut self, slot: usize) {
         self.reserved[slot] = 0;
@@ -5947,6 +5960,40 @@ impl EngineBackend<'_, '_> {
         self.reserved[slot] = need;
         Ok(Some(n))
     }
+}
+
+/// Default prompt pass cap while anything decodes (see [`feed_knob`]; "0" = whole chunks).
+/// dyn3 11-09, 48/0+T2, 8 staggered requests: worst token gap 10.7-12.0 s -> 4.0 s at the
+/// same aggregate (18.7 vs 18.0-19.3 tok/s); 1024 = 2.7 s at -11 %, 512 = 2.1 s at -23 %.
+const SERVE_FEED_CHUNK: &str = "2048";
+
+/// A serve feed knob while `decoding` other slots stream (0 = no limit, and always 0 with
+/// none): env `var` (else `default`) is `n` from one decoder up, or `d:n,d:n,...` = the
+/// `n` of the largest `d <= decoding`.
+fn feed_knob(var: &str, decoding: usize, default: &str) -> usize {
+    let v = std::env::var(var).unwrap_or_else(|_| default.to_string());
+    if decoding == 0 {
+        return 0;
+    }
+    if let Ok(n) = v.trim().parse() {
+        return n;
+    }
+    v.split(',')
+        .filter_map(|e| e.split_once(':').and_then(|(d, n)| Some((d.trim().parse::<usize>().ok()?, n.trim().parse::<usize>().ok()?))))
+        .filter(|&(d, _)| d <= decoding)
+        .max_by_key(|e| e.0)
+        .map_or(0, |e| e.1)
+}
+
+#[cfg(test)]
+#[test]
+fn feed_knob_by_decoders() {
+    std::env::set_var("BRECCIA_TEST_KNOB", "2:2048, 6:512,4:1024");
+    let k = |d| feed_knob("BRECCIA_TEST_KNOB", d, "");
+    assert_eq!([k(0), k(1), k(2), k(3), k(5), k(8)], [0, 0, 2048, 2048, 1024, 512]);
+    std::env::set_var("BRECCIA_TEST_KNOB", "256");
+    assert_eq!([k(0), k(1)], [0, 256]);
+    assert_eq!(feed_knob("BRECCIA_TEST_KNOB_UNSET", 3, "1:9"), 9);
 }
 
 /// shortcut: one-stream RX-only is measured at 8k only (G1 11-07: 26.09 vs dual 25.32 tok/s);
@@ -6020,10 +6067,18 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
     // single-stream path). Spec decode then runs only when one request is live.
     let seqs = std::env::var("BRECCIA_SERVE_SEQS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
     anyhow::ensure!(seqs == 1 || a.prefill_chunk > 0, "BRECCIA_SERVE_SEQS > 1 needs chunked prefill");
+    // Slots share one KV page pool by default (half of them at full ctx, plus the sink page):
+    // short requests pack, and a growing set of streams queues in `reserve` instead of every
+    // slot holding a full ctx of K/V. BRECCIA_KV_POOL_CELLS overrides; =0 = a KV per slot.
+    if seqs > 1 && std::env::var_os("BRECCIA_KV_POOL_CELLS").is_none() {
+        let cells = a.ctx * seqs.div_ceil(2) + breccia_kernels::qsa::PAGE_CELLS;
+        std::env::set_var("BRECCIA_KV_POOL_CELLS", cells.to_string());
+    }
     let (spec_margin, draft_headroom): (u64, u64) = match (mtp, mtp_dev) {
         (false, _) => (0, 0),
-        // Measured 11-09: draft 1033 MiB + spec slots 648 MiB (48/0+T2, the worst seen) = 1681.
-        (true, 0) => (1792 << 20, 0),
+        // Measured 11-09: draft 1033 MiB + spec slots 113 MiB with the chunk scratch present
+        // (648 without it: a manual arena with no block, which serve's auto arena never is).
+        (true, 0) => (1280 << 20, 0),
         (true, _) => (1024 << 20, 1536 << 20),
     };
     let arena = if a.gpu_experts == "auto" {
@@ -6135,6 +6190,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         spec_now: false,
         reserved: vec![0; seqs],
         feeds: (0..seqs).map(|_| None).collect(),
+        yielded: false,
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))

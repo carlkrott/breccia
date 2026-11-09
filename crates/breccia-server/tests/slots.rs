@@ -131,7 +131,7 @@ impl Backend for Feeder {
         self.pending[slot] = prompt.len();
         Ok(Some((None, max_tokens)))
     }
-    fn feed(&mut self, slot: usize, _others: bool) -> Result<Option<u32>, String> {
+    fn feed(&mut self, slot: usize, _decoding: usize) -> Result<Option<u32>, String> {
         assert!(self.pending[slot] > 0, "fed a slot with its prompt in");
         self.pending[slot] -= 1;
         Ok((self.pending[slot] == 0).then_some(b'a' as u32 + 1))
@@ -164,4 +164,85 @@ fn a_long_prompt_feeds_between_the_live_slots_steps() {
     let v = a.join().unwrap();
     assert_eq!(v["choices"][0]["text"].as_str().unwrap().len(), 25);
     assert!(interleaved.load(Ordering::SeqCst) >= 10, "the live slot waited for the prompt");
+}
+
+/// A spec run alone (`complete_alone`) hands over to batched decode when a request arrives.
+struct Spec {
+    live: Vec<bool>,
+    yielded: Arc<AtomicUsize>,
+    widest: Arc<AtomicUsize>,
+}
+
+impl Backend for Spec {
+    fn model_name(&self) -> String {
+        "spec".into()
+    }
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
+        Ok(text.bytes().map(|b| b as u32 + 1).collect())
+    }
+    fn decode_text(&self, ids: &[u32]) -> String {
+        ids.iter().map(|&i| char::from_u32(i - 1).unwrap_or('?')).collect()
+    }
+    fn complete(&mut self, _prompt: &[u32], _max_tokens: usize) -> Result<Vec<u32>, String> {
+        Err("complete_alone only".into())
+    }
+    fn eos(&self) -> Option<u32> {
+        Some(b'z' as u32 + 1)
+    }
+    fn spec_hint(&mut self, explicit: Option<bool>, _code: bool) -> bool {
+        explicit.unwrap_or(false)
+    }
+    fn slots(&self) -> usize {
+        self.live.len()
+    }
+    fn complete_alone(&mut self, slot: usize, _prompt: &[u32], max_tokens: usize, waiting: &Arc<std::sync::atomic::AtomicBool>) -> Result<(Vec<u32>, usize, bool), String> {
+        assert!(self.live.iter().all(|l| !l), "a spec run started beside live slots");
+        let mut ids = vec![b'A' as u32 + 1];
+        while ids.len() < max_tokens {
+            if waiting.load(Ordering::SeqCst) {
+                self.live[slot] = true;
+                self.yielded.fetch_add(1, Ordering::SeqCst);
+                return Ok((ids, max_tokens, true));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ids.push(ids.last().unwrap() + 1);
+        }
+        Ok((ids, max_tokens, false))
+    }
+    fn admit(&mut self, slot: usize, _prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
+        assert!(!self.live[slot]);
+        self.live[slot] = true;
+        Ok(Some((b'a' as u32 + 1, max_tokens)))
+    }
+    fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
+        assert!(rows.iter().all(|&(s, _)| self.live[s]));
+        self.widest.fetch_max(rows.len(), Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        Ok(rows.iter().map(|&(_, t)| t + 1).collect())
+    }
+    fn release(&mut self, slot: usize) {
+        self.live[slot] = false;
+    }
+}
+
+#[test]
+fn a_spec_run_hands_over_when_a_request_arrives() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let (yielded, widest) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let b = Spec { live: vec![false; 2], yielded: yielded.clone(), widest: widest.clone() };
+    std::thread::spawn(move || serve(&format!("127.0.0.1:{port}"), b));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // alone to the end: the slot is released, the next spec run may start
+    let v = post(port, r#"{"prompt":"hi","max_tokens":4,"mtp":true}"#);
+    assert_eq!(v["choices"][0]["text"], "ABCD");
+    let a = std::thread::spawn(move || post(port, r#"{"prompt":"hi","max_tokens":40,"mtp":true}"#));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let v = post(port, r#"{"prompt":"hi","max_tokens":3}"#);
+    assert_eq!(v["choices"][0]["text"], "abc");
+    let v = a.join().unwrap();
+    let want: String = (b'A'..b'A' + 40).map(char::from).collect();
+    assert_eq!(v["choices"][0]["text"], want.as_str(), "the handed-over stream continued in order");
+    assert_eq!(yielded.load(Ordering::SeqCst), 1);
+    assert!(widest.load(Ordering::SeqCst) >= 2, "the two streams never stepped together");
 }

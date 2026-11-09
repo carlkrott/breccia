@@ -810,6 +810,9 @@ pub struct Session<'m> {
     /// Decode stops after emitting this token (serve sets it to the tokenizer EOS). `None`
     /// (the default) keeps every bench at exactly `n` tokens.
     pub stop_token: Option<u32>,
+    /// Spec decode (`mtp_spec::generate_prefix`) returns at the next token boundary once
+    /// this is set (serve: another request arrived), with `SpecStats::yielded`.
+    pub preempt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// `BRECCIA_DUMP_STATE` snapshots written so far (`dump_state`).
     dumps: usize,
     /// Device whose dispatch batch is currently open (`None` = none). At most
@@ -1233,7 +1236,11 @@ impl<'m> Session<'m> {
             // An `auto` arena reserved this scratch (`with_prefill_chunk`) even when no block
             // fit, and the merged pass streams host-lane blocks too, so 0 resident still gets it.
             let auto = model.arena.as_ref().is_some_and(|r| r.rule == "auto");
-            let pf = if chunk > 0 && cfg.prefill_merged && (auto || !model.placed.is_empty()) {
+            // A device with no layers (the 48/0 helper) never runs a chunk unless the opt-in
+            // `BRECCIA_PF_EXPERT_DEVICE` prototype names it; the arena gave its share back.
+            let owns = (0..mc.n_layers).any(|b| model.device_of(b) == i)
+                || std::env::var("BRECCIA_PF_EXPERT_DEVICE").ok().and_then(|v| v.parse::<usize>().ok()) == Some(i);
+            let pf = if chunk > 0 && cfg.prefill_merged && owns && (auto || !model.placed.is_empty()) {
                 let k = mc.n_expert_used;
                 let nb = mc.n_embd as u64 * 4;
                 let nfb = mc.n_ff as u64 * 4;
@@ -1474,6 +1481,7 @@ impl<'m> Session<'m> {
             dumps: 0,
             expert_bytes: 0,
             stop_token: None,
+            preempt: None,
             pending_batch: None,
             pending_seg: None,
             pending_dev: None,
@@ -8107,21 +8115,24 @@ impl<'m> Session<'m> {
     /// Option 4: the next chunk of several sequences' prompt passes in **one**
     /// merged pass ([`Self::prefill_segs`]), so the fixed expert pass is paid once.
     /// `feeds[i] = (seq, feed)`, oldest first; chunks are taken while their sum
-    /// fits the prefill chunk (`max` > 0 caps each). Returns each feed's "prompt
-    /// is in" flag; a feed that did not fit keeps its chunk for the next call.
+    /// fits the pass budget: the prefill chunk, or `max` when > 0 (serve's stall cap,
+    /// so it bounds the whole pass, not each chunk). The last chunk taken is cut to
+    /// fill the budget. Returns each feed's "prompt is in" flag; a feed that did not
+    /// fit keeps its (rest of the) chunk for the next call.
     /// Ends with sequence `feeds[0].0` active.
     pub fn feed_steps(&mut self, feeds: &mut [(usize, &mut PromptFeed)], max: usize) -> Result<Vec<bool>> {
         anyhow::ensure!(self.prefill_chunk > 0 && self.image.is_empty(), "merged prompt chunks need chunked text prefill");
         let mut take = Vec::new(); // (feed index, len, save)
         let mut sum = 0;
+        let budget = if max > 0 { max.min(self.prefill_chunk) } else { self.prefill_chunk };
         for (i, (_, f)) in feeds.iter().enumerate() {
             anyhow::ensure!(f.part.is_none(), "a paused chunk cannot merge");
             let Some(&(len, save)) = f.chunks.front() else { continue };
-            let cap = if max > 0 { max.min(self.prefill_chunk) } else { self.prefill_chunk };
-            let (len, save) = if len > cap { (cap, false) } else { (len, save) };
-            if sum + len > self.prefill_chunk {
+            let room = budget - sum;
+            if room == 0 {
                 break;
             }
+            let (len, save) = if len > room { (room, false) } else { (len, save) };
             sum += len;
             take.push((i, len, save));
         }
