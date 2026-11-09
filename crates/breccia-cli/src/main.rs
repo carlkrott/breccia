@@ -5998,6 +5998,9 @@ fn open_serve_draft<'m>(
     }
 }
 
+/// Serve's RX desktop margin (was 2560); BRECCIA_DISPLAY_RESERVE_MIB overrides it.
+const SERVE_DISPLAY_RESERVE_MIB: u64 = 768;
+
 fn serve_http(mut a: ServeArgs) -> Result<()> {
     a.devices = serve_devices(&a.devices, a.ctx);
     // MTP spec decode runs on one card or the dual split (replay verify, `Session::spec_enable`)
@@ -6019,14 +6022,17 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
     anyhow::ensure!(seqs == 1 || a.prefill_chunk > 0, "BRECCIA_SERVE_SEQS > 1 needs chunked prefill");
     let (spec_margin, draft_headroom): (u64, u64) = match (mtp, mtp_dev) {
         (false, _) => (0, 0),
-        (true, 0) => (2048 << 20, 0),
+        // Measured 11-09: draft 1033 MiB + spec slots 648 MiB (48/0+T2, the worst seen) = 1681.
+        (true, 0) => (1792 << 20, 0),
         (true, _) => (1024 << 20, 1536 << 20),
     };
     let arena = if a.gpu_experts == "auto" {
         let d = breccia_engine::ArenaOpts::default();
         breccia_engine::ArenaSpec::Auto(
             breccia_engine::ArenaOpts {
-                display_reserve: (2560 << 20) + spec_margin,
+                // The desktop renders on the iGPU and only scans out on the RX: idle RX use
+                // 848 MiB is already outside the measured free, so this is growth margin only.
+                display_reserve: (std::env::var("BRECCIA_DISPLAY_RESERVE_MIB").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(SERVE_DISPLAY_RESERVE_MIB) << 20) + spec_margin,
                 headroom: d.headroom + draft_headroom,
                 sessions: seqs,
                 ..d

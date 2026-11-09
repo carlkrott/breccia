@@ -1230,7 +1230,10 @@ impl<'m> Session<'m> {
             let moe_fanin = breccia_kernels::MoeFanIn::new(gpu)?;
             // The merged prefill pass's chunk scratch (§8v): only when the flag is
             // on, so a session that does not use it pays nothing.
-            let pf = if chunk > 0 && cfg.prefill_merged && !model.placed.is_empty() {
+            // An `auto` arena reserved this scratch (`with_prefill_chunk`) even when no block
+            // fit, and the merged pass streams host-lane blocks too, so 0 resident still gets it.
+            let auto = model.arena.as_ref().is_some_and(|r| r.rule == "auto");
+            let pf = if chunk > 0 && cfg.prefill_merged && (auto || !model.placed.is_empty()) {
                 let k = mc.n_expert_used;
                 let nb = mc.n_embd as u64 * 4;
                 let nfb = mc.n_ff as u64 * 4;
