@@ -7593,7 +7593,7 @@ impl<'m> Session<'m> {
         prefix: Prefix<'_>,
     ) -> Result<(Generation, Option<PrefixState>)> {
         let mut feed = self.feed_start(prompt, prefix)?;
-        while !self.feed_step(&mut feed)? {}
+        while !self.feed_step(&mut feed, 0)? {}
         let PromptFeed { mut pos, mut logits, saved, .. } = feed;
         let mut trace = debug;
         // The prompt is not part of the decode measurement.
@@ -7741,10 +7741,16 @@ impl<'m> Session<'m> {
 
     /// Run the next chunk of `f` on the active sequence; true once the prompt is in
     /// (`f.logits` then holds the last cell's logits, `f.saved` the prefix if asked).
-    pub fn feed_step(&mut self, f: &mut PromptFeed) -> Result<bool> {
-        let Some((len, save)) = f.chunks.pop_front() else {
+    /// `max` > 0 caps this chunk (the rest stays queued, keeping its prefix save), so
+    /// live slots wait less per step.
+    pub fn feed_step(&mut self, f: &mut PromptFeed, max: usize) -> Result<bool> {
+        let Some((mut len, mut save)) = f.chunks.pop_front() else {
             return Ok(true);
         };
+        if max > 0 && len > max {
+            f.chunks.push_front((len - max, save));
+            (len, save) = (max, false);
+        }
         let pos = f.pos;
         let t = std::time::Instant::now();
         f.logits = if self.prefill_chunk > 0 {

@@ -5698,10 +5698,12 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         self.feeds[slot] = Some((f, prompt[..cut].to_vec()));
         Ok(Some((None, n)))
     }
-    fn feed(&mut self, slot: usize) -> Result<Option<u32>, String> {
+    fn feed(&mut self, slot: usize, others: bool) -> Result<Option<u32>, String> {
         let (mut f, key) = self.feeds[slot].take().ok_or("no prompt pass on this slot")?;
         self.sess.use_seq(slot).map_err(|e| e.to_string())?;
-        if !self.sess.feed_step(&mut f).map_err(|e| format!("{e:#}"))? {
+        // `BRECCIA_SERVE_FEED_CHUNK=n`: cap a chunk at n tokens while other slots decode
+        let max = if others { std::env::var("BRECCIA_SERVE_FEED_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(0) } else { 0 };
+        if !self.sess.feed_step(&mut f, max).map_err(|e| format!("{e:#}"))? {
             self.feeds[slot] = Some((f, key));
             return Ok(None);
         }

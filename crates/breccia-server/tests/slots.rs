@@ -131,7 +131,7 @@ impl Backend for Feeder {
         self.pending[slot] = prompt.len();
         Ok(Some((None, max_tokens)))
     }
-    fn feed(&mut self, slot: usize) -> Result<Option<u32>, String> {
+    fn feed(&mut self, slot: usize, _others: bool) -> Result<Option<u32>, String> {
         assert!(self.pending[slot] > 0, "fed a slot with its prompt in");
         self.pending[slot] -= 1;
         Ok((self.pending[slot] == 0).then_some(b'a' as u32 + 1))

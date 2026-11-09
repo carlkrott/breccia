@@ -74,9 +74,10 @@ pub trait Backend {
         Ok(self.admit(slot, prompt, max_tokens)?.map(|(t, n)| (Some(t), n)))
     }
     /// The next prompt chunk of slot `slot` (after `admit_start` gave `None`); the first
-    /// generated token once the prompt is in.
-    fn feed(&mut self, slot: usize) -> Result<Option<u32>, String> {
-        let _ = slot;
+    /// generated token once the prompt is in. `others` = other slots are decoding (a
+    /// backend may run a smaller chunk then).
+    fn feed(&mut self, slot: usize, others: bool) -> Result<Option<u32>, String> {
+        let _ = (slot, others);
         Err("this backend has no chunked admission".into())
     }
     /// One decode step: feed `rows[i] = (slot, token)`, return each row's next token.
@@ -331,7 +332,8 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             .min()
             .map(|x| x.1);
         if let Some(s) = feeding {
-            match b.feed(s) {
+            let others = live.iter().any(|l| l.as_ref().is_some_and(|l| !l.ids.is_empty()));
+            match b.feed(s, others) {
                 Ok(Some(tok)) => {
                     let l = live[s].as_mut().expect("a live slot");
                     l.ids.push(tok);
