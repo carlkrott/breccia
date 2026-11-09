@@ -5440,6 +5440,8 @@ struct EngineBackend<'a, 'm> {
     spec_now: bool,
     /// shared KV pool cells held by each sequence slot's request (0 = free slot)
     reserved: Vec<usize>,
+    /// a slot's prompt pass in progress (`admit_start`), with the text prefix key to save under
+    feeds: Vec<Option<(breccia_engine::PromptFeed, Vec<u32>)>>,
 }
 
 /// A saved text prompt state: plain, or with the MTP draft's state when spec decode is on.
@@ -5660,25 +5662,62 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn slots(&self) -> usize {
         self.sess.n_seqs()
     }
-    fn admit(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
-        let n = max_tokens.min(self.max_tokens).max(1);
-        // a pool request holds its cells (rounded to pages) until release, so decode never runs the pool dry
-        let need = (prompt.len() + n).min(self.ctx).div_ceil(breccia_kernels::qsa::PAGE_CELLS);
-        if let Some(cells) = breccia_kernels::qsa::kv_pool_cells() {
-            let pages = (cells / breccia_kernels::qsa::PAGE_CELLS).saturating_sub(1); // page 0 is the sink
-            if need > pages {
-                return Err(format!(
-                    "{} prompt + {n} new tokens need more than the shared KV pool ({cells} cells, BRECCIA_KV_POOL_CELLS)",
-                    prompt.len()
-                ));
-            }
-            if self.reserved.iter().sum::<usize>() + need > pages {
-                return Ok(None);
-            }
+    fn admit_start(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(Option<u32>, usize)>, String> {
+        use breccia_engine::Prefix;
+        // `BRECCIA_SERVE_FEED=0`: the whole prompt pass inside admit (live slots wait for it)
+        if std::env::var("BRECCIA_SERVE_FEED").is_ok_and(|v| v == "0") {
+            return Ok(self.admit(slot, prompt, max_tokens)?.map(|(t, n)| (Some(t), n)));
         }
+        let Some(n) = self.reserve(slot, prompt.len(), max_tokens)? else {
+            return Ok(None);
+        };
+        self.sess.clear_image();
+        // the same text prefix reuse as `complete_text`'s plain path
+        let now = std::time::Instant::now();
+        prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+        let cut = if self.sess.prefill_chunk > 0 && self.sess.prefill_target > 0 && prompt.len() > TEXT_PREFIX_MIN { prompt.len() - 1 } else { 0 };
+        let hit = self
+            .text_prefixes
+            .iter_mut()
+            .filter(|e| cut > 0 && e.0.len() <= cut && prompt.starts_with(&e.0) && matches!(e.2, TextPrefix::Plain(_)))
+            .max_by_key(|e| e.0.len());
+        let p = match hit {
+            Some(e) => {
+                e.1 = now;
+                println!("prefix   {} of {} cells from RAM", e.2.cells(), prompt.len());
+                match &e.2 {
+                    TextPrefix::Plain(st) if st.cells < cut => Prefix::ResumeSave(st, cut),
+                    TextPrefix::Plain(st) => Prefix::Resume(st),
+                    TextPrefix::Spec(_) => unreachable!("filtered to plain prefixes"),
+                }
+            }
+            None if cut > 0 => Prefix::Save(cut),
+            None => Prefix::None,
+        };
+        let f = self.sess.feed_start(prompt, p).map_err(|e| format!("{e:#}"))?;
+        self.feeds[slot] = Some((f, prompt[..cut].to_vec()));
+        Ok(Some((None, n)))
+    }
+    fn feed(&mut self, slot: usize) -> Result<Option<u32>, String> {
+        let (mut f, key) = self.feeds[slot].take().ok_or("no prompt pass on this slot")?;
         self.sess.use_seq(slot).map_err(|e| e.to_string())?;
-        self.spec_now = false; // spec decode runs only alone (`spec_hint`)
-        self.reserved[slot] = need;
+        if !self.sess.feed_step(&mut f).map_err(|e| format!("{e:#}"))? {
+            self.feeds[slot] = Some((f, key));
+            return Ok(None);
+        }
+        let tok = self.sess.feed_sample(&f).map_err(|e| e.to_string())?;
+        if let Some(st) = f.saved.take() {
+            let now = std::time::Instant::now();
+            println!("prefix   {} cells kept ({} MiB)", st.cells, st.bytes() >> 20);
+            self.text_prefixes.push((key, now, TextPrefix::Plain(st)));
+            prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+        }
+        Ok(Some(tok))
+    }
+    fn admit(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
+        let Some(n) = self.reserve(slot, prompt.len(), max_tokens)? else {
+            return Ok(None);
+        };
         let ids = self.complete(prompt, 1)?;
         let &tok = ids.first().ok_or("the prompt pass gave no token")?;
         Ok(Some((tok, n)))
@@ -5688,12 +5727,39 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
     fn release(&mut self, slot: usize) {
         self.reserved[slot] = 0;
+        self.feeds[slot] = None;
         if let Err(e) = self.sess.use_seq(slot).and_then(|_| self.sess.reset()) {
             eprintln!("breccia-server: releasing slot {slot}: {e:#}");
         }
     }
     fn context(&self) -> Option<usize> {
         Some(self.ctx)
+    }
+}
+
+impl EngineBackend<'_, '_> {
+    /// Hold slot `slot`'s KV pool pages and make it the active sequence; the tokens
+    /// allowed, or `None` when the pool cannot hold it beside the running slots yet.
+    fn reserve(&mut self, slot: usize, prompt_len: usize, max_tokens: usize) -> Result<Option<usize>, String> {
+        let n = max_tokens.min(self.max_tokens).max(1);
+        // a pool request holds its cells (rounded to pages) until release, so decode never runs the pool dry
+        let need = (prompt_len + n).min(self.ctx).div_ceil(breccia_kernels::qsa::PAGE_CELLS);
+        if let Some(cells) = breccia_kernels::qsa::kv_pool_cells() {
+            let pages = (cells / breccia_kernels::qsa::PAGE_CELLS).saturating_sub(1); // page 0 is the sink
+            if need > pages {
+                return Err(format!(
+                    "{} prompt + {n} new tokens need more than the shared KV pool ({cells} cells, BRECCIA_KV_POOL_CELLS)",
+                    prompt_len
+                ));
+            }
+            if self.reserved.iter().sum::<usize>() + need > pages {
+                return Ok(None);
+            }
+        }
+        self.sess.use_seq(slot).map_err(|e| e.to_string())?;
+        self.spec_now = false; // spec decode runs only alone (`spec_hint`)
+        self.reserved[slot] = need;
+        Ok(Some(n))
     }
 }
 
@@ -5876,6 +5942,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         mtp_always: mtp_env == "1",
         spec_now: false,
         reserved: vec![0; seqs],
+        feeds: (0..seqs).map(|_| None).collect(),
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))

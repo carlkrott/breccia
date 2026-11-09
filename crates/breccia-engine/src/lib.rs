@@ -66,7 +66,7 @@ pub mod xfer;
 pub use arena::{ArenaChoice, ArenaOpts, ArenaReport, ArenaSpec};
 pub use config::{LayerKind, ModelConfig};
 pub use graph::{
-    prefill_cap, prefill_plan, Generation, GpuStageRow, Prefix, PrefixState, Session, SessionCfg,
+    prefill_cap, prefill_plan, Generation, GpuStageRow, Prefix, PrefixState, PromptFeed, Session, SessionCfg,
     Timers, STAGES,
 };
 pub use head::{HeadChoice, HeadSpec};

@@ -7592,78 +7592,10 @@ impl<'m> Session<'m> {
         debug: Option<&mut Vec<LayerTrace>>,
         prefix: Prefix<'_>,
     ) -> Result<(Generation, Option<PrefixState>)> {
-        if prompt.is_empty() {
-            bail!("the prompt is empty: the n-gram window and the first token both need history");
-        }
-        // reset() undoes set_images; a generate() over the images' prompt keeps them
-        // (only when the prompt still holds every one: a --then prompt is text)
-        let held = |&(c0, nx, ny, _): &(usize, usize, usize, Buf)| {
-            prompt
-                .get(c0..c0 + nx * ny)
-                .is_some_and(|c| c.iter().all(|&t| t == IMAGE_PLE_TOKEN))
-        };
-        let mut img = std::mem::take(&mut self.image);
-        if !img.iter().all(held) {
-            self.image = std::mem::take(&mut img); // reset() frees them
-        }
-        let r = self.reset();
-        self.image = img;
-        r?;
-        if !self.image.is_empty() {
-            anyhow::ensure!(
-                self.prefill_chunk > 0,
-                "an image prompt needs chunked prefill"
-            );
-            self.image_positions()?;
-        }
+        let mut feed = self.feed_start(prompt, prefix)?;
+        while !self.feed_step(&mut feed)? {}
+        let PromptFeed { mut pos, mut logits, saved, .. } = feed;
         let mut trace = debug;
-        let mut pos = 0usize;
-        let mut logits = Vec::new();
-        let mut saved = None;
-        let (resume, save) = match prefix {
-            Prefix::None => (None, 0),
-            Prefix::Save(c) => (None, c),
-            Prefix::Resume(st) => (Some(st), 0),
-            Prefix::ResumeSave(st, c) => (Some(st), c),
-        };
-        let cut = save.max(resume.map_or(0, |st| st.cells));
-        if let (Some(st), true) = (resume, save > 0) {
-            anyhow::ensure!(save > st.cells, "the save cut ({save}) must lie past the resumed prefix ({})", st.cells);
-        }
-        if cut > 0 {
-            anyhow::ensure!(
-                self.prefill_chunk > 0,
-                "a saved prefix needs chunked prefill"
-            );
-            anyhow::ensure!(
-                cut < prompt.len(),
-                "the prefix ({cut} cells) must leave prompt to run"
-            );
-        }
-        if let Some(st) = resume {
-            self.restore_prefix(st)?;
-            pos = st.cells;
-        }
-        if self.prefill_chunk > 0 {
-            // Chunked prompt pass (§8s): same tokens, same arithmetic, grouped
-            // expert lane. The chunk sizes come from the planner, so a prompt does
-            // not end in a tiny tail chunk (`prefill_plan`). `pos` is the outer
-            // one — decode continues from it. A prefix splits it at `cut`.
-            for end in [cut, prompt.len()] {
-                for len in prefill_plan(end.saturating_sub(pos), self.prefill_target) {
-                    logits = self.prefill(&prompt[pos..pos + len], pos)?;
-                    pos += len;
-                }
-                if end == cut && save > 0 {
-                    saved = Some(self.save_prefix(cut)?);
-                }
-            }
-        } else {
-            for &t in prompt {
-                logits = self.token(t, pos, None)?;
-                pos += 1;
-            }
-        }
         // The prompt is not part of the decode measurement.
         self.forwards = 0;
         self.expert_bytes = 0;
@@ -7730,6 +7662,110 @@ impl<'m> Session<'m> {
             },
             saved,
         ))
+    }
+
+    /// Start a prompt pass on the active sequence (reset, prefix resume, chunk plan);
+    /// [`Self::feed_step`] runs it one chunk at a time, so serve can decode other
+    /// sequences between chunks. Same chunks and arithmetic as [`Self::generate_prefix`].
+    pub fn feed_start(&mut self, prompt: &[u32], prefix: Prefix<'_>) -> Result<PromptFeed> {
+        if prompt.is_empty() {
+            bail!("the prompt is empty: the n-gram window and the first token both need history");
+        }
+        // reset() undoes set_images; a generate() over the images' prompt keeps them
+        // (only when the prompt still holds every one: a --then prompt is text)
+        let held = |&(c0, nx, ny, _): &(usize, usize, usize, Buf)| {
+            prompt
+                .get(c0..c0 + nx * ny)
+                .is_some_and(|c| c.iter().all(|&t| t == IMAGE_PLE_TOKEN))
+        };
+        let mut img = std::mem::take(&mut self.image);
+        if !img.iter().all(held) {
+            self.image = std::mem::take(&mut img); // reset() frees them
+        }
+        let r = self.reset();
+        self.image = img;
+        r?;
+        if !self.image.is_empty() {
+            anyhow::ensure!(
+                self.prefill_chunk > 0,
+                "an image prompt needs chunked prefill"
+            );
+            self.image_positions()?;
+        }
+        let (resume, save) = match prefix {
+            Prefix::None => (None, 0),
+            Prefix::Save(c) => (None, c),
+            Prefix::Resume(st) => (Some(st), 0),
+            Prefix::ResumeSave(st, c) => (Some(st), c),
+        };
+        let cut = save.max(resume.map_or(0, |st| st.cells));
+        if let (Some(st), true) = (resume, save > 0) {
+            anyhow::ensure!(save > st.cells, "the save cut ({save}) must lie past the resumed prefix ({})", st.cells);
+        }
+        if cut > 0 {
+            anyhow::ensure!(
+                self.prefill_chunk > 0,
+                "a saved prefix needs chunked prefill"
+            );
+            anyhow::ensure!(
+                cut < prompt.len(),
+                "the prefix ({cut} cells) must leave prompt to run"
+            );
+        }
+        let mut pos = 0usize;
+        if let Some(st) = resume {
+            self.restore_prefix(st)?;
+            pos = st.cells;
+        }
+        let mut chunks = std::collections::VecDeque::new();
+        if self.prefill_chunk > 0 {
+            // Chunked prompt pass (§8s): same tokens, same arithmetic, grouped
+            // expert lane. The chunk sizes come from the planner, so a prompt does
+            // not end in a tiny tail chunk (`prefill_plan`). A prefix splits it at
+            // `cut`; the chunk that reaches `cut` saves the state after it.
+            let mut p = pos;
+            for end in [cut, prompt.len()] {
+                let plan = prefill_plan(end.saturating_sub(p), self.prefill_target);
+                let last = plan.len();
+                for (i, len) in plan.into_iter().enumerate() {
+                    chunks.push_back((len, end == cut && save > 0 && i + 1 == last));
+                }
+                p = p.max(end);
+            }
+        } else {
+            // unchunked: one token per step
+            chunks.extend(std::iter::repeat((1, false)).take(prompt.len()));
+        }
+        Ok(PromptFeed { prompt: prompt.to_vec(), pos, chunks, cut, logits: Vec::new(), saved: None })
+    }
+
+    /// Run the next chunk of `f` on the active sequence; true once the prompt is in
+    /// (`f.logits` then holds the last cell's logits, `f.saved` the prefix if asked).
+    pub fn feed_step(&mut self, f: &mut PromptFeed) -> Result<bool> {
+        let Some((len, save)) = f.chunks.pop_front() else {
+            return Ok(true);
+        };
+        let pos = f.pos;
+        let t = std::time::Instant::now();
+        f.logits = if self.prefill_chunk > 0 {
+            self.prefill(&f.prompt[pos..pos + len], pos)?
+        } else {
+            self.token(f.prompt[pos], pos, None)?
+        };
+        f.pos += len;
+        if std::env::var_os("BRECCIA_FEED_TRACE").is_some() {
+            eprintln!("feed     chunk {pos}+{len} in {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+        if save {
+            f.saved = Some(self.save_prefix(f.cut)?);
+        }
+        Ok(f.chunks.is_empty())
+    }
+
+    /// Sample the first token after a finished [`PromptFeed`] (the active sequence's sampler).
+    pub fn feed_sample(&mut self, f: &PromptFeed) -> Result<u32> {
+        anyhow::ensure!(f.chunks.is_empty() && !f.logits.is_empty(), "the prompt pass is not done");
+        self.sampler.sample(&f.logits, &self.sampling).ok_or_else(|| anyhow!("the sampler produced no token"))
     }
 }
 
@@ -7911,6 +7947,18 @@ pub enum Prefix<'a> {
     Resume(&'a PrefixState),
     /// Resume from the state, then save again at a later cut (a conversation's next turn).
     ResumeSave(&'a PrefixState, usize),
+}
+
+/// A prompt pass in progress on one sequence ([`Session::feed_start`]).
+pub struct PromptFeed {
+    prompt: Vec<u32>,
+    /// Cells fed so far; decode continues at this cell.
+    pub pos: usize,
+    /// `(chunk length, save the prefix after it)`, in order.
+    chunks: std::collections::VecDeque<(usize, bool)>,
+    cut: usize,
+    pub logits: Vec<f32>,
+    pub saved: Option<PrefixState>,
 }
 
 /// The sequence state after a prompt's first `cells` cells, in host RAM.

@@ -67,6 +67,18 @@ pub trait Backend {
         let _ = (slot, prompt, max_tokens);
         Err("this backend has no sequence slots".into())
     }
+    /// [`Self::admit`] that may hand back `(None, allowed)`: the prompt pass then runs one
+    /// chunk per [`Self::feed`] call, between the live slots' decode steps, so they keep
+    /// streaming while a long prompt goes in. Default: the whole pass in `admit`.
+    fn admit_start(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(Option<u32>, usize)>, String> {
+        Ok(self.admit(slot, prompt, max_tokens)?.map(|(t, n)| (Some(t), n)))
+    }
+    /// The next prompt chunk of slot `slot` (after `admit_start` gave `None`); the first
+    /// generated token once the prompt is in.
+    fn feed(&mut self, slot: usize) -> Result<Option<u32>, String> {
+        let _ = slot;
+        Err("this backend has no chunked admission".into())
+    }
     /// One decode step: feed `rows[i] = (slot, token)`, return each row's next token.
     fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
         let _ = rows;
@@ -222,6 +234,9 @@ struct Live {
     ids: Vec<u32>,
     allowed: usize,
     t0: std::time::Instant,
+    /// When the last token came, and the worst wait between two (the stall a long admit causes).
+    last: std::time::Instant,
+    gap: f64,
 }
 
 /// Several sequence slots: connection threads read requests and answer `/health` and
@@ -290,9 +305,10 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
                 let _ = q.reply.send(run_alone(&mut b, &p));
                 continue;
             }
-            match b.admit(slot, &p.prompt, p.max_tokens) {
+            match b.admit_start(slot, &p.prompt, p.max_tokens) {
+                // a slot still feeding its prompt holds no ids: it joins the steps once fed
                 Ok(Some((tok, allowed))) => {
-                    live[slot] = Some(Live { reply: q.reply, p, ids: vec![tok], allowed, t0: std::time::Instant::now() });
+                    live[slot] = Some(Live { reply: q.reply, p, ids: tok.into_iter().collect(), allowed, t0: std::time::Instant::now(), last: std::time::Instant::now(), gap: 0.0 });
                 }
                 Ok(None) => {
                     q.p = Some(p);
@@ -307,6 +323,29 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
         }
         queue = wait;
         retire(&mut live, &mut b, ctx);
+        // one prompt chunk (oldest admission first) per decode step
+        let feeding = live
+            .iter()
+            .enumerate()
+            .filter_map(|(s, l)| l.as_ref().filter(|l| l.ids.is_empty()).map(|l| (l.t0, s)))
+            .min()
+            .map(|x| x.1);
+        if let Some(s) = feeding {
+            match b.feed(s) {
+                Ok(Some(tok)) => {
+                    let l = live[s].as_mut().expect("a live slot");
+                    l.ids.push(tok);
+                    l.last = std::time::Instant::now();
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    b.release(s);
+                    eprintln!("breccia-server: request failed: {e}");
+                    let l = live[s].take().expect("a live slot");
+                    let _ = l.reply.send(Response::json(500, json!({"error": {"message": e}})));
+                }
+            }
+        }
         let rows: Vec<(usize, u32)> = live
             .iter()
             .enumerate()
@@ -317,8 +356,12 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
         }
         match b.step(&rows) {
             Ok(next) => {
+                let now = std::time::Instant::now();
                 for (&(s, _), t) in rows.iter().zip(next) {
-                    live[s].as_mut().expect("a live slot").ids.push(t);
+                    let l = live[s].as_mut().expect("a live slot");
+                    l.ids.push(t);
+                    l.gap = l.gap.max((now - l.last).as_secs_f64());
+                    l.last = now;
                 }
                 retire(&mut live, &mut b, ctx);
             }
@@ -347,6 +390,7 @@ fn retire<B: Backend>(live: &mut [Option<Live>], b: &mut B, ctx: usize) {
         if let Some(l) = slot.take_if(|_| done) {
             b.release(s);
             let secs = l.t0.elapsed().as_secs_f64();
+            eprintln!("breccia-server: slot {s} done: {} tokens in {secs:.2} s, worst token gap {:.0} ms", l.ids.len(), l.gap * 1e3);
             let _ = l.reply.send(finish(b, &l.p, l.ids, secs));
         }
     }

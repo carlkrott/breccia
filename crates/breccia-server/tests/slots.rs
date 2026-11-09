@@ -97,3 +97,71 @@ fn slots_batch_concurrent_requests_and_spec_runs_alone() {
     assert_eq!(v["choices"][0]["text"], "ABC");
     assert_eq!(alone.load(Ordering::SeqCst), 1);
 }
+
+/// Chunked admission: the prompt goes in one `feed` per loop turn, one char per chunk.
+struct Feeder {
+    pending: Vec<usize>,
+    live: Vec<bool>,
+    /// decode steps that ran while some slot was still feeding its prompt
+    interleaved: Arc<AtomicUsize>,
+}
+
+impl Backend for Feeder {
+    fn model_name(&self) -> String {
+        "feeder".into()
+    }
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
+        Ok(text.bytes().map(|b| b as u32 + 1).collect())
+    }
+    fn decode_text(&self, ids: &[u32]) -> String {
+        ids.iter().map(|&i| char::from_u32(i - 1).unwrap_or('?')).collect()
+    }
+    fn complete(&mut self, _prompt: &[u32], _max_tokens: usize) -> Result<Vec<u32>, String> {
+        Err("slots only".into())
+    }
+    fn eos(&self) -> Option<u32> {
+        Some(b'z' as u32 + 1)
+    }
+    fn slots(&self) -> usize {
+        self.live.len()
+    }
+    fn admit_start(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(Option<u32>, usize)>, String> {
+        assert!(!self.live[slot]);
+        self.live[slot] = true;
+        self.pending[slot] = prompt.len();
+        Ok(Some((None, max_tokens)))
+    }
+    fn feed(&mut self, slot: usize) -> Result<Option<u32>, String> {
+        assert!(self.pending[slot] > 0, "fed a slot with its prompt in");
+        self.pending[slot] -= 1;
+        Ok((self.pending[slot] == 0).then_some(b'a' as u32 + 1))
+    }
+    fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
+        assert!(rows.iter().all(|&(s, _)| self.live[s] && self.pending[s] == 0), "a feeding slot stepped");
+        if self.pending.iter().any(|&p| p > 0) {
+            self.interleaved.fetch_add(1, Ordering::SeqCst);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        Ok(rows.iter().map(|&(_, t)| t + 1).collect())
+    }
+    fn release(&mut self, slot: usize) {
+        self.live[slot] = false;
+    }
+}
+
+#[test]
+fn a_long_prompt_feeds_between_the_live_slots_steps() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let interleaved = Arc::new(AtomicUsize::new(0));
+    let b = Feeder { pending: vec![0; 2], live: vec![false; 2], interleaved: interleaved.clone() };
+    std::thread::spawn(move || serve(&format!("127.0.0.1:{port}"), b));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let a = std::thread::spawn(move || post(port, r#"{"prompt":"hi","max_tokens":40}"#));
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let v = post(port, r#"{"prompt":"a much longer prompt","max_tokens":3}"#);
+    assert_eq!(v["choices"][0]["text"], "abc");
+    let v = a.join().unwrap();
+    assert_eq!(v["choices"][0]["text"].as_str().unwrap().len(), 25);
+    assert!(interleaved.load(Ordering::SeqCst) >= 10, "the live slot waited for the prompt");
+}
