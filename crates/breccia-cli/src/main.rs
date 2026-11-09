@@ -5855,7 +5855,7 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         let merge = slots.len() > 1
             && std::env::var("BRECCIA_SERVE_MERGE").map_or(true, |v| v != "0")
             && !(others && std::env::var("BRECCIA_SERVE_FEED_BLOCKS").is_ok_and(|v| v.parse::<usize>().unwrap_or(0) > 0))
-            && self.sess.prefill_chunk > 0
+            && self.sess.can_merge()
             && slots.iter().all(|&s| self.feeds[s].as_ref().is_some_and(|(f, _)| !f.paused()));
         if !merge {
             let mut r = vec![self.feed(slots[0], others)];

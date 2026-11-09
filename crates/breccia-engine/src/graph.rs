@@ -3433,11 +3433,8 @@ impl<'m> Session<'m> {
     pub fn prefill_segs(&mut self, segs: &[(usize, &[u32], usize)]) -> Result<Vec<Vec<f32>>> {
         let m = self.model;
         anyhow::ensure!(!segs.is_empty(), "no prompt segments");
-        anyhow::ensure!(
-            // spec is enabled for serve's draft but only active inside a verify
-            self.spec.as_ref().map_or(true, |sp| !sp.active) && self.pf_hold == 0 && self.rows_seq.is_empty(),
-            "merged prompts need no speculative verify and no paused chunk"
-        );
+        // spec is enabled for serve's draft but only active inside a verify
+        anyhow::ensure!(self.can_merge(), "merged prompts need the merged expert pass on every block, no verify and no paused chunk");
         let mut toks = Vec::new();
         let mut plan = Vec::with_capacity(segs.len());
         for (i, &(s, tk, pos0)) in segs.iter().enumerate() {
@@ -3750,6 +3747,37 @@ impl<'m> Session<'m> {
     }
 
     /// Inside a rows-mode verify: the per-row hooks apply and the mixers run per row.
+    /// Whether block `b`'s chunk takes the merged expert pass (§8v). A session
+    /// without the chunk scratch (no resident block) or a role type with no
+    /// multi-user GEMM keeps the per-token path (documented fallback, §8v/§8x).
+    fn merged_ready(&self, b: usize) -> bool {
+        let m = self.model;
+        let dev = m.device_of(b);
+        if !self.prefill_merged || self.venues[dev].pf.is_none() {
+            return false;
+        }
+        let plan = &m.layers[b].experts;
+        let (gt, ut, dt) = match m.placed.get(&b) {
+            Some(pe) => (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty),
+            None => (plan.gate.ty, plan.up.ty, plan.down.ty),
+        };
+        let pipes = &self.venues[dev].pipes;
+        [gt, ut, dt].iter().all(|ty| pipes.gemm(*ty).is_some())
+    }
+
+    /// Whether [`Self::prefill_segs`] can run now: no verify or paused chunk, and
+    /// every block takes the merged expert pass and the batched PLE phase.
+    pub fn can_merge(&self) -> bool {
+        let m = self.model;
+        let mc = &m.cfg;
+        self.prefill_chunk > 0
+            && self.spec.as_ref().map_or(true, |sp| !sp.active)
+            && self.pf_hold == 0
+            && self.rows_seq.is_empty()
+            && std::env::var_os("BRECCIA_NO_PLE_BATCH").is_none()
+            && (0..mc.n_layers).all(|b| self.merged_ready(b) && (!mc.is_ple_layer(b) || self.venues[m.device_of(b)].ple_emb_chunk.is_some()))
+    }
+
     fn spec_rows_active(&self) -> bool {
         self.spec.as_ref().is_some_and(|sp| sp.active && !sp.replay)
     }
@@ -4338,20 +4366,8 @@ impl<'m> Session<'m> {
         // `(token, expert)` pairs and runs one multi-user GEMM per distinct expert
         // instead of one GEMV per token. A block whose role type has no multi-user
         // GEMM, or a session without the chunk scratch, keeps the path below.
-        if self.prefill_merged && self.venues[dev].pf.is_some() {
-            let pe = m.placed.get(&b);
-            let plan = &m.layers[b].experts;
-            let (gt, ut, dt) = match pe {
-                Some(pe) => (pe.gate.key.ty, pe.up.key.ty, pe.down.key.ty),
-                None => (plan.gate.ty, plan.up.ty, plan.down.ty),
-            };
-            let pipes = &self.venues[dev].pipes;
-            // A role type with no multi-user GEMM keeps the per-token path for
-            // that block (documented fallback, §8v/§8x).
-            let ready = [gt, ut, dt].iter().all(|ty| pipes.gemm(*ty).is_some());
-            if ready {
-                return self.prefill_block_merged(b, t, pos0, pe);
-            }
+        if self.merged_ready(b) {
+            return self.prefill_block_merged(b, t, pos0, m.placed.get(&b));
         }
 
         // ---- pass 1: the whole chunk's dense chain, one submission -----------
