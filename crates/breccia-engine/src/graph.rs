@@ -3434,8 +3434,9 @@ impl<'m> Session<'m> {
         let m = self.model;
         anyhow::ensure!(!segs.is_empty(), "no prompt segments");
         anyhow::ensure!(
-            self.spec.is_none() && self.pf_hold == 0 && self.rows_seq.is_empty(),
-            "merged prompts need no speculative decoding and no paused chunk"
+            // spec is enabled for serve's draft but only active inside a verify
+            self.spec.as_ref().map_or(true, |sp| !sp.active) && self.pf_hold == 0 && self.rows_seq.is_empty(),
+            "merged prompts need no speculative verify and no paused chunk"
         );
         let mut toks = Vec::new();
         let mut plan = Vec::with_capacity(segs.len());
