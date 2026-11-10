@@ -5760,7 +5760,7 @@ impl<'m> Session<'m> {
         }
         // Speed probe only (wrong output): no barrier inside the expert loop.
         let nobar = inplace && pf_nobar_probe();
-        // Option 1 (`BRECCIA_PF_GROUPED=1`): record a window's groups as one phase of
+        // Option 1 (grouped, default; `BRECCIA_PF_GROUPED=0` off): record a window's groups as one phase of
         // gate GEMMs and one of downs, so the independent GEMMs overlap on the GPU.
         let grouped = inplace && !nobar && pf_grouped();
         let grp_cap = pf_grouped_rows();
@@ -9139,10 +9139,11 @@ pub fn pf_prefetch() -> usize {
 
 /// `BRECCIA_PF_NOBAR_PROBE=1`: speed probe, drops every barrier in the merged expert
 /// loop (output is wrong). Measures what grouping the expert GEMMs could save.
-/// `BRECCIA_PF_GROUPED=1`: phase-grouped in-place expert GEMMs (see `pf_group_run`).
+/// Phase-grouped in-place expert GEMMs (see `pf_group_run`). Default on since 11-10
+/// (8x32k streams ABBA: ~7 % less wall, coherent, no asserts); `BRECCIA_PF_GROUPED=0` opts out.
 fn pf_grouped() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BRECCIA_PF_GROUPED").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_GROUPED").map_or(true, |v| v != "0"))
 }
 
 /// Rows of act/gg/uu one grouped phase may hold (`BRECCIA_PF_GROUPED_ROWS`, 4096).
