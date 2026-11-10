@@ -766,6 +766,9 @@ pub struct Session<'m> {
     /// and the MI50 pf buffers already zeroed (by address).
     t2_imp: Option<crate::xfer::ShipImport>,
     t2_zeroed: Vec<usize>,
+    /// `BRECCIA_PF_T2_THREAD=1`: the helper pass is recorded, submitted and waited on
+    /// this thread, which keeps its own batch ring and submit-guard state.
+    t2_worker: Option<T2Worker>,
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
     /// `BRECCIA_KV_POOL_CELLS`: per QSA layer, the K/V page pool every sequence
@@ -1468,6 +1471,7 @@ impl<'m> Session<'m> {
             ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() == Ok("0"),
             t2_imp: None,
             t2_zeroed: Vec::new(),
+            t2_worker: None,
             gdn_state,
             qsa_state,
             kv_pool,
@@ -4722,8 +4726,121 @@ impl<'m> Session<'m> {
     /// (`ao`), so nothing in a phase reads what another dispatch of it writes.
     /// Unphased with one group it is the old per-group sequence.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn pf_group_run(
         &self,
+        edev: usize,
+        b: usize,
+        pe: Option<&crate::model::PlacedExperts>,
+        tys: (QuantType, QuantType, QuantType),
+        pair: bool,
+        phased: bool,
+        groups: &[PfGroup],
+    ) -> Result<()> {
+        Self::pf_group_run_in(self.model, &self.venues[edev], edev, b, pe, tys, pair, phased, groups)
+    }
+
+    /// Option 2's helper pass recorded and submitted on the calling thread's ring.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn t2_record(
+        m: &Model,
+        hv: &Venue<'_>,
+        hd: usize,
+        b: usize,
+        zi: &Buf,
+        t2_groups: &[(u32, u32, Vec<usize>)],
+        tys: (QuantType, QuantType, QuantType),
+        [wgate, wup, wdown]: [u32; 3],
+        (t, k, n_embd, n_ff, zero, res, zero_sh): (usize, usize, usize, usize, u64, u64, bool),
+    ) -> Result<(batch_cmd::Segment, T2Stats)> {
+        let hgpu = m.devices[hd].gpu();
+        let xpf = hv.pf_at(b);
+        let nb = (n_embd * 4) as u64;
+        let (tb, kb) = (t as u64 * nb, (t * k * 4) as u64);
+        let tl = std::time::Instant::now();
+        let mut tq = [0f64; 6];
+        tq[0] = tl.elapsed().as_secs_f64();
+        batch_cmd::begin(hgpu)?;
+        tq[1] = tl.elapsed().as_secs_f64();
+        let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = vec![
+            (&xpf.mixed, 0, zi, 0, tb),
+            (&xpf.w, 0, zi, tb, kb),
+            (&xpf.scratch, (t * k) as u64 * nb, zi, zero, nb),
+            (&xpf.gate, 0, zi, zero, t as u64 * 4),
+        ];
+        if zero_sh {
+            copies.push((&xpf.shared, 0, zi, zero, xpf.shared.size));
+        }
+        batch_cmd::record_copies(hgpu, &copies)?;
+        let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
+        for (_, base, users) in t2_groups {
+            let mut a = 0usize;
+            while a < users.len() {
+                let mut z = a + 1;
+                while z < users.len() && users[z] == users[z - 1] + 1 {
+                    z += 1;
+                }
+                copies.push((
+                    &xpf.scratch,
+                    (*base as u64 + a as u64) * nb,
+                    &xpf.mixed,
+                    users[a] as u64 * nb,
+                    (z - a) as u64 * nb,
+                ));
+                a = z;
+            }
+        }
+        let copies_n = copies.len();
+        batch_cmd::record_copies(hgpu, &copies)?;
+        tq[2] = tl.elapsed().as_secs_f64();
+        // The pool holds the plan's own blobs (same types), slot `s` at `s` blobs in.
+        let (c0, w0) = (batch_cmd::guard_cuts(), batch_cmd::wait_seconds());
+        let grouped = pf_inplace() && pf_grouped();
+        let cap = pf_grouped_rows().max(pf_group_users());
+        let (mut rows, mut grp) = (0usize, Vec::<PfGroup>::new());
+        for (s, base, users) in t2_groups {
+            let mu = users.len();
+            let g = PfGroup {
+                src: PfSrc::Pool,
+                w: [s * wgate, s * wup, s * wdown],
+                xo: *base as u64 * nb,
+                mu,
+                ao: 0,
+            };
+            if grouped {
+                if rows + mu > cap {
+                    Self::pf_group_run_in(m, hv, hd, b, None, tys, false, true, &grp)?;
+                    (rows, grp) = (0, Vec::new());
+                }
+                grp.push(PfGroup { ao: (rows * n_ff * 4) as u64, ..g });
+                rows += mu;
+            } else {
+                Self::pf_group_run_in(m, hv, hd, b, None, tys, false, false, &[g])?;
+            }
+        }
+        Self::pf_group_run_in(m, hv, hd, b, None, tys, false, true, &grp)?;
+        tq[3] = tl.elapsed().as_secs_f64();
+        let (dc, dw) = (batch_cmd::guard_cuts() - c0, (batch_cmd::wait_seconds() - w0) * 1e3);
+        hv.moe_fanin.run(&xpf.scratch, &xpf.slots.buf, &xpf.w, &xpf.shared, &xpf.gate, &xpf.moe, t, k, n_embd)?;
+        batch_cmd::record_copy(hgpu, zi, res, &xpf.moe, 0, tb)?;
+        batch_cmd::record_barrier_to_host(hgpu)?;
+        anyhow::ensure!(
+            batch_cmd::recorded() < MERGED_BATCH_CAP,
+            "option 2 helper pass recorded {} commands",
+            batch_cmd::recorded()
+        );
+        tq[4] = tl.elapsed().as_secs_f64();
+        let seg = batch_cmd::end_submit(hgpu, None)
+            .map_err(|e| anyhow!("submitting the tier-2 prefill pass on device {hd}: {e}"))?;
+        tq[5] = tl.elapsed().as_secs_f64();
+        Ok((seg, (t2_groups.len(), copies_n, tq, dc, dw)))
+    }
+
+    /// [`Self::pf_group_run`] on one venue, callable off the session's thread.
+    #[allow(clippy::too_many_arguments)]
+    fn pf_group_run_in(
+        model: &Model,
+        v: &Venue<'_>,
         edev: usize,
         b: usize,
         pe: Option<&crate::model::PlacedExperts>,
@@ -4735,9 +4852,8 @@ impl<'m> Session<'m> {
         if groups.is_empty() {
             return Ok(());
         }
-        let (n_embd, n_ff) = (self.model.cfg.n_embd, self.model.cfg.n_ff);
-        let egpu = self.model.devices[edev].gpu();
-        let v = &self.venues[edev];
+        let (n_embd, n_ff) = (model.cfg.n_embd, model.cfg.n_ff);
+        let egpu = model.devices[edev].gpu();
         let pf = v.pf_at(b);
         let gate = v.pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
         let up = v.pipes.gemm(up_ty).expect("the up multi-user GEMM");
@@ -4747,7 +4863,7 @@ impl<'m> Session<'m> {
                 (PfSrc::Arena, Some(pe)) => [&pe.gate.buf, &pe.up.buf, &pe.down.buf],
                 (PfSrc::Pre, _) => [&pf.pre.as_ref().expect("the prefetch slots").buf; 3],
                 (PfSrc::Pool, _) => {
-                    let p = &self.model.t2.as_ref().expect("tier 2").pools[&b];
+                    let p = &model.t2.as_ref().expect("tier 2").pools[&b];
                     [&p.gate.buf, &p.up.buf, &p.down.buf]
                 }
                 _ => [&pf.stream.buf; 3],
@@ -5523,96 +5639,38 @@ impl<'m> Session<'m> {
                 self.t2_zeroed.push(key);
             }
             let zi = imp.get(hd);
-            let mut tq = [0f64; 6];
-            tq[0] = tl.elapsed().as_secs_f64();
-            batch_cmd::begin(hgpu)?;
-            tq[1] = tl.elapsed().as_secs_f64();
-            let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = vec![
-                (&xpf.mixed, 0, zi, 0, tb),
-                (&xpf.w, 0, zi, tb, kb),
-                (&xpf.scratch, (t * k) as u64 * nb, zi, zero, nb),
-                (&xpf.gate, 0, zi, zero, t as u64 * 4),
-            ];
-            if zero_sh {
-                copies.push((&xpf.shared, 0, zi, zero, xpf.shared.size));
-            }
-            batch_cmd::record_copies(hgpu, &copies)?;
-            let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
-            for (_, base, users) in &t2_groups {
-                let mut a = 0usize;
-                while a < users.len() {
-                    let mut z = a + 1;
-                    while z < users.len() && users[z] == users[z - 1] + 1 {
-                        z += 1;
-                    }
-                    copies.push((
-                        &xpf.scratch,
-                        (*base as u64 + a as u64) * nb,
-                        &xpf.mixed,
-                        users[a] as u64 * nb,
-                        (z - a) as u64 * nb,
-                    ));
-                    a = z;
-                }
-            }
-            let copies_n = copies.len();
-            batch_cmd::record_copies(hgpu, &copies)?;
-            tq[2] = tl.elapsed().as_secs_f64();
-            // The pool holds the plan's own blobs (same types), slot `s` at `s` blobs in.
+            let pre_s = tl.elapsed().as_secs_f64();
+            let dims = (t, k, n_embd, n_ff, zero, res, zero_sh);
             let tys = (gate_ty, up_ty, down_ty);
-            let (c0, w0) = (batch_cmd::guard_cuts(), batch_cmd::wait_seconds());
-            let grouped = pf_inplace() && pf_grouped();
-            let cap = pf_grouped_rows().max(pf_group_users());
-            let (mut rows, mut grp) = (0usize, Vec::<PfGroup>::new());
-            for (s, base, users) in &t2_groups {
-                let mu = users.len();
-                let g = PfGroup {
-                    src: PfSrc::Pool,
-                    w: [s * wgate, s * wup, s * wdown],
-                    xo: *base as u64 * nb,
-                    mu,
-                    ao: 0,
-                };
-                if grouped {
-                    if rows + mu > cap {
-                        self.pf_group_run(hd, b, None, tys, false, true, &grp)?;
-                        (rows, grp) = (0, Vec::new());
-                    }
-                    grp.push(PfGroup { ao: (rows * n_ff * 4) as u64, ..g });
-                    rows += mu;
-                } else {
-                    self.pf_group_run(hd, b, None, tys, false, false, &[g])?;
+            let w = [wgate, wup, wdown];
+            let pending = if pf_t2_thread() {
+                if self.t2_worker.is_none() {
+                    self.t2_worker = Some(T2Worker::new()?);
                 }
-            }
-            self.pf_group_run(hd, b, None, tys, false, true, &grp)?;
-            tq[3] = tl.elapsed().as_secs_f64();
-            let (dc, dw) = (batch_cmd::guard_cuts() - c0, (batch_cmd::wait_seconds() - w0) * 1e3);
-            hv.moe_fanin.run(&xpf.scratch, &xpf.slots.buf, &xpf.w, &xpf.shared, &xpf.gate, &xpf.moe, t, k, n_embd)?;
-            batch_cmd::record_copy(hgpu, zi, res, &xpf.moe, 0, tb)?;
-            batch_cmd::record_barrier_to_host(hgpu)?;
-            anyhow::ensure!(
-                batch_cmd::recorded() < MERGED_BATCH_CAP,
-                "option 2 helper pass recorded {} commands",
-                batch_cmd::recorded()
-            );
-            tq[4] = tl.elapsed().as_secs_f64();
-            let seg = batch_cmd::end_submit(hgpu, None)
-                .map_err(|e| anyhow!("submitting the tier-2 prefill pass on device {hd}: {e}"))?;
-            tq[5] = tl.elapsed().as_secs_f64();
-            if std::env::var_os("BRECCIA_PF_PHASES").is_some() {
-                eprintln!(
-                    "pf-t2q blk {b:>2}: groups {} copies {} | pre {:.2} begin {:.2} copies {:.2} gemm {:.2} fanin {:.2} submit {:.2} ms | cuts {dc} wait {dw:.2} ms",
-                    t2_groups.len(),
-                    copies_n,
-                    tq[0] * 1e3,
-                    (tq[1] - tq[0]) * 1e3,
-                    (tq[2] - tq[1]) * 1e3,
-                    (tq[3] - tq[2]) * 1e3,
-                    (tq[4] - tq[3]) * 1e3,
-                    (tq[5] - tq[4]) * 1e3
-                );
-            }
-            t2_seg = Some((seg, hd, res, zero));
+                let (rtx, rrx) = std::sync::mpsc::channel();
+                let (mp, vp, zp) = (SendPtr(m as *const Model), SendPtr((hv as *const Venue<'_>).cast::<Venue<'static>>()), SendPtr(zi as *const Buf));
+                let groups = t2_groups.clone();
+                let job: T2Job = Box::new(move || {
+                    let r = (|| -> Result<(f64, T2Stats)> {
+                        // Safety: the RX thread receives this result before it touches the
+                        // import, the helper venue or the pool again (see `T2Pending`).
+                        let (m, hv, zi) = unsafe { (mp.get(), vp.get(), zp.get()) };
+                        let hgpu = m.devices[hd].gpu();
+                        let (seg, st) = Self::t2_record(m, hv, hd, b, zi, &groups, tys, w, dims)?;
+                        let tw = std::time::Instant::now();
+                        batch_cmd::wait(&[hgpu], seg).map_err(|e| anyhow!("waiting for the tier-2 prefill pass: {e}"))?;
+                        Ok((tw.elapsed().as_secs_f64(), st))
+                    })();
+                    let _ = rtx.send(r);
+                });
+                self.t2_worker.as_ref().expect("just made").send(job)?;
+                T2Pending::Thread(rrx)
+            } else {
+                let (seg, st) = Self::t2_record(m, hv, hd, b, zi, &t2_groups, tys, w, dims)?;
+                t2_print(b, pre_s, &st);
+                T2Pending::Seg(seg)
+            };
+            t2_seg = Some((pending, hd, res, zero, pre_s));
             t2_rec_s = tl.elapsed().as_secs_f64();
             // RX flushes in the loop must not wait for the helper's segment.
             self.wait_scope = Some(dev);
@@ -6045,7 +6103,7 @@ impl<'m> Session<'m> {
                 (hp.size() / nb - 1) * nb,
                 nb,
             )?;
-        } else if let Some((_, _, _, zero)) = t2_seg {
+        } else if let Some((_, _, _, zero, _)) = t2_seg {
             let nb = (n_embd * 4) as u64;
             let imp = self.t2_imp.as_ref().expect("t2 import");
             let pf = self.venues[edev].pf_at(b);
@@ -6066,10 +6124,18 @@ impl<'m> Session<'m> {
                 n_embd,
             )?;
         }
-        if let Some((seg, hd, res, _)) = t2_seg.take() {
+        if let Some((pending, hd, res, _, pre_s)) = t2_seg.take() {
             let tw = std::time::Instant::now();
-            batch_cmd::wait(&[m.devices[hd].gpu()], seg)
-                .map_err(|e| anyhow!("waiting for the tier-2 prefill pass: {e}"))?;
+            match pending {
+                T2Pending::Seg(seg) => {
+                    batch_cmd::wait(&[m.devices[hd].gpu()], seg)
+                        .map_err(|e| anyhow!("waiting for the tier-2 prefill pass: {e}"))?;
+                }
+                T2Pending::Thread(rx) => {
+                    let (_, st) = rx.recv().map_err(|_| anyhow!("the tier-2 helper thread exited on block {b}"))??;
+                    t2_print(b, pre_s, &st);
+                }
+            }
             let t2_wait_s = tw.elapsed().as_secs_f64();
             let imp = self.t2_imp.as_ref().expect("t2 import");
             let v = &self.venues[edev];
@@ -8577,6 +8643,8 @@ impl Drop for Session<'_> {
     /// `Buf`: those are the caller's to release, and a leak here shows up as a
     /// `VUID-vkDestroyDevice-device-05137` at teardown.
     fn drop(&mut self) {
+        // Joins the helper thread; its own ring shuts down there.
+        self.t2_worker = None;
         let m = self.model;
         // Every submission must be finished before anything it references is
         // freed, and the ring's descriptor pools are shared by every session on
@@ -9187,6 +9255,85 @@ fn pf_t2() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("BRECCIA_PF_T2").is_ok_and(|v| v == "1"))
 }
+
+/// `BRECCIA_PF_T2_THREAD=1` (with `BRECCIA_PF_T2=1`): the helper pass runs on its own
+/// host thread, so its recording, guard cuts and ring waits leave the RX thread.
+fn pf_t2_thread() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_T2_THREAD").is_ok_and(|v| v == "1"))
+}
+
+/// A borrow handed to [`T2Worker`]. Safety: the owner joins the job (its result
+/// channel) before the pointee is touched mutably or dropped.
+/// `BRECCIA_PF_PHASES` line for one tier-2 helper pass.
+fn t2_print(b: usize, pre_s: f64, (groups, copies_n, tq, dc, dw): &T2Stats) {
+    if std::env::var_os("BRECCIA_PF_PHASES").is_some() {
+        eprintln!(
+            "pf-t2q blk {b:>2}: groups {groups} copies {copies_n} | pre {:.2} begin {:.2} copies {:.2} gemm {:.2} fanin {:.2} submit {:.2} ms | cuts {dc} wait {dw:.2} ms",
+            pre_s * 1e3,
+            (tq[1] - tq[0]) * 1e3,
+            (tq[2] - tq[1]) * 1e3,
+            (tq[3] - tq[2]) * 1e3,
+            (tq[4] - tq[3]) * 1e3,
+            (tq[5] - tq[4]) * 1e3
+        );
+    }
+}
+
+struct SendPtr<T: ?Sized>(*const T);
+unsafe impl<T: ?Sized> Send for SendPtr<T> {}
+impl<T: ?Sized> SendPtr<T> {
+    /// Safety: see the type.
+    unsafe fn get<'a>(&self) -> &'a T {
+        unsafe { &*self.0 }
+    }
+}
+
+type T2Job = Box<dyn FnOnce() + Send>;
+
+/// One persistent thread per session: `batch_cmd`'s ring and the submit guard are
+/// thread-local, so a fresh thread per block would relearn every pipeline.
+struct T2Worker {
+    tx: Option<std::sync::mpsc::Sender<T2Job>>,
+    h: Option<std::thread::JoinHandle<()>>,
+}
+
+impl T2Worker {
+    fn new() -> Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<T2Job>();
+        let h = std::thread::Builder::new().name("breccia-t2".into()).spawn(move || {
+            for job in rx {
+                job();
+            }
+            if let Err(e) = batch_cmd::shutdown() {
+                eprintln!("breccia: tier-2 helper thread shutdown: {e}");
+            }
+        })?;
+        Ok(Self { tx: Some(tx), h: Some(h) })
+    }
+    fn send(&self, job: T2Job) -> Result<()> {
+        self.tx.as_ref().expect("live").send(job).map_err(|_| anyhow!("the tier-2 helper thread is gone"))
+    }
+}
+
+impl Drop for T2Worker {
+    fn drop(&mut self) {
+        self.tx = None;
+        if let Some(h) = self.h.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// The helper pass in flight: on this thread's ring, or on [`T2Worker`]'s (which
+/// also waits, and sends back its wait seconds and stats).
+enum T2Pending {
+    Seg(batch_cmd::Segment),
+    Thread(std::sync::mpsc::Receiver<Result<(f64, T2Stats)>>),
+}
+
+/// (groups, copies, phase ends in s [6], guard cuts, ring wait s) of one helper pass.
+type T2Stats = (usize, usize, [f64; 6], u64, f64);
 
 /// `BRECCIA_PF_T2_PROBE=1`: speed probe for option 2 (see `t2_skip`); wrong output.
 fn pf_t2_probe() -> bool {
