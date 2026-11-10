@@ -71,6 +71,8 @@ thread_local! {
     /// Set by [`skip_next_barrier`]: the next recorded dispatch is provably
     /// independent of the one before it, so its trailing fence can be dropped.
     static SKIP_BARRIER: Cell<bool> = const { Cell::new(false) };
+    /// Inside [`phase_begin`]..[`phase_end`]: no barrier between dispatches.
+    static PHASE: Cell<bool> = const { Cell::new(false) };
     /// Batches currently being recorded, one per device.
     static OPEN: RefCell<Vec<Open>> = const { RefCell::new(Vec::new()) };
     /// Round-robin cursor for [`begin`].
@@ -353,6 +355,37 @@ pub fn skip_next_barrier() {
     // this box's CPU-contention noise. Kept as a no-op so the call sites document
     // where the independent pairs are, and so nothing unsafe is reachable.
     let _ = SKIP_BARRIER.with(|c| c.replace(false));
+}
+
+/// **Phase recording.** Between `phase_begin` and `phase_end` the caller asserts
+/// that no dispatch reads or overlaps what another dispatch of the phase writes
+/// (the merged prefill's per-group GEMMs: disjoint scratch rows and act regions),
+/// so the tracker records none of its per-dispatch barriers. One barrier at each
+/// end fences the phase against what came before and after. Unlike
+/// [`skip_next_barrier`] this is per phase, not per call site: a split-K form that
+/// records a dependent pair inside a phase would lose its fence, so phase callers
+/// must use single-dispatch forms only (the caller checks `recorded()`).
+pub fn phase_begin(gpu: &Gpu) -> Result<()> {
+    fence_dirty(gpu)?;
+    PHASE.with(|p| p.set(true));
+    Ok(())
+}
+
+/// Ends the phase opened by [`phase_begin`] with one barrier.
+pub fn phase_end(gpu: &Gpu) -> Result<()> {
+    PHASE.with(|p| p.set(false));
+    fence_dirty(gpu)
+}
+
+fn fence_dirty(gpu: &Gpu) -> Result<()> {
+    if !track_disabled() && DIRTY.with(|d| d.borrow().is_empty()) {
+        return Ok(());
+    }
+    let (_, cmd) = open_cmd(gpu).ok_or_else(|| anyhow!("phase barrier without an open batch"))?;
+    unsafe { gpu.barrier_compute_on(cmd) };
+    BARRIERS.with(|c| c.set(c.get() + 1));
+    DIRTY.with(|d| d.borrow_mut().clear());
+    Ok(())
 }
 
 /// Is a batch open on this thread (on any device)?
@@ -1026,6 +1059,8 @@ pub fn end_submit(gpu: &Gpu, signal: Option<(&Timeline, u64)>) -> Result<Segment
     // `OPEN` no longer holds it (it was taken above).
     probe::close(slot);
     guard::close(gpu, slot, cmd);
+    // Fail-safe: a phase never spans submissions.
+    PHASE.with(|p| p.set(false));
     if !track_disabled() && DIRTY.with(|d| !d.borrow().is_empty()) {
         unsafe { gpu.barrier_compute_on(cmd) };
         BARRIERS.with(|c| c.set(c.get() + 1));
@@ -1577,7 +1612,8 @@ pub(crate) fn record_off(
         //
         // This is per *dispatch*, not per call site: that distinction is exactly
         // why `skip_next_barrier` failed its parity gate (§8z/§8aa).
-        let need = if SKIP_BARRIER.with(|c| c.replace(false)) || track_disabled() {
+        let in_phase = PHASE.with(|p| p.get());
+        let need = if in_phase || SKIP_BARRIER.with(|c| c.replace(false)) || track_disabled() {
             false
         } else {
             DIRTY.with(|d| {
@@ -1600,7 +1636,7 @@ pub(crate) fn record_off(
                 prof(6, t);
             }
             BARRIERS.with(|c| c.set(c.get() + 1));
-        } else if track_disabled() {
+        } else if track_disabled() && !in_phase {
             // A/B arm: the pre-§8al always-barrier shape.
             gpu.barrier_compute_on(cmd);
             BARRIERS.with(|c| c.set(c.get() + 1));

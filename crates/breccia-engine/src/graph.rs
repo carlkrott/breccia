@@ -1245,7 +1245,12 @@ impl<'m> Session<'m> {
                 let nb = mc.n_embd as u64 * 4;
                 let nfb = mc.n_ff as u64 * 4;
                 let nsb = mc.n_ff_shared as u64 * 4;
-                let users = pf_group_users() as u64;
+                // Grouped phases pack many groups' act/gg/uu regions.
+                let users = if pf_grouped() {
+                    pf_group_users().max(pf_grouped_rows()) as u64
+                } else {
+                    pf_group_users() as u64
+                };
                 // Streamed experts: the largest role blob among the blocks that
                 // are **not** resident (the resident ones address the arena).
                 let (mut g_max, mut u_max, mut d_max) = (0usize, 0usize, 0usize);
@@ -4703,6 +4708,87 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// Record the in-place expert GEMMs of `groups` (gate/up [+SwiGLU], then down).
+    /// `phased`: every group's gate (and up) GEMM in one barrier-free phase, then
+    /// every down in another; the groups own disjoint scratch rows and act regions
+    /// (`ao`), so nothing in a phase reads what another dispatch of it writes.
+    /// Unphased with one group it is the old per-group sequence.
+    #[allow(clippy::too_many_arguments)]
+    fn pf_group_run(
+        &self,
+        edev: usize,
+        b: usize,
+        pe: Option<&crate::model::PlacedExperts>,
+        (gate_ty, up_ty, down_ty): (QuantType, QuantType, QuantType),
+        pair: bool,
+        phased: bool,
+        groups: &[PfGroup],
+    ) -> Result<()> {
+        if groups.is_empty() {
+            return Ok(());
+        }
+        let (n_embd, n_ff) = (self.model.cfg.n_embd, self.model.cfg.n_ff);
+        let egpu = self.model.devices[edev].gpu();
+        let v = &self.venues[edev];
+        let pf = v.pf_at(b);
+        let gate = v.pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
+        let up = v.pipes.gemm(up_ty).expect("the up multi-user GEMM");
+        let down = v.pipes.gemm(down_ty).expect("the down multi-user GEMM");
+        let bufs = |s: PfSrc| -> [&Buf; 3] {
+            match (s, pe) {
+                (PfSrc::Arena, Some(pe)) => [&pe.gate.buf, &pe.up.buf, &pe.down.buf],
+                (PfSrc::Pre, _) => [&pf.pre.as_ref().expect("the prefetch slots").buf; 3],
+                _ => [&pf.stream.buf; 3],
+            }
+        };
+        // A phase drops the barriers between its dispatches, so every call in it
+        // must record exactly one (a split-K form would race with itself). The
+        // monotonic counter: a submit-guard cut resets the per-batch one.
+        let one = |r: Result<()>, r0: u64| -> Result<()> {
+            r?;
+            anyhow::ensure!(
+                !phased || batch_cmd::recorded_dispatches() == r0 + 1,
+                "grouped expert pass: a GEMM recorded {} dispatches",
+                batch_cmd::recorded_dispatches() - r0
+            );
+            Ok(())
+        };
+        if phased {
+            batch_cmd::phase_begin(egpu)?;
+        }
+        let mut rows = 0usize;
+        for g in groups {
+            let [gw, uw, _] = bufs(g.src);
+            let r0 = batch_cmd::recorded_dispatches();
+            if pair {
+                one(gate.run_pair_at_off(gw, &pf.scratch, &pf.act, n_ff, n_embd, g.mu, g.w[0], (g.xo, g.ao)), r0)?;
+            } else {
+                one(gate.run_at_off(gw, &pf.scratch, &pf.gg, n_ff, n_embd, g.mu, g.w[0], (g.xo, g.ao)), r0)?;
+                let r0 = batch_cmd::recorded_dispatches();
+                one(up.run_at_off(uw, &pf.scratch, &pf.uu, n_ff, n_embd, g.mu, g.w[1], (g.xo, g.ao)), r0)?;
+            }
+            rows += g.mu;
+        }
+        if phased {
+            batch_cmd::phase_end(egpu)?;
+        }
+        if !pair {
+            // The regions are packed from 0 in group order: one SwiGLU covers them.
+            v.swiglu.run(&pf.gg, &pf.uu, &pf.act, rows * n_ff)?;
+        }
+        if phased {
+            batch_cmd::phase_begin(egpu)?;
+        }
+        for g in groups {
+            let r0 = batch_cmd::recorded_dispatches();
+            one(down.run_at_off(bufs(g.src)[2], &pf.act, &pf.scratch, n_embd, n_ff, g.mu, g.w[2], (g.ao, g.xo)), r0)?;
+        }
+        if phased {
+            batch_cmd::phase_end(egpu)?;
+        }
+        Ok(())
+    }
+
     /// One block of a chunk with the **merged** expert pass (§8v).
     ///
     /// Pass 1 is the same dense chain per token, but a block whose experts are
@@ -5162,6 +5248,31 @@ impl<'m> Session<'m> {
             }
             at = end;
         }
+        // Option 2 probe (`BRECCIA_PF_T2_PROBE=1`, wrong output): the RX skips the
+        // experts the helper card's tier-2 pool holds, to price the RX side's saving.
+        let t2_skip: Vec<usize> = match m.t2.as_ref() {
+            Some(h) if pf_t2_probe() && streamed && xdev.is_none() && pe.is_none() && h.dev != dev => {
+                match h.pools.get(&b) {
+                    Some(p) => {
+                        let st = p.state.lock().expect("t2 pool state");
+                        let mut v: Vec<usize> =
+                            groups.iter().map(|g| g.0).filter(|&e| st.slot_of[e] != crate::d1::MISS).collect();
+                        v.dedup();
+                        if b == 10 {
+                            let rows: usize = groups.iter().filter(|g| v.contains(&g.0)).map(|g| g.2.len()).sum();
+                            eprintln!(
+                                "t2-probe blk {b}: {} of {distinct} experts, {rows} of {} rows in the pool",
+                                v.len(),
+                                t * k
+                            );
+                        }
+                        v
+                    }
+                    None => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        };
         if streamed && pf_prefetch() > 0 {
             let mut users = vec![0u32; mc.n_expert];
             for (e, _, u) in &groups {
@@ -5169,6 +5280,7 @@ impl<'m> Session<'m> {
             }
             let mut ids: Vec<u32> = (0..mc.n_expert as u32).filter(|&e| users[e as usize] > 0).collect();
             ids.sort_by_key(|&e| std::cmp::Reverse(users[e as usize]));
+            ids.retain(|e| !t2_skip.contains(&(*e as usize)));
             ids.truncate(pf_prefetch());
             if self.pf_pre_pred.len() < mc.n_layers {
                 self.pf_pre_pred.resize(mc.n_layers, Vec::new());
@@ -5427,7 +5539,7 @@ impl<'m> Session<'m> {
             let pf = self.venues[edev].pf_at(b);
             let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
             for (e, base, users) in groups.iter() {
-                if host_set.contains(e) {
+                if host_set.contains(e) || t2_skip.contains(e) {
                     continue;
                 }
                 let mut a = 0usize;
@@ -5451,13 +5563,24 @@ impl<'m> Session<'m> {
         if streamed && cpu::expert_prefetch_on() {
             // Cold start: queue every streamed expert's read before the serial fills fault them in.
             for (e, _, _) in groups.iter() {
-                if !host_set.contains(e) && pre_slot.get(*e).is_none_or(|&s| s == u32::MAX) {
+                if !host_set.contains(e) && !t2_skip.contains(e) && pre_slot.get(*e).is_none_or(|&s| s == u32::MAX) {
                     m.layers[b].experts.willneed(&m.shards, *e);
                 }
             }
         }
+        // Speed probe only (wrong output): no barrier inside the expert loop.
+        let nobar = inplace && pf_nobar_probe();
+        // Option 1 (`BRECCIA_PF_GROUPED=1`): record a window's groups as one phase of
+        // gate GEMMs and one of downs, so the independent GEMMs overlap on the GPU.
+        let grouped = inplace && !nobar && pf_grouped();
+        let grp_cap = pf_grouped_rows();
+        let tys = (gate_ty, up_ty, down_ty);
+        let (mut grp_rows, mut grp) = (0usize, Vec::<PfGroup>::new());
+        if nobar {
+            batch_cmd::phase_begin(egpu)?;
+        }
         for (e, base, users) in groups.iter() {
-            if host_set.contains(e) {
+            if host_set.contains(e) || t2_skip.contains(e) {
                 continue;
             }
             let mu = users.len();
@@ -5473,6 +5596,9 @@ impl<'m> Session<'m> {
                 // Refill a slot; when the slots are exhausted, drain first so the
                 // in-flight copies never see the next expert's bytes.
                 if expert_index > 0 && expert_index.is_multiple_of(STREAM_SLOTS) {
+                    // The ring half about to be refilled must be fully recorded first.
+                    self.pf_group_run(edev, b, pe, tys, pair, true, &grp)?;
+                    (grp_rows, grp) = (0, Vec::new());
                     let t0 = std::time::Instant::now();
                     if overlap {
                         // Double buffer: the half about to be refilled was read by the
@@ -5488,6 +5614,9 @@ impl<'m> Session<'m> {
                         self.flush()?;
                         self.ensure_batch(edev)?;
                     }
+                    if nobar {
+                        batch_cmd::phase_begin(egpu)?;
+                    }
                     self.pf_stream_wait_s += t0.elapsed().as_secs_f64();
                 }
                 self.fill_stream_slot(edev, b, *e, expert_index % (2 * STREAM_SLOTS))?;
@@ -5496,62 +5625,46 @@ impl<'m> Session<'m> {
                 prev_expert = Some(*e);
             }
             if inplace {
-                let v = &self.venues[edev];
-                let pf = v.pf_at(b);
-                let pipes = &v.pipes;
-                let gate = pipes.gemm(gate_ty).expect("the gate multi-user GEMM");
-                let up = pipes.gemm(up_ty).expect("the up multi-user GEMM");
-                let down = pipes.gemm(down_ty).expect("the down multi-user GEMM");
+                let pf = self.venues[edev].pf_at(b);
                 let xo = *base as u64 * row_bytes;
                 let words = |bytes: u64| -> Result<u32> {
                     u32::try_from(bytes / 2)
                         .map_err(|_| anyhow!("stream slot offset past u32 words"))
                 };
-                let (gbuf, ubuf, dbuf, gb, ub, db) = match pe {
-                    Some(pe) => (
-                        &pe.gate.buf,
-                        &pe.up.buf,
-                        &pe.down.buf,
-                        (*e as u32) * wgate,
-                        (*e as u32) * wup,
-                        (*e as u32) * wdown,
-                    ),
+                let g = match pe {
+                    Some(_) => PfGroup {
+                        src: PfSrc::Arena,
+                        w: [(*e as u32) * wgate, (*e as u32) * wup, (*e as u32) * wdown],
+                        xo,
+                        mu,
+                        ao: 0,
+                    },
                     None => {
-                        let (sb, off) = match (pre_hit, pf.pre.as_ref()) {
-                            (Some(s), Some(pre)) => (&pre.buf, s * pf.slot_stride),
+                        let (src, off) = match (pre_hit, pf.pre.as_ref()) {
+                            (Some(s), Some(_)) => (PfSrc::Pre, s * pf.slot_stride),
                             _ => (
-                                &pf.stream.buf,
+                                PfSrc::Ring,
                                 ((expert_index - 1) % (2 * STREAM_SLOTS)) as u64 * pf.slot_stride,
                             ),
                         };
-                        (
-                            sb,
-                            sb,
-                            sb,
+                        let w = [
                             words(off)?,
                             words(off + pf.g_bytes)?,
                             words(off + pf.g_bytes + pf.u_bytes)?,
-                        )
+                        ];
+                        PfGroup { src, w, xo, mu, ao: 0 }
                     }
                 };
-                if pair {
-                    gate.run_pair_at_off(
-                        gbuf,
-                        &pf.scratch,
-                        &pf.act,
-                        n_ff,
-                        n_embd,
-                        mu,
-                        gb,
-                        (xo, 0),
-                    )?;
+                if grouped {
+                    if grp_rows + mu > grp_cap {
+                        self.pf_group_run(edev, b, pe, tys, pair, true, &grp)?;
+                        (grp_rows, grp) = (0, Vec::new());
+                    }
+                    grp.push(PfGroup { ao: (grp_rows * n_ff * 4) as u64, ..g });
+                    grp_rows += mu;
                 } else {
-                    batch_cmd::skip_next_barrier();
-                    gate.run_at_off(gbuf, &pf.scratch, &pf.gg, n_ff, n_embd, mu, gb, (xo, 0))?;
-                    up.run_at_off(ubuf, &pf.scratch, &pf.uu, n_ff, n_embd, mu, ub, (xo, 0))?;
-                    v.swiglu.run(&pf.gg, &pf.uu, &pf.act, mu * n_ff)?;
+                    self.pf_group_run(edev, b, pe, tys, pair, false, &[g])?;
                 }
-                down.run_at_off(dbuf, &pf.act, &pf.scratch, n_embd, n_ff, mu, db, (0, xo))?;
             } else {
                 let v = &self.venues[edev];
                 let pf = v.pf_at(b);
@@ -5633,9 +5746,18 @@ impl<'m> Session<'m> {
                 pending_down = Some((*base, mu));
             }
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
+                self.pf_group_run(edev, b, pe, tys, pair, true, &grp)?;
+                (grp_rows, grp) = (0, Vec::new());
                 self.flush()?;
                 self.ensure_batch(edev)?;
+                if nobar {
+                    batch_cmd::phase_begin(egpu)?;
+                }
             }
+        }
+        self.pf_group_run(edev, b, pe, tys, pair, true, &grp)?;
+        if nobar {
+            batch_cmd::phase_end(egpu)?;
         }
         // The last expert's result still has to reach the fan-in's scratch.
         if let Some((pb, pm)) = pending_down {
@@ -8791,6 +8913,55 @@ pub fn pf_prefetch() -> usize {
     *N.get_or_init(|| {
         std::env::var("BRECCIA_PF_PREFETCH").ok().and_then(|v| v.parse().ok()).unwrap_or(0)
     })
+}
+
+/// `BRECCIA_PF_NOBAR_PROBE=1`: speed probe, drops every barrier in the merged expert
+/// loop (output is wrong). Measures what grouping the expert GEMMs could save.
+/// `BRECCIA_PF_GROUPED=1`: phase-grouped in-place expert GEMMs (see `pf_group_run`).
+fn pf_grouped() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_GROUPED").is_ok_and(|v| v == "1"))
+}
+
+/// Rows of act/gg/uu one grouped phase may hold (`BRECCIA_PF_GROUPED_ROWS`, 4096).
+fn pf_grouped_rows() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("BRECCIA_PF_GROUPED_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(4096)
+    })
+}
+
+/// Where a grouped expert GEMM reads its weights.
+#[derive(Clone, Copy)]
+enum PfSrc {
+    Arena,
+    Pre,
+    Ring,
+}
+
+/// One in-place expert group: weight word offsets (gate, up, down), its scratch
+/// rows at byte `xo`, `mu` users, and its act/gg/uu region at byte `ao`.
+#[derive(Clone, Copy)]
+struct PfGroup {
+    src: PfSrc,
+    w: [u32; 3],
+    xo: u64,
+    mu: usize,
+    ao: u64,
+}
+
+/// `BRECCIA_PF_T2_PROBE=1`: speed probe for option 2 (see `t2_skip`); wrong output.
+fn pf_t2_probe() -> bool {
+    std::env::var("BRECCIA_PF_T2_PROBE").is_ok_and(|v| v == "1")
+}
+
+fn pf_nobar_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_NOBAR_PROBE").is_ok_and(|v| v == "1"))
 }
 
 fn pf_inplace() -> bool {
