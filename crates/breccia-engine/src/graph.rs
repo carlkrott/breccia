@@ -762,6 +762,10 @@ pub struct Session<'m> {
     /// Rows the current (or next) `ship_imp` covers: see [`ship_rows`].
     ship_rows: usize,
     ship_imp_off: bool,
+    /// Option 2 (`BRECCIA_PF_T2=1`): host import for the RX -> MI50 prefill hand-off,
+    /// and the MI50 pf buffers already zeroed (by address).
+    t2_imp: Option<crate::xfer::ShipImport>,
+    t2_zeroed: Vec<usize>,
     gdn_state: Vec<Option<GdnState>>,
     qsa_state: Vec<Option<QsaState>>,
     /// `BRECCIA_KV_POOL_CELLS`: per QSA layer, the K/V page pool every sequence
@@ -1239,7 +1243,8 @@ impl<'m> Session<'m> {
             // A device with no layers (the 48/0 helper) never runs a chunk unless the opt-in
             // `BRECCIA_PF_EXPERT_DEVICE` prototype names it; the arena gave its share back.
             let owns = (0..mc.n_layers).any(|b| model.device_of(b) == i)
-                || std::env::var("BRECCIA_PF_EXPERT_DEVICE").ok().and_then(|v| v.parse::<usize>().ok()) == Some(i);
+                || std::env::var("BRECCIA_PF_EXPERT_DEVICE").ok().and_then(|v| v.parse::<usize>().ok()) == Some(i)
+                || (pf_t2() && model.t2.as_ref().is_some_and(|h| h.dev == i));
             let pf = if chunk > 0 && cfg.prefill_merged && owns && (auto || !model.placed.is_empty()) {
                 let k = mc.n_expert_used;
                 let nb = mc.n_embd as u64 * 4;
@@ -1295,7 +1300,8 @@ impl<'m> Session<'m> {
                         shared: alloc(chunk as u64 * nb, "prefill chunk shared")?,
                         gate: alloc(chunk as u64 * 4, "prefill chunk shared gate")?,
                         slots: Mailbox::new(gpu, chunk as u64 * k as u64 * 4)?,
-                        scratch: alloc(chunk as u64 * k as u64 * nb, "prefill merged scratch")?,
+                        // `BRECCIA_PF_T2`: one more row, the zero row pool pairs point at.
+                        scratch: alloc((chunk as u64 * k as u64 + pf_t2() as u64) * nb, "prefill merged scratch")?,
                         x: alloc(users * nb, "prefill expert gather")?,
                         gg: alloc(users * nfb, "prefill expert gate")?,
                         uu: alloc(users * nfb, "prefill expert up")?,
@@ -1460,6 +1466,8 @@ impl<'m> Session<'m> {
             ship_imp: None,
             ship_rows: SHIP_SMALL_ROWS,
             ship_imp_off: std::env::var("BRECCIA_SHIP_IMPORT").as_deref() == Ok("0"),
+            t2_imp: None,
+            t2_zeroed: Vec::new(),
             gdn_state,
             qsa_state,
             kv_pool,
@@ -4738,6 +4746,10 @@ impl<'m> Session<'m> {
             match (s, pe) {
                 (PfSrc::Arena, Some(pe)) => [&pe.gate.buf, &pe.up.buf, &pe.down.buf],
                 (PfSrc::Pre, _) => [&pf.pre.as_ref().expect("the prefetch slots").buf; 3],
+                (PfSrc::Pool, _) => {
+                    let p = &self.model.t2.as_ref().expect("tier 2").pools[&b];
+                    [&p.gate.buf, &p.up.buf, &p.down.buf]
+                }
                 _ => [&pf.stream.buf; 3],
             }
         };
@@ -5251,7 +5263,18 @@ impl<'m> Session<'m> {
         // Option 2 probe (`BRECCIA_PF_T2_PROBE=1`, wrong output): the RX skips the
         // experts the helper card's tier-2 pool holds, to price the RX side's saving.
         let t2_skip: Vec<usize> = match m.t2.as_ref() {
-            Some(h) if pf_t2_probe() && streamed && xdev.is_none() && pe.is_none() && h.dev != dev => {
+            Some(h)
+                if (pf_t2_probe()
+                    || (pf_t2()
+                        && !split_on
+                        && self.venues[h.dev].pf.is_some()
+                        && [gate_ty, up_ty, down_ty].iter().all(|&ty| self.venues[h.dev].pipes.gemm(ty).is_some())))
+                    && streamed
+                    && xdev.is_none()
+                    && pe.is_none()
+                    && !micro
+                    && h.dev != dev =>
+            {
                 match h.pools.get(&b) {
                     Some(p) => {
                         let st = p.state.lock().expect("t2 pool state");
@@ -5412,6 +5435,37 @@ impl<'m> Session<'m> {
                 t2_job = Some((h, p, hits, tok_ids, hf[..t * n_embd].to_vec()));
             }
         }
+        // Option 2 (`BRECCIA_PF_T2=1`): the pool's pairs point at the RX scratch's zero
+        // row `t*k`; the helper computes them into its own scratch, packed from row 0
+        // (`hslots`), and its fan-in result is added to the RX one.
+        let t2_real = pf_t2() && !t2_skip.is_empty();
+        // (pool slot, first helper row, users)
+        let mut t2_groups: Vec<(u32, u32, Vec<usize>)> = Vec::new();
+        let mut hslots: Vec<u32> = Vec::new();
+        if t2_real {
+            let st = m.t2.as_ref().expect("tier 2").pools[&b].state.lock().expect("t2 pool state");
+            hslots = vec![(t * k) as u32; t * k];
+            let mut hs = 0u32;
+            let mut at = 0usize;
+            while at < pairs.len() {
+                let e = pairs[at].0;
+                let end = pairs[at..].iter().position(|p| p.0 != e).map_or(pairs.len(), |d| at + d);
+                if st.slot_of[e] != crate::d1::MISS {
+                    for c in pairs[at..end].chunks(pf_group_users()) {
+                        let base = hs;
+                        let mut users = Vec::with_capacity(c.len());
+                        for &(_, ti, j) in c {
+                            slots[ti * k + j] = (t * k) as u32;
+                            hslots[ti * k + j] = hs;
+                            hs += 1;
+                            users.push(ti);
+                        }
+                        t2_groups.push((st.slot_of[e], base, users));
+                    }
+                }
+                at = end;
+            }
+        }
         let bk_w0 = bucket_t0.elapsed().as_secs_f64();
         let slot_bytes: Vec<u8> = slots.iter().flat_map(|s| s.to_le_bytes()).collect();
         self.venues[dev].pf_at(b).slots.write(&slot_bytes)?;
@@ -5427,6 +5481,142 @@ impl<'m> Session<'m> {
         }
         Self::pf_mark(b, "bucket", &pf_tp);
         pf_tp = std::time::Instant::now();
+        // (segment, helper device, result offset, zero offset) of option 2's helper pass.
+        let mut t2_seg = None;
+        let (mut t2_ship_s, mut t2_rec_s) = (0.0f64, 0.0f64);
+        let t2_scope = self.wait_scope;
+        if t2_real {
+            let tl = std::time::Instant::now();
+            let hd = m.t2.as_ref().expect("tier 2").dev;
+            let hgpu = m.devices[hd].gpu();
+            let nb = (n_embd * 4) as u64;
+            let (tb, kb) = (t as u64 * nb, (t * k * 4) as u64);
+            let chunk = self.prefill_chunk as u64;
+            // Import layout: [mixed | w] in, the helper's MoE result at `res`, then a
+            // zero range nothing writes (the zero rows and the helper's shared/gate).
+            let res = (chunk * (nb + k as u64 * 4)).div_ceil(4096) * 4096;
+            let zero = (res + chunk * nb).div_ceil(4096) * 4096;
+            let zlen = self.venues[hd].pf_at(b).shared.size.max(nb);
+            self.submit_batch()?;
+            self.flush()?;
+            if self.t2_imp.is_none() {
+                self.t2_imp = Some(crate::xfer::ShipImport::new(zero + zlen, m.devices.len())?);
+            }
+            let imp = self.t2_imp.as_mut().expect("just made");
+            imp.ensure(dev, gpu)?;
+            imp.ensure(hd, hgpu)?;
+            let imp = self.t2_imp.as_ref().expect("just made");
+            let pf = self.venues[dev].pf_at(b);
+            t2_ship_s = crate::xfer::copy_fenced(
+                gpu,
+                &[(&pf.mixed, imp.get(dev), 0, 0, tb), (&pf.w, imp.get(dev), 0, tb, kb)],
+            )?;
+            let hv = &self.venues[hd];
+            let xpf = hv.pf_at(b);
+            let hb: Vec<u8> = hslots.iter().flat_map(|s| s.to_le_bytes()).collect();
+            xpf.slots.write(&hb)?;
+            // The helper's `shared` stays zero, so its fan-in adds only the routed sum;
+            // a helper that owns blocks of its own overwrites it, so then every block.
+            let key = &xpf.shared as *const Buf as usize;
+            let zero_sh = self.dev_blocks[hd] > 0 || !self.t2_zeroed.contains(&key);
+            if zero_sh && !self.t2_zeroed.contains(&key) {
+                self.t2_zeroed.push(key);
+            }
+            let zi = imp.get(hd);
+            let mut tq = [0f64; 6];
+            tq[0] = tl.elapsed().as_secs_f64();
+            batch_cmd::begin(hgpu)?;
+            tq[1] = tl.elapsed().as_secs_f64();
+            let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = vec![
+                (&xpf.mixed, 0, zi, 0, tb),
+                (&xpf.w, 0, zi, tb, kb),
+                (&xpf.scratch, (t * k) as u64 * nb, zi, zero, nb),
+                (&xpf.gate, 0, zi, zero, t as u64 * 4),
+            ];
+            if zero_sh {
+                copies.push((&xpf.shared, 0, zi, zero, xpf.shared.size));
+            }
+            batch_cmd::record_copies(hgpu, &copies)?;
+            let mut copies: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
+            for (_, base, users) in &t2_groups {
+                let mut a = 0usize;
+                while a < users.len() {
+                    let mut z = a + 1;
+                    while z < users.len() && users[z] == users[z - 1] + 1 {
+                        z += 1;
+                    }
+                    copies.push((
+                        &xpf.scratch,
+                        (*base as u64 + a as u64) * nb,
+                        &xpf.mixed,
+                        users[a] as u64 * nb,
+                        (z - a) as u64 * nb,
+                    ));
+                    a = z;
+                }
+            }
+            let copies_n = copies.len();
+            batch_cmd::record_copies(hgpu, &copies)?;
+            tq[2] = tl.elapsed().as_secs_f64();
+            // The pool holds the plan's own blobs (same types), slot `s` at `s` blobs in.
+            let tys = (gate_ty, up_ty, down_ty);
+            let (c0, w0) = (batch_cmd::guard_cuts(), batch_cmd::wait_seconds());
+            let grouped = pf_inplace() && pf_grouped();
+            let cap = pf_grouped_rows().max(pf_group_users());
+            let (mut rows, mut grp) = (0usize, Vec::<PfGroup>::new());
+            for (s, base, users) in &t2_groups {
+                let mu = users.len();
+                let g = PfGroup {
+                    src: PfSrc::Pool,
+                    w: [s * wgate, s * wup, s * wdown],
+                    xo: *base as u64 * nb,
+                    mu,
+                    ao: 0,
+                };
+                if grouped {
+                    if rows + mu > cap {
+                        self.pf_group_run(hd, b, None, tys, false, true, &grp)?;
+                        (rows, grp) = (0, Vec::new());
+                    }
+                    grp.push(PfGroup { ao: (rows * n_ff * 4) as u64, ..g });
+                    rows += mu;
+                } else {
+                    self.pf_group_run(hd, b, None, tys, false, false, &[g])?;
+                }
+            }
+            self.pf_group_run(hd, b, None, tys, false, true, &grp)?;
+            tq[3] = tl.elapsed().as_secs_f64();
+            let (dc, dw) = (batch_cmd::guard_cuts() - c0, (batch_cmd::wait_seconds() - w0) * 1e3);
+            hv.moe_fanin.run(&xpf.scratch, &xpf.slots.buf, &xpf.w, &xpf.shared, &xpf.gate, &xpf.moe, t, k, n_embd)?;
+            batch_cmd::record_copy(hgpu, zi, res, &xpf.moe, 0, tb)?;
+            batch_cmd::record_barrier_to_host(hgpu)?;
+            anyhow::ensure!(
+                batch_cmd::recorded() < MERGED_BATCH_CAP,
+                "option 2 helper pass recorded {} commands",
+                batch_cmd::recorded()
+            );
+            tq[4] = tl.elapsed().as_secs_f64();
+            let seg = batch_cmd::end_submit(hgpu, None)
+                .map_err(|e| anyhow!("submitting the tier-2 prefill pass on device {hd}: {e}"))?;
+            tq[5] = tl.elapsed().as_secs_f64();
+            if std::env::var_os("BRECCIA_PF_PHASES").is_some() {
+                eprintln!(
+                    "pf-t2q blk {b:>2}: groups {} copies {} | pre {:.2} begin {:.2} copies {:.2} gemm {:.2} fanin {:.2} submit {:.2} ms | cuts {dc} wait {dw:.2} ms",
+                    t2_groups.len(),
+                    copies_n,
+                    tq[0] * 1e3,
+                    (tq[1] - tq[0]) * 1e3,
+                    (tq[2] - tq[1]) * 1e3,
+                    (tq[3] - tq[2]) * 1e3,
+                    (tq[4] - tq[3]) * 1e3,
+                    (tq[5] - tq[4]) * 1e3
+                );
+            }
+            t2_seg = Some((seg, hd, res, zero));
+            t2_rec_s = tl.elapsed().as_secs_f64();
+            // RX flushes in the loop must not wait for the helper's segment.
+            self.wait_scope = Some(dev);
+        }
         let (fill0, wait0) = (self.pf_stream_fill_s, self.pf_stream_wait_s);
 
         let mut ship_s = 0.0f64;
@@ -5774,6 +5964,7 @@ impl<'m> Session<'m> {
         }
         self.submit_batch()?;
         self.flush()?;
+        self.wait_scope = t2_scope;
         // Tier 2 records after the block card's submit, so the helper's host-side
         // record/map writes overlap the block card's GPU time, not delay it.
         let mut t2_job = match t2_job {
@@ -5854,6 +6045,11 @@ impl<'m> Session<'m> {
                 (hp.size() / nb - 1) * nb,
                 nb,
             )?;
+        } else if let Some((_, _, _, zero)) = t2_seg {
+            let nb = (n_embd * 4) as u64;
+            let imp = self.t2_imp.as_ref().expect("t2 import");
+            let pf = self.venues[edev].pf_at(b);
+            batch_cmd::record_copy(egpu, &pf.scratch, (t * k) as u64 * nb, imp.get(edev), zero, nb)?;
         }
         {
             let v = &self.venues[edev];
@@ -5869,6 +6065,29 @@ impl<'m> Session<'m> {
                 k,
                 n_embd,
             )?;
+        }
+        if let Some((seg, hd, res, _)) = t2_seg.take() {
+            let tw = std::time::Instant::now();
+            batch_cmd::wait(&[m.devices[hd].gpu()], seg)
+                .map_err(|e| anyhow!("waiting for the tier-2 prefill pass: {e}"))?;
+            let t2_wait_s = tw.elapsed().as_secs_f64();
+            let imp = self.t2_imp.as_ref().expect("t2 import");
+            let v = &self.venues[edev];
+            let pf = v.pf_at(b);
+            let n = (t * n_embd * 4) as u64;
+            // The fan-in has read the scratch (record_copy fences): reuse it for the helper's sum.
+            batch_cmd::record_copy(egpu, &pf.scratch, 0, imp.get(edev), res, n)?;
+            v.add.run(&pf.moe, &pf.scratch, &pf.moe, t * n_embd, 1.0)?;
+            if std::env::var_os("BRECCIA_PF_PHASES").is_some() {
+                let rows: usize = t2_groups.iter().map(|g| g.2.len()).sum();
+                eprintln!(
+                    "pf-t2 blk {b:>2}: {rows} of {} rows, ship {:.2} rec+submit {:.2} wait {:.2} ms",
+                    t * k,
+                    t2_ship_s * 1e3,
+                    t2_rec_s * 1e3,
+                    t2_wait_s * 1e3
+                );
+            }
         }
         Self::pf_mark(b, "fan-rec", &t_fan);
         let mut host_wait_s = 0.0f64;
@@ -8371,6 +8590,9 @@ impl Drop for Session<'_> {
         if let Some(mut imp) = self.ship_imp.take() {
             imp.release(&gpus);
         }
+        if let Some(mut imp) = self.t2_imp.take() {
+            imp.release(&gpus);
+        }
         if LIVE_SESSIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
             let _ = breccia_kernels::batch_cmd::shutdown();
             crate::d1::report("d1", &m.d1);
@@ -8941,6 +9163,8 @@ enum PfSrc {
     Arena,
     Pre,
     Ring,
+    /// The tier-2 pool of the block (helper card), word offsets by pool slot.
+    Pool,
 }
 
 /// One in-place expert group: weight word offsets (gate, up, down), its scratch
@@ -8952,6 +9176,15 @@ struct PfGroup {
     xo: u64,
     mu: usize,
     ao: u64,
+}
+
+/// `BRECCIA_PF_T2=1` (opt-in, output-changing order of adds only): streamed prefill
+/// blocks send the experts the helper card's tier-2 pool holds to that card, which
+/// computes them from the pool while the RX streams the rest; the result is added
+/// after the RX fan-in.
+fn pf_t2() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_T2").is_ok_and(|v| v == "1"))
 }
 
 /// `BRECCIA_PF_T2_PROBE=1`: speed probe for option 2 (see `t2_skip`); wrong output.

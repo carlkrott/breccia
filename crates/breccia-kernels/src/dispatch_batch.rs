@@ -153,7 +153,9 @@ thread_local! {
 /// Segments that may be in flight at once. Two are enough for a block (the
 /// pre-router segment and the shared-expert segment); three leaves room for the
 /// next block's first segment to be recorded while the previous one drains.
-pub const RING: usize = 6;
+/// 64, not 6: the tier-2 prefill pass (`BRECCIA_PF_T2`) leaves up to ~60 guard
+/// cuts in flight on the MI50, and with fewer slots `begin` waits on each one.
+pub const RING: usize = 64;
 
 /// One device's open recording.
 #[derive(Clone, Copy, Debug)]
