@@ -137,6 +137,36 @@ impl LayerPlan {
         self.gate.bytes() + self.up.bytes() + self.down.bytes()
     }
 
+    /// Ask the kernel to read expert `expert`'s gate/up/down bytes now
+    /// (`MADV_WILLNEED`). Cold faults read one readahead window at a time
+    /// (~210 MB/s on the first prompt after a load, 11-09); the hint queues
+    /// every range at once. A blob whose first page is cached is skipped, so a
+    /// warm expert costs one `mincore`. A hint only: failure never changes a result.
+    pub fn willneed(&self, set: &ShardSet, expert: usize) {
+        // The kernel truncates one WILLNEED call to the readahead window (128 KiB
+        // on /srv's btrfs, 11-10), so a ~1 MiB blob is hinted in window-sized pieces.
+        // shortcut: fixed 128 KiB, the kernel's default window; read the bdi's if a mount differs.
+        const STEP: usize = 128 << 10;
+        let Ok(s) = self.slices(set, expert) else { return };
+        for blob in [s.gate, s.up, s.down] {
+            let a = blob.as_ptr() as usize;
+            let (start, end) = (a & !4095, a + blob.len());
+            let mut vec = 0u8;
+            // SAFETY: start..start+4096 lies inside the shard mapping; mincore and
+            // madvise only read page state and queue reads.
+            unsafe {
+                if libc::mincore(start as *mut libc::c_void, 4096, &mut vec) == 0 && vec & 1 == 1 {
+                    continue;
+                }
+                let mut p = start;
+                while p < end {
+                    libc::madvise(p as *mut libc::c_void, STEP.min(end - p), libc::MADV_WILLNEED);
+                    p += STEP;
+                }
+            }
+        }
+    }
+
     /// Zero-copy `gate | up | down` slices of expert `e`.
     pub fn slices<'a>(&self, set: &'a ShardSet, expert: usize) -> Result<ExpertSlices<'a>> {
         if expert >= self.n_experts {
@@ -313,6 +343,10 @@ pub struct ExpertPool {
     /// Tree-wake fan-out ([`wake_fanout`]); 0 = the coordinator wakes every worker.
     fanout: usize,
     handles: Vec<JoinHandle<()>>,
+    /// The mapping the workers read, for [`ExpertPool::prefetch`].
+    set: Arc<ShardSet>,
+    /// `(block, expert)` pairs already prefetched once.
+    seen: std::collections::HashSet<(usize, usize)>,
 }
 
 /// One worker's work for one phase.
@@ -411,6 +445,12 @@ fn wake_fanout() -> usize {
         .unwrap_or(2)
 }
 
+/// `BRECCIA_EXPERT_PREFETCH=0` turns off the cold-start [`LayerPlan::willneed`] hints.
+pub fn expert_prefetch_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_EXPERT_PREFETCH").as_deref() != Ok("0"))
+}
+
 /// `BRECCIA_LANE_STATS=1`: time every pool phase (coord plan Phase 0).
 pub fn lane_stats_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -489,7 +529,7 @@ impl ExpertPool {
         let pin = crate::cpu::cpu_pin();
         for (id, job_rx) in job_rxs.into_iter().enumerate() {
             let done = done_tx.clone();
-            let set = Arc::clone(&set);
+            let set_w = Arc::clone(&set);
             let cpu = pin.as_ref().map(|p| p.workers[id % p.workers.len()]);
             let handle = thread::Builder::new()
                 .name(format!("breccia-expert-{id}"))
@@ -497,7 +537,7 @@ impl ExpertPool {
                     if let Some(c) = cpu {
                         crate::cpu::pin_current(&[c]);
                     }
-                    worker_loop(id, &set, path, &job_rx, &done)
+                    worker_loop(id, &set_w, path, &job_rx, &done)
                 })
                 .expect("spawning an expert worker");
             handles.push(handle);
@@ -511,6 +551,23 @@ impl ExpertPool {
             rx,
             fanout: wake_fanout(),
             handles,
+            set,
+            seen: Default::default(),
+        }
+    }
+
+    /// Cold start: [`LayerPlan::willneed`] the first time an expert is used, before
+    /// the workers fault it in.
+    // shortcut: once per expert per process; an expert the page cache later evicts
+    // faults back in as before. Re-prefetch on a miss signal if steady-state refaults show up.
+    fn prefetch(&mut self, plan: &LayerPlan, experts: impl IntoIterator<Item = usize>) {
+        if !expert_prefetch_on() {
+            return;
+        }
+        for e in experts {
+            if e < plan.n_experts && self.seen.insert((plan.block, e)) {
+                plan.willneed(&self.set, e);
+            }
         }
     }
 
@@ -648,6 +705,7 @@ impl ExpertPool {
             return Ok(0);
         }
         let k = ids.len();
+        self.prefetch(plan, ids.iter().copied());
         let (n_ff, n_embd) = (plan.n_ff, plan.n_embd);
         let x = Arc::new(x.to_vec());
 
@@ -970,6 +1028,7 @@ impl ExpertPool {
             }
         }
         let distinct = by.len();
+        self.prefetch(plan, by.keys().copied());
         let pairs: usize = by.values().map(Vec::len).sum();
         self.last_distinct = distinct;
         let words = Arc::new(x[..t * n_embd].to_vec());

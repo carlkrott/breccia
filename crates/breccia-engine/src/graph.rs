@@ -5081,6 +5081,11 @@ impl<'m> Session<'m> {
                 batch_cmd::record_barrier_to_host(gpu)?;
                 self.submit_batch()?;
                 let t_pre = std::time::Instant::now();
+                if cpu::expert_prefetch_on() {
+                    for &e in &list {
+                        self.model.layers[b].experts.willneed(&self.model.shards, e as usize);
+                    }
+                }
                 for (s, &e) in list.iter().enumerate() {
                     self.fill_slot(dev, b, e as usize, s, true)?;
                     pre_slot[e as usize] = s as u32;
@@ -5442,6 +5447,14 @@ impl<'m> Session<'m> {
                 }
             }
             batch_cmd::record_copies(egpu, &copies)?;
+        }
+        if streamed && cpu::expert_prefetch_on() {
+            // Cold start: queue every streamed expert's read before the serial fills fault them in.
+            for (e, _, _) in groups.iter() {
+                if !host_set.contains(e) && pre_slot.get(*e).is_none_or(|&s| s == u32::MAX) {
+                    m.layers[b].experts.willneed(&m.shards, *e);
+                }
+            }
         }
         for (e, base, users) in groups.iter() {
             if host_set.contains(e) {

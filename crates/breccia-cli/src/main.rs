@@ -1261,6 +1261,34 @@ fn placement_split(
     }
 }
 
+/// Strata's ranked expert list, the tier-2 pool seed when `BRECCIA_D1_PROFILE` is unset.
+const T2_SEED_PROFILE: &str = "/home/korphaus/projects/strata-v0210/data/expert-profile.bin";
+
+/// Default two-card layout (Carl 11-09): the fast card drives every block and the
+/// other is a tier-2 expert helper (`48,0` + `BRECCIA_T2_GIB=12`, frozen seed). Measured
+/// 29.1 vs 24.0 tok/s one-stream decode against the profile's 38/10, battery 0 flips.
+/// `BRECCIA_PLACEMENT=split` keeps the profile verdict. Unset T2/D1 env vars get defaults.
+fn primary_helper(blocks: &[usize], fast: usize) -> Option<Vec<usize>> {
+    // shortcut: fast card first only (the measured order); swap order once a 0,48 run exists.
+    if std::env::var("BRECCIA_PLACEMENT").as_deref() == Ok("split") || fast != 0 || blocks.len() != 2 {
+        return None;
+    }
+    let set = |k: &str, v: &str| {
+        if std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+        }
+    };
+    set("BRECCIA_T2_GIB", "12");
+    set("BRECCIA_T2_DEVICE", "1");
+    set("BRECCIA_D1_FREEZE", "1");
+    if std::path::Path::new(T2_SEED_PROFILE).exists() {
+        set("BRECCIA_D1_PROFILE", T2_SEED_PROFILE);
+    }
+    let split = vec![blocks.iter().sum(), 0];
+    println!("split-blocks {split:?} (primary + tier-2 helper default; BRECCIA_PLACEMENT=split for the profile's {blocks:?})");
+    Some(split)
+}
+
 /// `--split-blocks` parsed, else [`placement_default`] (which also points the prefill
 /// expert helper at the fast card unless `BRECCIA_PF_EXPERT_DEVICE` is set).
 fn split_or_placement(split: Option<&str>, devs: &[String]) -> Option<Vec<usize>> {
@@ -1270,6 +1298,9 @@ fn split_or_placement(split: Option<&str>, devs: &[String]) -> Option<Vec<usize>
         return Some(blocks);
     }
     let (blocks, fast) = placement_default(devs)?;
+    if let Some(p) = primary_helper(&blocks, fast) {
+        return Some(p);
+    }
     if std::env::var_os("BRECCIA_PF_EXPERT_DEVICE").is_none() {
         std::env::set_var("BRECCIA_PF_EXPERT_DEVICE", fast.to_string());
     }
