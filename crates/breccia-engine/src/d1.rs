@@ -223,14 +223,16 @@ pub fn build(
 
 /// Reload choice: uncached experts by descending `heat` against cached slots by
 /// ascending heat (empty slots first), while the newcomer is `ratio` x hotter.
-fn pick(heat: &[f32], slot_of: &[u32], expert_of: &[u32], max: usize, ratio: f32) -> Vec<(usize, usize)> {
-    let mut hot: Vec<usize> = (0..heat.len()).filter(|&e| slot_of[e] == MISS && heat[e] > 0.0).collect();
+/// `busy`: moves still in flight (option 1 async), neither their experts nor slots are picked.
+fn pick(heat: &[f32], slot_of: &[u32], expert_of: &[u32], max: usize, ratio: f32, busy: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut hot: Vec<usize> =
+        (0..heat.len()).filter(|&e| slot_of[e] == MISS && heat[e] > 0.0 && !busy.iter().any(|m| m.0 == e)).collect();
     hot.sort_by(|a, b| heat[*b].total_cmp(&heat[*a]));
     let vh = |s: usize| match expert_of[s] {
         MISS => -1.0,
         e => heat[e as usize],
     };
-    let mut cold: Vec<usize> = (0..expert_of.len()).collect();
+    let mut cold: Vec<usize> = (0..expert_of.len()).filter(|&s| !busy.iter().any(|m| m.1 == s)).collect();
     cold.sort_by(|a, b| vh(*a).total_cmp(&vh(*b)));
     // A seeded slot that sat idle this window is not evidence: the newcomer must also be
     // `ratio` x the window's mean count, or one-off experts thrash the seed.
@@ -342,21 +344,34 @@ impl Pool {
     /// coldest cached out, `ratio` rule) and empty their slots now: the old experts
     /// miss from here on and the new ones only hit after [`Pool::land`], so nothing
     /// reads a slot while its copy is in flight. Halves the counts.
-    pub fn take_reload(&self, max: usize) -> Vec<(usize, usize)> {
+    pub fn take_reload(&self, max: usize, busy: &[(usize, usize)]) -> Vec<(usize, usize)> {
+        let moves = self.pick_reload(max, busy);
+        self.evict(&moves);
+        moves
+    }
+
+    /// [`Pool::take_reload`] without emptying the slots (async: [`Pool::evict`] at submit).
+    pub fn pick_reload(&self, max: usize, busy: &[(usize, usize)]) -> Vec<(usize, usize)> {
         let mut st = self.state.lock().expect("D1 state");
         let st = &mut *st;
-        let moves = pick(&st.pf, &st.slot_of, &st.expert_of, max, policy().ratio);
-        for &(_, s) in &moves {
-            if st.expert_of[s] != MISS {
-                st.slot_of[st.expert_of[s] as usize] = MISS;
-                st.expert_of[s] = MISS;
-            }
-        }
+        let moves = pick(&st.pf, &st.slot_of, &st.expert_of, max, policy().ratio, busy);
         for h in st.pf.iter_mut() {
             *h *= 0.5;
         }
         st.pf_tokens = 0;
         moves
+    }
+
+    /// Empty the slots `moves` will overwrite: their old experts miss from now on.
+    pub fn evict(&self, moves: &[(usize, usize)]) {
+        let mut st = self.state.lock().expect("D1 state");
+        for &(_, s) in moves {
+            if st.expert_of[s] != MISS {
+                let old = st.expert_of[s] as usize;
+                st.slot_of[old] = MISS;
+                st.expert_of[s] = MISS;
+            }
+        }
     }
 
     /// The copies for `moves`: `(blob, dst buffer, dst offset)` per role and move.
@@ -427,11 +442,13 @@ mod tests {
         let slot_of = [0, 1, MISS, MISS, MISS, MISS];
         let expert_of = [0, 1];
         // 4 replaces cold 1; 5 is not 1.5x hotter than 0, so it stops there.
-        assert_eq!(super::pick(&heat, &slot_of, &expert_of, 8, 1.5), vec![(4, 1)]);
+        assert_eq!(super::pick(&heat, &slot_of, &expert_of, 8, 1.5, &[]), vec![(4, 1)]);
         // an empty slot takes anything hot
-        assert_eq!(super::pick(&heat, &slot_of, &[0, MISS], 8, 1.5), vec![(4, 1)]);
-        assert_eq!(super::pick(&heat, &slot_of, &expert_of, 0, 1.5), vec![]);
+        assert_eq!(super::pick(&heat, &slot_of, &[0, MISS], 8, 1.5, &[]), vec![(4, 1)]);
+        assert_eq!(super::pick(&heat, &slot_of, &expert_of, 0, 1.5, &[]), vec![]);
         // idle seeded slots (1, 2, 3) only go to misses above 1.5 x the mean (2.5)
-        assert_eq!(super::pick(&heat, &[MISS, 0, 1, 2, MISS, MISS], &[1, 2, 3], 8, 1.5), vec![(4, 0), (0, 1)]);
+        assert_eq!(super::pick(&heat, &[MISS, 0, 1, 2, MISS, MISS], &[1, 2, 3], 8, 1.5, &[]), vec![(4, 0), (0, 1)]);
+        // In-flight moves: neither their expert nor their slot is picked again.
+        assert_eq!(super::pick(&heat, &[MISS, 0, 1, 2, MISS, MISS], &[1, 2, 3], 8, 1.5, &[(4, 0)]), vec![(0, 1)]);
     }
 }

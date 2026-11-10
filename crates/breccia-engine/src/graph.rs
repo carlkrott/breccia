@@ -5407,6 +5407,15 @@ impl<'m> Session<'m> {
                         let mut v: Vec<usize> =
                             groups.iter().map(|g| g.0).filter(|&e| st.slot_of[e] != crate::d1::MISS).collect();
                         v.dedup();
+                        // Cap the helper's share: its pass is ~0.4 ms per group whatever the
+                        // guard does, so past a point the RX finishes first and waits. Keep the
+                        // experts with the most rows (most work per group).
+                        if let Some(cap) = pf_t2_max_groups().filter(|&c| c < v.len()) {
+                            let rows = |e: usize| groups.iter().filter(|g| g.0 == e).map(|g| g.2.len()).sum::<usize>();
+                            v.sort_by_key(|&e| std::cmp::Reverse(rows(e)));
+                            v.truncate(cap);
+                            v.sort_unstable();
+                        }
                         if b == 10 {
                             let rows: usize = groups.iter().filter(|g| v.contains(&g.0)).map(|g| g.2.len()).sum();
                             eprintln!(
@@ -5576,7 +5585,8 @@ impl<'m> Session<'m> {
             while at < pairs.len() {
                 let e = pairs[at].0;
                 let end = pairs[at..].iter().position(|p| p.0 != e).map_or(pairs.len(), |d| at + d);
-                if st.slot_of[e] != crate::d1::MISS {
+                // Exactly the RX's skip set (a `BRECCIA_PF_T2_MAX_GROUPS` cap leaves some hits to the RX).
+                if st.slot_of[e] != crate::d1::MISS && t2_skip.contains(&e) {
                     for c in pairs[at..end].chunks(pf_group_users()) {
                         let base = hs;
                         let mut users = Vec::with_capacity(c.len());
@@ -9345,6 +9355,13 @@ enum T2Pending {
 
 /// (groups, copies, phase ends in s [6], guard cuts, ring wait s) of one helper pass.
 type T2Stats = (usize, usize, [f64; 6], u64, f64);
+
+/// `BRECCIA_PF_T2_MAX_GROUPS=<n>` (with `BRECCIA_PF_T2=1`): at most `n` pool-hit experts
+/// per block go to the helper, the ones with the most rows. Exact (same maths per expert).
+fn pf_t2_max_groups() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("BRECCIA_PF_T2_MAX_GROUPS").ok()?.parse().ok())
+}
 
 /// `BRECCIA_PF_T2_PROBE=1`: speed probe for option 2 (see `t2_skip`); wrong output.
 fn pf_t2_probe() -> bool {

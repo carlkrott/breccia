@@ -174,8 +174,21 @@ pub(crate) fn before_dispatch(
             .get(&key)
             .map(|b| b * wg as f64 * s.corr.get(&dev).copied().unwrap_or(1.0));
         let sl = &mut s.slots[slot];
-        let cut = count > 0
-            && (sl.solo.is_some() || est.is_none() || sl.pred_ns + est.unwrap_or(0.0) > budget);
+        let why = if count == 0 {
+            None
+        } else if sl.solo.is_some() {
+            Some(0)
+        } else if est.is_none() {
+            Some(1)
+        } else if sl.pred_ns + est.unwrap_or(0.0) > budget {
+            Some(2)
+        } else {
+            None
+        };
+        let cut = why.is_some();
+        if let Some(w) = why {
+            WHY[(gpu.index as usize).min(1) * 3 + w].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if !cut {
             sl.n += 1;
             match est {
@@ -237,6 +250,9 @@ pub(crate) fn read(gpu: &Gpu, slot: usize) {
     });
 }
 
+/// Cut reasons per device (0, 1+): after an unmeasured pipeline's solo dispatch, before one, over budget.
+static WHY: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn count_cut() {
@@ -258,6 +274,15 @@ pub(crate) fn shutdown() {
                 cuts(),
                 s.max_solo.0 / 1e6,
                 s.max_solo.1
+            );
+        }
+        let w = |i: usize| WHY[i].load(std::sync::atomic::Ordering::Relaxed);
+        if cuts() > 0 {
+            let mut c: Vec<_> = s.corr.values().map(|v| format!("{v:.2}")).collect();
+            c.sort();
+            eprintln!(
+                "submit guard: cut reasons (after-solo/unmeasured/budget) dev0 {}/{}/{} dev1+ {}/{}/{}; this thread corr [{}], {} pipelines measured",
+                w(0), w(1), w(2), w(3), w(4), w(5), c.join(" "), s.per_wg.len()
             );
         }
         s.max_solo = (0.0, 0);

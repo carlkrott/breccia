@@ -16,6 +16,9 @@
 //!   the helper while the block computes and lands at the next block's start.
 //!   `BRECCIA_T2_RELOAD_DECODE=1`: count decode rows only (prompt chunks over
 //!   `MAX_ROWS` are skipped), i.e. async adaptive swaps from decode history.
+//! * `BRECCIA_T2_RELOAD_ASYNC=1`: a worker thread reads the picked blobs (mmap page
+//!   faults included) into one of two mapped staging buffers; the driving thread only
+//!   submits the copy at the block's next due check. One check later, same output.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -52,6 +55,10 @@ pub fn reload_every() -> Option<usize> {
     std::env::var("BRECCIA_T2_RELOAD").ok()?.parse().ok().filter(|&n: &usize| n > 0)
 }
 
+fn reload_async() -> bool {
+    std::env::var("BRECCIA_T2_RELOAD_ASYNC").is_ok_and(|v| v == "1")
+}
+
 fn reload_max() -> usize {
     std::env::var("BRECCIA_T2_RELOAD_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
 }
@@ -64,14 +71,58 @@ pub struct Reload {
     reloads: u64,
     record_s: f64,
     wait_s: f64,
+    /// `BRECCIA_T2_RELOAD_ASYNC`: two mapped stages (the pending copy reads one while the
+    /// worker fills the other), the pending copy's stage, and the gather in flight.
+    stages: Vec<(Buf, usize)>,
+    pending_stage: usize,
+    gather: Option<Gather>,
+    skipped: u64,
+}
+
+/// A worker thread's blob gather into `stages[stage]`: block, moves, and per copy
+/// `(role, stage offset, pool offset, bytes)`.
+struct Gather {
+    done: std::thread::JoinHandle<()>,
+    b: usize,
+    moves: Vec<(usize, usize)>,
+    stage: usize,
+    copies: Vec<(usize, u64, u64, u64)>,
 }
 
 impl Reload {
     pub fn new(gpu: &Gpu, pools: &BTreeMap<usize, Pool>) -> Result<Option<Mutex<Self>>> {
         let Some(every) = reload_every() else { return Ok(None) };
         let most = pools.values().map(|p| p.per_expert()).max().unwrap_or(0);
-        let stage = breccia_kernels::gemv::staging(gpu, (reload_max() as u64 * most).max(1))?;
-        Ok(Some(Mutex::new(Reload { every, stage, pending: None, reloads: 0, record_s: 0.0, wait_s: 0.0 })))
+        let size = (reload_max() as u64 * most).max(1);
+        let (stage, stages) = if reload_async() {
+            let mut v = Vec::new();
+            for _ in 0..2 {
+                let (b, ptr) = gpu
+                    .buf_mapped(
+                        size,
+                        ash::vk::BufferUsageFlags::TRANSFER_SRC,
+                        ash::vk::MemoryPropertyFlags::HOST_VISIBLE | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
+                        ash::vk::MemoryPropertyFlags::HOST_VISIBLE | ash::vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                    .map_err(|e| anyhow::anyhow!("t2 reload stage: {e}"))?;
+                v.push((b, ptr as usize));
+            }
+            (breccia_kernels::gemv::staging(gpu, 4)?, v)
+        } else {
+            (breccia_kernels::gemv::staging(gpu, size)?, Vec::new())
+        };
+        Ok(Some(Mutex::new(Reload {
+            every,
+            stage,
+            pending: None,
+            reloads: 0,
+            record_s: 0.0,
+            wait_s: 0.0,
+            stages,
+            pending_stage: 0,
+            gather: None,
+            skipped: 0,
+        })))
     }
 }
 
@@ -91,7 +142,12 @@ impl Tier2 {
         }
         self.land(gpu, &mut r)?;
         let t0 = std::time::Instant::now();
-        let moves = p.take_reload(reload_max());
+        if !r.stages.is_empty() {
+            self.note_async(gpu, b, p, &mut r)?;
+            r.record_s += t0.elapsed().as_secs_f64();
+            return Ok(());
+        }
+        let moves = p.take_reload(reload_max(), &[]);
         r.reloads += 1;
         if moves.is_empty() {
             return Ok(());
@@ -108,6 +164,58 @@ impl Tier2 {
         drop(copies);
         r.pending = Some((pc, b, moves));
         r.record_s += t0.elapsed().as_secs_f64();
+        Ok(())
+    }
+
+    /// Async option 1 at a due check (the previous copy has landed): submit a finished
+    /// gather, then pick this block's moves and start the next gather into the other stage.
+    fn note_async(&self, gpu: &Gpu, b: usize, p: &Pool, r: &mut Reload) -> Result<()> {
+        if let Some(g) = r.gather.take() {
+            if !g.done.is_finished() {
+                r.gather = Some(g);
+                r.skipped += 1;
+                return Ok(());
+            }
+            g.done.join().map_err(|_| anyhow::anyhow!("t2 reload gather panicked"))?;
+            let gp = &self.pools[&g.b];
+            let dst = [&gp.gate.buf, &gp.up.buf, &gp.down.buf];
+            let stage = &r.stages[g.stage].0;
+            let copies: Vec<_> = g.copies.iter().map(|&(role, so, dof, n)| (stage, dst[role], so, dof, n)).collect();
+            // The slots empty now: nothing may hit them while the copy writes.
+            gp.evict(&g.moves);
+            let pc = crate::xfer::copy_submit(gpu, &copies)?;
+            r.pending = Some((pc, g.b, g.moves));
+            r.pending_stage = g.stage;
+        }
+        let busy = match &r.pending {
+            Some((_, pb, mv)) if *pb == b => mv.clone(),
+            _ => Vec::new(),
+        };
+        let moves = p.pick_reload(reload_max(), &busy);
+        r.reloads += 1;
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let stage = if r.pending.is_some() { 1 - r.pending_stage } else { 0 };
+        let (mut srcs, mut copies, mut off) = (Vec::new(), Vec::new(), 0u64);
+        for (i, (blob, _, dof)) in p.reload_parts(&moves).into_iter().enumerate() {
+            srcs.push((blob.as_ptr() as usize, blob.len()));
+            copies.push((i / moves.len(), off, dof, blob.len() as u64));
+            off += blob.len() as u64;
+        }
+        ensure!(off <= r.stages[stage].0.size, "t2 reload: {off} bytes over the stage");
+        let (src, dst) = (p.src.clone(), r.stages[stage].1);
+        let done = std::thread::Builder::new().name("t2-gather".into()).spawn(move || {
+            let _keep = src; // the mmap the blob pointers point into
+            let mut o = 0;
+            for (ptr, n) in srcs {
+                // SAFETY: `ptr..ptr+n` is inside `_keep`'s mmap; `dst` is the mapped stage,
+                // which no copy reads and nothing else writes until this thread is joined.
+                unsafe { std::ptr::copy_nonoverlapping(ptr as *const u8, (dst as *mut u8).add(o), n) };
+                o += n;
+            }
+        })?;
+        r.gather = Some(Gather { done, b, moves, stage, copies });
         Ok(())
     }
 
@@ -134,7 +242,13 @@ impl Tier2 {
     pub fn report(&self) {
         crate::d1::report("t2", &self.pools);
         if let Some(Ok(r)) = self.reload.as_ref().map(|m| m.lock()) {
-            eprintln!("t2 reload: {} checks, record {:.1} ms, landing waits {:.1} ms", r.reloads, r.record_s * 1e3, r.wait_s * 1e3);
+            eprintln!(
+                "t2 reload: {} checks, record {:.1} ms, landing waits {:.1} ms, {} checks skipped (gather busy)",
+                r.reloads,
+                r.record_s * 1e3,
+                r.wait_s * 1e3,
+                r.skipped
+            );
         }
     }
 
@@ -142,6 +256,12 @@ impl Tier2 {
         // The in-flight copy writes into a pool: land it before the pools go.
         if let Some(Ok(mut r)) = self.reload.as_ref().map(|m| m.lock()) {
             let _ = self.land(gpu, &mut r);
+            if let Some(g) = r.gather.take() {
+                let _ = g.done.join();
+            }
+            for (b, _) in &r.stages {
+                gpu.destroy_buf(b);
+            }
             eprintln!(
                 "t2 reload: {} checks, record {:.1} ms, landing waits {:.1} ms",
                 r.reloads,
