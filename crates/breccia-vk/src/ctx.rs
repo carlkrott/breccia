@@ -424,7 +424,7 @@ pub struct Timing {
 /// They must be separate objects: a buffer that is pending execution cannot be
 /// reset, and the whole point of the ring is to have one segment in flight while
 /// the next is being recorded.
-pub const BATCH_CMDS: usize = 64;
+pub const BATCH_CMDS: usize = 6;
 
 /// `BRECCIA_SHARED_DEVICE=1` (G1, `docs/coord/G1-shared-device.md`): several
 /// sessions on several threads share one [`Gpu`], so the one-shot and ring command
