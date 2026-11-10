@@ -274,6 +274,33 @@ impl Placement {
         Ok(())
     }
 
+    /// Move `blocks` to device `dev` (non-contiguous allowed: one run per same-device
+    /// stretch; the hand-offs key on `device_of(b-1) != device_of(b)`). The tail stays
+    /// charged where the last block runs.
+    pub fn reassign(&mut self, blocks: &[usize], dev: usize, layer_bytes: &[u64], tail_bytes: u64) {
+        for &b in blocks {
+            self.layer_device[b] = dev;
+        }
+        let n = self.layer_device.len();
+        self.bytes = vec![0; self.devices.len()];
+        self.runs.clear();
+        for b in 0..n {
+            let d = self.layer_device[b];
+            self.bytes[d] += layer_bytes[b];
+            match self.runs.last_mut() {
+                Some(r) if r.device == d => {
+                    r.blocks.1 = b + 1;
+                    r.bytes += layer_bytes[b];
+                }
+                _ => self.runs.push(LayerRun { device: d, blocks: (b, b + 1), bytes: layer_bytes[b] }),
+            }
+        }
+        self.bytes[self.layer_device[n - 1]] += tail_bytes;
+        if let Some(r) = self.runs.last_mut() {
+            r.bytes += tail_bytes;
+        }
+    }
+
     /// True when the block runs are contiguous per device and cover every block.
     pub fn is_contiguous(&self) -> bool {
         let mut expect = 0usize;
@@ -350,6 +377,19 @@ mod tests {
         assert_eq!(p.layer_device.len(), 48);
         assert!(p.layer_device.iter().all(|&d| d == 0));
         assert_eq!(p.bytes[0], 4800);
+    }
+
+    #[test]
+    fn reassign_moves_blocks_and_rebuilds_runs() {
+        let lb = vec![100u64; 8];
+        let mut p = Placement::balanced(specs(2), &lb, 0);
+        p.layer_device = vec![0; 8];
+        p.reassign(&[3], 1, &lb, 7);
+        assert_eq!(p.layer_device, vec![0, 0, 0, 1, 0, 0, 0, 0]);
+        let r: Vec<_> = p.runs.iter().map(|r| (r.device, r.blocks)).collect();
+        assert_eq!(r, vec![(0, (0, 3)), (1, (3, 4)), (0, (4, 8))]);
+        assert_eq!(p.bytes, vec![707, 100]);
+        assert_eq!(p.runs[2].bytes, 407);
     }
 
     #[test]

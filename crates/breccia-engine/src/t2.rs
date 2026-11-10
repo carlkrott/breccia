@@ -10,6 +10,12 @@
 //! * `BRECCIA_D1_PROFILE` / `BRECCIA_D1_FREEZE` / `BRECCIA_D1_EVERY..` as for D1.
 //! * `BRECCIA_T2_DECODE=0`: keep plain (t=1) decode on the host lane. Default on; without
 //!   `BRECCIA_D1_FREEZE=1` its swaps are synchronous on every decode token.
+//! * `BRECCIA_T2_RELOAD=<tokens>` (option 1): count every block's routed experts
+//!   (prompt chunks and decode rows) and every `<tokens>` swap up to
+//!   `BRECCIA_T2_RELOAD_MAX` (32) hot ones in, ignoring the freeze. The copy runs on
+//!   the helper while the block computes and lands at the next block's start.
+//!   `BRECCIA_T2_RELOAD_DECODE=1`: count decode rows only (prompt chunks over
+//!   `MAX_ROWS` are skipped), i.e. async adaptive swaps from decode history.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -39,6 +45,118 @@ pub struct Tier2 {
     pub dev: usize,
     pub pools: BTreeMap<usize, Pool>,
     pub scratch: Mutex<Scratch>,
+    pub reload: Option<Mutex<Reload>>,
+}
+
+pub fn reload_every() -> Option<usize> {
+    std::env::var("BRECCIA_T2_RELOAD").ok()?.parse().ok().filter(|&n: &usize| n > 0)
+}
+
+fn reload_max() -> usize {
+    std::env::var("BRECCIA_T2_RELOAD_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(32)
+}
+
+/// Option 1's one in-flight pool copy (helper staging, the fence, which block and moves).
+pub struct Reload {
+    every: usize,
+    stage: Buf,
+    pending: Option<(crate::xfer::PendingCopy, usize, Vec<(usize, usize)>)>,
+    reloads: u64,
+    record_s: f64,
+    wait_s: f64,
+}
+
+impl Reload {
+    pub fn new(gpu: &Gpu, pools: &BTreeMap<usize, Pool>) -> Result<Option<Mutex<Self>>> {
+        let Some(every) = reload_every() else { return Ok(None) };
+        let most = pools.values().map(|p| p.per_expert()).max().unwrap_or(0);
+        let stage = breccia_kernels::gemv::staging(gpu, (reload_max() as u64 * most).max(1))?;
+        Ok(Some(Mutex::new(Reload { every, stage, pending: None, reloads: 0, record_s: 0.0, wait_s: 0.0 })))
+    }
+}
+
+impl Tier2 {
+    /// Option 1, at a block's routing: count `ids` (over `tokens` tokens) and, when the
+    /// block is due, land the previous copy and start this block's.
+    pub fn note(&self, gpu: &Gpu, b: usize, ids: impl Iterator<Item = usize>, tokens: usize) -> Result<()> {
+        let (Some(rl), Some(p)) = (&self.reload, self.pools.get(&b)) else { return Ok(()) };
+        static DECODE_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if tokens > MAX_ROWS && *DECODE_ONLY.get_or_init(|| std::env::var("BRECCIA_T2_RELOAD_DECODE").is_ok_and(|v| v == "1")) {
+            return Ok(());
+        }
+        let mut r = rl.lock().expect("t2 reload");
+        // One session only: another one may hold hits into a slot this would empty.
+        if !p.note(ids, tokens, r.every) || crate::graph::LIVE_SESSIONS.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+            return Ok(());
+        }
+        self.land(gpu, &mut r)?;
+        let t0 = std::time::Instant::now();
+        let moves = p.take_reload(reload_max());
+        r.reloads += 1;
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let parts = p.reload_parts(&moves);
+        let mut data = Vec::with_capacity(parts.iter().map(|x| x.0.len()).sum());
+        let mut copies = Vec::with_capacity(parts.len());
+        for &(blob, dst, off) in &parts {
+            copies.push((&r.stage, dst, data.len() as u64, off, blob.len() as u64));
+            data.extend_from_slice(blob);
+        }
+        gpu.write_host(&r.stage, &data).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let pc = crate::xfer::copy_submit(gpu, &copies)?;
+        drop(copies);
+        r.pending = Some((pc, b, moves));
+        r.record_s += t0.elapsed().as_secs_f64();
+        Ok(())
+    }
+
+    /// Land the in-flight reload (if any). Called at each block's start, before
+    /// anything else records on the helper's one-shot buffer.
+    pub fn settle(&self, gpu: &Gpu) -> Result<()> {
+        match &self.reload {
+            Some(rl) => self.land(gpu, &mut rl.lock().expect("t2 reload")),
+            None => Ok(()),
+        }
+    }
+
+    fn land(&self, gpu: &Gpu, r: &mut Reload) -> Result<()> {
+        if let Some((pc, b, moves)) = r.pending.take() {
+            let t0 = std::time::Instant::now();
+            pc.wait(gpu)?;
+            r.wait_s += t0.elapsed().as_secs_f64();
+            self.pools[&b].land(&moves);
+        }
+        Ok(())
+    }
+
+    /// Hit and reload stats so far (serve prints them as each slot retires).
+    pub fn report(&self) {
+        crate::d1::report("t2", &self.pools);
+        if let Some(Ok(r)) = self.reload.as_ref().map(|m| m.lock()) {
+            eprintln!("t2 reload: {} checks, record {:.1} ms, landing waits {:.1} ms", r.reloads, r.record_s * 1e3, r.wait_s * 1e3);
+        }
+    }
+
+    pub fn release(&self, gpu: &Gpu) {
+        // The in-flight copy writes into a pool: land it before the pools go.
+        if let Some(Ok(mut r)) = self.reload.as_ref().map(|m| m.lock()) {
+            let _ = self.land(gpu, &mut r);
+            eprintln!(
+                "t2 reload: {} checks, record {:.1} ms, landing waits {:.1} ms",
+                r.reloads,
+                r.record_s * 1e3,
+                r.wait_s * 1e3
+            );
+            gpu.destroy_buf(&r.stage);
+        }
+        for p in self.pools.values() {
+            p.release(gpu);
+        }
+        if let Ok(sc) = self.scratch.lock() {
+            sc.release(gpu);
+        }
+    }
 }
 
 pub struct Scratch {

@@ -5950,6 +5950,9 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         if let Err(e) = self.sess.use_seq(slot).and_then(|_| self.sess.reset()) {
             eprintln!("breccia-server: releasing slot {slot}: {e:#}");
         }
+        if let Some(t) = &self.sess.model.t2 {
+            t.report();
+        }
     }
     fn context(&self) -> Option<usize> {
         Some(self.ctx)

@@ -69,6 +69,9 @@ pub struct Pool {
     owns_stage: bool,
     /// Blocks check on different tokens, so swaps do not all land on one token.
     phase: u32,
+    /// Where the slot blobs come from (option 2: a lower-bit GGUF for T2 pools).
+    pub src: std::sync::Arc<ShardSet>,
+    pub plan: LayerPlan,
 }
 
 pub struct State {
@@ -79,6 +82,10 @@ pub struct State {
     pub hits: u64,
     pub routed: u64,
     pub swaps: u64,
+    /// Option 1 (`BRECCIA_T2_RELOAD`): routed counts since the last reload (prompt and
+    /// decode rows), halved at each reload, and the tokens they cover.
+    pf: Vec<f32>,
+    pf_tokens: usize,
 }
 
 pub fn freeze() -> bool {
@@ -106,7 +113,7 @@ pub fn read_strp(path: &std::path::Path) -> Result<Vec<(usize, usize)>> {
     Ok((0..n).map(|i| (h(24 + 4 * i), h(26 + 4 * i))).collect())
 }
 
-fn blob<'a>(shards: &'a ShardSet, r: &RolePlan, e: usize) -> &'a [u8] {
+pub(crate) fn blob<'a>(shards: &'a ShardSet, r: &RolePlan, e: usize) -> &'a [u8] {
     let s = shards.parts()[r.shard].bytes();
     &s[r.offset + e * r.per_expert..][..r.per_expert]
 }
@@ -119,7 +126,7 @@ fn per_expert(p: &LayerPlan) -> u64 {
 /// nothing when `BRECCIA_D1_GIB` is unset.
 pub fn build(
     gpus: &[&Gpu],
-    shards: &ShardSet,
+    shards: &std::sync::Arc<ShardSet>,
     plans: &[(usize, usize, LayerPlan, [PipeKey; 3])],
     k: usize,
     total: Option<u64>,
@@ -152,6 +159,8 @@ pub fn build(
             hits: 0,
             routed: 0,
             swaps: 0,
+            pf: vec![0.0; plan.n_experts],
+            pf_tokens: 0,
         };
         let mut n = 0;
         for &(l, e) in &seed {
@@ -196,6 +205,7 @@ pub fn build(
             Pool {
                 device: dev, slots, gate, up, down, table, slot_ids, hit_w,
                 state: Mutex::new(st), stage, owns_stage, phase: b as u32 % policy().every,
+                src: shards.clone(), plan: *plan,
             },
         );
     }
@@ -209,6 +219,28 @@ pub fn build(
         if freeze() { ", frozen" } else { "" }
     );
     Ok(out)
+}
+
+/// Reload choice: uncached experts by descending `heat` against cached slots by
+/// ascending heat (empty slots first), while the newcomer is `ratio` x hotter.
+fn pick(heat: &[f32], slot_of: &[u32], expert_of: &[u32], max: usize, ratio: f32) -> Vec<(usize, usize)> {
+    let mut hot: Vec<usize> = (0..heat.len()).filter(|&e| slot_of[e] == MISS && heat[e] > 0.0).collect();
+    hot.sort_by(|a, b| heat[*b].total_cmp(&heat[*a]));
+    let vh = |s: usize| match expert_of[s] {
+        MISS => -1.0,
+        e => heat[e as usize],
+    };
+    let mut cold: Vec<usize> = (0..expert_of.len()).collect();
+    cold.sort_by(|a, b| vh(*a).total_cmp(&vh(*b)));
+    // A seeded slot that sat idle this window is not evidence: the newcomer must also be
+    // `ratio` x the window's mean count, or one-off experts thrash the seed.
+    let mean = heat.iter().sum::<f32>() / heat.len().max(1) as f32;
+    hot.iter()
+        .zip(cold.iter())
+        .take(max)
+        .take_while(|(&e, &s)| vh(s) < 0.0 || heat[e] > ratio * vh(s).max(mean))
+        .map(|(&e, &s)| (e, s))
+        .collect()
 }
 
 fn u32_bytes(v: &[u32]) -> Vec<u8> {
@@ -228,7 +260,8 @@ impl Pool {
     /// After the block's lane ran on `ids`: count hits, heat, and every
     /// `every` tokens swap hot uncached experts in. Call only after the
     /// block's segment has completed (the pool is not read by anything in flight).
-    pub fn observe(&self, gpu: &Gpu, shards: &ShardSet, plan: &LayerPlan, ids: &[usize]) -> Result<()> {
+    pub fn observe(&self, gpu: &Gpu, ids: &[usize]) -> Result<()> {
+        let (shards, plan) = (&*self.src, &self.plan);
         let mut st = self.state.lock().map_err(|_| anyhow!("D1 state poisoned"))?;
         st.routed += ids.len() as u64;
         st.hits += ids.iter().filter(|&&e| st.slot_of[e] != MISS).count() as u64;
@@ -294,6 +327,63 @@ impl Pool {
         ids.iter().zip(weights).filter(|(e, _)| st.slot_of[**e] == MISS).map(|(e, w)| (*e, *w)).unzip()
     }
 
+    /// Option 1: add routed experts to the reload counts; true when `every` tokens
+    /// have passed since the last reload.
+    pub fn note(&self, ids: impl Iterator<Item = usize>, tokens: usize, every: usize) -> bool {
+        let mut st = self.state.lock().expect("D1 state");
+        for e in ids {
+            st.pf[e] += 1.0;
+        }
+        st.pf_tokens += tokens;
+        st.pf_tokens >= every
+    }
+
+    /// Option 1: pick up to `max` swaps (hottest uncached by the reload counts in,
+    /// coldest cached out, `ratio` rule) and empty their slots now: the old experts
+    /// miss from here on and the new ones only hit after [`Pool::land`], so nothing
+    /// reads a slot while its copy is in flight. Halves the counts.
+    pub fn take_reload(&self, max: usize) -> Vec<(usize, usize)> {
+        let mut st = self.state.lock().expect("D1 state");
+        let st = &mut *st;
+        let moves = pick(&st.pf, &st.slot_of, &st.expert_of, max, policy().ratio);
+        for &(_, s) in &moves {
+            if st.expert_of[s] != MISS {
+                st.slot_of[st.expert_of[s] as usize] = MISS;
+                st.expert_of[s] = MISS;
+            }
+        }
+        for h in st.pf.iter_mut() {
+            *h *= 0.5;
+        }
+        st.pf_tokens = 0;
+        moves
+    }
+
+    /// The copies for `moves`: `(blob, dst buffer, dst offset)` per role and move.
+    pub fn reload_parts(&self, moves: &[(usize, usize)]) -> Vec<(&[u8], &Buf, u64)> {
+        let mut v = Vec::new();
+        for (w, r) in [(&self.gate, &self.plan.gate), (&self.up, &self.plan.up), (&self.down, &self.plan.down)] {
+            for &(e, s) in moves {
+                v.push((blob(&self.src, r, e), &w.buf, (s * r.per_expert) as u64));
+            }
+        }
+        v
+    }
+
+    /// The reload's copy has completed: the new experts hit from now on.
+    pub fn land(&self, moves: &[(usize, usize)]) {
+        let mut st = self.state.lock().expect("D1 state");
+        for &(e, s) in moves {
+            st.slot_of[e] = s as u32;
+            st.expert_of[s] = e as u32;
+        }
+        st.swaps += moves.len() as u64;
+    }
+
+    pub fn per_expert(&self) -> u64 {
+        per_expert(&self.plan)
+    }
+
     /// `(hits, routed, swaps)` so far.
     pub fn counts(&self) -> (u64, u64, u64) {
         self.state.lock().map(|s| (s.hits, s.routed, s.swaps)).unwrap_or_default()
@@ -327,5 +417,21 @@ mod tests {
         std::fs::write(&p, &b).unwrap();
         assert_eq!(super::read_strp(&p).unwrap(), vec![(3, 7), (47, 511)]);
         std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn reload_pick_swaps_hot_misses_for_cold_slots() {
+        use super::MISS;
+        // experts 0..6, slots hold 0 (heat 5) and 1 (heat 0); 4 (heat 9) and 5 (heat 1) miss.
+        let heat = [5.0, 0.0, 0.0, 0.0, 9.0, 1.0];
+        let slot_of = [0, 1, MISS, MISS, MISS, MISS];
+        let expert_of = [0, 1];
+        // 4 replaces cold 1; 5 is not 1.5x hotter than 0, so it stops there.
+        assert_eq!(super::pick(&heat, &slot_of, &expert_of, 8, 1.5), vec![(4, 1)]);
+        // an empty slot takes anything hot
+        assert_eq!(super::pick(&heat, &slot_of, &[0, MISS], 8, 1.5), vec![(4, 1)]);
+        assert_eq!(super::pick(&heat, &slot_of, &expert_of, 0, 1.5), vec![]);
+        // idle seeded slots (1, 2, 3) only go to misses above 1.5 x the mean (2.5)
+        assert_eq!(super::pick(&heat, &[MISS, 0, 1, 2, MISS, MISS], &[1, 2, 3], 8, 1.5), vec![(4, 0), (0, 1)]);
     }
 }

@@ -3159,6 +3159,9 @@ impl<'m> Session<'m> {
         trace: &mut Option<&mut Vec<LayerTrace>>,
     ) -> Result<BlockDigests> {
         let m = self.model;
+        if let Some(h) = &m.t2 {
+            h.settle(m.devices[h.dev].gpu())?;
+        }
         let mc = &m.cfg;
         let pos = self.pos;
         let dev = m.device_of(b);
@@ -5106,6 +5109,9 @@ impl<'m> Session<'m> {
         pe: Option<&'m crate::model::PlacedExperts>,
     ) -> Result<()> {
         let m = self.model;
+        if let Some(h) = &m.t2 {
+            h.settle(m.devices[h.dev].gpu())?;
+        }
         let mc = &m.cfg;
         let dev = m.device_of(b);
         let n_embd = mc.n_embd;
@@ -5375,6 +5381,10 @@ impl<'m> Session<'m> {
                 u = g_end;
             }
             at = end;
+        }
+        // T2 option 1: the chunk's routing (prompt or batched decode rows) feeds the reload.
+        if let Some(h) = m.t2.as_ref().filter(|h| h.reload.is_some() && h.dev != dev) {
+            h.note(m.devices[h.dev].gpu(), b, groups.iter().flat_map(|g| std::iter::repeat_n(g.0, g.2.len())), t)?;
         }
         // Option 2 probe (`BRECCIA_PF_T2_PROBE=1`, wrong output): the RX skips the
         // experts the helper card's tier-2 pool holds, to price the RX side's saving.
@@ -6173,7 +6183,7 @@ impl<'m> Session<'m> {
                 t2_fin_s = tf.elapsed().as_secs_f64();
                 // The helper's segment is done: nothing in flight reads the pool.
                 for ids in &ids {
-                    p.observe(hg, &m.shards, &m.layers[b].experts, ids)?;
+                    p.observe(hg, ids)?;
                 }
             }
             host_wait_s = tw.elapsed().as_secs_f64();
@@ -7024,6 +7034,7 @@ impl<'m> Session<'m> {
         let mut misses = d1.map(|p| p.misses(&ids, &weights));
         let mut t2_job = None;
         if let Some((h, p)) = t2 {
+            h.note(m.devices[h.dev].gpu(), b, ids.iter().copied(), 1)?;
             let (mut hits, mut mi, mut mw) = (Vec::new(), Vec::new(), Vec::new());
             {
                 let st = p.state.lock().expect("t2 pool state");
@@ -7066,7 +7077,7 @@ impl<'m> Session<'m> {
                 self.t2_hits += hits.len() as u64;
             }
             drop(sc);
-            p.observe(hg, &m.shards, &m.layers[b].experts, &ids)?;
+            p.observe(hg, &ids)?;
             if std::env::var_os("BRECCIA_T2_CHECK").is_some() && self.t2_checks < 64 {
                 // Diagnostic: the host's full top-k against lane misses + helper hits.
                 self.t2_checks += 1;
@@ -7094,7 +7105,7 @@ impl<'m> Session<'m> {
         }
         if let Some(p) = d1 {
             // This block's segment completed above, so nothing in flight reads the pool.
-            p.observe(m.devices[dev].gpu(), &m.shards, &m.layers[b].experts, &ids)?;
+            p.observe(m.devices[dev].gpu(), &ids)?;
         }
         let moe_out = if trace.is_some() {
             Some(Checksum::of(&out, 0))

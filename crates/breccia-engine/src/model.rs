@@ -416,7 +416,7 @@ impl Model {
                 .map(|d| placement::DeviceSpec::parse(d))
                 .collect()
         };
-        let placement =
+        let mut placement =
             match &opts.blocks {
                 Some(counts) => {
                     if counts.len() != specs.len() {
@@ -488,6 +488,20 @@ impl Model {
                     }
                 }
             };
+        // `BRECCIA_QSA_DEVICE=d` (option 3, opt-in): QSA blocks (their KV, indexer and
+        // attention, but also their FFN) run on device `d`; the last block stays put so
+        // the head does not cross.
+        if let Some(d) = std::env::var("BRECCIA_QSA_DEVICE").ok().and_then(|v| v.parse::<usize>().ok()) {
+            if d >= placement.devices.len() {
+                bail!("BRECCIA_QSA_DEVICE={d} but only {} devices", placement.devices.len());
+            }
+            let n = cfg.n_layers;
+            let qsa: Vec<usize> = (0..n - 1)
+                .filter(|&b| matches!(cfg.layer_kind(b), crate::config::LayerKind::Qsa))
+                .collect();
+            placement.reassign(&qsa, d, &layer_bytes, tail_bytes);
+            eprintln!("breccia: BRECCIA_QSA_DEVICE={d}: {} QSA blocks moved, {} runs", qsa.len(), placement.runs.len());
+        }
         let mut devices = Vec::with_capacity(placement.devices.len());
         for spec in &placement.devices {
             devices.push(
@@ -1038,15 +1052,56 @@ impl Model {
             let hd = crate::t2::device();
             let t2 = match crate::t2::bytes() {
                 Some(total) if hd < gpus.len() => {
-                    let plans: Vec<_> = plans.iter().map(|(b, _, p, k)| (*b, hd, *p, *k)).collect();
-                    let pools = crate::d1::build(&gpus, &shards, &plans, cfg.n_expert_used, Some(total), "t2")?;
+                    // Blocks placed on the helper itself never use its pool (option 3).
+                    let plans: Vec<_> =
+                        plans.iter().filter(|p| p.1 != hd).map(|(b, _, p, k)| (*b, hd, *p, *k)).collect();
+                    // Option 2 (`BRECCIA_T2_Q2=<gguf glob>`): blocks whose experts are smaller
+                    // in that GGUF pool its blobs instead (more experts per byte, other output).
+                    let (lo, plans) = match std::env::var("BRECCIA_T2_Q2") {
+                        Ok(g) => {
+                            let q = Arc::new(ShardSet::open_glob(&g).with_context(|| format!("BRECCIA_T2_Q2 {g}"))?);
+                            let ql = q.layout()?;
+                            let mut lo = Vec::new();
+                            let mut keep = Vec::new();
+                            let mut iq3 = Vec::new();
+                            for (b, d, p, k) in plans {
+                                let qp = match ql.block(b) {
+                                    Some(qb) => Some(LayerPlan::from_block(&q, qb)?),
+                                    None => None,
+                                };
+                                let pe = |p: &LayerPlan| p.gate.per_expert + p.up.per_expert + p.down.per_expert;
+                                match qp.filter(|qp| qp.n_experts == p.n_experts && pe(qp) < pe(&p)) {
+                                    Some(qp) => {
+                                        let key = |r: &str| -> Result<PipeKey> {
+                                            let n = format!("blk.{b}.ffn_{r}_exps.weight");
+                                            PipeKey::of(&q.tensor(&n).ok_or_else(|| anyhow!("T2 Q2: {n} missing"))?)
+                                        };
+                                        lo.push((b, d, qp, [key("gate")?, key("up")?, key("down")?]));
+                                        iq3.push((b, p));
+                                    }
+                                    None => keep.push((b, d, p, k)),
+                                }
+                            }
+                            (Some((q, lo, iq3)), keep)
+                        }
+                        Err(_) => (None, plans),
+                    };
+                    let n = (plans.len() + lo.as_ref().map_or(0, |l| l.1.len())).max(1) as u64;
+                    let mut pools =
+                        crate::d1::build(&gpus, &shards, &plans, cfg.n_expert_used, Some(total * plans.len() as u64 / n), "t2")?;
+                    if let Some((q, lo, iq3)) = &lo {
+                        pools.extend(crate::d1::build(&gpus, q, lo, cfg.n_expert_used, Some(total * lo.len() as u64 / n), "t2-q2")?);
+                        page_drop_q2(q, &shards, lo.iter().map(|l| l.0));
+                        touch_hot_iq3(&shards, &pools, iq3);
+                    }
                     for p in pools.values() {
                         for w in [&p.gate, &p.up, &p.down] {
                             keys.insert(w.key);
                         }
                     }
                     let scratch = crate::t2::Scratch::new(gpus[hd], cfg.n_expert_used, cfg.n_embd, cfg.n_ff)?;
-                    Some(crate::t2::Tier2 { dev: hd, pools, scratch: std::sync::Mutex::new(scratch) })
+                    let reload = crate::t2::Reload::new(gpus[hd], &pools)?;
+                    Some(crate::t2::Tier2 { dev: hd, pools, scratch: std::sync::Mutex::new(scratch), reload })
                 }
                 _ => None,
             };
@@ -1302,13 +1357,7 @@ impl Drop for Model {
             p.release(self.devices[p.device].gpu());
         }
         if let Some(t) = &self.t2 {
-            let gpu = self.devices[t.dev].gpu();
-            for p in t.pools.values() {
-                p.release(gpu);
-            }
-            if let Ok(sc) = t.scratch.lock() {
-                sc.release(gpu);
-            }
+            t.release(self.devices[t.dev].gpu());
         }
         if let Some(p) = &self.ple {
             let dev = self.placement.device_of(self.cfg.ple.layers[0]);
@@ -1556,6 +1605,57 @@ fn page_hint_experts(
             };
         }
     }
+}
+
+/// Evict the Q2 expert source pages once the pool holds them. The upload read
+/// ~10 GB of the Q2 file and pushed the IQ3 set out of the page cache (N8 1k:
+/// majflt 0.2M -> 3.5M, wall 124 -> 224 s). fadvise alone skips mmap-held pages,
+/// so unmap them from this process first. Reloads re-fault on demand.
+fn page_drop_q2(q: &ShardSet, main: &ShardSet, blocks: impl Iterator<Item = usize>) {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).ok();
+    let shared: Vec<_> = main.parts().iter().filter_map(|g| canon(g.path())).collect();
+    for b in blocks {
+        for role in ["gate", "up", "down"] {
+            let name = format!("blk.{b}.ffn_{role}_exps.weight");
+            let (Some(t), Some(si)) = (q.tensor(&name), q.shard_of(&name)) else {
+                continue;
+            };
+            let part = &q.parts()[si];
+            // A Q2 shard symlinked to an IQ3 shard is live main weights: keep it.
+            if canon(part.path()).is_some_and(|c| shared.contains(&c)) {
+                continue;
+            }
+            let r = t.file_range();
+            let start = r.start as usize & !4095;
+            let bytes = part.bytes();
+            let end = (r.end as usize).min(bytes.len());
+            // SAFETY: read-only shared file mapping; DONTNEED only drops PTEs, later reads re-fault the same file bytes.
+            unsafe { libc::madvise(bytes.as_ptr().add(start) as *mut libc::c_void, end - start, libc::MADV_DONTNEED) };
+            if let Ok(f) = std::fs::File::open(part.path()) {
+                let _ = breccia_vk::pagecache::drop_range(&f, start as u64, (end - start) as u64);
+            }
+        }
+    }
+}
+
+/// Read the IQ3 pages of the experts the Q2 pools hold. The base T2 upload reads
+/// them at load, which keeps them hot in the page cache; Q2 pools skip them, so
+/// they were evicted first and prefill refaulted them (N8 1k: 2qa 3.0M majflt,
+/// and the next base arm 2.2M / 173 s vs 115 s).
+fn touch_hot_iq3(shards: &ShardSet, pools: &std::collections::BTreeMap<usize, crate::d1::Pool>, iq3: &[(usize, LayerPlan)]) {
+    let mut sum = 0u8;
+    for (b, p) in iq3 {
+        let Some(pool) = pools.get(b) else { continue };
+        let st = pool.state.lock().expect("t2 pool");
+        for e in (0..st.slot_of.len()).filter(|&e| st.slot_of[e] != crate::d1::MISS) {
+            for r in [&p.gate, &p.up, &p.down] {
+                for x in crate::d1::blob(shards, r, e).iter().step_by(4096) {
+                    sum ^= unsafe { std::ptr::read_volatile(x) };
+                }
+            }
+        }
+    }
+    std::hint::black_box(sum);
 }
 
 fn w(gpu: &Gpu, shards: &ShardSet, name: &str) -> Result<W> {
