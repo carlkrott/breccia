@@ -130,7 +130,13 @@ impl ArenaOpts {
         // shortcut: `BRECCIA_PF_PREFETCH` slots at 2 MiB each (this model's streamed slot
         // is ~1.8 MiB); derive from the slot stride if another model is run with it.
         let pre = crate::graph::pf_prefetch() as u64 * (2 << 20);
-        let extra = prefill_scratch_bytes(crate::graph::prefill_cap(chunk).min(ctx)) + pre;
+        let tokens = crate::graph::prefill_cap(chunk).min(ctx);
+        // The chunk QSA workspace is sized by the cache (`Qsa::workspace(gpu, chunk, cap)`):
+        // its indexer score slot is tokens x cells/4 f32 = 1 byte per cell per row. The fit
+        // above was measured at ctx ~ chunk, so add the rest (R200k chunk 4096: 1164 MiB,
+        // spilled 1200 MiB and hung the RX on 11-11).
+        let scores = tokens as u64 * ctx.saturating_sub(tokens) as u64;
+        let extra = prefill_scratch_bytes(tokens) + scores + pre;
         ArenaOpts {
             display_reserve: self.display_reserve + extra,
             headroom: self.headroom + extra,
@@ -381,13 +387,17 @@ mod tests {
         let o = ArenaOpts::default();
         assert_eq!(o.with_prefill_chunk(0, 4096), o);
         let c = o.with_prefill_chunk(1024, 4096); // chunks up to 1536 tokens
-        assert_eq!(c.headroom - o.headroom, prefill_scratch_bytes(1536));
-        assert_eq!(
-            c.display_reserve - o.display_reserve,
-            prefill_scratch_bytes(1536)
-        );
+        let want = prefill_scratch_bytes(1536) + 1536 * (4096 - 1536);
+        assert_eq!(c.headroom - o.headroom, want);
+        assert_eq!(c.display_reserve - o.display_reserve, want);
         let c = o.with_prefill_chunk(2048, 1100); // the ctx caps the chunk
         assert_eq!(c.headroom - o.headroom, prefill_scratch_bytes(1100));
+        // Long ctx adds the indexer score slot (1 byte per cell per chunk row): R200k at
+        // chunk 4096 (cap 6144) must cover the 1200 MiB buffer that spilled on 11-11.
+        let c = o.with_prefill_chunk(4096, 204800);
+        let t = crate::graph::prefill_cap(4096) as u64;
+        assert_eq!(c.headroom - o.headroom, prefill_scratch_bytes(t as usize) + t * (204800 - t));
+        assert!(c.headroom - o.headroom - prefill_scratch_bytes(t as usize) > 1100 << 20);
         // Covers every measured chunk, with a margin that does not waste a block.
         for (t, mib) in [(1536usize, 1540u64), (3072, 2775), (6144, 5142), (12288, 9973)] {
             let got = prefill_scratch_bytes(t) >> 20;
