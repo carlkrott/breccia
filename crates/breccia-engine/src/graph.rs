@@ -923,6 +923,12 @@ pub struct Session<'m> {
     pf_stream_bytes: u64,
     pf_stream_fill_s: f64,
     pf_stream_wait_s: f64,
+    /// `BRECCIA_PF_DIRECT`: whole-block O_DIRECT expert reads ([`crate::block_read`]),
+    /// used for chunks of at least `BRECCIA_PF_DIRECT_MIN_ROWS` rows (default 1024;
+    /// a decode batch would read a 725 MB block for a few experts). `.2`: blocks whose
+    /// buffer was checked against the mmap once.
+    pf_direct: Option<(crate::block_read::BlockReader, usize, Vec<bool>)>,
+    pf_rows: usize,
     /// `BRECCIA_PF_PREFETCH`: per block, the experts to prefetch next time (the last
     /// chunk's, most users first; seeded from `BRECCIA_D1_PROFILE`).
     pf_pre_pred: Vec<Vec<u32>>,
@@ -1547,6 +1553,8 @@ impl<'m> Session<'m> {
             pf_stream_bytes: 0,
             pf_stream_fill_s: 0.0,
             pf_stream_wait_s: 0.0,
+            pf_direct: pf_direct_reader(model),
+            pf_rows: 0,
             pf_pre_pred: Vec::new(),
             shared_deferred: false,
             qsa_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
@@ -4894,9 +4902,25 @@ impl<'m> Session<'m> {
                 }
                 Some(Err(e)) => bail!("imported expert read: {e}"),
                 None => {
-                    dst.write_at(off, slices.gate)?;
-                    dst.write_at(off + g, slices.up)?;
-                    dst.write_at(off + g + u, slices.down)?;
+                    let direct = match &mut self.pf_direct {
+                        Some((r, min_rows, checked)) if !pre && self.pf_rows >= *min_rows => r.get(b).and_then(|(map_lo, buf)| {
+                            let at = |s: &[u8]| {
+                                let o = (s.as_ptr() as usize).checked_sub(map_lo)?;
+                                buf.get(o..o + s.len())
+                            };
+                            let v = [at(slices.gate)?, at(slices.up)?, at(slices.down)?];
+                            if !checked[b] {
+                                checked[b] = true;
+                                assert!(v[0] == slices.gate && v[1] == slices.up && v[2] == slices.down, "pf-direct: blk.{b} buffer differs from the mmap");
+                            }
+                            Some(v)
+                        }),
+                        _ => None,
+                    };
+                    let [gs, us, ds] = direct.unwrap_or([slices.gate, slices.up, slices.down]);
+                    dst.write_at(off, gs)?;
+                    dst.write_at(off + g, us)?;
+                    dst.write_at(off + g + u, ds)?;
                 }
             }
             slices.gate.len() + slices.up.len() + slices.down.len()
@@ -5292,6 +5316,7 @@ impl<'m> Session<'m> {
         pe: Option<&'m crate::model::PlacedExperts>,
     ) -> Result<()> {
         let m = self.model;
+        self.pf_rows = t;
         if let Some(h) = &m.t2 {
             h.settle(m.devices[h.dev].gpu())?;
         }
@@ -8836,6 +8861,45 @@ impl<'m> Session<'m> {
     pub fn feed_sample(&mut self, f: &PromptFeed) -> Result<u32> {
         anyhow::ensure!(f.chunks.is_empty() && f.part.is_none() && !f.logits.is_empty(), "the prompt pass is not done");
         self.sampler.sample(&f.logits, &self.sampling).ok_or_else(|| anyhow!("the sampler produced no token"))
+    }
+}
+
+/// [`Session::pf_direct`]: one span per streamed (non-placed) block, all three expert
+/// tensors in one shard, None when off or with the imported host arena.
+fn pf_direct_reader(m: &Model) -> Option<(crate::block_read::BlockReader, usize, Vec<bool>)> {
+    let bufs = crate::block_read::direct_bufs()?;
+    if m.imported_experts.is_some() {
+        eprintln!("breccia: pf-direct: off (imported host expert arena)");
+        return None;
+    }
+    let parts = m.shards.parts();
+    let spans = (0..m.layers.len())
+        .map(|b| {
+            if m.placed.contains_key(&b) {
+                return None;
+            }
+            let names = ["gate", "up", "down"].map(|r| format!("blk.{b}.ffn_{r}_exps.weight"));
+            let si = m.shards.shard_of(&names[0])?;
+            let mut ranges = Vec::new();
+            for n in &names {
+                if m.shards.shard_of(n)? != si {
+                    return None;
+                }
+                ranges.push(m.shards.tensor(n)?.file_range());
+            }
+            let map = parts[si].bytes();
+            let (lo, hi) = crate::block_read::span_of(&ranges, map.len() as u64);
+            Some(crate::block_read::Span { shard: si, lo, hi, map_lo: map.as_ptr() as usize + lo as usize })
+        })
+        .collect();
+    let paths: Vec<_> = parts.iter().map(|p| p.path().to_path_buf()).collect();
+    let min_rows = std::env::var("BRECCIA_PF_DIRECT_MIN_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    match crate::block_read::BlockReader::new(spans, &paths, bufs) {
+        Ok(r) => Some((r, min_rows, vec![false; m.layers.len()])),
+        Err(e) => {
+            eprintln!("breccia: pf-direct: off ({e:#})");
+            None
+        }
     }
 }
 

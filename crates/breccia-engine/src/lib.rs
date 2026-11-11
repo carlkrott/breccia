@@ -44,6 +44,7 @@
 //! ```
 
 pub mod arena;
+pub mod block_read;
 pub mod config;
 pub mod d1;
 pub mod graph;
