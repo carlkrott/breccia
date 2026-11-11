@@ -1443,7 +1443,8 @@ impl<'m> Session<'m> {
         // Per-layer recurrent / KV state, on the device that owns the block.
         let (kv_pool, kv_free) = match breccia_kernels::qsa::kv_pool_cells() {
             // P0.5 park mode: one context of pool while prompts fill (`generate_seqs` grows it)
-            Some(cells) if kv_park_prefill().is_some() => new_kv_pool(model, cells.min(ctx_capacity))?,
+            // (+1 page: page 0 is never handed out, so N contexts of pool hold N streams)
+            Some(cells) if kv_park_prefill().is_some() => new_kv_pool(model, cells.min(ctx_capacity + breccia_kernels::qsa::PAGE_CELLS))?,
             Some(cells) => new_kv_pool(model, cells)?,
             None => (Vec::new(), Vec::new()),
         };
@@ -2633,7 +2634,7 @@ impl<'m> Session<'m> {
             return Ok(());
         };
         let pages = self.kv_pool.iter().flatten().map(|p| p.pages).min().unwrap_or(0);
-        let base = target.min(self.seq_ctx).div_ceil(PAGE_CELLS);
+        let base = target.min(self.seq_ctx + PAGE_CELLS).div_ceil(PAGE_CELLS);
         let idle = self.kv_free.len() + 1 == pages;
         if held == 0 && idle && pages > base {
             let t = std::time::Instant::now();
@@ -2644,7 +2645,8 @@ impl<'m> Session<'m> {
         if held + need + 1 <= pages {
             return Ok(());
         }
-        let cells = ((held + need + 1).max(2 * pages) * PAGE_CELLS).min(target);
+        // doubling the usable pages (page 0 is reserved): 1 -> 2 -> 4 -> 8 streams, not one early
+        let cells = ((held + need + 1).max(2 * pages - 1) * PAGE_CELLS).min(target);
         let t = std::time::Instant::now();
         self.flush()?;
         let m = self.model;
