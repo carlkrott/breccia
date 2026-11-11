@@ -59,11 +59,11 @@ fn check(gpu: &Gpu, qsa: &Qsa<'_>, ws: &QsaWorkspace, scores: &[f32], pos0: usiz
         count,
         want.len()
     );
-    assert_eq!(
-        &got[..count],
-        &want[..count],
-        "{what}: selection differs from the CPU reference"
-    );
+    // Radix emits ascending block ids (same set, see qsa_topk_radix.comp): compare sets.
+    let (mut g, mut w) = (got[..count].to_vec(), want[..count].to_vec());
+    g.sort_unstable();
+    w.sort_unstable();
+    assert_eq!(g, w, "{what}: selection differs from the CPU reference");
 
     // Dispatch cost at this block count: a handful of passes over the score row,
     // not the prefill that an end-to-end run would need.
@@ -132,10 +132,11 @@ fn topk_rank_pruning_is_exact_at_long_context() {
         eprintln!("qsa_topk: no device for {selector}");
         return;
     };
-    let qsa = Qsa::new(&gpu, 1 << 17).expect("qsa pipelines");
+    let qsa = Qsa::new(&gpu, 1 << 18).expect("qsa pipelines");
     // 65536 cells = 16384 blocks (a 64k-token cache), then a count that is not a
     // multiple of the 256-wide rank workgroup.
-    for cells in [65536usize, 65521] {
+    // 204800 = the 200k tiered-context row (51200 blocks).
+    for cells in [65536usize, 65521, 204800] {
         run_for_cells(&gpu, &qsa, cells);
     }
 }
