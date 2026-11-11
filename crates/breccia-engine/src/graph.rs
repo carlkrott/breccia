@@ -9401,11 +9401,16 @@ enum T2Pending {
 /// (groups, copies, phase ends in s [6], guard cuts, ring wait s) of one helper pass.
 type T2Stats = (usize, usize, [f64; 6], u64, f64);
 
-/// `BRECCIA_PF_T2_MAX_GROUPS=<n>` (with `BRECCIA_PF_T2=1`): at most `n` pool-hit experts
+/// `BRECCIA_PF_T2_MAX_GROUPS=<n>` (with T2 prefill on): at most `n` pool-hit experts
 /// per block go to the helper, the ones with the most rows. Exact (same maths per expert).
+/// Default 64 (Carl 11-11: 8k ABBA +4.1 %, battery clean); `=0` or `=off` removes the cap.
 fn pf_t2_max_groups() -> Option<usize> {
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| std::env::var("BRECCIA_PF_T2_MAX_GROUPS").ok()?.parse().ok())
+    *N.get_or_init(|| match std::env::var("BRECCIA_PF_T2_MAX_GROUPS").as_deref() {
+        Err(_) => Some(64),
+        Ok("0" | "off") => None,
+        Ok(v) => v.parse().ok(),
+    })
 }
 
 /// `BRECCIA_PF_T2_PROBE=1`: speed probe for option 2 (see `t2_skip`); wrong output.
