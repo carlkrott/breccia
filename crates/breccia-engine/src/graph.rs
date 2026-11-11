@@ -5728,7 +5728,7 @@ impl<'m> Session<'m> {
                     let _ = rtx.send(r);
                 });
                 self.t2_worker.as_ref().expect("just made").send(job)?;
-                T2Pending::Thread(rrx)
+                T2Pending::Thread(T2Rx(Some(rrx)))
             } else {
                 let (seg, st) = Self::t2_record(m, hv, hd, b, zi, &t2_groups, tys, w, dims)?;
                 t2_print(b, pre_s, &st);
@@ -9396,7 +9396,25 @@ impl Drop for T2Worker {
 /// also waits, and sends back its wait seconds and stats).
 enum T2Pending {
     Seg(batch_cmd::Segment),
-    Thread(std::sync::mpsc::Receiver<Result<(f64, T2Stats)>>),
+    Thread(T2Rx),
+}
+
+/// The threaded pass's result. Dropping it unreceived (an early `?` between send and
+/// receive) blocks until the worker is done with the venue/import pointers it was handed.
+struct T2Rx(Option<std::sync::mpsc::Receiver<Result<(f64, T2Stats)>>>);
+
+impl T2Rx {
+    fn recv(mut self) -> Result<Result<(f64, T2Stats)>, std::sync::mpsc::RecvError> {
+        self.0.take().expect("received once").recv()
+    }
+}
+
+impl Drop for T2Rx {
+    fn drop(&mut self) {
+        if let Some(rx) = self.0.take() {
+            let _ = rx.recv();
+        }
+    }
 }
 
 /// (groups, copies, phase ends in s [6], guard cuts, ring wait s) of one helper pass.
