@@ -5620,6 +5620,117 @@ struct EngineBackend<'a, 'm> {
     feeds: Vec<Option<(breccia_engine::PromptFeed, Vec<u32>)>>,
     /// the last spec run stopped early for `Session::preempt` (`complete_alone`)
     yielded: bool,
+    /// `BRECCIA_SERVE_TRACE=1`: per-30 s window log of the engine calls
+    trace: Option<ServeTrace>,
+}
+
+/// One kind of engine call in a [`ServeTrace`] window.
+#[derive(Default)]
+struct TraceBucket {
+    calls: u32,
+    wall: f64,
+    wall_max: f64,
+    /// decode rows (step) or prompt cells fed (feed)
+    units: usize,
+    /// GPU ns per probe stage per device, from the probe totals around each call
+    gpu: Vec<[u64; breccia_kernels::batch_cmd::probe::MAX]>,
+}
+
+impl TraceBucket {
+    fn add(&mut self, wall: f64, units: usize, before: &[[u64; breccia_kernels::batch_cmd::probe::MAX]], after: &[[u64; breccia_kernels::batch_cmd::probe::MAX]]) {
+        self.calls += 1;
+        self.wall += wall;
+        self.wall_max = self.wall_max.max(wall);
+        self.units += units;
+        self.gpu.resize(after.len(), [0; breccia_kernels::batch_cmd::probe::MAX]);
+        for (g, (b, a)) in self.gpu.iter_mut().zip(before.iter().zip(after)) {
+            for k in 0..g.len() {
+                g[k] += a[k].saturating_sub(b[k]);
+            }
+        }
+    }
+    /// `dev0[stage=ms ...] dev1[...]`, stages >= 2 % of the bucket's GPU time
+    fn gpu_line(&self) -> String {
+        let total: u64 = self.gpu.iter().flatten().sum();
+        if total == 0 {
+            return String::new();
+        }
+        let names = breccia_kernels::batch_cmd::probe::NAMES;
+        self.gpu
+            .iter()
+            .enumerate()
+            .map(|(d, g)| {
+                let mut st: Vec<(usize, u64)> = g.iter().copied().enumerate().filter(|&(k, ns)| ns * 50 >= total && !names[k].is_empty()).collect();
+                st.sort_by_key(|x| std::cmp::Reverse(x.1));
+                let parts: Vec<String> = st.iter().map(|&(k, ns)| format!("{}={:.0}", names[k], ns as f64 / 1e6)).collect();
+                format!("dev{d}[{} | sum {:.0} ms]", parts.join(" "), g.iter().sum::<u64>() as f64 / 1e6)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// `BRECCIA_SERVE_TRACE=1`: what the engine thread did per window (decode steps,
+/// prompt passes, the longest gap between engine calls, which holds admits and pool
+/// grows), plus per-call GPU stage ms when `BRECCIA_GPU_TIME=1`. Printed from the
+/// engine thread because the probe totals are thread-local.
+struct ServeTrace {
+    t_start: std::time::Instant,
+    win: std::time::Instant,
+    last_end: Option<std::time::Instant>,
+    gap_max: f64,
+    step: TraceBucket,
+    feed: TraceBucket,
+    /// per slot: (admitted at, prompt length)
+    fills: Vec<Option<(std::time::Instant, usize)>>,
+}
+
+impl ServeTrace {
+    fn begin(&mut self) -> std::time::Instant {
+        let now = std::time::Instant::now();
+        if let Some(e) = self.last_end {
+            self.gap_max = self.gap_max.max((now - e).as_secs_f64());
+        }
+        now
+    }
+    fn end(&mut self, decoding: usize) {
+        let now = std::time::Instant::now();
+        self.last_end = Some(now);
+        let w = (now - self.win).as_secs_f64();
+        if w < 30.0 {
+            return;
+        }
+        let (s, f) = (&self.step, &self.feed);
+        eprintln!(
+            "trace t={:.0}s win {w:.1}s decoding={decoding}: steps {} rows/step {:.2} step ms avg {:.1} max {:.1} ({:.2} row-tok/s) | feeds {} cells {} ({:.1} tok/s) feed ms avg {:.1} max {:.1} | gap max {:.0} ms",
+            (now - self.t_start).as_secs_f64(),
+            s.calls,
+            s.units as f64 / s.calls.max(1) as f64,
+            s.wall * 1e3 / s.calls.max(1) as f64,
+            s.wall_max * 1e3,
+            s.units as f64 / w,
+            f.calls,
+            f.units,
+            f.units as f64 / w,
+            f.wall * 1e3 / f.calls.max(1) as f64,
+            f.wall_max * 1e3,
+            self.gap_max * 1e3,
+        );
+        for (tag, b) in [("step", s), ("feed", f)] {
+            let g = b.gpu_line();
+            if !g.is_empty() {
+                eprintln!("trace   {tag} gpu ms: {g}");
+            }
+        }
+        self.win = now;
+        self.gap_max = 0.0;
+        self.step = TraceBucket::default();
+        self.feed = TraceBucket::default();
+    }
+}
+
+fn probe_now(sess: &breccia_engine::Session) -> Vec<[u64; breccia_kernels::batch_cmd::probe::MAX]> {
+    sess.device_gpus().into_iter().map(|g| breccia_kernels::batch_cmd::probe::totals(g).0).collect()
 }
 
 /// A saved text prompt state: plain, or with the MTP draft's state when spec decode is on.
@@ -5874,6 +5985,10 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
             None => Prefix::None,
         };
         let f = self.sess.feed_start(prompt, p).map_err(|e| format!("{e:#}"))?;
+        if let Some(t) = &mut self.trace {
+            eprintln!("trace t={:.0}s slot {slot} admitted: prompt {}, start cell {}", t.t_start.elapsed().as_secs_f64(), prompt.len(), f.pos);
+            t.fills[slot] = Some((std::time::Instant::now(), prompt.len() - f.pos));
+        }
         self.feeds[slot] = Some((f, prompt[..cut].to_vec()));
         Ok(Some((None, n)))
     }
@@ -5890,42 +6005,31 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         self.feed_done(f, key)
     }
     fn feed_many(&mut self, slots: &[usize], decoding: usize) -> Vec<Result<Option<u32>, String>> {
-        // option 4: several prompts' next chunks through one pass (`BRECCIA_SERVE_MERGE=0` off);
-        // paused chunks (FEED_BLOCKS) keep the one-slot path
-        let merge = slots.len() > 1
-            && std::env::var("BRECCIA_SERVE_MERGE").map_or(true, |v| v != "0")
-            && feed_knob("BRECCIA_SERVE_FEED_BLOCKS", decoding, "") == 0
-            && self.sess.can_merge()
-            && slots.iter().all(|&s| self.feeds[s].as_ref().is_some_and(|(f, _)| !f.paused()));
-        if !merge {
-            let mut r = vec![self.feed(slots[0], decoding)];
-            r.resize_with(slots.len(), || Ok(None));
-            return r;
+        if self.trace.is_none() {
+            return self.feed_many_inner(slots, decoding);
         }
-        let max = feed_knob("BRECCIA_SERVE_FEED_CHUNK", decoding, SERVE_FEED_CHUNK);
-        let mut taken: Vec<_> = slots.iter().map(|&s| self.feeds[s].take().expect("a feeding slot")).collect();
-        let mut refs: Vec<(usize, &mut breccia_engine::PromptFeed)> = slots.iter().copied().zip(taken.iter_mut().map(|t| &mut t.0)).collect();
-        let done = match self.sess.feed_steps(&mut refs, max) {
-            Ok(d) => d,
-            Err(e) => {
-                let e = format!("{e:#}");
-                for (&s, t) in slots.iter().zip(taken) {
-                    self.feeds[s] = Some(t);
+        let pos = |me: &Self| -> Vec<Option<usize>> { slots.iter().map(|&s| me.feeds[s].as_ref().map(|(f, _)| f.pos)).collect() };
+        let (p0, g0) = (pos(self), probe_now(self.sess));
+        let t0 = self.trace.as_mut().expect("trace on").begin();
+        let r = self.feed_many_inner(slots, decoding);
+        let (p1, g1) = (pos(self), probe_now(self.sess));
+        let t = self.trace.as_mut().expect("trace on");
+        let mut cells = 0;
+        for (i, &s) in slots.iter().enumerate() {
+            match (p0[i], p1[i]) {
+                (Some(a), Some(b)) => cells += b - a,
+                (Some(a), None) => {
+                    let (at, len) = t.fills[s].take().unwrap_or((t0, 0));
+                    let end = a.max(len); // the prompt length when the trace saw the admit
+                    cells += end.saturating_sub(a);
+                    eprintln!("trace t={:.0}s slot {s} fed: {len} cells in {:.1} s ({:.1} tok/s), decoding={decoding}", t.t_start.elapsed().as_secs_f64(), at.elapsed().as_secs_f64(), len as f64 / at.elapsed().as_secs_f64());
                 }
-                return slots.iter().map(|_| Err(e.clone())).collect();
+                _ => {}
             }
-        };
-        let mut out = Vec::with_capacity(slots.len());
-        for ((&s, (f, key)), d) in slots.iter().zip(taken).zip(done) {
-            if !d {
-                self.feeds[s] = Some((f, key));
-                out.push(Ok(None));
-                continue;
-            }
-            // feed_sample uses the active sequence's sampler
-            out.push(self.sess.use_seq(s).map_err(|e| e.to_string()).and_then(|_| self.feed_done(f, key)));
         }
-        out
+        t.feed.add(t0.elapsed().as_secs_f64(), cells, &g0, &g1);
+        t.end(decoding);
+        r
     }
     fn admit(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
         let Some(n) = self.reserve(slot, prompt.len(), max_tokens)? else {
@@ -5936,7 +6040,17 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         Ok(Some((tok, n)))
     }
     fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
-        self.sess.step_seqs(rows).map_err(|e| format!("{e:#}"))
+        if self.trace.is_none() {
+            return self.sess.step_seqs(rows).map_err(|e| format!("{e:#}"));
+        }
+        let g0 = probe_now(self.sess);
+        let t0 = self.trace.as_mut().expect("trace on").begin();
+        let r = self.sess.step_seqs(rows).map_err(|e| format!("{e:#}"));
+        let g1 = probe_now(self.sess);
+        let t = self.trace.as_mut().expect("trace on");
+        t.step.add(t0.elapsed().as_secs_f64(), rows.len(), &g0, &g1);
+        t.end(rows.len());
+        r
     }
     fn complete_alone(&mut self, slot: usize, prompt: &[u32], max_tokens: usize, waiting: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Result<(Vec<u32>, usize, bool), String> {
         let spec = self.spec_now; // reserve() clears it
@@ -5967,6 +6081,44 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
 }
 
 impl EngineBackend<'_, '_> {
+    fn feed_many_inner(&mut self, slots: &[usize], decoding: usize) -> Vec<Result<Option<u32>, String>> {
+        // option 4: several prompts' next chunks through one pass (`BRECCIA_SERVE_MERGE=0` off);
+        // paused chunks (FEED_BLOCKS) keep the one-slot path
+        let merge = slots.len() > 1
+            && std::env::var("BRECCIA_SERVE_MERGE").map_or(true, |v| v != "0")
+            && feed_knob("BRECCIA_SERVE_FEED_BLOCKS", decoding, "") == 0
+            && self.sess.can_merge()
+            && slots.iter().all(|&s| self.feeds[s].as_ref().is_some_and(|(f, _)| !f.paused()));
+        if !merge {
+            let mut r = vec![breccia_server::Backend::feed(self, slots[0], decoding)];
+            r.resize_with(slots.len(), || Ok(None));
+            return r;
+        }
+        let max = feed_knob("BRECCIA_SERVE_FEED_CHUNK", decoding, SERVE_FEED_CHUNK);
+        let mut taken: Vec<_> = slots.iter().map(|&s| self.feeds[s].take().expect("a feeding slot")).collect();
+        let mut refs: Vec<(usize, &mut breccia_engine::PromptFeed)> = slots.iter().copied().zip(taken.iter_mut().map(|t| &mut t.0)).collect();
+        let done = match self.sess.feed_steps(&mut refs, max) {
+            Ok(d) => d,
+            Err(e) => {
+                let e = format!("{e:#}");
+                for (&s, t) in slots.iter().zip(taken) {
+                    self.feeds[s] = Some(t);
+                }
+                return slots.iter().map(|_| Err(e.clone())).collect();
+            }
+        };
+        let mut out = Vec::with_capacity(slots.len());
+        for ((&s, (f, key)), d) in slots.iter().zip(taken).zip(done) {
+            if !d {
+                self.feeds[s] = Some((f, key));
+                out.push(Ok(None));
+                continue;
+            }
+            // feed_sample uses the active sequence's sampler
+            out.push(self.sess.use_seq(s).map_err(|e| e.to_string()).and_then(|_| self.feed_done(f, key)));
+        }
+        out
+    }
     /// A prompt pass is in: its first token, and keep its saved text prefix.
     fn feed_done(&mut self, mut f: breccia_engine::PromptFeed, key: Vec<u32>) -> Result<Option<u32>, String> {
         let tok = self.sess.feed_sample(&f).map_err(|e| e.to_string())?;
@@ -6235,6 +6387,10 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         reserved: vec![0; seqs],
         feeds: (0..seqs).map(|_| None).collect(),
         yielded: false,
+        trace: (std::env::var("BRECCIA_SERVE_TRACE").as_deref() == Ok("1")).then(|| {
+            let now = std::time::Instant::now();
+            ServeTrace { t_start: now, win: now, last_end: None, gap_max: 0.0, step: TraceBucket::default(), feed: TraceBucket::default(), fills: (0..seqs).map(|_| None).collect() }
+        }),
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))

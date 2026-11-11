@@ -1632,7 +1632,7 @@ impl<'m> Session<'m> {
     }
 
     /// This session's devices (one model's placement).
-    fn device_gpus(&self) -> Vec<&breccia_vk::ctx::Gpu> {
+    pub fn device_gpus(&self) -> Vec<&breccia_vk::ctx::Gpu> {
         if let Some(d) = self.wait_scope {
             return vec![self.model.devices[d].gpu()];
         }

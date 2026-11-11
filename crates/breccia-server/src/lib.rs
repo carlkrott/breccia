@@ -433,7 +433,8 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
 
 /// Answer and free the slots that are done: max tokens, EOS, or the context's end.
 fn retire<B: Backend>(live: &mut [Option<Live>], b: &mut B, ctx: usize) {
-    let eos = b.eos();
+    // `BRECCIA_SERVE_IGNORE_EOS=1`: benches only, every request runs to max_tokens
+    let eos = b.eos().filter(|_| std::env::var("BRECCIA_SERVE_IGNORE_EOS").map_or(true, |v| v != "1"));
     for (s, slot) in live.iter_mut().enumerate() {
         let done = slot.as_ref().is_some_and(|l| {
             l.ids.len() >= l.allowed
