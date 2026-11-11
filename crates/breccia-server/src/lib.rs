@@ -289,6 +289,10 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
     let ctx = b.context().unwrap_or(usize::MAX);
     let mut queue: VecDeque<Pending> = VecDeque::new();
     let mut live: Vec<Option<Live>> = (0..b.slots()).map(|_| None).collect();
+    // `BRECCIA_SERVE_DECODE_SHARE=0.5`: while prompts feed and others decode, decode gets this
+    // share of the wall (feed passes wait until the steps since have paid it); unset = one pass per step
+    let share = std::env::var("BRECCIA_SERVE_DECODE_SHARE").ok().and_then(|v| v.parse::<f64>().ok()).filter(|s| *s > 0.0 && *s < 1.0);
+    let (mut feed_s, mut step_s) = (0.0f64, 0.0f64);
     loop {
         let busy = live.iter().any(Option::is_some);
         let mut jobs: Vec<Job> = Vec::new();
@@ -381,7 +385,16 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
         feeding.sort();
         let feeding: Vec<usize> = feeding.into_iter().map(|x| x.1).collect();
         let decoding = live.iter().filter(|l| l.as_ref().is_some_and(|l| !l.ids.is_empty())).count();
+        if feeding.is_empty() || decoding == 0 {
+            (feed_s, step_s) = (0.0, 0.0);
+        }
+        let shared = share.is_some() && !feeding.is_empty() && decoding > 0;
+        let feeding = if shared && !feed_now(share, feed_s, step_s) { Vec::new() } else { feeding };
+        let t = std::time::Instant::now();
         let fed = if feeding.is_empty() { Vec::new() } else { b.feed_many(&feeding, decoding) };
+        if shared {
+            feed_s += t.elapsed().as_secs_f64();
+        }
         for (s, r) in feeding.into_iter().zip(fed) {
             match r {
                 Ok(Some(tok)) => {
@@ -407,9 +420,13 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
         if rows.is_empty() {
             continue;
         }
+        let t = std::time::Instant::now();
         match b.step(&rows) {
             Ok(next) => {
                 let now = std::time::Instant::now();
+                if shared {
+                    step_s += (now - t).as_secs_f64();
+                }
                 for (&(s, _), t) in rows.iter().zip(next) {
                     let l = live[s].as_mut().expect("a live slot");
                     l.ids.push(t);
@@ -429,6 +446,21 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             }
         }
     }
+}
+
+/// Decode share: feed again once decode's time since the last reset reaches `share` of the total.
+fn feed_now(share: Option<f64>, feed_s: f64, step_s: f64) -> bool {
+    share.map_or(true, |s| step_s >= feed_s * s / (1.0 - s))
+}
+
+#[test]
+fn feed_now_pays_the_decode_share() {
+    assert!(feed_now(None, 9.0, 0.0));
+    assert!(feed_now(Some(0.5), 0.0, 0.0));
+    assert!(!feed_now(Some(0.5), 8.0, 7.9));
+    assert!(feed_now(Some(0.5), 8.0, 8.0));
+    assert!(!feed_now(Some(0.75), 2.0, 5.9));
+    assert!(feed_now(Some(0.75), 2.0, 6.0));
 }
 
 /// Answer and free the slots that are done: max tokens, EOS, or the context's end.
