@@ -142,3 +142,42 @@ fn topk_rank_pruning_is_exact_at_long_context() {
         run_for_cells(&gpu, &qsa, cells);
     }
 }
+
+/// Prefill shape: one dispatch selects for many tokens (timing only; the
+/// selection itself is checked above). `BRECCIA_TOPK_PREFILL_TOKENS` enables it.
+#[test]
+fn topk_prefill_shape_timing() {
+    let (Ok(selector), Ok(tokens)) = (
+        std::env::var("BRECCIA_KERNEL_DEVICE"),
+        std::env::var("BRECCIA_TOPK_PREFILL_TOKENS"),
+    ) else {
+        eprintln!("qsa_topk prefill: SKIPPED — set BRECCIA_KERNEL_DEVICE and BRECCIA_TOPK_PREFILL_TOKENS");
+        return;
+    };
+    let tokens: usize = tokens.parse().expect("token count");
+    let Some((_host, gpu)) = open(&selector) else {
+        return;
+    };
+    let qsa = Qsa::new(&gpu, 1 << 18).expect("qsa pipelines");
+    for cells in [32768usize, 204800] {
+        let ws = qsa.workspace(&gpu, tokens, cells).expect("workspace");
+        let mut seed = 0x2545_f491u32;
+        let mut bytes = Vec::with_capacity(tokens * ws.n_blocks * 4);
+        for _ in 0..tokens * ws.n_blocks {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            bytes.extend_from_slice(&(((seed >> 8) & 0xffff) as f32 / 65536.0).to_le_bytes());
+        }
+        upload_into(&gpu, &ws.idx_scores, &bytes).expect("upload scores");
+        let pos0 = cells - tokens;
+        qsa.topk(&ws, pos0).expect("warm");
+        const REPS: u32 = 5;
+        breccia_kernels::dispatch_batch::begin(&gpu).expect("begin");
+        for _ in 0..REPS {
+            qsa.topk(&ws, pos0).expect("topk timing");
+        }
+        let t0 = std::time::Instant::now();
+        breccia_kernels::dispatch_batch::end(&gpu).expect("end");
+        let us = t0.elapsed().as_secs_f64() * 1e6 / REPS as f64;
+        println!("qsa_topk prefill: tokens {tokens:>5} n_blocks {:>6}  {us:>9.1} us per call", ws.n_blocks);
+    }
+}
