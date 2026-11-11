@@ -9187,6 +9187,12 @@ enum BufKind {
 
 /// Touch one byte of each of `rows` from up to four threads, so 16 page faults
 /// cost one fault latency instead of sixteen.
+/// `BRECCIA_PLE_WILLNEED=1`: [`prefetch_rows`] queues each row's page with MADV_WILLNEED before touching it.
+fn ple_willneed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_PLE_WILLNEED").is_ok_and(|v| v == "1"))
+}
+
 fn prefetch_rows(table: &[u8], rows: &[u32], row_bytes: usize) {
     if rows.len() < 2 || table.is_empty() {
         return;
@@ -9196,6 +9202,18 @@ fn prefetch_rows(table: &[u8], rows: &[u32], row_bytes: usize) {
     std::thread::scope(|s| {
         for chunk in rows.chunks(per) {
             s.spawn(move || {
+                if ple_willneed() {
+                    // Queue every row's page as async readahead first, so the NVMe sees a
+                    // deep queue instead of 8 blocking touches (11-11: qd ~8, 21k IO/s).
+                    for r in chunk {
+                        let at = (*r as usize).saturating_mul(row_bytes);
+                        if at < table.len() {
+                            let p = (table.as_ptr() as usize + at) & !4095;
+                            // SAFETY: the page holds a byte of the mapping; WILLNEED only queues reads.
+                            unsafe { libc::madvise(p as *mut libc::c_void, 4096, libc::MADV_WILLNEED) };
+                        }
+                    }
+                }
                 let mut sink = 0u8;
                 for r in chunk {
                     let at = (*r as usize).saturating_mul(row_bytes);
