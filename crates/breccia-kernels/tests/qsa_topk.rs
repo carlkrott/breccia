@@ -61,8 +61,10 @@ fn check(gpu: &Gpu, qsa: &Qsa<'_>, ws: &QsaWorkspace, scores: &[f32], pos0: usiz
     );
     // Radix emits ascending block ids (same set, see qsa_topk_radix.comp): compare sets.
     let (mut g, mut w) = (got[..count].to_vec(), want[..count].to_vec());
-    g.sort_unstable();
-    w.sort_unstable();
+    if std::env::var("BRECCIA_QSA_TOPK").map_or(true, |v| v == "auto" || v == "radix") {
+        g.sort_unstable();
+        w.sort_unstable();
+    }
     assert_eq!(g, w, "{what}: selection differs from the CPU reference");
 
     // Dispatch cost at this block count: a handful of passes over the score row,
