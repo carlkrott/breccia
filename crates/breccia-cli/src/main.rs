@@ -5607,6 +5607,8 @@ struct EngineBackend<'a, 'm> {
     /// state after a text prompt's first `len - 1` tokens, keyed by those tokens; a later
     /// request that starts with them (the next chat turn, a retry) resumes from the longest
     text_prefixes: Vec<(Vec<u32>, std::time::Instant, TextPrefix)>,
+    /// cells of the shortest text prefix seen over the cap: saves at least that long are skipped
+    text_prefix_over: usize,
     prefix_ttl: std::time::Duration,
     /// MTP draft for spec decode of text prompts (one card or dual, `BRECCIA_MTP=0` turns it off)
     draft: Option<breccia_engine::mtp_draft::MtpDraft<'m>>,
@@ -5833,16 +5835,17 @@ impl EngineBackend<'_, '_> {
             self.yielded = st.yielded;
             (toks, saved.map(TextPrefix::Spec))
         } else {
+            let fits = cut < self.text_prefix_over;
             let p = match hit {
-                Some(TextPrefix::Plain(st)) if st.cells < cut => Prefix::ResumeSave(st, cut),
+                Some(TextPrefix::Plain(st)) if st.cells < cut && fits => Prefix::ResumeSave(st, cut),
                 Some(TextPrefix::Plain(st)) => Prefix::Resume(st),
-                _ if cut > 0 => Prefix::Save(cut),
+                _ if cut > 0 && fits => Prefix::Save(cut),
                 _ => Prefix::None,
             };
             let (g, saved) = self.sess.generate_prefix(prompt, n, None, p).map_err(|e| e.to_string())?;
             (g.tokens, saved.map(TextPrefix::Plain))
         };
-        if let Some(st) = saved {
+        if let Some(st) = saved.filter(|st| self.keep_text_prefix(st.cells(), st.bytes())) {
             println!("prefix   {} cells kept ({} MiB), request {:.2} s", st.cells(), st.bytes() >> 20, now.elapsed().as_secs_f64());
             self.text_prefixes.push((prompt[..cut].to_vec(), now, st));
             prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
@@ -5971,17 +5974,18 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
             .iter_mut()
             .filter(|e| cut > 0 && e.0.len() <= cut && prompt.starts_with(&e.0) && matches!(e.2, TextPrefix::Plain(_)))
             .max_by_key(|e| e.0.len());
+        let fits = cut < self.text_prefix_over;
         let p = match hit {
             Some(e) => {
                 e.1 = now;
                 println!("prefix   {} of {} cells from RAM", e.2.cells(), prompt.len());
                 match &e.2 {
-                    TextPrefix::Plain(st) if st.cells < cut => Prefix::ResumeSave(st, cut),
+                    TextPrefix::Plain(st) if st.cells < cut && fits => Prefix::ResumeSave(st, cut),
                     TextPrefix::Plain(st) => Prefix::Resume(st),
                     TextPrefix::Spec(_) => unreachable!("filtered to plain prefixes"),
                 }
             }
-            None if cut > 0 => Prefix::Save(cut),
+            None if cut > 0 && fits => Prefix::Save(cut),
             None => Prefix::None,
         };
         let f = self.sess.feed_start(prompt, p).map_err(|e| format!("{e:#}"))?;
@@ -6119,10 +6123,19 @@ impl EngineBackend<'_, '_> {
         }
         out
     }
+    /// False (and a log line) when a saved text prefix is over the cap; longer saves are then skipped.
+    fn keep_text_prefix(&mut self, cells: usize, bytes: usize) -> bool {
+        let keep = bytes <= TEXT_PREFIX_CAP_BYTES;
+        if !keep {
+            self.text_prefix_over = self.text_prefix_over.min(cells);
+            println!("prefix   {cells} cells ({} MiB) over the {} MiB cap, not kept", bytes >> 20, TEXT_PREFIX_CAP_BYTES >> 20);
+        }
+        keep
+    }
     /// A prompt pass is in: its first token, and keep its saved text prefix.
     fn feed_done(&mut self, mut f: breccia_engine::PromptFeed, key: Vec<u32>) -> Result<Option<u32>, String> {
         let tok = self.sess.feed_sample(&f).map_err(|e| e.to_string())?;
-        if let Some(st) = f.saved.take() {
+        if let Some(st) = f.saved.take().filter(|st| self.keep_text_prefix(st.cells, st.bytes())) {
             let now = std::time::Instant::now();
             println!("prefix   {} cells kept ({} MiB)", st.cells, st.bytes() >> 20);
             self.text_prefixes.push((key, now, TextPrefix::Plain(st)));
@@ -6380,6 +6393,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         images: Vec::new(),
         prefixes: Vec::new(),
         text_prefixes: Vec::new(),
+        text_prefix_over: usize::MAX,
         prefix_ttl: std::time::Duration::from_secs(a.image_ttl_min * 60),
         draft,
         mtp_always: mtp_env == "1",
