@@ -2621,6 +2621,70 @@ impl<'m> Session<'m> {
         Ok(())
     }
 
+    /// Serve side of P0.5 (`BRECCIA_KV_PARK_PREFILL` with `BRECCIA_KV_POOL_CELLS`): the
+    /// pool holds one context while nothing is held and grows **in place** (doubling,
+    /// capped at the env size) when `held + need` reserved pages (sink excluded) do not
+    /// fit, so a lone long prompt fills with a small pinned pool. Live sequences keep
+    /// their pages: the K/V bytes are copied into the bigger pool and every alias is
+    /// rebound, nothing is parked. No-op without park mode.
+    pub fn kv_pool_fit(&mut self, held: usize, need: usize) -> Result<()> {
+        use breccia_kernels::qsa::PAGE_CELLS;
+        let Some(target) = breccia_kernels::qsa::kv_pool_cells().filter(|_| kv_park_prefill().is_some() && !self.kv_pool.is_empty()) else {
+            return Ok(());
+        };
+        let pages = self.kv_pool.iter().flatten().map(|p| p.pages).min().unwrap_or(0);
+        let base = target.min(self.seq_ctx).div_ceil(PAGE_CELLS);
+        let idle = self.kv_free.len() + 1 == pages;
+        if held == 0 && idle && pages > base {
+            let t = std::time::Instant::now();
+            self.regrow_kv_pool(base * PAGE_CELLS)?;
+            eprintln!("breccia: KV pool idle, shrunk to {} cells in {:.2} s", base * PAGE_CELLS, t.elapsed().as_secs_f64());
+            return self.kv_pool_fit(held, need);
+        }
+        if held + need + 1 <= pages {
+            return Ok(());
+        }
+        let cells = ((held + need + 1).max(2 * pages) * PAGE_CELLS).min(target);
+        let t = std::time::Instant::now();
+        self.flush()?;
+        let m = self.model;
+        let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
+        batch_cmd::wait_all(&gpus)?;
+        let mut grown: Vec<Option<KvPool>> = Vec::with_capacity(self.kv_pool.len());
+        for (b, p) in self.kv_pool.iter().enumerate() {
+            match p.as_ref().map(|p| p.grown(m.devices[m.device_of(b)].gpu(), cells)).transpose() {
+                Ok(g) => grown.push(g),
+                Err(e) => {
+                    for (b, g) in grown.iter().enumerate() {
+                        if let Some(g) = g {
+                            g.release(m.devices[m.device_of(b)].gpu());
+                        }
+                    }
+                    return Err(e.context(format!("growing the shared KV pool of block {b}")));
+                }
+            }
+        }
+        let alias = |b: &breccia_vk::ctx::Buf| breccia_vk::ctx::Buf { buf: b.buf, mem: b.mem, size: b.size, id: b.id };
+        // every sequence's per-layer states: the active one's in the session, the rest in their slots
+        for layers in std::iter::once(&mut self.qsa_state).chain(self.seqs.iter_mut().flatten().map(|s| &mut s.qsa_state)) {
+            for (b, st) in layers.iter_mut().enumerate() {
+                if let Some(st) = st {
+                    let g = grown[b].as_ref().expect("a QSA block has a pool");
+                    (st.k_pool, st.v_pool) = (alias(&g.k), alias(&g.v));
+                }
+            }
+        }
+        for (b, p) in std::mem::replace(&mut self.kv_pool, grown).into_iter().enumerate() {
+            if let Some(p) = p {
+                p.release(m.devices[m.device_of(b)].gpu());
+            }
+        }
+        let now = self.kv_pool.iter().flatten().map(|p| p.pages).min().unwrap_or(0);
+        self.kv_free.extend(pages as u32..now as u32);
+        eprintln!("breccia: KV pool grown in place to {cells} cells ({pages} -> {now} pages) in {:.2} s", t.elapsed().as_secs_f64());
+        Ok(())
+    }
+
     /// Shared KV pool: give the active sequence pool pages for cells `0..cells`
     /// and write them into its page tables. No-op without a pool.
     fn kv_ensure(&mut self, cells: usize) -> Result<()> {

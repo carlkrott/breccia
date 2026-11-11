@@ -5992,9 +5992,12 @@ impl EngineBackend<'_, '_> {
                     prompt_len
                 ));
             }
-            if self.reserved.iter().sum::<usize>() + need > pages {
+            let held = self.reserved.iter().sum::<usize>();
+            if held + need > pages {
                 return Ok(None);
             }
+            // P0.5 park mode: the live pool may be smaller than the env size; grow it in place
+            self.sess.kv_pool_fit(held, need).map_err(|e| format!("{e:#}"))?;
         }
         self.sess.use_seq(slot).map_err(|e| e.to_string())?;
         self.spec_now = false; // spec decode runs only alone (`spec_hint`)

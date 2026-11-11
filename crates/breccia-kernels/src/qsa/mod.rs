@@ -563,6 +563,43 @@ impl KvPool {
         Ok(KvPool { k, v, pages })
     }
 
+    /// A pool of `cells` (>= this one's) holding this pool's pages at the same page
+    /// numbers: rows are page-major, so the old bytes are a prefix of the new. The tail
+    /// is GPU-filled (zero, or NaN under BRECCIA_FAULT_POISON_QSA). The caller rebinds
+    /// every alias and releases `self` once nothing in flight reads it.
+    pub fn grown(&self, gpu: &Gpu, cells: usize) -> Result<Self> {
+        let pages = cells.div_ceil(PAGE_CELLS);
+        anyhow::ensure!(pages >= self.pages, "KvPool::grown shrinks {} -> {pages} pages", self.pages);
+        let s = buffer_sizes(pages * PAGE_CELLS, 8, VLayout::current());
+        let host = kv_host_on(&gpu.pci_address);
+        let mk = |n: u64| if host { alloc_host(gpu, n) } else { alloc(gpu, n) };
+        let k = mk(s[0].0).map_err(|e| anyhow!("growing the shared KV pool (k): {e}"))?;
+        let v = match mk(s[1].0) {
+            Ok(v) => v,
+            Err(e) => {
+                gpu.destroy_buf(&k);
+                return Err(anyhow!("growing the shared KV pool (v): {e}"));
+            }
+        };
+        let fill = if std::env::var_os("BRECCIA_FAULT_POISON_QSA").is_some() { f32::NAN.to_bits() } else { 0 };
+        let r = gpu.wall_run(breccia_vk::ctx::Qc::X, |d, cmd| unsafe {
+            Gpu::barrier_all(d, cmd);
+            for (old, new) in [(&self.k, &k), (&self.v, &v)] {
+                d.cmd_copy_buffer(cmd, old.buf, new.buf, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: old.size }]);
+                if new.size > old.size {
+                    d.cmd_fill_buffer(cmd, new.buf, old.size & !3, vk::WHOLE_SIZE, fill);
+                }
+            }
+            Gpu::barrier_all(d, cmd);
+        });
+        if let Err(e) = r {
+            gpu.destroy_buf(&k);
+            gpu.destroy_buf(&v);
+            return Err(anyhow!("copying the shared KV pool: {e}"));
+        }
+        Ok(KvPool { k, v, pages })
+    }
+
     pub fn bytes(&self) -> u64 {
         self.k.size + self.v.size
     }
