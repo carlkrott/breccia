@@ -9313,20 +9313,21 @@ struct PfGroup {
     ao: u64,
 }
 
-/// `BRECCIA_PF_T2=1` (opt-in, output-changing order of adds only): streamed prefill
+/// T2 prefill pass, default on since 11-11 with the cap 64 below (`BRECCIA_PF_T2=0` opts out;
+/// output-changing order of adds only): streamed prefill
 /// blocks send the experts the helper card's tier-2 pool holds to that card, which
 /// computes them from the pool while the RX streams the rest; the result is added
 /// after the RX fan-in.
 fn pf_t2() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BRECCIA_PF_T2").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_T2").map_or(true, |v| v != "0"))
 }
 
-/// `BRECCIA_PF_T2_THREAD=1` (with `BRECCIA_PF_T2=1`): the helper pass runs on its own
+/// T2 helper thread, default on (`BRECCIA_PF_T2_THREAD=0` opts out): the helper pass runs on its own
 /// host thread, so its recording, guard cuts and ring waits leave the RX thread.
 fn pf_t2_thread() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("BRECCIA_PF_T2_THREAD").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("BRECCIA_PF_T2_THREAD").map_or(true, |v| v != "0"))
 }
 
 /// A borrow handed to [`T2Worker`]. Safety: the owner joins the job (its result
