@@ -2725,7 +2725,7 @@ impl<'m> Session<'m> {
                 self.restore_prefix(st)?;
                 // Slots copy the session sampler, so reseed: with --temperature > 0 the
                 // clones then decode distinct continuations (distinct expert routing).
-                self.sampler = Sampler::new(self.sampling.seed.wrapping_add(i as u64));
+                self.sampler = Sampler::new(self.sampling.seed ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c16)); // even multiplier: `Sampler::new` ORs in bit 0
                 logits.push(logits[0].clone());
                 continue;
             }
