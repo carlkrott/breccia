@@ -705,6 +705,40 @@ fn alloc_seq_state(model: &Model, ctx_capacity: usize, kv_pool: &[Option<KvPool>
     Ok((gdn_state, qsa_state))
 }
 
+/// The shared KV pool (`BRECCIA_KV_POOL_CELLS`): per QSA layer, `cells` cells, and its free list.
+fn new_kv_pool(model: &Model, cells: usize) -> Result<(Vec<Option<KvPool>>, Vec<u32>)> {
+    let mc = &model.cfg;
+    let mut kv_pool: Vec<Option<KvPool>> = Vec::new();
+    for b in 0..mc.n_layers {
+        kv_pool.push(match mc.layer_kind(b) {
+            LayerKind::Qsa => Some(
+                KvPool::new(model.devices[model.device_of(b)].gpu(), cells)
+                    .with_context(|| format!("the shared KV pool of block {b}"))?,
+            ),
+            LayerKind::Gdn => None,
+        });
+    }
+    let pages = kv_pool.iter().flatten().map(|p| p.pages).min().unwrap_or(0);
+    // page 0 is the sink unmapped table entries point at, never handed
+    // out; popped from the end, pages go out high to low, so no table is
+    // identity (the paged path is exercised from token 0)
+    let kv_free = (1..pages as u32).collect();
+    eprintln!(
+        "breccia: shared KV pool {cells} cells/layer ({pages} pages), {} MiB",
+        kv_pool.iter().flatten().map(|p| p.bytes()).sum::<u64>() >> 20
+    );
+    Ok((kv_pool, kv_free))
+}
+
+/// `BRECCIA_KV_PARK_PREFILL=<dir>` (P0.5, opt-in, with `BRECCIA_KV_POOL_CELLS`): while
+/// [`Session::generate_seqs`] fills prompts the pool holds one context and each filled
+/// sequence is parked to `<dir>`; the pool then grows to its full size and every
+/// sequence is unparked before decode. Keeps pinned host KV off the page cache the
+/// streamed experts need during prefill.
+fn kv_park_prefill() -> Option<std::path::PathBuf> {
+    std::env::var_os("BRECCIA_KV_PARK_PREFILL").filter(|v| !v.is_empty()).map(Into::into)
+}
+
 fn release_seq_state(
     model: &Model,
     gdn_state: &[Option<GdnState>],
@@ -1407,28 +1441,12 @@ impl<'m> Session<'m> {
         }
 
         // Per-layer recurrent / KV state, on the device that owns the block.
-        let mut kv_pool: Vec<Option<KvPool>> = Vec::new();
-        let mut kv_free = Vec::new();
-        if let Some(cells) = breccia_kernels::qsa::kv_pool_cells() {
-            for b in 0..mc.n_layers {
-                kv_pool.push(match mc.layer_kind(b) {
-                    LayerKind::Qsa => Some(
-                        KvPool::new(model.devices[model.device_of(b)].gpu(), cells)
-                            .with_context(|| format!("the shared KV pool of block {b}"))?,
-                    ),
-                    LayerKind::Gdn => None,
-                });
-            }
-            let pages = kv_pool.iter().flatten().map(|p| p.pages).min().unwrap_or(0);
-            // page 0 is the sink unmapped table entries point at, never handed
-            // out; popped from the end, pages go out high to low, so no table is
-            // identity (the paged path is exercised from token 0)
-            kv_free = (1..pages as u32).collect();
-            eprintln!(
-                "breccia: shared KV pool {cells} cells/layer ({pages} pages), {} MiB",
-                kv_pool.iter().flatten().map(|p| p.bytes()).sum::<u64>() >> 20
-            );
-        }
+        let (kv_pool, kv_free) = match breccia_kernels::qsa::kv_pool_cells() {
+            // P0.5 park mode: one context of pool while prompts fill (`generate_seqs` grows it)
+            Some(cells) if kv_park_prefill().is_some() => new_kv_pool(model, cells.min(ctx_capacity))?,
+            Some(cells) => new_kv_pool(model, cells)?,
+            None => (Vec::new(), Vec::new()),
+        };
         let (gdn_state, qsa_state) = alloc_seq_state(model, ctx_capacity, &kv_pool)?;
 
         // Hoist the QSA workspaces: capacity-sized once, mutated per call.
@@ -2572,6 +2590,37 @@ impl<'m> Session<'m> {
         std::mem::swap(&mut self.ple, &mut slot.ple);
     }
 
+    /// P0.5 park mode: replace the shared KV pool with one of `cells` cells. Every
+    /// sequence must be reset (no pages held); their QSA state aliases the old pool,
+    /// so all sequence state is made anew (restore or reset it before use).
+    // shortcut: an allocation error midway leaves freed state behind (Drop would free it
+    // again); fine for the opt-in bench path, make it transactional before serve uses it.
+    fn regrow_kv_pool(&mut self, cells: usize) -> Result<()> {
+        anyhow::ensure!(
+            self.kv_pages.is_empty() && self.seqs.iter().flatten().all(|s| s.kv_pages.is_empty()),
+            "regrow_kv_pool needs every sequence reset"
+        );
+        self.flush()?;
+        let m = self.model;
+        let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
+        batch_cmd::wait_all(&gpus)?;
+        release_seq_state(m, &self.gdn_state, &self.qsa_state);
+        for slot in self.seqs.iter().flatten() {
+            release_seq_state(m, &slot.gdn_state, &slot.qsa_state);
+        }
+        for (b, p) in self.kv_pool.iter().enumerate() {
+            if let Some(p) = p {
+                p.release(m.devices[m.device_of(b)].gpu());
+            }
+        }
+        (self.kv_pool, self.kv_free) = new_kv_pool(m, cells)?;
+        (self.gdn_state, self.qsa_state) = alloc_seq_state(m, self.seq_ctx, &self.kv_pool)?;
+        for slot in self.seqs.iter_mut().flatten() {
+            (slot.gdn_state, slot.qsa_state) = alloc_seq_state(m, self.seq_ctx, &self.kv_pool)?;
+        }
+        Ok(())
+    }
+
     /// Shared KV pool: give the active sequence pool pages for cells `0..cells`
     /// and write them into its page tables. No-op without a pool.
     fn kv_ensure(&mut self, cells: usize) -> Result<()> {
@@ -2717,12 +2766,16 @@ impl<'m> Session<'m> {
         // BRECCIA_SEQS_CLONE=1 (lab, 8x200k sizing): prefill prompt 0 once, then restore
         // its saved state into every other sequence; all sequences decode prompt 0.
         let clone = std::env::var("BRECCIA_SEQS_CLONE").as_deref() == Ok("1");
+        let park = kv_park_prefill().filter(|_| !self.kv_pool.is_empty());
+        let park_file = |dir: &std::path::Path, i: usize| dir.join(format!("seq-{}-{i}.park", std::process::id()));
         let mut saved: Option<PrefixState> = None;
         for (i, prompt) in prompts.iter().enumerate() {
             self.use_seq(i)?;
             self.reset()?;
             if let Some(st) = &saved {
-                self.restore_prefix(st)?;
+                if park.is_none() {
+                    self.restore_prefix(st)?; // park mode restores every clone at unpark
+                }
                 // Slots copy the session sampler, so reseed: with --temperature > 0 the
                 // clones then decode distinct continuations (distinct expert routing).
                 self.sampler = Sampler::new(self.sampling.seed ^ (i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c16)); // even multiplier: `Sampler::new` ORs in bit 0
@@ -2741,8 +2794,36 @@ impl<'m> Session<'m> {
             if clone && k > 1 {
                 saved = Some(self.save_prefix(prompt.len())?);
             }
+            if let Some(dir) = &park {
+                let t = std::time::Instant::now();
+                match &saved {
+                    Some(st) => st.save_file(&park_file(dir, i))?,
+                    None => self.save_prefix(prompt.len())?.save_file(&park_file(dir, i))?,
+                }
+                self.reset()?;
+                eprintln!("seq {i}: parked in {:.2} s", t.elapsed().as_secs_f64());
+            }
         }
         drop(saved);
+        if let Some(dir) = &park {
+            let t = std::time::Instant::now();
+            let cells = breccia_kernels::qsa::kv_pool_cells().expect("park mode needs the pool");
+            self.regrow_kv_pool(cells)?;
+            let grow_s = t.elapsed().as_secs_f64();
+            for i in 0..k {
+                self.use_seq(i)?;
+                self.reset()?;
+                let f = park_file(dir, if clone { 0 } else { i });
+                self.restore_prefix(&PrefixState::load_file(&f)?)?;
+                if !clone || i + 1 == k {
+                    std::fs::remove_file(&f)?;
+                }
+            }
+            eprintln!(
+                "breccia: KV pool grown to {cells} cells in {grow_s:.2} s, {k} sequences unparked in {:.2} s",
+                t.elapsed().as_secs_f64() - grow_s
+            );
+        }
         self.flush()?;
         self.forwards = 0;
         self.expert_bytes = 0;
