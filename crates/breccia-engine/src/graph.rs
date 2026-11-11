@@ -2650,33 +2650,23 @@ impl<'m> Session<'m> {
         let m = self.model;
         let gpus: Vec<&breccia_vk::ctx::Gpu> = m.devices.iter().map(|d| d.gpu()).collect();
         batch_cmd::wait_all(&gpus)?;
-        let mut grown: Vec<Option<KvPool>> = Vec::with_capacity(self.kv_pool.len());
-        for (b, p) in self.kv_pool.iter().enumerate() {
-            match p.as_ref().map(|p| p.grown(m.devices[m.device_of(b)].gpu(), cells)).transpose() {
-                Ok(g) => grown.push(g),
-                Err(e) => {
-                    for (b, g) in grown.iter().enumerate() {
-                        if let Some(g) = g {
-                            g.release(m.devices[m.device_of(b)].gpu());
-                        }
-                    }
-                    return Err(e.context(format!("growing the shared KV pool of block {b}")));
-                }
-            }
-        }
         let alias = |b: &breccia_vk::ctx::Buf| breccia_vk::ctx::Buf { buf: b.buf, mem: b.mem, size: b.size, id: b.id };
-        // every sequence's per-layer states: the active one's in the session, the rest in their slots
-        for layers in std::iter::once(&mut self.qsa_state).chain(self.seqs.iter_mut().flatten().map(|s| &mut s.qsa_state)) {
-            for (b, st) in layers.iter_mut().enumerate() {
-                if let Some(st) = st {
-                    let g = grown[b].as_ref().expect("a QSA block has a pool");
+        // One layer at a time (grow, rebind, free the old) so the pinned peak is the new
+        // pool plus one old layer, not old + new (23 GB at 4 -> 8 x 200k vs a 29 GiB TTM cap).
+        // A failure part way leaves some layers bigger: harmless, page numbers stay valid,
+        // and kv_free only grows once every layer has.
+        for b in 0..self.kv_pool.len() {
+            let gpu = m.devices[m.device_of(b)].gpu();
+            let Some(old) = self.kv_pool[b].as_ref().filter(|p| p.pages * PAGE_CELLS < cells) else { continue };
+            let g = old.grown(gpu, cells).map_err(|e| e.context(format!("growing the shared KV pool of block {b}")))?;
+            // every sequence's states for this layer: the active one's in the session, the rest in their slots
+            for layers in std::iter::once(&mut self.qsa_state).chain(self.seqs.iter_mut().flatten().map(|s| &mut s.qsa_state)) {
+                if let Some(st) = layers[b].as_mut() {
                     (st.k_pool, st.v_pool) = (alias(&g.k), alias(&g.v));
                 }
             }
-        }
-        for (b, p) in std::mem::replace(&mut self.kv_pool, grown).into_iter().enumerate() {
-            if let Some(p) = p {
-                p.release(m.devices[m.device_of(b)].gpu());
+            if let Some(old) = self.kv_pool[b].replace(g) {
+                old.release(gpu);
             }
         }
         let now = self.kv_pool.iter().flatten().map(|p| p.pages).min().unwrap_or(0);
