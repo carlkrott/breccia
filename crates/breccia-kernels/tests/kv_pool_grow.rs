@@ -36,3 +36,24 @@ fn grown_keeps_pages_and_zeroes_the_tail() {
     old.release(&gpu);
     new.release(&gpu);
 }
+
+/// Grow stall at 8 x 200k scale, one QSA layer (x12 for the model):
+/// `BRECCIA_KV_HOST=1 cargo test --release --test kv_pool_grow -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn grow_time_200k() {
+    let Some((_host, gpu)) = open(&std::env::var("BRECCIA_KERNEL_DEVICE").unwrap_or_default()) else { return };
+    let t = std::time::Instant::now();
+    let old = KvPool::new(&gpu, 4 * 204800).expect("pool");
+    let t_new = t.elapsed();
+    let t = std::time::Instant::now();
+    let new = old.grown(&gpu, 8 * 204800).expect("grow");
+    let t_grow = t.elapsed();
+    let t = std::time::Instant::now();
+    old.release(&gpu);
+    eprintln!(
+        "per layer: new(4x200k, {} MiB) {:.3} s, grown(8x200k, {} MiB) {:.3} s, release old {:.3} s",
+        (old.k.size + old.v.size) >> 20, t_new.as_secs_f64(), (new.k.size + new.v.size) >> 20, t_grow.as_secs_f64(), t.elapsed().as_secs_f64()
+    );
+    new.release(&gpu);
+}
