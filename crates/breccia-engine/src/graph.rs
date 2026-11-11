@@ -2828,6 +2828,8 @@ impl<'m> Session<'m> {
         self.forwards = 0;
         self.expert_bytes = 0;
         self.timers.clear();
+        // BRECCIA_GPU_TIME: the stage table covers the decode window only.
+        self.snapshot_probe();
         let mut outs: Vec<Vec<u32>> = vec![Vec::with_capacity(n); k];
         let mut lasts: Vec<Vec<f32>> = vec![Vec::new(); k];
         let t = std::time::Instant::now();

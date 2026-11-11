@@ -4891,6 +4891,13 @@ fn bench_token(a: TokenArgs) -> Result<()> {
                 }
             }
         }
+        if let Some(rows) = sess.gpu_time_table() {
+            println!("gpu time, decode window (us per forward, {} forwards):", sess.forwards);
+            for row in rows.iter().filter(|r| r.total_us >= 1.0) {
+                let cols: Vec<String> = row.per_device.iter().map(|(us, _)| format!("{us:>9.1}")).collect();
+                println!("  {:<14} {}   sum {:>9.1}", row.stage, cols.join(""), row.total_us);
+            }
+        }
         let mut bad = 0;
         for (i, g) in gens.iter().enumerate() {
             println!("seq {i}: {:?}", &g.tokens[..g.tokens.len().min(12)]);
