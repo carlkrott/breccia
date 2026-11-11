@@ -2713,10 +2713,19 @@ impl<'m> Session<'m> {
             self.add_seq()?;
         }
         let k = prompts.len();
-        let mut logits = Vec::with_capacity(k);
+        let mut logits: Vec<Vec<f32>> = Vec::with_capacity(k);
+        // BRECCIA_SEQS_CLONE=1 (lab, 8x200k sizing): prefill prompt 0 once, then restore
+        // its saved state into every other sequence; all sequences decode prompt 0.
+        let clone = std::env::var("BRECCIA_SEQS_CLONE").as_deref() == Ok("1");
+        let mut saved: Option<PrefixState> = None;
         for (i, prompt) in prompts.iter().enumerate() {
             self.use_seq(i)?;
             self.reset()?;
+            if let Some(st) = &saved {
+                self.restore_prefix(st)?;
+                logits.push(logits[0].clone());
+                continue;
+            }
             let mut pos = 0usize;
             let mut l = Vec::new();
             for len in prefill_plan(prompt.len(), self.prefill_target) {
@@ -2726,7 +2735,11 @@ impl<'m> Session<'m> {
                 eprintln!("seq {i}: prefill {pos}/{}", prompt.len());
             }
             logits.push(l); // prefill leaves self.pos at the last prompt cell
+            if clone && k > 1 {
+                saved = Some(self.save_prefix(prompt.len())?);
+            }
         }
+        drop(saved);
         self.flush()?;
         self.forwards = 0;
         self.expert_bytes = 0;
@@ -2926,6 +2939,34 @@ impl<'m> Session<'m> {
                 std::fs::write(format!("{dir}/p{pos:06}-b{b:02}-{name}.bin"), bytes)?;
             }
         }
+        Ok(())
+    }
+
+    /// `BRECCIA_SEL_TRACE=<file>` (tiered-KV sizing): after each plain decode token, append
+    /// one line per QSA block: `pos block n_blocks id id ...` = the indexer's selected
+    /// 4-cell block ids (top-k, then the tail block). Read-only, output unchanged; it
+    /// flushes every token, so lab only.
+    fn sel_trace(&mut self, pos: usize) -> Result<()> {
+        use std::io::Write;
+        let Some(path) = std::env::var_os("BRECCIA_SEL_TRACE") else {
+            return Ok(());
+        };
+        self.flush()?;
+        let m = self.model;
+        let mut out = String::new();
+        for b in 0..m.cfg.n_layers {
+            let Some(ws) = self.qsa_ws[b].as_ref() else { continue };
+            let gpu = m.devices[m.device_of(b)].gpu();
+            let cnt = breccia_kernels::gemv::download(gpu, &ws.counts, 4)?;
+            let n = (u32::from_le_bytes(cnt[..4].try_into()?) as usize).min(ws.max_ids);
+            let ids = breccia_kernels::gemv::download(gpu, &ws.ids, n * 4)?;
+            out.push_str(&format!("{pos} {b} {}", ws.n_blocks));
+            for c in ids.chunks_exact(4) {
+                out.push_str(&format!(" {}", u32::from_le_bytes(c.try_into()?)));
+            }
+            out.push('\n');
+        }
+        std::fs::OpenOptions::new().create(true).append(true).open(path)?.write_all(out.as_bytes())?;
         Ok(())
     }
 
@@ -8411,6 +8452,7 @@ impl<'m> Session<'m> {
             let dbg = if i == 0 { trace.take() } else { None };
             logits = self.token(next, pos, dbg)?;
             self.dump_state(pos)?;
+            self.sel_trace(pos)?;
             pos += 1;
             if first_step_logits.is_empty() {
                 first_step_logits = logits.clone();
