@@ -5798,6 +5798,23 @@ fn prune_prefixes<K, T>(
     v.split_off(keep)
 }
 
+/// Drop RAM prefixes that `key` supersedes (a strict prefix of it, same kind): the
+/// next chat turn saves a longer key, and the old one would otherwise reach the disk
+/// tier on prune, one ~0.7 GB write per turn at 56k.
+/// shortcut: an edited last user turn then re-fills from its last kept ancestor (none in RAM); keep ancestors if agents start branching.
+fn drop_superseded<T>(v: &mut Vec<(Vec<u32>, std::time::Instant, T)>, key: &[u32], same: impl Fn(&T) -> bool) {
+    v.retain(|e| !(e.0.len() < key.len() && key.starts_with(&e.0) && same(&e.2)));
+}
+
+#[cfg(test)]
+#[test]
+fn superseded_prefixes_leave_ram() {
+    let now = std::time::Instant::now();
+    let mut v = vec![(vec![1, 2], now, 0), (vec![1, 2, 3], now, 0), (vec![1, 9], now, 0), (vec![1, 2, 3, 4], now, 1), (vec![1, 2, 3, 4, 5], now, 0)];
+    drop_superseded(&mut v, &[1, 2, 3, 4, 5], |&t| t == 0);
+    assert_eq!(v.iter().map(|e| e.0.clone()).collect::<Vec<_>>(), [vec![1, 9], vec![1, 2, 3, 4], vec![1, 2, 3, 4, 5]], "other branches, other kinds and the same key stay");
+}
+
 /// Write a plain prefix to the disk tier (a log line either way).
 /// shortcut: synchronous on the serve thread (~1-2 s per 64k state); a writer thread if decode stalls show it.
 fn spill(d: &mut prefix_disk::PrefixDisk, key: &[u32], st: &breccia_engine::PrefixState) {
@@ -6179,6 +6196,8 @@ impl EngineBackend<'_, '_> {
         if let (true, Some(d), TextPrefix::Plain(s)) = (self.disk_eager, &mut self.disk, &st) {
             spill(d, &key, s);
         }
+        let kind = std::mem::discriminant(&st);
+        drop_superseded(&mut self.text_prefixes, &key, |t| std::mem::discriminant(t) == kind);
         self.text_prefixes.push((key, now, st));
         self.prune_text(now);
     }
