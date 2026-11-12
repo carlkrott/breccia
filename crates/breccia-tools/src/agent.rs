@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
+use crate::mcp_client::McpServer;
 use crate::{call, canonical, enabled, image_part, openai_tools, Config, Ctx};
 
 #[derive(Clone, Debug)]
@@ -33,6 +34,8 @@ pub struct AgentConfig {
     /// HTTP timeout per call, seconds (long prefills).
     pub timeout: u64,
     pub verbose: bool,
+    /// External stdio MCP servers `(name, sh command)`; top-level agent only.
+    pub mcp: Vec<(String, String)>,
 }
 
 impl AgentConfig {
@@ -49,6 +52,7 @@ impl AgentConfig {
             system: None,
             timeout: 1800,
             verbose: false,
+            mcp: Vec::new(),
         }
     }
 }
@@ -131,7 +135,21 @@ fn run_depth(tcfg: Config, cfg: &AgentConfig, task: &str, depth: u32) -> Result<
     }
     let tools = enabled(&ctx, cfg.only.as_deref());
     let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
-    let tools_json = openai_tools(&tools);
+    let mut tools_json = openai_tools(&tools);
+    // shortcut: sub-agents (delegate) get only the built-in tools; share the servers if they need MCP
+    let mut servers = Vec::new();
+    if depth == 0 {
+        for (n, c) in &cfg.mcp {
+            if !n.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || n.is_empty() {
+                return Err(format!("mcp server name {n:?}: use letters, digits, '-'"));
+            }
+            let s = McpServer::spawn(n, c, std::time::Duration::from_secs(cfg.timeout.min(300)))?;
+            if let Value::Array(a) = &mut tools_json {
+                a.extend(s.openai_tools());
+            }
+            servers.push(s);
+        }
+    }
     let mut messages = vec![json!({"role": "system", "content": system_prompt(&ctx, cfg, &names)}), json!({"role": "user", "content": task})];
     let sessions = tcfg.data_dir.join("sessions");
     let _ = std::fs::create_dir_all(&sessions);
@@ -151,7 +169,7 @@ fn run_depth(tcfg: Config, cfg: &AgentConfig, task: &str, depth: u32) -> Result<
     };
     for step in 0..cfg.max_steps {
         let mut body = json!({"model": cfg.model, "messages": messages, "max_tokens": cfg.max_tokens, "stream": false});
-        if !tools.is_empty() {
+        if tools_json.as_array().is_some_and(|a| !a.is_empty()) {
             body["tools"] = tools_json.clone();
             body["tool_choice"] = json!("auto");
         }
@@ -189,7 +207,10 @@ fn run_depth(tcfg: Config, cfg: &AgentConfig, task: &str, depth: u32) -> Result<
             let name = f["name"].as_str().unwrap_or("");
             let id = c["id"].as_str().map_or_else(|| format!("call_{step}_{i}"), str::to_string);
             say(format!("  -> {name} {}", f["arguments"].to_string().chars().take(200).collect::<String>()));
-            let out = call(&ctx, &tools, name, &f["arguments"]);
+            let out = match servers.iter_mut().find_map(|s| s.owns(name).map(str::to_string).map(|t| (s, t))) {
+                Some((s, t)) => s.call(&t, &f["arguments"]),
+                None => call(&ctx, &tools, name, &f["arguments"]),
+            };
             say(format!("  <- {}", out.lines().next().unwrap_or("").chars().take(160).collect::<String>()));
             if !out.starts_with("error: ") && canonical(name) == "view_image" {
                 if let Some((mime, b64)) = image_part(&ctx, &f["arguments"]) {

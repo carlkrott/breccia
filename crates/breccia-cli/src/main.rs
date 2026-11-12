@@ -134,6 +134,10 @@ enum Command {
         /// No per-step progress on stderr
         #[arg(long)]
         quiet: bool,
+        /// External stdio MCP server whose tools are offered as mcp__NAME__TOOL (repeatable),
+        /// e.g. --mcp 'kanban=hermes mcp kanban'
+        #[arg(long, value_name = "NAME=COMMAND")]
+        mcp: Vec<String>,
         #[command(flatten)]
         tools: ToolFlags,
     },
@@ -538,6 +542,9 @@ struct ToolFlags {
     /// Enable bash, process, execute_code
     #[arg(long)]
     allow_exec: bool,
+    /// Enable web_search, web_fetch
+    #[arg(long)]
+    allow_net: bool,
     /// Only these tools (canonical names, comma list)
     #[arg(long, value_delimiter = ',')]
     tools: Vec<String>,
@@ -551,6 +558,7 @@ impl ToolFlags {
         let mut c = breccia_tools::Config::new(self.root.clone());
         c.allow_write = self.allow_write;
         c.allow_exec = self.allow_exec;
+        c.allow_net = self.allow_net;
         if let Some(d) = &self.data_dir {
             c.data_dir = d.clone();
         }
@@ -615,7 +623,7 @@ fn run(cli: Cli) -> Result<()> {
             cpu_lane,
             cpu_lane_reason,
         }),
-        Command::Agent { task, base_url, model, api_key_file, max_steps, max_tokens, reasoning_effort, temperature, system, quiet, tools } => {
+        Command::Agent { task, base_url, model, api_key_file, max_steps, max_tokens, reasoning_effort, temperature, system, quiet, mcp, tools } => {
             let mut a = breccia_tools::agent::AgentConfig::new(&base_url);
             a.model = model;
             a.api_key_file = api_key_file;
@@ -626,6 +634,10 @@ fn run(cli: Cli) -> Result<()> {
             a.system = system;
             a.verbose = !quiet;
             a.only = tools.only();
+            for spec in mcp {
+                let (n, c) = spec.split_once('=').ok_or_else(|| anyhow::anyhow!("--mcp wants NAME=COMMAND, got {spec:?}"))?;
+                a.mcp.push((n.trim().to_string(), c.to_string()));
+            }
             let answer = breccia_tools::agent::run(tools.config(), &a, &task).map_err(anyhow::Error::msg)?;
             println!("{answer}");
             Ok(())

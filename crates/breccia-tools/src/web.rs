@@ -18,7 +18,7 @@ pub fn tools() -> Vec<Tool> {
             description: "Search the web; returns title, URL and snippet per result.",
             schema: || json!({"type": "object", "properties": {
                 "query": {"type": "string"}, "limit": {"type": "integer", "description": "Max results (default 8)"}}, "required": ["query"]}),
-            gate: Gate::Read,
+            gate: Gate::Net,
             keys: &[("q", "query"), ("search_term", "query"), ("search_query", "query"), ("max_results", "limit"), ("num_results", "limit"), ("count", "limit")],
             run: web_search,
         },
@@ -27,7 +27,7 @@ pub fn tools() -> Vec<Tool> {
             description: "Fetch a public http(s) URL and return its text (HTML converted to plain text with [links](url)).",
             schema: || json!({"type": "object", "properties": {
                 "url": {"type": "string"}, "max_chars": {"type": "integer", "description": "Default 20000"}}, "required": ["url"]}),
-            gate: Gate::Read,
+            gate: Gate::Net,
             keys: &[("uri", "url"), ("link", "url"), ("urls", "url"), ("maxChars", "max_chars"), ("max_length", "max_chars"), ("limit", "max_chars")],
             run: web_fetch,
         },
@@ -259,7 +259,9 @@ mod tests {
         assert_eq!(parse_url("https://u:p@Example.com:8443/x?y").unwrap(), ("https", "example.com".into(), 8443));
         assert_eq!(parse_url("http://[::1]/").unwrap(), ("http", "::1".into(), 80));
         assert!(parse_url("file:///etc/passwd").is_err());
-        let c = Ctx::new(Config::new(std::env::temp_dir()));
+        let mut cfg = Config::new(std::env::temp_dir());
+        cfg.allow_net = true;
+        let c = Ctx::new(cfg);
         let t = enabled(&c, None);
         for u in ["http://127.0.0.1:8888/", "http://localhost/", "http://[::ffff:7f00:1]/", "http://100.64.0.5/", "gopher://x/"] {
             let r = call(&c, &t, "fetch", &json!({"url": u}));

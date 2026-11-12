@@ -115,7 +115,7 @@ pub fn resolve(ctx: &Ctx, p: &str) -> Result<PathBuf, String> {
     let full = if Path::new(p).is_absolute() { PathBuf::from(p) } else { root.join(p) };
     let mut existing = full.as_path();
     let mut rest = Vec::new();
-    while !existing.exists() {
+    while existing.symlink_metadata().is_err() {
         rest.push(existing.file_name().ok_or("bad path")?);
         existing = existing.parent().ok_or("bad path")?;
     }
@@ -457,6 +457,9 @@ mod tests {
         assert!(resolve(&c, "new/../../x").is_err());
         std::os::unix::fs::symlink("/etc", d.join("link")).unwrap();
         assert!(resolve(&c, "link/passwd").is_err());
+        std::os::unix::fs::symlink("/tmp/breccia-nonexistent-target", d.join("dangling")).unwrap();
+        assert!(resolve(&c, "dangling").is_err(), "a dangling symlink must not be writable through");
+        assert!(resolve(&c, "dangling/x").is_err());
         assert!(resolve(&c, "src/new.txt").unwrap().starts_with(d.canonicalize().unwrap()));
         std::fs::remove_dir_all(d).ok();
     }

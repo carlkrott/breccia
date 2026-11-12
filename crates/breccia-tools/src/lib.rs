@@ -22,6 +22,7 @@ pub mod agent;
 pub mod exec;
 pub mod fs;
 pub mod mcp;
+pub mod mcp_client;
 pub mod patch;
 pub mod state;
 pub mod web;
@@ -33,6 +34,9 @@ pub struct Config {
     pub root: PathBuf,
     pub allow_write: bool,
     pub allow_exec: bool,
+    /// `web_search`, `web_fetch` (off by default: with file reads on, a prompt-injected page
+    /// could otherwise carry workdir contents out in a URL).
+    pub allow_net: bool,
     /// SearXNG base URL for `web_search`.
     pub searx: String,
     /// Agent state: `memory/`, `sessions/`.
@@ -50,6 +54,7 @@ impl Config {
             root,
             allow_write: false,
             allow_exec: false,
+            allow_net: false,
             searx: std::env::var("BRECCIA_SEARX").unwrap_or_else(|_| "http://127.0.0.1:8888".into()),
             data_dir: home.join(".local/share/breccia/agent"),
             skill_dirs: vec![home.join(".hermes/skills"), home.join(".claude/skills")],
@@ -86,6 +91,7 @@ pub enum Gate {
     Read,
     Write,
     Exec,
+    Net,
     /// Needs a front-end hook (`ask_user`, `delegate`).
     Hook,
 }
@@ -143,6 +149,7 @@ pub fn enabled(ctx: &Ctx, only: Option<&[String]>) -> Vec<Tool> {
             Gate::Read => true,
             Gate::Write => ctx.cfg.allow_write,
             Gate::Exec => ctx.cfg.allow_exec,
+            Gate::Net => ctx.cfg.allow_net,
             Gate::Hook => (t.name == "ask_user" && ctx.ask.is_some()) || (t.name == "delegate" && ctx.delegate.is_some()),
         })
         .filter(|t| only.is_none_or(|o| o.iter().any(|n| n == t.name)))
@@ -232,10 +239,25 @@ pub fn base64(b: &[u8]) -> String {
     o
 }
 
-/// A fresh path in the temp dir (unique per process and call).
+/// A fresh path inside a private (0700, created exclusively) per-process temp dir, so other
+/// local users cannot pre-plant or read the files.
 pub(crate) fn tmp_path(tag: &str) -> PathBuf {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    std::env::temp_dir().join(format!("breccia-{tag}-{}-{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)))
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        for i in 0u32.. {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.subsec_nanos());
+            let d = std::env::temp_dir().join(format!("breccia-tools-{}-{nanos:x}{i}", std::process::id()));
+            if std::fs::DirBuilder::new().mode(0o700).create(&d).is_ok() {
+                return d;
+            }
+            assert!(i < 100, "cannot create a private temp dir in {}", std::env::temp_dir().display());
+        }
+        unreachable!()
+    });
+    dir.join(format!("{tag}-{}", SEQ.fetch_add(1, Ordering::Relaxed)))
 }
 
 pub(crate) fn s<'a>(a: &'a Args, k: &str) -> Result<&'a str, String> {
