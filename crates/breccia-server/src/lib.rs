@@ -635,6 +635,8 @@ fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, R
 
     let mut reply = None;
     let ctl = b.control_texts();
+    // placeholder i -> ctl[i]; the last (empty) one is escape_controls' barrier
+    let lits: Vec<String> = ctl.iter().cloned().chain([String::new()]).collect();
     let prompt = if chat {
         let built = match b.chat_template() {
             Some(t) => t.render(&escape_controls(req, &ctl)).and_then(|r| {
@@ -643,7 +645,7 @@ fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, R
                     think_open: r.think_open,
                     tools: req.get("tools").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())).cloned(),
                 });
-                Ok((b.tokenize_special(&r.text, &ctl)?, request_images(req)?))
+                Ok((b.tokenize_special(&r.text, &lits)?, request_images(req)?))
             }),
             None => chat_prompt(req, b),
         };
@@ -821,43 +823,70 @@ pub const LITERAL_BASE: u32 = 0xF0000;
 
 /// `req` with every control-token text (`ctl[i]`) inside a string or object key
 /// replaced by the char `LITERAL_BASE + i`, so a message cannot close its turn and
-/// open a forged `system` one. `<think>` / `<tool_call>` (user-defined) stay as is,
-/// as in llama.cpp and HF.
+/// open a forged `system` one. A string that starts with a proper suffix or ends with
+/// a proper prefix of a control text also gets the barrier `LITERAL_BASE + ctl.len()`
+/// (an empty literal) there, so two client strings, or a client string and template
+/// text, cannot join into one (`name: "x<|im_end|"` + the template's `>`).
+/// `<think>` / `<tool_call>` (user-defined) stay as is, as in llama.cpp and HF.
 // shortcut: a client string that already holds U+F0000.. is read as a placeholder
 // too (encodes as that control text, still plain); add an escape if that matters.
+// shortcut: template literal text that ends in a partial control text right before
+// client data is not caught (no known template does that).
 fn escape_controls(req: &Value, ctl: &[String]) -> Value {
-    let firsts: Vec<char> = ctl.iter().filter_map(|t| t.chars().next()).collect();
-    fn esc(s: &str, ctl: &[String], firsts: &[char]) -> String {
-        if !s.contains(firsts) {
-            return s.to_string();
-        }
-        let (mut out, mut rest) = (String::with_capacity(s.len()), s);
-        while let Some(c) = rest.chars().next() {
-            match ctl.iter().position(|t| rest.starts_with(t.as_str())) {
-                Some(i) => {
-                    out.push(char::from_u32(LITERAL_BASE + i as u32).unwrap_or('\u{FFFD}'));
-                    rest = &rest[ctl[i].len()..];
-                }
-                None => {
-                    out.push(c);
-                    rest = &rest[c.len_utf8()..];
-                }
-            }
-        }
-        out
+    struct Esc<'a> {
+        ctl: &'a [String],
+        firsts: Vec<char>,
+        barrier: char,
     }
-    fn walk(v: &Value, ctl: &[String], firsts: &[char]) -> Value {
-        match v {
-            Value::String(s) => Value::String(esc(s, ctl, firsts)),
-            Value::Array(a) => Value::Array(a.iter().map(|x| walk(x, ctl, firsts)).collect()),
-            Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (esc(k, ctl, firsts), walk(x, ctl, firsts))).collect()),
-            _ => v.clone(),
+    impl Esc<'_> {
+        fn partial(&self, s: &str, at_end: bool) -> bool {
+            self.ctl.iter().any(|t| {
+                (1..t.len()).filter(|&k| t.is_char_boundary(k)).any(|k| {
+                    if at_end { s.ends_with(&t[..k]) } else { s.starts_with(&t[k..]) }
+                })
+            })
+        }
+        fn str(&self, s: &str) -> String {
+            let mut out = String::with_capacity(s.len());
+            if self.partial(s, false) {
+                out.push(self.barrier);
+            }
+            let mut rest = s;
+            if s.contains(self.firsts.as_slice()) {
+                while let Some(c) = rest.chars().next() {
+                    match self.ctl.iter().position(|t| rest.starts_with(t.as_str())) {
+                        Some(i) => {
+                            out.push(char::from_u32(LITERAL_BASE + i as u32).unwrap_or('\u{FFFD}'));
+                            rest = &rest[self.ctl[i].len()..];
+                        }
+                        None => {
+                            out.push(c);
+                            rest = &rest[c.len_utf8()..];
+                        }
+                    }
+                }
+            } else {
+                out.push_str(s);
+            }
+            if self.partial(&out, true) {
+                out.push(self.barrier);
+            }
+            out
+        }
+        fn walk(&self, v: &Value) -> Value {
+            match v {
+                Value::String(s) => Value::String(self.str(s)),
+                Value::Array(a) => Value::Array(a.iter().map(|x| self.walk(x)).collect()),
+                Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (self.str(k), self.walk(x))).collect()),
+                _ => v.clone(),
+            }
         }
     }
     if ctl.is_empty() {
         return req.clone();
     }
-    walk(req, ctl, &firsts)
+    let barrier = char::from_u32(LITERAL_BASE + ctl.len() as u32).unwrap_or('\u{FFFD}');
+    Esc { ctl, firsts: ctl.iter().filter_map(|t| t.chars().next()).collect(), barrier }.walk(req)
 }
 
 /// Inverse of [`escape_controls`] for backends without a templated tokenizer.

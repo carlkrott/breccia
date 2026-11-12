@@ -187,9 +187,9 @@ impl Tokenizer {
     /// [`Tokenizer::encode_templated`].
     pub fn control_texts(&self) -> Vec<String> {
         let mut v: Vec<String> = (0..self.tokens.len())
-            .filter(|&i| self.types.get(i) == Some(&3))
-            .map(|i| self.decode(&[i as u32]))
-            .filter(|t| !t.is_empty())
+            .filter(|&i| self.types.get(i) == Some(&3) && !self.tokens[i].is_empty())
+            // the raw text, the same string `specials` matches
+            .map(|i| self.tokens[i].clone())
             .collect();
         v.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
         v
