@@ -152,11 +152,16 @@ fn calls_in(f: Format, text: &str, tools: &[Json]) -> Option<(String, Vec<Call>)
         Format::HermesJson => blocks(text, "<tool_call>", "</tool_call>", &[], |b| json_calls(b)),
         Format::Glm => blocks(text, "<tool_call>", "</tool_call>", &[], |b| glm(b, tools)),
         Format::MiniMax => blocks(text, "<invoke name=", "</invoke>", &[("<minimax:tool_call>", "</minimax:tool_call>")], |b| minimax(b, tools)),
+        // V3.2 `function_calls`, V4 `tool_calls`, V4.1 `｜DSML｜ calls` (leading space on every tag)
         Format::DeepSeekDsml => blocks(
-            text,
+            &text.replace("｜DSML｜ ", "｜DSML｜"),
             "<｜DSML｜invoke name=",
             "</｜DSML｜invoke>",
-            &[("<｜DSML｜function_calls>", "</｜DSML｜function_calls>")],
+            &[
+                ("<｜DSML｜function_calls>", "</｜DSML｜function_calls>"),
+                ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"),
+                ("<｜DSML｜calls>", "</｜DSML｜calls>"),
+            ],
             |b| dsml(b),
         ),
         Format::DeepSeekV3 => blocks(
@@ -465,6 +470,8 @@ mod tests {
         check(Format::MiniMax, "<minimax:tool_call>\n<invoke name=\"special_function\">\n<parameter name=\"arg1\">1</parameter>\n</invoke>\n</minimax:tool_call>", "special_function", r#"{"arg1":1}"#);
         check(Format::DeepSeekDsml, "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_time\">\n<｜DSML｜parameter name=\"city\" string=\"true\">Tokyo</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>", "get_time", r#"{"city":"Tokyo"}"#);
         check(Format::DeepSeekDsml, "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"special_function\">\n<｜DSML｜parameter name=\"arg1\" string=\"false\">1</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜function_calls>", "special_function", r#"{"arg1":1}"#);
+        check(Format::DeepSeekDsml, "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"n\" string=\"false\">5</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>", "f", r#"{"n":5}"#);
+        check(Format::DeepSeekDsml, "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Hangzhou</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>", "get_weather", r#"{"location":"Hangzhou","days":2}"#);
         check(Format::DeepSeekV3, "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_time<｜tool▁sep｜>{\"city\": \"XYZ\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>", "get_time", r#"{"city":"XYZ"}"#);
         check(Format::DeepSeekV3, "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>special_function\n```json\n{\"arg1\": 1}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>", "special_function", r#"{"arg1":1}"#);
         let k = one(Format::KimiK2, "<|tool_calls_section_begin|><|tool_call_begin|>functions.special_function:0<|tool_call_argument_begin|>{\"arg1\": 1}<|tool_call_end|><|tool_calls_section_end|>", false);
