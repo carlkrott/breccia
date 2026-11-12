@@ -2832,6 +2832,7 @@ impl<'m> Session<'m> {
         let clone = std::env::var("BRECCIA_SEQS_CLONE").as_deref() == Ok("1");
         let park = kv_park_prefill().filter(|_| !self.kv_pool.is_empty());
         let park_file = |dir: &std::path::Path, i: usize| dir.join(format!("seq-{}-{i}.park", std::process::id()));
+        let prefix_file = std::env::var_os("BRECCIA_SEQS_PREFIX_FILE").filter(|v| clone && !v.is_empty()).map(std::path::PathBuf::from);
         let mut saved: Option<PrefixState> = None;
         for (i, prompt) in prompts.iter().enumerate() {
             self.use_seq(i)?;
@@ -2848,11 +2849,26 @@ impl<'m> Session<'m> {
             }
             let mut pos = 0usize;
             let mut l = Vec::new();
-            for len in prefill_plan(prompt.len(), self.prefill_target) {
+            // BRECCIA_SEQS_PREFIX_FILE=<path> (lab, split probe, with SEQS_CLONE): prompt 0's
+            // state after all but its last cell comes from the file when it exists (filled on
+            // another device layout), else is prefilled and saved there; the last cell is fed here.
+            let pfile = prefix_file.as_ref().filter(|_| i == 0 && prompt.len() > 1);
+            let body = if pfile.is_some() { prompt.len() - 1 } else { prompt.len() };
+            if let Some(f) = pfile.filter(|f| f.exists()) {
+                self.restore_prefix(&PrefixState::load_file(f)?)?;
+                pos = body;
+            }
+            for len in prefill_plan(body - pos, self.prefill_target) {
                 l = self.prefill(&prompt[pos..pos + len], pos)?;
                 pos += len;
                 // keeps the bench hang-watch fed during long multi-sequence prefills
                 eprintln!("seq {i}: prefill {pos}/{}", prompt.len());
+            }
+            if let Some(f) = pfile {
+                if !f.exists() {
+                    self.save_prefix(body)?.save_file(f)?;
+                }
+                l = self.prefill(&prompt[body..], body)?;
             }
             logits.push(l); // prefill leaves self.pos at the last prompt cell
             if clone && k > 1 {
