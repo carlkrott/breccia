@@ -4901,6 +4901,9 @@ fn bench_token(a: TokenArgs) -> Result<()> {
         let mut bad = 0;
         for (i, g) in gens.iter().enumerate() {
             println!("seq {i}: {:?}", &g.tokens[..g.tokens.len().min(12)]);
+            if std::env::var_os("BRECCIA_SEQS_PRINT_ALL").is_some() {
+                println!("seq {i} all: {:?}", g.tokens); // lab: full ids for on/off comparisons
+            }
             if std::env::var("BRECCIA_SEQS_PARITY").is_ok_and(|v| v == "1") {
                 sess.use_seq(0)?;
                 let solo = sess.generate(&prompts[i], a.gen, None)?;

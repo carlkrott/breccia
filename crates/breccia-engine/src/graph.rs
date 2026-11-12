@@ -932,6 +932,9 @@ pub struct Session<'m> {
     /// `BRECCIA_PF_PREFETCH`: per block, the experts to prefetch next time (the last
     /// chunk's, most users first; seeded from `BRECCIA_D1_PROFILE`).
     pf_pre_pred: Vec<Vec<u32>>,
+    /// `BRECCIA_D1_MERGED`: per block, the last merged call's routed rows, fed to the
+    /// D1 pool's `observe` at the block's next call (its GPU work is done by then).
+    d1_rows: Vec<Vec<Vec<usize>>>,
     /// Merged pass 1 only: the prelude leaves the shared expert's gate/up/SwiGLU/
     /// down out, and the pass runs them once over the chunk (`BRECCIA_PF_SHCHUNK`).
     shared_deferred: bool,
@@ -1556,6 +1559,7 @@ impl<'m> Session<'m> {
             pf_direct: pf_direct_reader(model),
             pf_rows: 0,
             pf_pre_pred: Vec::new(),
+            d1_rows: Vec::new(),
             shared_deferred: false,
             qsa_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
             gdn_chunk_ws: (0..model.devices.len()).map(|_| None).collect(),
@@ -5096,6 +5100,10 @@ impl<'m> Session<'m> {
                     let p = &model.t2.as_ref().expect("tier 2").pools[&b];
                     [&p.gate.buf, &p.up.buf, &p.down.buf]
                 }
+                (PfSrc::D1, _) => {
+                    let p = &model.d1[&b];
+                    [&p.gate.buf, &p.up.buf, &p.down.buf]
+                }
                 _ => [&pf.stream.buf; 3],
             }
         };
@@ -5678,6 +5686,9 @@ impl<'m> Session<'m> {
         // pairs point at the scratch's zero row, so the fan-in adds nothing for them
         // and the host partial lands after it.
         let mut host_set: Vec<usize> = Vec::new();
+        // `[n_expert]` D1 slot per expert in rows mode (`BRECCIA_D1_MERGED`), else empty.
+        let mut d1_slot: Vec<u32> = Vec::new();
+        let d1_of = |e: usize, d: &[u32]| d.get(e).copied().filter(|&s| s != crate::d1::MISS);
         let mut host_job = None;
         let mut t2_job = None;
         let (mut t2_launch_s, mut t2_fin_s) = (0.0f64, 0.0f64);
@@ -5712,6 +5723,29 @@ impl<'m> Session<'m> {
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
                     .collect();
+                // D1 in rows mode: the pool's hits run on this card from the pool, the
+                // misses stay on the host lane (same GEMMs as a streamed expert).
+                if let Some(p) = m.d1.get(&b).filter(|p| {
+                    d1_merged()
+                        && p.device == dev
+                        && pf_inplace()
+                        && [&p.gate, &p.up, &p.down].iter().zip([gate_ty, up_ty, down_ty]).all(|(w, ty)| w.key.ty == ty)
+                }) {
+                    if self.d1_rows.len() < mc.n_layers {
+                        self.d1_rows.resize(mc.n_layers, Vec::new());
+                    }
+                    for r in std::mem::take(&mut self.d1_rows[b]) {
+                        p.observe(gpu, &r)?;
+                    }
+                    // one observe per step, all rows pooled (per-row calls swapped 4x as often: -20 % at 4 seqs)
+                    self.d1_rows[b] = vec![raw.chunks_exact(4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]) as usize).collect()];
+                    let st = p.state.lock().expect("D1 state");
+                    d1_slot = vec![crate::d1::MISS; mc.n_expert];
+                    host_set.retain(|&e| {
+                        d1_slot[e] = st.slot_of[e];
+                        st.slot_of[e] == crate::d1::MISS
+                    });
+                }
             } else if let Some((dev_rate, host_rate)) = tp {
                 let mut rows: Vec<(usize, u32)> = Vec::with_capacity(distinct);
                 for &(e, _, _) in &pairs {
@@ -6059,7 +6093,7 @@ impl<'m> Session<'m> {
         if streamed && cpu::expert_prefetch_on() {
             // Cold start: queue every streamed expert's read before the serial fills fault them in.
             for (e, _, _) in groups.iter() {
-                if !host_set.contains(e) && !t2_skip.contains(e) && pre_slot.get(*e).is_none_or(|&s| s == u32::MAX) {
+                if !host_set.contains(e) && !t2_skip.contains(e) && d1_of(*e, &d1_slot).is_none() && pre_slot.get(*e).is_none_or(|&s| s == u32::MAX) {
                     m.layers[b].experts.willneed(&m.shards, *e);
                 }
             }
@@ -6072,6 +6106,9 @@ impl<'m> Session<'m> {
         let grp_cap = pf_grouped_rows();
         let tys = (gate_ty, up_ty, down_ty);
         let (mut grp_rows, mut grp) = (0usize, Vec::<PfGroup>::new());
+        // D1 groups run apart from `grp`: the pool keeps gate and up in separate
+        // buffers, so the fused pair does not apply (it is bit-identical anyway).
+        let (mut d1_n, mut d1_grp) = (0usize, Vec::<PfGroup>::new());
         if nobar {
             batch_cmd::phase_begin(egpu)?;
         }
@@ -6080,6 +6117,26 @@ impl<'m> Session<'m> {
                 continue;
             }
             let mu = users.len();
+            if let Some(s) = d1_of(*e, &d1_slot) {
+                let g = PfGroup {
+                    src: PfSrc::D1,
+                    w: [s * wgate, s * wup, s * wdown],
+                    xo: *base as u64 * row_bytes,
+                    mu,
+                    ao: 0,
+                };
+                if !grouped {
+                    self.pf_group_run(edev, b, pe, tys, false, false, &[g])?;
+                    continue;
+                }
+                if d1_n + mu > grp_cap {
+                    self.pf_group_run(edev, b, pe, tys, false, true, &d1_grp)?;
+                    (d1_n, d1_grp) = (0, Vec::new());
+                }
+                d1_grp.push(PfGroup { ao: (d1_n * n_ff * 4) as u64, ..g });
+                d1_n += mu;
+                continue;
+            }
             // First group of a new distinct expert: stream it (once per chunk).
             let new_expert = Some(*e) != prev_expert;
             if streamed && new_expert && pre_slot.get(*e).is_some_and(|&s| s != u32::MAX) {
@@ -6244,6 +6301,8 @@ impl<'m> Session<'m> {
             if batch_cmd::recorded() >= MERGED_BATCH_CAP {
                 self.pf_group_run(edev, b, pe, tys, pair, true, &grp)?;
                 (grp_rows, grp) = (0, Vec::new());
+                self.pf_group_run(edev, b, pe, tys, false, true, &d1_grp)?;
+                (d1_n, d1_grp) = (0, Vec::new());
                 self.flush()?;
                 self.ensure_batch(edev)?;
                 if nobar {
@@ -6252,6 +6311,7 @@ impl<'m> Session<'m> {
             }
         }
         self.pf_group_run(edev, b, pe, tys, pair, true, &grp)?;
+        self.pf_group_run(edev, b, pe, tys, false, true, &d1_grp)?;
         if nobar {
             batch_cmd::phase_end(egpu)?;
         }
@@ -9541,6 +9601,8 @@ enum PfSrc {
     Ring,
     /// The tier-2 pool of the block (helper card), word offsets by pool slot.
     Pool,
+    /// The block's D1 pool on its own card (`BRECCIA_D1_MERGED`), word offsets by slot.
+    D1,
 }
 
 /// One in-place expert group: weight word offsets (gate, up, down), its scratch
@@ -10162,6 +10224,13 @@ mod tests {
             super::Session::imported_role_slices(&arena, 4, 0, EXPERTS, EXPERTS, EXPERTS).is_err()
         );
     }
+}
+
+/// `BRECCIA_D1_MERGED=1` (opt-in): the merged pass's cold blocks (rows mode / batched
+/// decode) run the D1 pool's hits on the card instead of the host lane.
+fn d1_merged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BRECCIA_D1_MERGED").as_deref() == Ok("1"))
 }
 
 /// `BRECCIA_ROWS_STREAM=1`: rows mode (batched decode) streams a cold block's
