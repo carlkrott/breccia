@@ -5913,8 +5913,11 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
         Ok(self.tok.encode(text))
     }
-    fn tokenize_special(&self, text: &str) -> Result<Vec<u32>, String> {
-        Ok(self.tok.encode_special(text))
+    fn tokenize_special(&self, text: &str, literals: &[String]) -> Result<Vec<u32>, String> {
+        Ok(self.tok.encode_templated(text, literals))
+    }
+    fn control_texts(&self) -> Vec<String> {
+        self.tok.control_texts()
     }
     fn chat_template(&self) -> Option<&breccia_chat::ChatTemplate> {
         self.template.as_ref()

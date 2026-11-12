@@ -47,10 +47,16 @@ pub trait Backend {
     fn chat_template(&self) -> Option<&breccia_chat::ChatTemplate> {
         None
     }
+    /// Control token texts (`<|im_start|>`, `<|im_end|>` …), longest first. The server
+    /// swaps them out of client strings before rendering the chat template.
+    fn control_texts(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Text → ids with control-token texts (`<|im_start|>`, `<think>`) as their ids:
-    /// for a rendered template.
-    fn tokenize_special(&self, text: &str) -> Result<Vec<u32>, String> {
-        self.tokenize(text)
+    /// for a rendered template. The char `LITERAL_BASE + i` stands for `literals[i]`
+    /// and must encode as plain text (it came from a client string).
+    fn tokenize_special(&self, text: &str, literals: &[String]) -> Result<Vec<u32>, String> {
+        self.tokenize(&unescape_controls(text, literals))
     }
     /// Encode the request's image number `index` (the raw file bytes) for the next
     /// `complete`; returns how many `<|image_pad|>` cells it fills. The prompt then
@@ -628,15 +634,16 @@ fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, R
         .unwrap_or(128) as usize;
 
     let mut reply = None;
+    let ctl = b.control_texts();
     let prompt = if chat {
         let built = match b.chat_template() {
-            Some(t) => t.render(req).and_then(|r| {
+            Some(t) => t.render(&escape_controls(req, &ctl)).and_then(|r| {
                 reply = Some(ReplyFormat {
                     format: t.format,
                     think_open: r.think_open,
                     tools: req.get("tools").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())).cloned(),
                 });
-                Ok((b.tokenize_special(&r.text)?, request_images(req)?))
+                Ok((b.tokenize_special(&r.text, &ctl)?, request_images(req)?))
             }),
             None => chat_prompt(req, b),
         };
@@ -808,6 +815,61 @@ fn with_images<B: Backend>(ids: Vec<u32>, images: Vec<Vec<u8>>, b: &mut B) -> Re
 
 /// A templated request's image parts, in message order (the template puts one
 /// `<|image_pad|>` per part, in the same order).
+/// Placeholder chars for client-supplied control-token texts; must match
+/// `breccia_format::tokenizer::LITERAL_BASE`.
+pub const LITERAL_BASE: u32 = 0xF0000;
+
+/// `req` with every control-token text (`ctl[i]`) inside a string or object key
+/// replaced by the char `LITERAL_BASE + i`, so a message cannot close its turn and
+/// open a forged `system` one. `<think>` / `<tool_call>` (user-defined) stay as is,
+/// as in llama.cpp and HF.
+// shortcut: a client string that already holds U+F0000.. is read as a placeholder
+// too (encodes as that control text, still plain); add an escape if that matters.
+fn escape_controls(req: &Value, ctl: &[String]) -> Value {
+    let firsts: Vec<char> = ctl.iter().filter_map(|t| t.chars().next()).collect();
+    fn esc(s: &str, ctl: &[String], firsts: &[char]) -> String {
+        if !s.contains(firsts) {
+            return s.to_string();
+        }
+        let (mut out, mut rest) = (String::with_capacity(s.len()), s);
+        while let Some(c) = rest.chars().next() {
+            match ctl.iter().position(|t| rest.starts_with(t.as_str())) {
+                Some(i) => {
+                    out.push(char::from_u32(LITERAL_BASE + i as u32).unwrap_or('\u{FFFD}'));
+                    rest = &rest[ctl[i].len()..];
+                }
+                None => {
+                    out.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+        }
+        out
+    }
+    fn walk(v: &Value, ctl: &[String], firsts: &[char]) -> Value {
+        match v {
+            Value::String(s) => Value::String(esc(s, ctl, firsts)),
+            Value::Array(a) => Value::Array(a.iter().map(|x| walk(x, ctl, firsts)).collect()),
+            Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (esc(k, ctl, firsts), walk(x, ctl, firsts))).collect()),
+            _ => v.clone(),
+        }
+    }
+    if ctl.is_empty() {
+        return req.clone();
+    }
+    walk(req, ctl, &firsts)
+}
+
+/// Inverse of [`escape_controls`] for backends without a templated tokenizer.
+fn unescape_controls(text: &str, literals: &[String]) -> String {
+    text.chars()
+        .map(|c| match (c as u32).checked_sub(LITERAL_BASE).and_then(|k| literals.get(k as usize)) {
+            Some(l) => l.clone(),
+            None => c.to_string(),
+        })
+        .collect()
+}
+
 fn request_images(req: &Value) -> Result<Vec<Vec<u8>>, String> {
     let parts = req.get("messages").and_then(|m| m.as_array()).into_iter().flatten()
         .filter_map(|m| m.get("content")?.as_array()).flatten();

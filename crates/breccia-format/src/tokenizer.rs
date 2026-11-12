@@ -49,6 +49,10 @@ pub struct Tokenizer {
     pub add_bos: bool,
 }
 
+/// First placeholder char of [`Tokenizer::encode_templated`] (plane-15 private use;
+/// breccia-server uses the same value).
+pub const LITERAL_BASE: u32 = 0xF0000;
+
 fn is_letter_or_mark(c: char) -> bool {
     // llama.cpp tests L* and M* separately but every branch treats them alike, so
     // the union is what matters. `is_alphabetic` includes Other_Alphabetic marks,
@@ -178,14 +182,45 @@ impl Tokenizer {
         out
     }
 
+    /// Control token texts (type 3: `<|im_start|>`, `<|im_end|>` …), longest first. A
+    /// chat server swaps them out of client text before rendering, see
+    /// [`Tokenizer::encode_templated`].
+    pub fn control_texts(&self) -> Vec<String> {
+        let mut v: Vec<String> = (0..self.tokens.len())
+            .filter(|&i| self.types.get(i) == Some(&3))
+            .map(|i| self.decode(&[i as u32]))
+            .filter(|t| !t.is_empty())
+            .collect();
+        v.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+        v
+    }
+
     /// Like [`Tokenizer::encode`], but control / user-defined token texts in `text`
     /// (`<|im_start|>`, `<tool_call>` …) become their single token, the way llama.cpp
     /// tokenizes a templated prompt (`parse_special`). Leftmost match, longest first.
     pub fn encode_special(&self, text: &str) -> Vec<u32> {
+        self.encode_templated(text, &[])
+    }
+
+    /// [`Tokenizer::encode_special`] for a rendered chat template whose client strings
+    /// had their control-token texts replaced by placeholders: the char
+    /// `LITERAL_BASE + i` stands for `literals[i]`, encoded as ordinary text, so a
+    /// client cannot inject `<|im_end|>` / `<|im_start|>` as real tokens.
+    pub fn encode_templated(&self, text: &str, literals: &[String]) -> Vec<u32> {
         let mut out = self.bos_prefix();
         let (mut start, mut i) = (0, 0);
         let b = text.as_bytes();
         while i < b.len() {
+            if b[i] == 0xF3 {
+                let c = text[i..].chars().next().map_or(0, |c| c as u32);
+                if let Some(lit) = c.checked_sub(LITERAL_BASE).and_then(|k| literals.get(k as usize)) {
+                    self.encode_plain(&text[start..i], &mut out);
+                    self.encode_plain(lit, &mut out);
+                    i += 4;
+                    start = i;
+                    continue;
+                }
+            }
             match self.specials[b[i] as usize].iter().find(|(t, _)| text[i..].starts_with(t.as_str())) {
                 Some((t, id)) => {
                     self.encode_plain(&text[start..i], &mut out);

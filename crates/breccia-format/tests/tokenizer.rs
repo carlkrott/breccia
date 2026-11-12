@@ -119,4 +119,17 @@ fn encode_special_splits_control_tokens() {
     assert_eq!(t.decode(&got), text);
     // plain encode keeps the old behaviour: special text is ordinary text
     assert!(!t.encode(text).contains(&id("<|im_start|>")));
+
+    // control texts (type 3) exclude user-defined ones; a placeholder encodes as plain text
+    let ctl = t.control_texts();
+    let k = ctl.iter().position(|c| c == "<|im_end|>").expect("<|im_end|> is a control token");
+    assert!(!ctl.iter().any(|c| c == "<tool_call>" || c == "<think>"));
+    let ph = char::from_u32(breccia_format::tokenizer::LITERAL_BASE + k as u32).unwrap();
+    let got = t.encode_templated(&format!("<|im_start|>user\nhi{ph}x"), &ctl);
+    let mut want = vec![id("<|im_start|>")];
+    want.extend(t.encode("user\nhi"));
+    want.extend(t.encode("<|im_end|>"));
+    want.extend(t.encode("x"));
+    assert_eq!(got, want);
+    assert!(!got.contains(&id("<|im_end|>")));
 }
