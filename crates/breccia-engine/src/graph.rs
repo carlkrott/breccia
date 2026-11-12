@@ -2916,6 +2916,10 @@ impl<'m> Session<'m> {
         // BRECCIA_SEQ_BATCH=1: one chunk forward per step over every sequence
         let batched = std::env::var("BRECCIA_SEQ_BATCH").as_deref() == Ok("1");
         for step in 0..n {
+            if step % 32 == 0 {
+                // decode-rate windows for concurrent runs (split probe), timestamped by the watcher
+                eprintln!("seqs: step {step}/{n} at {:.2} s", t.elapsed().as_secs_f64());
+            }
             if batched {
                 let mut toks = Vec::with_capacity(k);
                 for i in 0..k {
