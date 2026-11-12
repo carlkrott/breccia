@@ -5894,13 +5894,12 @@ impl EngineBackend<'_, '_> {
             let (g, saved) = self.sess.generate_prefix(prompt, n, None, p).map_err(|e| e.to_string())?;
             (g.tokens, saved.map(TextPrefix::Plain))
         };
-        if let Some(st) = saved.filter(|st| self.keep_text_prefix(st.cells(), st.bytes())) {
-            println!("prefix   {} cells kept ({} MiB), request {:.2} s", st.cells(), st.bytes() >> 20, now.elapsed().as_secs_f64());
-            self.keep_text(prompt[..cut].to_vec(), now, st);
+        let saved = saved.filter(|st| self.keep_text_prefix(st.cells(), st.bytes()));
+        if let Some(st) = &saved {
+            println!("prefix   {} cells saved ({} MiB), request {:.2} s", st.cells(), st.bytes() >> 20, now.elapsed().as_secs_f64());
         }
-        if std::mem::take(&mut self.handoff_now) {
-            self.handoff_spill(&prompt[..cut]);
-        }
+        let handoff = std::mem::take(&mut self.handoff_now);
+        self.keep_or_handoff(prompt[..cut].to_vec(), now, saved, handoff);
         Ok(toks)
     }
 }
@@ -6231,15 +6230,31 @@ impl EngineBackend<'_, '_> {
     /// A prompt pass is in: its first token, and keep its saved text prefix.
     fn feed_done(&mut self, slot: usize, mut f: breccia_engine::PromptFeed, key: Vec<u32>) -> Result<Option<u32>, String> {
         let tok = self.sess.feed_sample(&f).map_err(|e| e.to_string())?;
-        if let Some(st) = f.saved.take().filter(|st| self.keep_text_prefix(st.cells, st.bytes())) {
-            let now = std::time::Instant::now();
-            println!("prefix   {} cells kept ({} MiB)", st.cells, st.bytes() >> 20);
-            self.keep_text(key.clone(), now, TextPrefix::Plain(st));
+        let saved = f.saved.take().filter(|st| self.keep_text_prefix(st.cells, st.bytes()));
+        if let Some(st) = &saved {
+            println!("prefix   {} cells saved ({} MiB)", st.cells, st.bytes() >> 20);
         }
-        if std::mem::take(&mut self.handoff[slot]) {
-            self.handoff_spill(&key);
-        }
+        let handoff = std::mem::take(&mut self.handoff[slot]);
+        self.keep_or_handoff(key, std::time::Instant::now(), saved.map(TextPrefix::Plain), handoff);
         Ok(Some(tok))
+    }
+    /// Keep a request's saved prefix in RAM, or for a hand-off request write it to disk only:
+    /// the router moves that session to the other card, and a RAM copy here would push out a live session.
+    fn keep_or_handoff(&mut self, key: Vec<u32>, now: std::time::Instant, saved: Option<TextPrefix>, handoff: bool) {
+        match (saved, handoff, &mut self.disk) {
+            (Some(TextPrefix::Plain(st)), true, Some(d)) => {
+                spill(d, &key, &st);
+                drop_superseded(&mut self.text_prefixes, &key, |t| matches!(t, TextPrefix::Plain(_)));
+            }
+            (saved, _, _) => {
+                if let Some(st) = saved {
+                    self.keep_text(key.clone(), now, st);
+                }
+                if handoff {
+                    self.handoff_spill(&key);
+                }
+            }
+        }
     }
     /// A hand-off request: write the longest RAM prefix of its saved key to disk (the
     /// one it just kept, or the one it resumed when nothing new was saved).
@@ -6249,7 +6264,10 @@ impl EngineBackend<'_, '_> {
             TextPrefix::Spec(_) => None,
         }).max_by_key(|e| e.0);
         match (best, &mut self.disk) {
-            (Some((_, k, st)), Some(d)) => spill(d, &k, st),
+            (Some((_, k, st)), Some(d)) => {
+                spill(d, &k, st);
+                self.text_prefixes.retain(|e| e.0 != k); // the session leaves this card (see keep_or_handoff)
+            }
             (_, None) => println!("prefix   hand-off asked but BRECCIA_PREFIX_DIR is not set"),
             (None, _) => println!("prefix   hand-off asked but no plain prefix of this prompt is kept (short or spec prompt)"),
         }
