@@ -105,6 +105,43 @@ enum Command {
         #[arg(long, value_name = "TEXT", default_value = "")]
         cpu_lane_reason: String,
     },
+    /// Agent loop with the breccia-tools set (files, edit/patch, search, shell, web,
+    /// todo/memory/skills, delegate) against an OpenAI-compatible endpoint
+    Agent {
+        /// The task
+        task: String,
+        /// Chat endpoint base (a `breccia serve` started with BRECCIA_JINJA=1, or any OpenAI-compatible server)
+        #[arg(long)]
+        base_url: String,
+        #[arg(long, default_value = "breccia")]
+        model: String,
+        /// File holding an API key (sent as a Bearer header)
+        #[arg(long, value_name = "FILE")]
+        api_key_file: Option<PathBuf>,
+        #[arg(long, default_value_t = 50)]
+        max_steps: usize,
+        /// Per-response token budget (serve caps it at its own --max-tokens)
+        #[arg(long, default_value_t = 8192)]
+        max_tokens: u64,
+        /// Sent only when given; must be a value the model's template accepts
+        #[arg(long)]
+        reasoning_effort: Option<String>,
+        #[arg(long)]
+        temperature: Option<f64>,
+        /// Extra system prompt text
+        #[arg(long)]
+        system: Option<String>,
+        /// No per-step progress on stderr
+        #[arg(long)]
+        quiet: bool,
+        #[command(flatten)]
+        tools: ToolFlags,
+    },
+    /// The breccia-tools set as a stdio MCP server (for Hermes, Claude Code, OpenClaw)
+    ToolsMcp {
+        #[command(flatten)]
+        tools: ToolFlags,
+    },
     /// OpenAI-compatible HTTP server over the in-process engine
     Serve {
         /// TCP port (binds 127.0.0.1)
@@ -490,6 +527,40 @@ enum BenchKind {
         page_hint_trim: bool,
     },
 }
+#[derive(clap::Args)]
+struct ToolFlags {
+    /// Workdir: file tools cannot leave it
+    #[arg(long, default_value = ".")]
+    root: PathBuf,
+    /// Enable write_file, edit, apply_patch, memory
+    #[arg(long)]
+    allow_write: bool,
+    /// Enable bash, process, execute_code
+    #[arg(long)]
+    allow_exec: bool,
+    /// Only these tools (canonical names, comma list)
+    #[arg(long, value_delimiter = ',')]
+    tools: Vec<String>,
+    /// Agent state dir (memory/, sessions/); default ~/.local/share/breccia/agent
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+}
+
+impl ToolFlags {
+    fn config(&self) -> breccia_tools::Config {
+        let mut c = breccia_tools::Config::new(self.root.clone());
+        c.allow_write = self.allow_write;
+        c.allow_exec = self.allow_exec;
+        if let Some(d) = &self.data_dir {
+            c.data_dir = d.clone();
+        }
+        c
+    }
+    fn only(&self) -> Option<Vec<String>> {
+        (!self.tools.is_empty()).then(|| self.tools.iter().map(|t| breccia_tools::canonical(t)).collect())
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     // §12 defaults: cached host staging (§11f) everywhere. Set before any thread starts.
@@ -544,6 +615,27 @@ fn run(cli: Cli) -> Result<()> {
             cpu_lane,
             cpu_lane_reason,
         }),
+        Command::Agent { task, base_url, model, api_key_file, max_steps, max_tokens, reasoning_effort, temperature, system, quiet, tools } => {
+            let mut a = breccia_tools::agent::AgentConfig::new(&base_url);
+            a.model = model;
+            a.api_key_file = api_key_file;
+            a.max_steps = max_steps;
+            a.max_tokens = max_tokens;
+            a.reasoning_effort = reasoning_effort;
+            a.temperature = temperature;
+            a.system = system;
+            a.verbose = !quiet;
+            a.only = tools.only();
+            let answer = breccia_tools::agent::run(tools.config(), &a, &task).map_err(anyhow::Error::msg)?;
+            println!("{answer}");
+            Ok(())
+        }
+        Command::ToolsMcp { tools } => {
+            let ctx = breccia_tools::Ctx::new(tools.config());
+            let set = breccia_tools::enabled(&ctx, tools.only().as_deref());
+            breccia_tools::mcp::serve(&ctx, &set, std::io::stdin().lock(), std::io::stdout().lock())?;
+            Ok(())
+        }
         Command::Serve {
             port,
             gguf,

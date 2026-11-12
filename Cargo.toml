@@ -11,6 +11,7 @@ members = [
     "crates/breccia-draft",
     "crates/breccia-chat",
     "crates/breccia-server",
+    "crates/breccia-tools",
     "crates/breccia-cli",
 ]
 

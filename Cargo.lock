@@ -127,6 +127,7 @@ dependencies = [
  "breccia-kernels",
  "breccia-profile",
  "breccia-server",
+ "breccia-tools",
  "breccia-vk",
  "clap",
  "libc",
@@ -224,6 +225,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+]
+
+[[package]]
+name = "breccia-tools"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "regex",
+ "serde_json",
 ]
 
 [[package]]

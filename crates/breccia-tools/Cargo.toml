@@ -1,0 +1,11 @@
+[package]
+name = "breccia-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Agent toolset for Breccia (files, shell, web, state), an OpenAI agent loop and a stdio MCP server"
+
+[dependencies]
+serde_json = { workspace = true }
+libc = { workspace = true }
+regex = "1"
