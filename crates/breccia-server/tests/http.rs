@@ -295,3 +295,40 @@ fn base64_matches_known_vectors() {
     assert_eq!(d("Zm9vYmFy\n").unwrap(), b"foobar");
     assert!(d("Zm9v!").is_err());
 }
+
+/// Records the hand-off hint each `complete` ran under.
+struct HandoffMock {
+    now: bool,
+    seen: Vec<bool>,
+}
+
+impl Backend for HandoffMock {
+    fn model_name(&self) -> String {
+        "mock".into()
+    }
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
+        Ok(text.bytes().map(|b| b as u32 + 1).collect())
+    }
+    fn decode_text(&self, _ids: &[u32]) -> String {
+        String::new()
+    }
+    fn complete(&mut self, _prompt: &[u32], _max_tokens: usize) -> Result<Vec<u32>, String> {
+        self.seen.push(std::mem::take(&mut self.now));
+        Ok(vec![1])
+    }
+    fn eos(&self) -> Option<u32> {
+        None
+    }
+    fn handoff_hint(&mut self, on: bool) {
+        self.now = on;
+    }
+}
+
+#[test]
+fn breccia_handoff_field_reaches_the_backend() {
+    let mut m = HandoffMock { now: false, seen: Vec::new() };
+    for v in [serde_json::json!({"prompt": "abc", "breccia_handoff": true}), serde_json::json!({"prompt": "abc"})] {
+        assert_eq!(dispatch("POST", "/v1/completions", &body(v), &mut m).status, 200);
+    }
+    assert_eq!(m.seen, [true, false]);
+}

@@ -57,6 +57,12 @@ pub trait Backend {
         let _ = (explicit, code);
         false
     }
+    /// Hand-off hint for the next `complete` / `admit_start`: the request's
+    /// `"breccia_handoff"` field. When true, the prefix it saves is written to the disk
+    /// tier at once, for another serve to resume (the router moves the session there).
+    fn handoff_hint(&mut self, on: bool) {
+        let _ = on;
+    }
     /// Sequence slots that decode together (1 = one request at a time via `complete`).
     fn slots(&self) -> usize {
         1
@@ -328,6 +334,7 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
                 },
             };
             let spec = b.spec_hint(p.mtp, p.code);
+            b.handoff_hint(p.handoff);
             if !busy && (q.image || spec) {
                 // clear, then drain: a request sent after this load sets `waiting` again
                 waiting.store(false, Ordering::SeqCst);
@@ -581,6 +588,7 @@ fn completions<B: Backend>(body: &[u8], b: &mut B, chat: bool) -> Response {
         Err(r) => return r,
     };
     b.spec_hint(p.mtp, p.code);
+    b.handoff_hint(p.handoff);
     run_alone(b, &p)
 }
 
@@ -591,6 +599,7 @@ struct Prepared {
     max_tokens: usize,
     mtp: Option<bool>,
     code: bool,
+    handoff: bool,
 }
 
 fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, Response> {
@@ -631,7 +640,7 @@ fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, R
     } else {
         req.get("prompt").and_then(|v| v.as_str()).is_some_and(wants_code)
     };
-    Ok(Prepared { chat, prompt, max_tokens, mtp: req.get("mtp").and_then(|v| v.as_bool()), code })
+    Ok(Prepared { chat, prompt, max_tokens, mtp: req.get("mtp").and_then(|v| v.as_bool()), code, handoff: req.get("breccia_handoff").and_then(|v| v.as_bool()).unwrap_or(false) })
 }
 
 /// Run one prepared request on its own through [`Backend::complete`].

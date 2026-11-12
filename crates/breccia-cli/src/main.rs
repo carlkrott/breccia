@@ -5620,6 +5620,9 @@ struct EngineBackend<'a, 'm> {
     disk: Option<prefix_disk::PrefixDisk>,
     /// `BRECCIA_PREFIX_DIR_EAGER=1`: write every kept prefix to disk at once (hand-off to another serve)
     disk_eager: bool,
+    /// `"breccia_handoff"` of the next request (`handoff_hint`), then per slot until its prompt is in
+    handoff_now: bool,
+    handoff: Vec<bool>,
     prefix_ttl: std::time::Duration,
     /// MTP draft for spec decode of text prompts (one card or dual, `BRECCIA_MTP=0` turns it off)
     draft: Option<breccia_engine::mtp_draft::MtpDraft<'m>>,
@@ -5878,6 +5881,9 @@ impl EngineBackend<'_, '_> {
             println!("prefix   {} cells kept ({} MiB), request {:.2} s", st.cells(), st.bytes() >> 20, now.elapsed().as_secs_f64());
             self.keep_text(prompt[..cut].to_vec(), now, st);
         }
+        if std::mem::take(&mut self.handoff_now) {
+            self.handoff_spill(&prompt[..cut]);
+        }
         Ok(toks)
     }
 }
@@ -5980,6 +5986,9 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         }
         self.spec_now && self.draft.is_some()
     }
+    fn handoff_hint(&mut self, on: bool) {
+        self.handoff_now = on;
+    }
     fn slots(&self) -> usize {
         self.sess.n_seqs()
     }
@@ -5992,6 +6001,7 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         let Some(n) = self.reserve(slot, prompt.len(), max_tokens)? else {
             return Ok(None);
         };
+        self.handoff[slot] = std::mem::take(&mut self.handoff_now);
         self.sess.clear_image();
         // the same text prefix reuse as `complete_text`'s plain path
         let now = std::time::Instant::now();
@@ -6035,7 +6045,7 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
             self.feeds[slot] = Some((f, key));
             return Ok(None);
         }
-        self.feed_done(f, key)
+        self.feed_done(slot, f, key)
     }
     fn feed_many(&mut self, slots: &[usize], decoding: usize) -> Vec<Result<Option<u32>, String>> {
         if self.trace.is_none() {
@@ -6098,6 +6108,7 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
     fn release(&mut self, slot: usize) {
         self.reserved[slot] = 0;
+        self.handoff[slot] = false;
         if let Some((f, _)) = self.feeds[slot].take() {
             self.sess.feed_abort(&f);
         }
@@ -6148,7 +6159,7 @@ impl EngineBackend<'_, '_> {
                 continue;
             }
             // feed_sample uses the active sequence's sampler
-            out.push(self.sess.use_seq(s).map_err(|e| e.to_string()).and_then(|_| self.feed_done(f, key)));
+            out.push(self.sess.use_seq(s).map_err(|e| e.to_string()).and_then(|_| self.feed_done(s, f, key)));
         }
         out
     }
@@ -6199,14 +6210,30 @@ impl EngineBackend<'_, '_> {
         keep
     }
     /// A prompt pass is in: its first token, and keep its saved text prefix.
-    fn feed_done(&mut self, mut f: breccia_engine::PromptFeed, key: Vec<u32>) -> Result<Option<u32>, String> {
+    fn feed_done(&mut self, slot: usize, mut f: breccia_engine::PromptFeed, key: Vec<u32>) -> Result<Option<u32>, String> {
         let tok = self.sess.feed_sample(&f).map_err(|e| e.to_string())?;
         if let Some(st) = f.saved.take().filter(|st| self.keep_text_prefix(st.cells, st.bytes())) {
             let now = std::time::Instant::now();
             println!("prefix   {} cells kept ({} MiB)", st.cells, st.bytes() >> 20);
-            self.keep_text(key, now, TextPrefix::Plain(st));
+            self.keep_text(key.clone(), now, TextPrefix::Plain(st));
+        }
+        if std::mem::take(&mut self.handoff[slot]) {
+            self.handoff_spill(&key);
         }
         Ok(Some(tok))
+    }
+    /// A hand-off request: write the longest RAM prefix of its saved key to disk (the
+    /// one it just kept, or the one it resumed when nothing new was saved).
+    fn handoff_spill(&mut self, key: &[u32]) {
+        let best = self.text_prefixes.iter().filter(|e| !e.0.is_empty() && key.starts_with(&e.0)).filter_map(|e| match &e.2 {
+            TextPrefix::Plain(st) => Some((e.0.len(), e.0.clone(), st)),
+            TextPrefix::Spec(_) => None,
+        }).max_by_key(|e| e.0);
+        match (best, &mut self.disk) {
+            (Some((_, k, st)), Some(d)) => spill(d, &k, st),
+            (_, None) => println!("prefix   hand-off asked but BRECCIA_PREFIX_DIR is not set"),
+            (None, _) => println!("prefix   hand-off asked but no plain prefix of this prompt is kept (short or spec prompt)"),
+        }
     }
     /// Hold slot `slot`'s KV pool pages and make it the active sequence; the tokens
     /// allowed, or `None` when the pool cannot hold it beside the running slots yet.
@@ -6472,6 +6499,8 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         text_prefix_cap,
         disk,
         disk_eager: std::env::var("BRECCIA_PREFIX_DIR_EAGER").as_deref() == Ok("1"),
+        handoff_now: false,
+        handoff: vec![false; seqs],
         prefix_ttl: std::time::Duration::from_secs(a.image_ttl_min * 60),
         draft,
         mtp_always: mtp_env == "1",
