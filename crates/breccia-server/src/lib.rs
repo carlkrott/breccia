@@ -635,6 +635,11 @@ fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, R
     if prompt.is_empty() {
         return Err(Response::json(400, json!({"error": {"message": "empty prompt"}})));
     }
+    // reject before the fill: an over-long prompt otherwise fails minutes in, at the KV cap
+    if let Some(ctx) = b.context().filter(|&c| prompt.len() >= c) {
+        let msg = format!("the prompt is {} tokens, over the {ctx}-token context", prompt.len());
+        return Err(Response::json(400, json!({"error": {"message": msg}})));
+    }
     let code = if chat {
         last_user_text(req).is_some_and(|t| wants_code(&t))
     } else {

@@ -322,6 +322,9 @@ impl Backend for HandoffMock {
     fn handoff_hint(&mut self, on: bool) {
         self.now = on;
     }
+    fn context(&self) -> Option<usize> {
+        Some(4)
+    }
 }
 
 #[test]
@@ -331,4 +334,7 @@ fn breccia_handoff_field_reaches_the_backend() {
         assert_eq!(dispatch("POST", "/v1/completions", &body(v), &mut m).status, 200);
     }
     assert_eq!(m.seen, [true, false]);
+    // over the context: a 400 before any fill (the router does not retry a 4xx)
+    assert_eq!(dispatch("POST", "/v1/completions", &body(serde_json::json!({"prompt": "abcd"})), &mut m).status, 400);
+    assert_eq!(m.seen.len(), 2);
 }
