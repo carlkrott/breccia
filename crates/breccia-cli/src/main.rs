@@ -5638,6 +5638,8 @@ struct EngineBackend<'a, 'm> {
     yielded: bool,
     /// `BRECCIA_SERVE_TRACE=1`: per-30 s window log of the engine calls
     trace: Option<ServeTrace>,
+    /// `BRECCIA_JINJA=1`: the GGUF chat template (or `BRECCIA_CHAT_TEMPLATE`), for tools
+    template: Option<breccia_chat::ChatTemplate>,
 }
 
 /// One kind of engine call in a [`ServeTrace`] window.
@@ -5910,6 +5912,12 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     }
     fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
         Ok(self.tok.encode(text))
+    }
+    fn tokenize_special(&self, text: &str) -> Result<Vec<u32>, String> {
+        Ok(self.tok.encode_special(text))
+    }
+    fn chat_template(&self) -> Option<&breccia_chat::ChatTemplate> {
+        self.template.as_ref()
     }
     fn decode_text(&self, ids: &[u32]) -> String {
         self.tok.decode(ids)
@@ -6474,6 +6482,18 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         tok.bos,
         tok.eos
     );
+    let template = if std::env::var("BRECCIA_JINJA").as_deref() == Ok("1") {
+        let source = match std::env::var_os("BRECCIA_CHAT_TEMPLATE").filter(|v| !v.is_empty()) {
+            Some(path) => std::fs::read_to_string(&path).with_context(|| format!("reading {}", std::path::Path::new(&path).display()))?,
+            None => shards.primary().metadata_str("tokenizer.chat_template").context("BRECCIA_JINJA=1 but the model has no tokenizer.chat_template")?.to_string(),
+        };
+        let text = |id: Option<u32>| id.map(|i| tok.decode(&[i])).unwrap_or_default();
+        let t = breccia_chat::ChatTemplate::new(&source, &text(tok.bos), &text(tok.eos)).map_err(|e| anyhow::anyhow!("chat template: {e}"))?;
+        println!("template jinja ({} bytes), tool calls as {:?}", source.len(), t.format);
+        Some(t)
+    } else {
+        None
+    };
     // stop at the same EOS the server trims at (`EngineBackend::eos`), so the reply text is unchanged
     sess.stop_token = tok.eos.filter(|_| std::env::var("BRECCIA_SERVE_IGNORE_EOS").map_or(true, |v| v != "1"));
     // the slots exist before spec_enable (add_seq refuses a spec session)
@@ -6549,6 +6569,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
             let now = std::time::Instant::now();
             ServeTrace { t_start: now, win: now, last_end: None, gap_max: 0.0, step: TraceBucket::default(), feed: TraceBucket::default(), fills: (0..seqs).map(|_| None).collect() }
         }),
+        template,
     };
     breccia_server::serve(&format!("127.0.0.1:{}", a.port), backend)
         .map_err(|e| anyhow::anyhow!("server: {e}"))

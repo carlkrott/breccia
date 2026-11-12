@@ -95,3 +95,28 @@ fn encode_matches_llama_tokenize() {
         t.vocab_size()
     );
 }
+
+#[test]
+fn encode_special_splits_control_tokens() {
+    let Some(path) = model_path() else {
+        eprintln!("tokenizer: SKIPPED — model not present (set BRECCIA_TOKENIZER_GGUF)");
+        return;
+    };
+    let t = Tokenizer::from_gguf(&path).expect("tokenizer");
+    let id = |s: &str| t.id(s).unwrap_or_else(|| panic!("{s} not in vocab"));
+    let text = "<|im_start|>user\nhi <tool_call><|im_end|>\n<|im_start|>assistant\n<think>\n";
+    let mut want = vec![id("<|im_start|>")];
+    want.extend(t.encode("user\nhi "));
+    want.extend([id("<tool_call>"), id("<|im_end|>")]);
+    want.extend(t.encode("\n"));
+    want.push(id("<|im_start|>"));
+    want.extend(t.encode("assistant\n"));
+    want.push(id("<think>"));
+    want.extend(t.encode("\n"));
+    let got = t.encode_special(text);
+    assert_eq!(got, want);
+    assert!(got.iter().filter(|&&i| t.special(i)).count() >= 4);
+    assert_eq!(t.decode(&got), text);
+    // plain encode keeps the old behaviour: special text is ordinary text
+    assert!(!t.encode(text).contains(&id("<|im_start|>")));
+}

@@ -39,6 +39,9 @@ pub struct Tokenizer {
     /// Per-token type from `tokenizer.ggml.token_type` (1 normal, 2 unknown,
     /// 3 control, 4 user-defined, 5 unused, 6 byte).
     types: Vec<u8>,
+    /// Control / user-defined token texts (types 3 and 4) by first byte, longest first:
+    /// what [`Tokenizer::encode_special`] matches.
+    specials: Vec<Vec<(String, u32)>>,
     /// `tokenizer.ggml.pre`.
     pub pre: String,
     pub bos: Option<u32>,
@@ -115,6 +118,15 @@ impl Tokenizer {
         }
 
         let (byte_to_char, char_to_byte) = gpt2_byte_maps();
+        let mut specials = vec![Vec::new(); 256];
+        for (i, t) in tokens.iter().enumerate() {
+            if matches!(types.get(i), Some(3) | Some(4)) && !t.is_empty() {
+                specials[t.as_bytes()[0] as usize].push((t.clone(), i as u32));
+            }
+        }
+        for v in &mut specials {
+            v.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        }
         Ok(Self {
             tokens,
             ids,
@@ -122,6 +134,7 @@ impl Tokenizer {
             byte_to_char,
             char_to_byte,
             types,
+            specials,
             pre,
             bos: md
                 .get("tokenizer.ggml.bos_token_id")
@@ -160,12 +173,38 @@ impl Tokenizer {
 
     /// Text → token ids (byte-exact with llama.cpp's BPE for this vocabulary).
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        let mut out = Vec::new();
-        if self.add_bos {
-            if let Some(b) = self.bos {
-                out.push(b);
+        let mut out = self.bos_prefix();
+        self.encode_plain(text, &mut out);
+        out
+    }
+
+    /// Like [`Tokenizer::encode`], but control / user-defined token texts in `text`
+    /// (`<|im_start|>`, `<tool_call>` …) become their single token, the way llama.cpp
+    /// tokenizes a templated prompt (`parse_special`). Leftmost match, longest first.
+    pub fn encode_special(&self, text: &str) -> Vec<u32> {
+        let mut out = self.bos_prefix();
+        let (mut start, mut i) = (0, 0);
+        let b = text.as_bytes();
+        while i < b.len() {
+            match self.specials[b[i] as usize].iter().find(|(t, _)| text[i..].starts_with(t.as_str())) {
+                Some((t, id)) => {
+                    self.encode_plain(&text[start..i], &mut out);
+                    out.push(*id);
+                    i += t.len();
+                    start = i;
+                }
+                None => i += 1,
             }
         }
+        self.encode_plain(&text[start..], &mut out);
+        out
+    }
+
+    fn bos_prefix(&self) -> Vec<u32> {
+        self.bos.filter(|_| self.add_bos).into_iter().collect()
+    }
+
+    fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
         for word in self.split(text) {
             let encoded = self.byte_encode(&word);
             for sym in self.bpe(&encoded) {
@@ -186,7 +225,6 @@ impl Tokenizer {
                 }
             }
         }
-        out
     }
 
     /// Token ids → text.

@@ -9,6 +9,7 @@ members = [
     "crates/breccia-cache",
     "crates/breccia-engine",
     "crates/breccia-draft",
+    "crates/breccia-chat",
     "crates/breccia-server",
     "crates/breccia-cli",
 ]
@@ -28,7 +29,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 # CLI & config (llama.cpp-compatible flag surface)
 clap = { version = "4", features = ["derive", "env"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order: tool schemas and call arguments keep the client's key order (chat templates render them)
+serde_json = { version = "1", features = ["preserve_order"] }
 # zero-copy model files
 memmap2 = "0.9"
 libc = "0.2"

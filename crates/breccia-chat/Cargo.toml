@@ -1,0 +1,10 @@
+[package]
+name = "breccia-chat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde_json = { workspace = true }
+minijinja = { version = "=3.0.3", default-features = false, features = ["builtins", "macros", "multi_template", "adjacent_loop_items", "std_collections", "serde", "loop_controls", "preserve_order"] }
+minijinja-contrib = { version = "=3.0.3", default-features = false, features = ["pycompat"] }

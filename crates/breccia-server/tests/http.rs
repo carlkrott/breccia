@@ -338,3 +338,62 @@ fn breccia_handoff_field_reaches_the_backend() {
     assert_eq!(dispatch("POST", "/v1/completions", &body(serde_json::json!({"prompt": "abcd"})), &mut m).status, 400);
     assert_eq!(m.seen.len(), 2);
 }
+
+/// `BRECCIA_JINJA=1` path: the model's template renders `tools`, the reply is read back
+/// as reasoning + an OpenAI tool call.
+struct Templated {
+    t: breccia_chat::ChatTemplate,
+    prompt: std::cell::RefCell<String>,
+}
+
+impl Backend for Templated {
+    fn model_name(&self) -> String {
+        "mock".into()
+    }
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
+        Ok(text.bytes().map(|b| b as u32 + 1).collect())
+    }
+    fn decode_text(&self, ids: &[u32]) -> String {
+        String::from_utf8(ids.iter().map(|&i| (i - 1) as u8).collect()).unwrap()
+    }
+    fn complete(&mut self, prompt: &[u32], _max: usize) -> Result<Vec<u32>, String> {
+        *self.prompt.borrow_mut() = self.decode_text(prompt);
+        let reply = "Need the weather.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nBern\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+        let mut ids = self.tokenize(reply)?;
+        ids.push(0);
+        Ok(ids)
+    }
+    fn eos(&self) -> Option<u32> {
+        Some(0)
+    }
+    fn chat_template(&self) -> Option<&breccia_chat::ChatTemplate> {
+        Some(&self.t)
+    }
+}
+
+#[test]
+fn templated_chat_returns_tool_calls() {
+    let src = include_str!("../../breccia-chat/tests/data/qwen3.8-flash-next.jinja");
+    let mut m = Templated { t: breccia_chat::ChatTemplate::new(src, "", "<|im_end|>").unwrap(), prompt: Default::default() };
+    let tools = serde_json::json!([{"type": "function", "function": {"name": "get_weather", "parameters": {
+        "type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}}}}]);
+    let req = serde_json::json!({"messages": [{"role": "user", "content": "Weather in Bern?"}], "tools": tools});
+    let r = dispatch("POST", "/v1/chat/completions", &body(req), &mut m);
+    assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+    let p = m.prompt.borrow().clone();
+    assert!(p.contains("<tools>\n{\"type\": \"function\""), "{p}");
+    assert!(p.ends_with("<|im_start|>assistant\n<think>\n"), "{p}");
+    let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+    let c = &v["choices"][0];
+    assert_eq!(c["finish_reason"], "tool_calls");
+    assert_eq!(c["message"]["content"], serde_json::Value::Null);
+    assert_eq!(c["message"]["reasoning_content"], "Need the weather.");
+    let call = &c["message"]["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "get_weather");
+    let args: serde_json::Value = serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args, serde_json::json!({"city": "Bern", "days": 3}));
+
+    // a bad reasoning_effort is the template's raise_exception -> 400
+    let req = serde_json::json!({"messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "max"});
+    assert_eq!(dispatch("POST", "/v1/chat/completions", &body(req), &mut m).status, 400);
+}

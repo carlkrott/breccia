@@ -3,8 +3,8 @@
 //! With one sequence slot ([`Backend::slots`] = 1) the server is a single-threaded
 //! HTTP/1.1 loop: accept, read one request, generate, respond. With more, connection
 //! threads hand requests to the engine thread, which decodes every admitted request
-//! in one batched step per token ([`serve`]). The crate stays dependency-free apart
-//! from `serde_json`.
+//! in one batched step per token ([`serve`]). Dependencies: `serde_json`, and
+//! `breccia-chat` for the model's own chat template and its tool-call formats.
 //!
 //! Routes:
 //!   `GET  /health`              liveness + loaded model
@@ -40,6 +40,17 @@ pub trait Backend {
     fn special(&self, text: &str) -> Option<u32> {
         let _ = text;
         None
+    }
+    /// The model's own chat template (`BRECCIA_JINJA=1`): chat requests are rendered
+    /// through it, with `tools`, and replies parsed for reasoning and tool calls. `None`
+    /// keeps the built-in ChatML prompt.
+    fn chat_template(&self) -> Option<&breccia_chat::ChatTemplate> {
+        None
+    }
+    /// Text → ids with control-token texts (`<|im_start|>`, `<think>`) as their ids:
+    /// for a rendered template.
+    fn tokenize_special(&self, text: &str) -> Result<Vec<u32>, String> {
+        self.tokenize(text)
     }
     /// Encode the request's image number `index` (the raw file bytes) for the next
     /// `complete`; returns how many `<|image_pad|>` cells it fills. The prompt then
@@ -600,6 +611,14 @@ struct Prepared {
     mtp: Option<bool>,
     code: bool,
     handoff: bool,
+    /// templated chat: how to read the reply
+    reply: Option<ReplyFormat>,
+}
+
+struct ReplyFormat {
+    format: breccia_chat::Format,
+    think_open: bool,
+    tools: Option<Value>,
 }
 
 fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, Response> {
@@ -608,8 +627,20 @@ fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, R
         .and_then(|v| v.as_u64())
         .unwrap_or(128) as usize;
 
+    let mut reply = None;
     let prompt = if chat {
-        match chat_prompt(req, b).and_then(|(ids, imgs)| with_images(ids, imgs, b)) {
+        let built = match b.chat_template() {
+            Some(t) => t.render(req).and_then(|r| {
+                reply = Some(ReplyFormat {
+                    format: t.format,
+                    think_open: r.think_open,
+                    tools: req.get("tools").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())).cloned(),
+                });
+                Ok((b.tokenize_special(&r.text)?, request_images(req)?))
+            }),
+            None => chat_prompt(req, b),
+        };
+        match built.and_then(|(ids, imgs)| with_images(ids, imgs, b)) {
             Ok(ids) => ids,
             Err(e) => return Err(Response::json(400, json!({"error": {"message": e}}))),
         }
@@ -645,7 +676,7 @@ fn prepare<B: Backend>(req: &Value, b: &mut B, chat: bool) -> Result<Prepared, R
     } else {
         req.get("prompt").and_then(|v| v.as_str()).is_some_and(wants_code)
     };
-    Ok(Prepared { chat, prompt, max_tokens, mtp: req.get("mtp").and_then(|v| v.as_bool()), code, handoff: req.get("breccia_handoff").and_then(|v| v.as_bool()).unwrap_or(false) })
+    Ok(Prepared { chat, prompt, max_tokens, mtp: req.get("mtp").and_then(|v| v.as_bool()), code, handoff: req.get("breccia_handoff").and_then(|v| v.as_bool()).unwrap_or(false), reply })
 }
 
 /// Run one prepared request on its own through [`Backend::complete`].
@@ -671,6 +702,26 @@ fn finish<B: Backend>(b: &mut B, p: &Prepared, ids: Vec<u32>, seconds: f64) -> R
     };
     let text = b.decode_text(&ids);
     let model = b.model_name();
+    let (message, finish_reason) = match &p.reply {
+        None => (json!({"role": "assistant", "content": text}), finish_reason),
+        Some(r) => {
+            let parsed = breccia_chat::parse(r.format, &text, r.think_open, r.tools.as_ref());
+            let calls = !parsed.calls.is_empty();
+            let mut m = json!({
+                "role": "assistant",
+                "content": if calls && parsed.content.is_empty() { Value::Null } else { parsed.content.into() },
+            });
+            if let Some(rc) = parsed.reasoning {
+                m["reasoning_content"] = rc.into();
+            }
+            if calls {
+                m["tool_calls"] = parsed.calls.iter().map(|c| json!({
+                    "id": c.id, "type": "function", "function": {"name": c.name, "arguments": c.arguments},
+                })).collect();
+            }
+            (m, if calls && finish_reason == "stop" { "tool_calls" } else { finish_reason })
+        }
+    };
     let usage = json!({
         "prompt_tokens": prompt_ids.len(),
         "completion_tokens": ids.len(),
@@ -687,7 +738,7 @@ fn finish<B: Backend>(b: &mut B, p: &Prepared, ids: Vec<u32>, seconds: f64) -> R
                 "model": model,
                 "choices": [{
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
+                    "message": message,
                     "finish_reason": finish_reason,
                 }],
                 "usage": usage,
@@ -753,6 +804,14 @@ fn with_images<B: Backend>(ids: Vec<u32>, images: Vec<Vec<u8>>, b: &mut B) -> Re
         }
     }
     Ok(out)
+}
+
+/// A templated request's image parts, in message order (the template puts one
+/// `<|image_pad|>` per part, in the same order).
+fn request_images(req: &Value) -> Result<Vec<Vec<u8>>, String> {
+    let parts = req.get("messages").and_then(|m| m.as_array()).into_iter().flatten()
+        .filter_map(|m| m.get("content")?.as_array()).flatten();
+    parts.filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("image_url")).map(image_bytes).collect()
 }
 
 /// Images arrive as `data:<mime>;base64,<...>` URLs (no remote fetch).
