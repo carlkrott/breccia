@@ -26,6 +26,8 @@ use std::path::PathBuf;
 
 use breccia_vk::DeviceSelector;
 
+mod prefix_disk;
+
 #[derive(Parser)]
 #[command(
     name = "breccia",
@@ -5612,6 +5614,12 @@ struct EngineBackend<'a, 'm> {
     text_prefixes: Vec<(Vec<u32>, std::time::Instant, TextPrefix)>,
     /// cells of the shortest text prefix seen over the cap: saves at least that long are skipped
     text_prefix_over: usize,
+    /// RAM cap of `text_prefixes` (`BRECCIA_TEXT_PREFIX_GIB`, default 2)
+    text_prefix_cap: usize,
+    /// `BRECCIA_PREFIX_DIR`: the disk tier under the RAM one (plain prefixes only)
+    disk: Option<prefix_disk::PrefixDisk>,
+    /// `BRECCIA_PREFIX_DIR_EAGER=1`: write every kept prefix to disk at once (hand-off to another serve)
+    disk_eager: bool,
     prefix_ttl: std::time::Duration,
     /// MTP draft for spec decode of text prompts (one card or dual, `BRECCIA_MTP=0` turns it off)
     draft: Option<breccia_engine::mtp_draft::MtpDraft<'m>>,
@@ -5759,7 +5767,7 @@ impl TextPrefix {
     }
 }
 
-/// shortcut: fixed cap and floor; make them flags once a box needs other values.
+/// Default RAM cap (`BRECCIA_TEXT_PREFIX_GIB` overrides). shortcut: fixed floor; make it a flag once a box needs another.
 const TEXT_PREFIX_CAP_BYTES: usize = 2 << 30;
 /// Prompts shorter than this re-prefill in well under a second, so they are not saved.
 const TEXT_PREFIX_MIN: usize = 512;
@@ -5767,21 +5775,35 @@ const TEXT_PREFIX_MIN: usize = 512;
 /// shortcut: a fixed RAM cap (~7 images' prompt state at ~135 MB each); make it a flag if a box needs more.
 const PREFIX_CAP_BYTES: usize = 1 << 30;
 
-/// Drops entries unused for `ttl`, then the least recently used until the rest fit in `cap` bytes.
+/// Drops entries unused for `ttl`, then the least recently used until the rest fit in `cap` bytes;
+/// returns the cap victims (the disk tier keeps them, expired ones are dead sessions).
 fn prune_prefixes<K, T>(
     v: &mut Vec<(K, std::time::Instant, T)>,
     now: std::time::Instant,
     ttl: std::time::Duration,
     cap: usize,
     bytes: impl Fn(&T) -> usize,
-) {
+) -> Vec<(K, std::time::Instant, T)> {
     v.retain(|e| now - e.1 < ttl);
     v.sort_by_key(|e| std::cmp::Reverse(e.1));
     let mut total = 0;
-    v.retain(|e| {
+    let keep = v.iter().take_while(|e| {
         total += bytes(&e.2);
         total <= cap
     });
+    let keep = keep.count();
+    v.split_off(keep)
+}
+
+/// Write a plain prefix to the disk tier (a log line either way).
+/// shortcut: synchronous on the serve thread (~1-2 s per 64k state); a writer thread if decode stalls show it.
+fn spill(d: &mut prefix_disk::PrefixDisk, key: &[u32], st: &breccia_engine::PrefixState) {
+    let t = std::time::Instant::now();
+    match d.put(key, |p| st.save_file(p)) {
+        Ok(true) => println!("prefix   {} cells to disk ({} MiB, {:.2} s)", st.cells, st.bytes() >> 20, t.elapsed().as_secs_f64()),
+        Ok(false) => {}
+        Err(e) => println!("prefix   disk write failed: {e:#}"),
+    }
 }
 
 #[cfg(test)]
@@ -5792,8 +5814,9 @@ fn prefix_prune_ttl_then_lru() {
     let at = |s: u64| now - D::from_secs(s);
     // (name, last use, bytes): c expired, then a is the oldest over the 100-byte cap
     let mut v = vec![("a", at(600), 60), ("b", at(10), 50), ("c", at(1900), 10), ("d", at(0), 40)];
-    prune_prefixes(&mut v, now, D::from_secs(1800), 100, |&b| b);
+    let gone = prune_prefixes(&mut v, now, D::from_secs(1800), 100, |&b| b);
     assert_eq!(v.iter().map(|e| e.0).collect::<Vec<_>>(), ["d", "b"]);
+    assert_eq!(gone.iter().map(|e| e.0).collect::<Vec<_>>(), ["a"], "cap victims only, not expired ones");
 }
 
 impl EngineBackend<'_, '_> {
@@ -5805,9 +5828,12 @@ impl EngineBackend<'_, '_> {
         use breccia_engine::mtp_spec::{generate_prefix, Accept, Policy};
         use breccia_engine::Prefix;
         let now = std::time::Instant::now();
-        prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+        self.prune_text(now);
         let chunk = self.sess.prefill_target; // the planner target, not the cap
         let cut = if chunk > 0 && prompt.len() > TEXT_PREFIX_MIN { prompt.len() - 1 } else { 0 };
+        if !(self.spec_now && self.draft.is_some()) {
+            self.disk_promote(prompt, cut);
+        }
         let hit = self
             .text_prefixes
             .iter_mut()
@@ -5850,8 +5876,7 @@ impl EngineBackend<'_, '_> {
         };
         if let Some(st) = saved.filter(|st| self.keep_text_prefix(st.cells(), st.bytes())) {
             println!("prefix   {} cells kept ({} MiB), request {:.2} s", st.cells(), st.bytes() >> 20, now.elapsed().as_secs_f64());
-            self.text_prefixes.push((prompt[..cut].to_vec(), now, st));
-            prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+            self.keep_text(prompt[..cut].to_vec(), now, st);
         }
         Ok(toks)
     }
@@ -5970,8 +5995,9 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         self.sess.clear_image();
         // the same text prefix reuse as `complete_text`'s plain path
         let now = std::time::Instant::now();
-        prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+        self.prune_text(now);
         let cut = if self.sess.prefill_chunk > 0 && self.sess.prefill_target > 0 && prompt.len() > TEXT_PREFIX_MIN { prompt.len() - 1 } else { 0 };
+        self.disk_promote(prompt, cut);
         let hit = self
             .text_prefixes
             .iter_mut()
@@ -6126,12 +6152,49 @@ impl EngineBackend<'_, '_> {
         }
         out
     }
+    /// RAM prune; cap victims go to the disk tier when it is on.
+    fn prune_text(&mut self, now: std::time::Instant) {
+        let gone = prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, self.text_prefix_cap, |st| st.bytes());
+        if let Some(d) = &mut self.disk {
+            for (key, _, tp) in &gone {
+                if let TextPrefix::Plain(st) = tp {
+                    spill(d, key, st);
+                }
+            }
+        }
+    }
+    /// Keep a saved text prefix in RAM (and on disk at once with `BRECCIA_PREFIX_DIR_EAGER=1`).
+    fn keep_text(&mut self, key: Vec<u32>, now: std::time::Instant, st: TextPrefix) {
+        if let (true, Some(d), TextPrefix::Plain(s)) = (self.disk_eager, &mut self.disk, &st) {
+            spill(d, &key, s);
+        }
+        self.text_prefixes.push((key, now, st));
+        self.prune_text(now);
+    }
+    /// Load the longest disk prefix of `prompt` into RAM when it beats every RAM one
+    /// (the RAM search then finds it); a failed read is a miss.
+    fn disk_promote(&mut self, prompt: &[u32], cut: usize) {
+        if cut == 0 || self.disk.is_none() {
+            return;
+        }
+        let ram = self.text_prefixes.iter().filter(|e| e.0.len() <= cut && prompt.starts_with(&e.0) && matches!(e.2, TextPrefix::Plain(_))).map(|e| e.0.len()).max().unwrap_or(0);
+        let Some((len, path)) = self.disk.as_mut().and_then(|d| d.longest(prompt, cut, ram)) else { return };
+        let t = std::time::Instant::now();
+        match breccia_engine::PrefixState::load_file(&path) {
+            Ok(st) => {
+                prefix_disk::drop_cache(&path);
+                println!("prefix   {} of {} cells from disk ({:.2} s)", st.cells, prompt.len(), t.elapsed().as_secs_f64());
+                self.text_prefixes.push((prompt[..len].to_vec(), std::time::Instant::now(), TextPrefix::Plain(st)));
+            }
+            Err(e) => println!("prefix   disk read failed: {e:#}"),
+        }
+    }
     /// False (and a log line) when a saved text prefix is over the cap; longer saves are then skipped.
     fn keep_text_prefix(&mut self, cells: usize, bytes: usize) -> bool {
-        let keep = bytes <= TEXT_PREFIX_CAP_BYTES;
+        let keep = bytes <= self.text_prefix_cap;
         if !keep {
             self.text_prefix_over = self.text_prefix_over.min(cells);
-            println!("prefix   {cells} cells ({} MiB) over the {} MiB cap, not kept", bytes >> 20, TEXT_PREFIX_CAP_BYTES >> 20);
+            println!("prefix   {cells} cells ({} MiB) over the {} MiB cap, not kept", bytes >> 20, self.text_prefix_cap >> 20);
         }
         keep
     }
@@ -6141,8 +6204,7 @@ impl EngineBackend<'_, '_> {
         if let Some(st) = f.saved.take().filter(|st| self.keep_text_prefix(st.cells, st.bytes())) {
             let now = std::time::Instant::now();
             println!("prefix   {} cells kept ({} MiB)", st.cells, st.bytes() >> 20);
-            self.text_prefixes.push((key, now, TextPrefix::Plain(st)));
-            prune_prefixes(&mut self.text_prefixes, now, self.prefix_ttl, TEXT_PREFIX_CAP_BYTES, |st| st.bytes());
+            self.keep_text(key, now, TextPrefix::Plain(st));
         }
         Ok(Some(tok))
     }
@@ -6349,7 +6411,7 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         tok.eos
     );
     // stop at the same EOS the server trims at (`EngineBackend::eos`), so the reply text is unchanged
-    sess.stop_token = tok.eos;
+    sess.stop_token = tok.eos.filter(|_| std::env::var("BRECCIA_SERVE_IGNORE_EOS").map_or(true, |v| v != "1"));
     // the slots exist before spec_enable (add_seq refuses a spec session)
     for _ in 1..seqs {
         sess.add_seq()?;
@@ -6386,6 +6448,16 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
             Some(Vision::new(encoder, mmproj, model, a.image_tokens, n_embd, cache, ttl)?)
         }
     };
+    let gib = |k: &str, d: f64| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(d);
+    let text_prefix_cap = (gib("BRECCIA_TEXT_PREFIX_GIB", (TEXT_PREFIX_CAP_BYTES >> 30) as f64) * (1u64 << 30) as f64) as usize;
+    let disk = match std::env::var_os("BRECCIA_PREFIX_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => {
+            let cap = (gib("BRECCIA_PREFIX_DIR_GIB", 32.0) * (1u64 << 30) as f64) as u64;
+            println!("prefix   RAM {} MiB, disk tier {} ({} GiB)", text_prefix_cap >> 20, std::path::Path::new(&dir).display(), cap >> 30);
+            Some(prefix_disk::PrefixDisk::new(dir.into(), cap)?)
+        }
+        None => None,
+    };
     let backend = EngineBackend {
         sess: &mut sess,
         tok,
@@ -6397,6 +6469,9 @@ fn serve_http(mut a: ServeArgs) -> Result<()> {
         prefixes: Vec::new(),
         text_prefixes: Vec::new(),
         text_prefix_over: usize::MAX,
+        text_prefix_cap,
+        disk,
+        disk_eager: std::env::var("BRECCIA_PREFIX_DIR_EAGER").as_deref() == Ok("1"),
         prefix_ttl: std::time::Duration::from_secs(a.image_ttl_min * 60),
         draft,
         mtp_always: mtp_env == "1",

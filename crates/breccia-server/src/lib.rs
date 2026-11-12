@@ -649,7 +649,9 @@ fn run_alone<B: Backend>(b: &mut B, p: &Prepared) -> Response {
 /// The OpenAI-shaped reply for generated `ids` (cut at EOS).
 fn finish<B: Backend>(b: &mut B, p: &Prepared, ids: Vec<u32>, seconds: f64) -> Response {
     let (chat, prompt_ids) = (p.chat, &p.prompt);
-    let (ids, finish_reason) = match b.eos().and_then(|eos| ids.iter().position(|&t| t == eos)) {
+    // `BRECCIA_SERVE_IGNORE_EOS=1` (benches): keep the whole run, as the scheduler does
+    let eos = b.eos().filter(|_| std::env::var("BRECCIA_SERVE_IGNORE_EOS").map_or(true, |v| v != "1"));
+    let (ids, finish_reason) = match eos.and_then(|eos| ids.iter().position(|&t| t == eos)) {
         Some(i) => (ids[..i].to_vec(), "stop"),
         None => (ids, "length"),
     };
