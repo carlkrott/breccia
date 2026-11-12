@@ -16,7 +16,7 @@
 //! (which owns the model, session and tokenizer), so this crate never links the
 //! engine.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -833,42 +833,45 @@ pub const LITERAL_BASE: u32 = 0xF0000;
 // shortcut: template literal text that ends in a partial control text right before
 // client data is not caught (no known template does that).
 fn escape_controls(req: &Value, ctl: &[String]) -> Value {
+    // Hash lookups bounded by the longest control text: vocabularies can carry thousands
+    // of control tokens, so scanning all of them per string (or per char) is a DoS vector.
     struct Esc<'a> {
-        ctl: &'a [String],
-        firsts: Vec<char>,
+        full: HashMap<&'a str, usize>,
+        pre: HashSet<&'a str>,
+        suf: HashSet<&'a str>,
+        max: usize,
         barrier: char,
     }
     impl Esc<'_> {
-        fn partial(&self, s: &str, at_end: bool) -> bool {
-            self.ctl.iter().any(|t| {
-                (1..t.len()).filter(|&k| t.is_char_boundary(k)).any(|k| {
-                    if at_end { s.ends_with(&t[..k]) } else { s.starts_with(&t[k..]) }
-                })
+        /// Char-boundary prefixes (or suffixes) of `s` no longer than the longest control text.
+        fn ends<'s>(&self, s: &'s str, at_end: bool) -> impl Iterator<Item = &'s str> {
+            let n = s.len();
+            (1..=n.min(self.max)).filter_map(move |k| {
+                let i = if at_end { n - k } else { k };
+                s.is_char_boundary(i).then(|| if at_end { &s[i..] } else { &s[..i] })
             })
         }
         fn str(&self, s: &str) -> String {
             let mut out = String::with_capacity(s.len());
-            if self.partial(s, false) {
+            if self.ends(s, false).any(|p| self.suf.contains(p)) {
                 out.push(self.barrier);
             }
             let mut rest = s;
-            if s.contains(self.firsts.as_slice()) {
-                while let Some(c) = rest.chars().next() {
-                    match self.ctl.iter().position(|t| rest.starts_with(t.as_str())) {
-                        Some(i) => {
-                            out.push(char::from_u32(LITERAL_BASE + i as u32).unwrap_or('\u{FFFD}'));
-                            rest = &rest[self.ctl[i].len()..];
-                        }
-                        None => {
-                            out.push(c);
-                            rest = &rest[c.len_utf8()..];
-                        }
+            while let Some(c) = rest.chars().next() {
+                // longest control text starting here
+                let hit = (1..=rest.len().min(self.max)).rev().filter(|&k| rest.is_char_boundary(k)).find_map(|k| self.full.get(&rest[..k]).map(|&i| (i, k)));
+                match hit {
+                    Some((i, len)) => {
+                        out.push(char::from_u32(LITERAL_BASE + i as u32).unwrap_or('\u{FFFD}'));
+                        rest = &rest[len..];
+                    }
+                    None => {
+                        out.push(c);
+                        rest = &rest[c.len_utf8()..];
                     }
                 }
-            } else {
-                out.push_str(s);
             }
-            if self.partial(&out, true) {
+            if self.ends(&out, true).any(|p| self.pre.contains(p)) {
                 out.push(self.barrier);
             }
             out
@@ -886,7 +889,15 @@ fn escape_controls(req: &Value, ctl: &[String]) -> Value {
         return req.clone();
     }
     let barrier = char::from_u32(LITERAL_BASE + ctl.len() as u32).unwrap_or('\u{FFFD}');
-    Esc { ctl, firsts: ctl.iter().filter_map(|t| t.chars().next()).collect(), barrier }.walk(req)
+    let cuts = |t: &String| (1..t.len()).filter(|&k| t.is_char_boundary(k)).collect::<Vec<_>>();
+    let esc = Esc {
+        full: ctl.iter().enumerate().rev().map(|(i, t)| (t.as_str(), i)).collect(),
+        pre: ctl.iter().flat_map(|t| cuts(t).into_iter().map(move |k| &t[..k])).collect(),
+        suf: ctl.iter().flat_map(|t| cuts(t).into_iter().map(move |k| &t[k..])).collect(),
+        max: ctl.iter().map(String::len).max().unwrap_or(0),
+        barrier,
+    };
+    esc.walk(req)
 }
 
 /// Inverse of [`escape_controls`] for backends without a templated tokenizer.
