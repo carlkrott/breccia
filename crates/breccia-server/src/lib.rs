@@ -361,7 +361,6 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             stop(&mut live, queue, &rx, &mut b);
         }
         drop_gone(&mut live, &mut queue, &mut b);
-        busy.store(live.iter().flatten().count() + queue.len(), Ordering::Relaxed);
         let idle = live.iter().all(Option::is_none);
         let mut jobs: Vec<Job> = Vec::new();
         if idle && queue.is_empty() {
@@ -449,7 +448,6 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             }
         }
         queue = wait;
-        busy.store(live.iter().flatten().count() + queue.len(), Ordering::Relaxed);
         retire(&mut live, &mut b, ctx);
         // one prompt pass (oldest admission first) per decode step
         let mut feeding: Vec<_> = live
@@ -642,6 +640,9 @@ fn handle_conn(mut stream: TcpStream, name: &str, tx: &mpsc::Sender<Job>, arrive
             if method == "POST" && path.contains("completions") {
                 arrived.store(true, Ordering::SeqCst); // a running spec request hands over
             }
+            // counted here, not by the engine: a request that arrives during a long pass sits unread
+            busy.fetch_add(1, Ordering::Relaxed);
+            let _open = Open(busy);
             tx.send(Job { method, path, body, reply, gone: gone.clone() }).map_err(|_| "the engine thread is gone")?;
             loop {
                 match done.recv_timeout(std::time::Duration::from_millis(500)) {
@@ -659,6 +660,14 @@ fn handle_conn(mut stream: TcpStream, name: &str, tx: &mpsc::Sender<Job>, arrive
     write_response(&mut stream, &resp)
 }
 
+/// One open engine request in `/slots`, released when its connection handler returns.
+struct Open<'a>(&'a AtomicUsize);
+impl Drop for Open<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The client closed its side or the connection broke. Pipelined bytes count as alive.
 fn client_gone(s: &TcpStream) -> bool {
     if s.set_nonblocking(true).is_err() {
@@ -672,7 +681,7 @@ fn client_gone(s: &TcpStream) -> bool {
     }
 }
 
-/// `/health`, `/v1/models`, `/slots`: answered without the engine. `busy` = live + queued requests.
+/// `/health`, `/v1/models`, `/slots`: answered without the engine. `busy` = open engine requests (live, queued or not yet read).
 fn info_route(method: &str, path: &str, name: &str, slots: usize, busy: usize) -> Option<Response> {
     match (method, path) {
         ("GET", "/health") => Some(Response::json(
