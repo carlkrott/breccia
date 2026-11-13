@@ -246,3 +246,123 @@ fn a_spec_run_hands_over_when_a_request_arrives() {
     assert_eq!(yielded.load(Ordering::SeqCst), 1);
     assert!(widest.load(Ordering::SeqCst) >= 2, "the two streams never stepped together");
 }
+
+fn get(port: u16, path: &str) -> serde_json::Value {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    serde_json::from_str(out.split_once("\r\n\r\n").unwrap().1).unwrap()
+}
+
+/// A client that hangs up mid-generation frees its slot; `/slots` shows the slot busy, then idle.
+#[test]
+fn disconnect_cancels_and_slots_report_busy() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let b = Forever { live: vec![false; 2] };
+    std::thread::spawn(move || serve(&format!("127.0.0.1:{port}"), b));
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let idle = serde_json::json!([{"id": 0, "is_processing": false}, {"id": 1, "is_processing": false}]);
+    assert_eq!(get(port, "/slots"), idle);
+
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let body = r#"{"prompt":"hi","max_tokens":100000}"#;
+    write!(s, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let busy = get(port, "/slots");
+    assert_eq!(busy[0]["is_processing"], true, "{busy}");
+    drop(s);
+    // the connection thread checks every 500 ms; the engine frees the slot on its next turn
+    let t = std::time::Instant::now();
+    while get(port, "/slots") != idle {
+        assert!(t.elapsed().as_secs() < 5, "slot still busy after the client left");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // the serve still answers
+    let v = post(port, r#"{"prompt":"hi","max_tokens":3}"#);
+    assert_eq!(v["choices"][0]["text"], "aaa");
+}
+
+/// Repeats 'a' (never EOS), so only max_tokens or a hang-up ends a request.
+struct Forever {
+    live: Vec<bool>,
+}
+
+impl Backend for Forever {
+    fn model_name(&self) -> String {
+        "forever".into()
+    }
+    fn tokenize(&self, text: &str) -> Result<Vec<u32>, String> {
+        Ok(text.bytes().map(|b| b as u32 + 1).collect())
+    }
+    fn decode_text(&self, ids: &[u32]) -> String {
+        ids.iter().map(|&i| char::from_u32(i - 1).unwrap_or('?')).collect()
+    }
+    fn complete(&mut self, _prompt: &[u32], _max_tokens: usize) -> Result<Vec<u32>, String> {
+        Err("slots only".into())
+    }
+    fn eos(&self) -> Option<u32> {
+        Some(b'z' as u32 + 1)
+    }
+    fn slots(&self) -> usize {
+        self.live.len()
+    }
+    fn admit(&mut self, slot: usize, _prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
+        assert!(!self.live[slot]);
+        self.live[slot] = true;
+        Ok(Some((b'a' as u32 + 1, max_tokens)))
+    }
+    fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
+        assert!(rows.iter().all(|&(s, _)| self.live[s]), "stepped a released slot");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        Ok(rows.iter().map(|&(_, t)| t).collect())
+    }
+    fn release(&mut self, slot: usize) {
+        self.live[slot] = false;
+    }
+}
+
+/// The child half of `sigterm_answers_503_and_exits_0`: a serve on the port in `BRECCIA_TEST_PORT`.
+#[test]
+#[ignore]
+fn sigterm_child() {
+    let Ok(port) = std::env::var("BRECCIA_TEST_PORT") else { return };
+    let _ = serve(&format!("127.0.0.1:{port}"), Forever { live: vec![false; 2] });
+}
+
+/// SIGTERM mid-request: the open request gets 503 and the process exits 0 at once.
+#[test]
+fn sigterm_answers_503_and_exits_0() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "sigterm_child", "--nocapture"])
+        .env("BRECCIA_TEST_PORT", port.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let t = std::time::Instant::now();
+    let mut s = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(s) => break s,
+            Err(_) if t.elapsed().as_secs() < 10 => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => panic!("child serve never listened: {e}"),
+        }
+    };
+    let body = r#"{"prompt":"hi","max_tokens":100000}"#;
+    write!(s, "POST /v1/completions HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let t = std::time::Instant::now();
+    assert_eq!(unsafe { libc_kill(child.id() as i32, 15) }, 0);
+    let mut out = String::new();
+    s.read_to_string(&mut out).unwrap();
+    assert!(out.starts_with("HTTP/1.1 503"), "{out}");
+    let st = child.wait().unwrap();
+    assert!(st.success(), "exit {st:?}");
+    assert!(t.elapsed().as_secs() < 5, "stop took {:?}", t.elapsed());
+}
+
+extern "C" {
+    #[link_name = "kill"]
+    fn libc_kill(pid: i32, sig: i32) -> i32;
+}

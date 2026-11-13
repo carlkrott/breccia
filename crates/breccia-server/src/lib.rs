@@ -11,6 +11,11 @@
 //!   `POST /v1/completions`      `{prompt, max_tokens}` → text completion
 //!   `POST /v1/chat/completions` `{messages, max_tokens}` → ChatML completion
 //!   `GET  /v1/models`           the served model name
+//!   `GET  /slots`               llama.cpp-style busy signal: `[{id, is_processing}]`
+//!
+//! With slots, a request whose client disconnects is cancelled (its slot freed), and
+//! SIGTERM answers every open request 503, lets the backend save state
+//! ([`Backend::shutdown`]) and exits 0.
 //!
 //! The caller supplies a [`Backend`]: tokenization and generation live in the CLI
 //! (which owns the model, session and tokenizer), so this crate never links the
@@ -19,7 +24,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
 
 use serde_json::{json, Value};
@@ -134,6 +139,15 @@ pub trait Backend {
     fn context(&self) -> Option<usize> {
         None
     }
+    /// The server is stopping (SIGTERM): save what a restart can reuse. Runs once, last.
+    fn shutdown(&mut self) {}
+}
+
+/// Set by SIGTERM (slot serve): the engine answers what is open with 503 and exits.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_term(_: libc::c_int) {
+    STOP.store(true, Ordering::SeqCst);
 }
 
 pub struct Response {
@@ -235,6 +249,7 @@ fn write_response(stream: &mut TcpStream, resp: &Response) -> Result<(), String>
     let reason = match resp.status {
         200 => "OK",
         400 => "Bad Request",
+        503 => "Service Unavailable",
         404 => "Not Found",
         405 => "Method Not Allowed",
         500 => "Internal Server Error",
@@ -258,11 +273,14 @@ struct Job {
     path: String,
     body: Vec<u8>,
     reply: mpsc::Sender<Response>,
+    /// set by the connection thread when the client hangs up: the engine drops the request
+    gone: Arc<AtomicBool>,
 }
 
 /// A completion request waiting for a slot (prepared once, on its first try).
 struct Pending {
     reply: mpsc::Sender<Response>,
+    gone: Arc<AtomicBool>,
     chat: bool,
     req: Value,
     image: bool,
@@ -272,6 +290,7 @@ struct Pending {
 /// A completion request decoding in a slot.
 struct Live {
     reply: mpsc::Sender<Response>,
+    gone: Arc<AtomicBool>,
     p: Prepared,
     ids: Vec<u32>,
     allowed: usize,
@@ -294,13 +313,19 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
     let name = b.model_name();
     let waiting = Arc::new(AtomicBool::new(false));
     let arrived = waiting.clone();
+    let slots = b.slots();
+    // live + queued requests, for `GET /slots`
+    let busy = Arc::new(AtomicUsize::new(0));
+    let busy_conn = busy.clone();
+    // SAFETY: the handler only stores to an atomic (async-signal-safe).
+    unsafe { libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t) };
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             match conn {
                 Ok(stream) => {
-                    let (tx, name, arrived) = (tx.clone(), name.clone(), arrived.clone());
+                    let (tx, name, arrived, busy) = (tx.clone(), name.clone(), arrived.clone(), busy_conn.clone());
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_conn(stream, &name, &tx, &arrived) {
+                        if let Err(e) = handle_conn(stream, &name, &tx, &arrived, &busy, slots) {
                             eprintln!("breccia-server: {e}");
                         }
                     });
@@ -317,10 +342,20 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
     let share = std::env::var("BRECCIA_SERVE_DECODE_SHARE").ok().and_then(|v| v.parse::<f64>().ok()).filter(|s| *s > 0.0 && *s < 1.0);
     let (mut feed_s, mut step_s) = (0.0f64, 0.0f64);
     loop {
-        let busy = live.iter().any(Option::is_some);
+        if STOP.load(Ordering::SeqCst) {
+            stop(&mut live, queue, &rx, &mut b);
+        }
+        drop_gone(&mut live, &mut queue, &mut b);
+        busy.store(live.iter().flatten().count() + queue.len(), Ordering::Relaxed);
+        let idle = live.iter().all(Option::is_none);
         let mut jobs: Vec<Job> = Vec::new();
-        if !busy && queue.is_empty() {
-            jobs.push(rx.recv().map_err(|_| "the listener thread is gone".to_string())?);
+        if idle && queue.is_empty() {
+            // a timeout so SIGTERM is seen while idle
+            match rx.recv_timeout(std::time::Duration::from_millis(250)) {
+                Ok(j) => jobs.push(j),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err("the listener thread is gone".into()),
+            }
         }
         jobs.extend(rx.try_iter());
         for job in jobs {
@@ -368,7 +403,7 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
                     Ok((ids, allowed, true)) => {
                         let now = std::time::Instant::now();
                         eprintln!("breccia-server: slot {slot}: spec run handed over after {} tokens ({:.2} s)", ids.len(), (now - t0).as_secs_f64());
-                        live[slot] = Some(Live { reply: q.reply, p, ids, allowed, t0, last: now, gap: 0.0, first: now });
+                        live[slot] = Some(Live { reply: q.reply, gone: q.gone, p, ids, allowed, t0, last: now, gap: 0.0, first: now });
                     }
                     Ok((ids, _, false)) => {
                         b.release(slot);
@@ -385,7 +420,7 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             match b.admit_start(slot, &p.prompt, p.max_tokens) {
                 // a slot still feeding its prompt holds no ids: it joins the steps once fed
                 Ok(Some((tok, allowed))) => {
-                    live[slot] = Some(Live { reply: q.reply, p, ids: tok.into_iter().collect(), allowed, t0: std::time::Instant::now(), last: std::time::Instant::now(), gap: 0.0, first: std::time::Instant::now() });
+                    live[slot] = Some(Live { reply: q.reply, gone: q.gone, p, ids: tok.into_iter().collect(), allowed, t0: std::time::Instant::now(), last: std::time::Instant::now(), gap: 0.0, first: std::time::Instant::now() });
                 }
                 Ok(None) => {
                     q.p = Some(p);
@@ -399,6 +434,7 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
             }
         }
         queue = wait;
+        busy.store(live.iter().flatten().count() + queue.len(), Ordering::Relaxed);
         retire(&mut live, &mut b, ctx);
         // one prompt pass (oldest admission first) per decode step
         let mut feeding: Vec<_> = live
@@ -472,6 +508,44 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
     }
 }
 
+/// Free the slots and queue places of requests whose client hung up (no reply is sent).
+/// shortcut: a `complete_alone` run (spec / image) is not interrupted, upgrade if those get long.
+fn drop_gone<B: Backend>(live: &mut [Option<Live>], queue: &mut VecDeque<Pending>, b: &mut B) {
+    queue.retain(|q| !q.gone.load(Ordering::SeqCst));
+    for (s, slot) in live.iter_mut().enumerate() {
+        if let Some(l) = slot.take_if(|l| l.gone.load(Ordering::SeqCst)) {
+            b.release(s);
+            eprintln!("breccia-server: slot {s}: client went away after {} tokens ({:.2} s), cancelled", l.ids.len(), l.t0.elapsed().as_secs_f64());
+        }
+    }
+}
+
+/// SIGTERM: answer every live, queued and unread request 503 (the router retries the
+/// other serve), let the backend save state, exit 0.
+fn stop<B: Backend>(live: &mut [Option<Live>], queue: VecDeque<Pending>, rx: &mpsc::Receiver<Job>, b: &mut B) -> ! {
+    let t = std::time::Instant::now();
+    let busy = || Response::json(503, json!({"error": {"message": "breccia serve is stopping", "type": "unavailable"}}));
+    let mut n = 0;
+    for (s, slot) in live.iter_mut().enumerate() {
+        if let Some(l) = slot.take() {
+            b.release(s);
+            n += l.reply.send(busy()).is_ok() as usize;
+        }
+    }
+    for q in queue {
+        n += q.reply.send(busy()).is_ok() as usize;
+    }
+    for j in rx.try_iter() {
+        n += j.reply.send(busy()).is_ok() as usize;
+    }
+    eprintln!("breccia-server: SIGTERM, {n} open request(s) answered 503");
+    b.shutdown();
+    // connection threads write the 503s (a spill above usually covers this already)
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    eprintln!("breccia-server: stopped in {:.2} s", t.elapsed().as_secs_f64());
+    std::process::exit(0)
+}
+
 /// Decode share: feed again once decode's time since the last reset reaches `share` of the total.
 fn feed_now(share: Option<f64>, feed_s: f64, step_s: f64) -> bool {
     share.map_or(true, |s| step_s >= feed_s * s / (1.0 - s))
@@ -529,7 +603,7 @@ fn intake<B: Backend>(job: Job, b: &mut B) -> Option<Pending> {
                     })
                 })
             });
-            Some(Pending { reply: job.reply, chat, req, image, p: None })
+            Some(Pending { reply: job.reply, gone: job.gone, chat, req, image, p: None })
         }
         Err(e) => {
             let _ = job.reply.send(Response::json(400, json!({"error": {"message": format!("invalid JSON: {e}")}})));
@@ -538,30 +612,61 @@ fn intake<B: Backend>(job: Job, b: &mut B) -> Option<Pending> {
     }
 }
 
-fn handle_conn(mut stream: TcpStream, name: &str, tx: &mpsc::Sender<Job>, arrived: &AtomicBool) -> Result<(), String> {
+fn handle_conn(mut stream: TcpStream, name: &str, tx: &mpsc::Sender<Job>, arrived: &AtomicBool, busy: &AtomicUsize, slots: usize) -> Result<(), String> {
     let Some((method, path, body)) = read_request(&mut stream)? else {
         return Ok(());
     };
-    let resp = match info_route(&method, path.split('?').next().unwrap_or(&path), name) {
+    if STOP.load(Ordering::SeqCst) {
+        return write_response(&mut stream, &Response::json(503, json!({"error": {"message": "breccia serve is stopping", "type": "unavailable"}})));
+    }
+    let resp = match info_route(&method, path.split('?').next().unwrap_or(&path), name, slots, busy.load(Ordering::Relaxed)) {
         Some(r) => r,
         None => {
             let (reply, done) = mpsc::channel();
+            let gone = Arc::new(AtomicBool::new(false));
             if method == "POST" && path.contains("completions") {
                 arrived.store(true, Ordering::SeqCst); // a running spec request hands over
             }
-            tx.send(Job { method, path, body, reply }).map_err(|_| "the engine thread is gone")?;
-            done.recv().map_err(|_| "the engine dropped the request")?
+            tx.send(Job { method, path, body, reply, gone: gone.clone() }).map_err(|_| "the engine thread is gone")?;
+            loop {
+                match done.recv_timeout(std::time::Duration::from_millis(500)) {
+                    Ok(r) => break r,
+                    Err(mpsc::RecvTimeoutError::Timeout) if client_gone(&stream) => {
+                        gone.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Err("the engine dropped the request".into()),
+                }
+            }
         }
     };
     write_response(&mut stream, &resp)
 }
 
-/// `/health` and `/v1/models`: answered without the engine.
-fn info_route(method: &str, path: &str, name: &str) -> Option<Response> {
+/// The client closed its side or the connection broke. Pipelined bytes count as alive.
+fn client_gone(s: &TcpStream) -> bool {
+    if s.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let r = s.peek(&mut [0u8; 1]);
+    let _ = s.set_nonblocking(false);
+    match r {
+        Ok(n) => n == 0,
+        Err(e) => !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted),
+    }
+}
+
+/// `/health`, `/v1/models`, `/slots`: answered without the engine. `busy` = live + queued requests.
+fn info_route(method: &str, path: &str, name: &str, slots: usize, busy: usize) -> Option<Response> {
     match (method, path) {
         ("GET", "/health") => Some(Response::json(
             200,
             json!({"status": "ok", "model": name, "backend": "breccia"}),
+        )),
+        ("GET", "/slots") => Some(Response::json(
+            200,
+            Value::Array((0..slots).map(|i| json!({"id": i, "is_processing": i < busy})).collect()),
         )),
         ("GET", "/v1/models") => Some(Response::json(
             200,
@@ -574,7 +679,7 @@ fn info_route(method: &str, path: &str, name: &str) -> Option<Response> {
 /// Route one request (exposed so the HTTP surface is testable without a model).
 pub fn dispatch<B: Backend>(method: &str, path: &str, body: &[u8], b: &mut B) -> Response {
     let path = path.split('?').next().unwrap_or(path);
-    if let Some(r) = info_route(method, path, &b.model_name()) {
+    if let Some(r) = info_route(method, path, &b.model_name(), b.slots(), 0) {
         return r;
     }
     match (method, path) {

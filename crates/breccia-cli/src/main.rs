@@ -6253,6 +6253,31 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn context(&self) -> Option<usize> {
         Some(self.ctx)
     }
+    /// SIGTERM: RAM plain prefixes to the disk tier, newest first, so a restart resumes
+    /// them (`disk_promote`); keys already on disk are skipped. `BRECCIA_STOP_SPILL=0` off,
+    /// `BRECCIA_STOP_SPILL_S` (default 25) is the time budget, inside systemd's 60 s stop.
+    fn shutdown(&mut self) {
+        let Some(d) = &mut self.disk else { return };
+        if std::env::var("BRECCIA_STOP_SPILL").is_ok_and(|v| v == "0") {
+            return;
+        }
+        let budget = std::env::var("BRECCIA_STOP_SPILL_S").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(25.0);
+        let t = std::time::Instant::now();
+        let mut plain: Vec<_> = self.text_prefixes.iter().filter_map(|(k, at, tp)| match tp {
+            TextPrefix::Plain(st) => Some((*at, k, st)),
+            TextPrefix::Spec(_) => None,
+        }).collect();
+        plain.sort_by(|a, b| b.0.cmp(&a.0));
+        let total = plain.len();
+        for (i, (_, k, st)) in plain.into_iter().enumerate() {
+            if t.elapsed().as_secs_f64() > budget {
+                println!("prefix   stop spill: budget {budget} s spent, {} of {total} not written", total - i);
+                break;
+            }
+            spill(d, k, st);
+        }
+        println!("prefix   stop spill: {total} RAM prefix(es) checked in {:.2} s", t.elapsed().as_secs_f64());
+    }
 }
 
 impl EngineBackend<'_, '_> {
