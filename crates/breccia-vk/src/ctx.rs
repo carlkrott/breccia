@@ -1156,8 +1156,29 @@ impl Gpu {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(base)
             << 20;
-        g.vram_others0 = g.mem_budget().map_or(0, |b| b.others());
+        g.vram_others0 = g.settled_others();
         Ok(g)
+    }
+
+    /// Other processes' VRAM once a process that just exited has given its share back:
+    /// the kernel frees it after the exit, so a unit restarted at once saw 13.6 GiB
+    /// "held" that was 1.1 GiB a second later, and the guard spilled the weights to host.
+    /// Reads every 250 ms until a read falls less than 64 MiB (at most
+    /// `BRECCIA_VRAM_SETTLE_S`, default 10 s).
+    fn settled_others(&self) -> u64 {
+        let read = || self.mem_budget().map_or(0, |b| b.others());
+        let secs = std::env::var("BRECCIA_VRAM_SETTLE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(10.0f64);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs_f64(secs);
+        let mut last = read();
+        while std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            let now = read();
+            if last.saturating_sub(now) < 64 << 20 {
+                return now;
+            }
+            last = now;
+        }
+        last
     }
 
     /// **VRAM guard**: `Some(why)` when `bytes` more device-local memory would leave
