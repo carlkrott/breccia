@@ -150,6 +150,15 @@ extern "C" fn on_term(_: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
 }
 
+/// When SIGTERM came (to within 20 ms), set by a watcher thread.
+static STOP_AT: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Time since SIGTERM (zero before it): a backend's [`Backend::shutdown`] budget counts from
+/// the signal, not from the end of the engine pass that was running.
+pub fn since_stop() -> std::time::Duration {
+    STOP_AT.get().map_or(std::time::Duration::ZERO, |t| t.elapsed())
+}
+
 pub struct Response {
     pub status: u16,
     pub body: Vec<u8>,
@@ -319,6 +328,12 @@ fn serve_slots<B: Backend>(listener: TcpListener, mut b: B) -> Result<(), String
     let busy_conn = busy.clone();
     // SAFETY: the handler only stores to an atomic (async-signal-safe).
     unsafe { libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t) };
+    std::thread::spawn(|| {
+        while !STOP.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = STOP_AT.set(std::time::Instant::now());
+    });
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             match conn {
@@ -538,11 +553,11 @@ fn stop<B: Backend>(live: &mut [Option<Live>], queue: VecDeque<Pending>, rx: &mp
     for j in rx.try_iter() {
         n += j.reply.send(busy()).is_ok() as usize;
     }
-    eprintln!("breccia-server: SIGTERM, {n} open request(s) answered 503");
+    eprintln!("breccia-server: SIGTERM, {n} open request(s) answered 503 ({:.2} s after the signal)", since_stop().as_secs_f64());
     b.shutdown();
     // connection threads write the 503s (a spill above usually covers this already)
     std::thread::sleep(std::time::Duration::from_millis(200));
-    eprintln!("breccia-server: stopped in {:.2} s", t.elapsed().as_secs_f64());
+    eprintln!("breccia-server: stopped {:.2} s after the signal (engine part {:.2} s)", since_stop().as_secs_f64(), t.elapsed().as_secs_f64());
     std::process::exit(0)
 }
 

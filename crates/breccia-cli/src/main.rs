@@ -6253,15 +6253,18 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
     fn context(&self) -> Option<usize> {
         Some(self.ctx)
     }
-    /// SIGTERM: RAM plain prefixes to the disk tier, newest first, so a restart resumes
-    /// them (`disk_promote`); keys already on disk are skipped. `BRECCIA_STOP_SPILL=0` off,
-    /// `BRECCIA_STOP_SPILL_S` (default 25) is the time budget, inside systemd's 60 s stop.
+    /// SIGTERM: RAM plain prefixes to the disk tier, so a restart resumes them
+    /// (`disk_promote`); keys already on disk are skipped. The newest that fit the budget
+    /// (at ~300 MB/s) are picked, then written oldest first so the disk LRU keeps the newest.
+    /// `BRECCIA_STOP_SPILL=0` off; `BRECCIA_STOP_SPILL_S` (default 25) counts from the
+    /// signal, inside systemd's 60 s stop.
     fn shutdown(&mut self) {
         let Some(d) = &mut self.disk else { return };
         if std::env::var("BRECCIA_STOP_SPILL").is_ok_and(|v| v == "0") {
             return;
         }
         let budget = std::env::var("BRECCIA_STOP_SPILL_S").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(25.0);
+        let left = || budget - breccia_server::since_stop().as_secs_f64();
         let t = std::time::Instant::now();
         let mut plain: Vec<_> = self.text_prefixes.iter().filter_map(|(k, at, tp)| match tp {
             TextPrefix::Plain(st) => Some((*at, k, st)),
@@ -6269,14 +6272,20 @@ impl breccia_server::Backend for EngineBackend<'_, '_> {
         }).collect();
         plain.sort_by(|a, b| b.0.cmp(&a.0));
         let total = plain.len();
-        for (i, (_, k, st)) in plain.into_iter().enumerate() {
-            if t.elapsed().as_secs_f64() > budget {
-                println!("prefix   stop spill: budget {budget} s spent, {} of {total} not written", total - i);
+        let mut bytes = 0.0;
+        plain.retain(|e| {
+            bytes += e.2.bytes() as f64;
+            bytes <= left().max(0.0) * 300e6
+        });
+        let picked = plain.len();
+        for (_, k, st) in plain.into_iter().rev() {
+            if left() <= 0.0 {
+                println!("prefix   stop spill: budget {budget} s spent");
                 break;
             }
             spill(d, k, st);
         }
-        println!("prefix   stop spill: {total} RAM prefix(es) checked in {:.2} s", t.elapsed().as_secs_f64());
+        println!("prefix   stop spill: {picked} of {total} RAM prefix(es) in budget, {:.2} s", t.elapsed().as_secs_f64());
     }
 }
 
