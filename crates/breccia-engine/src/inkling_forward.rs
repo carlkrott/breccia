@@ -22,7 +22,7 @@ use breccia_kernels::ops::{
     ControlWs, GluMode, LowRankControl, RelBias, RmsNorm, Router, RowClip, ShortConv, Sink,
 };
 use breccia_kernels::cpu::{ChunkRoute, ExpertPool, GluAct, LayerPlan};
-use breccia_kernels::{batch_cmd, gemv, proj, GemvBatch, MoeFanIn, QuantType, XLayout};
+use breccia_kernels::{batch_cmd, gemv, proj, GemvBatch, MoeFanIn, MoeMap, QuantType, XLayout};
 use breccia_vk::ctx::{Buf, Gpu};
 
 use crate::inkling::InklingConfig;
@@ -149,6 +149,7 @@ pub struct InklingForward<'g> {
     glu: Glu<'g>,
     router: Router<'g>,
     fanin: MoeFanIn<'g>,
+    moe_map: MoeMap<'g>,
     emb: EmbGather<'g>,
     clip_q: RowClip<'g>,
     clip_q_tau: RowClip<'g>,
@@ -182,7 +183,10 @@ pub struct InklingForward<'g> {
     /// Tokens since the last reload, and experts swapped so far.
     hot_tokens: usize,
     hot_swapped: u64,
+    /// Force the host-built expert maps even where the device path applies (A/B).
+    pub host_maps: bool,
     /// Seconds spent in the CPU lane, in `moe` overall, and in reloads.
+    /// shortcut: public test probe, move behind a stats accessor when serve reports it.
     pub prof: [f64; 3],
 }
 
@@ -274,6 +278,7 @@ impl<'g> InklingForward<'g> {
                 cfg.expert_weights_scale,
             )?,
             fanin: MoeFanIn::new(gpu)?,
+            moe_map: MoeMap::new(gpu)?,
             emb: EmbGather::new(gpu, emb_ty, n)?,
             clip_q: RowClip::new(gpu, hd, h, cfg.qk_clip, None)?,
             clip_q_tau: RowClip::new(gpu, hd, h, cfg.qk_clip, tau)?,
@@ -295,6 +300,7 @@ impl<'g> InklingForward<'g> {
             hot_swaps: HotSwaps { every: 8, max: 32 },
             hot_tokens: 0,
             hot_swapped: 0,
+            host_maps: false,
             prof: [0.0; 3],
             cfg,
         })
@@ -1190,9 +1196,14 @@ impl<'g> InklingForward<'g> {
 
         // readback through staging (recorded into the batch): ids, then for the
         // host lane the weights and x; one pause covers it and every upload below
-        let need = if lane.is_some() { 2 * pairs + t * n } else { pairs };
+        // decode on an all-resident layer: maps built on the device from the ids,
+        // no readback (and no routed counts), so the per-layer host round trip goes
+        let device = lane.is_none() && t == 1 && !self.host_maps;
+        let need = if lane.is_some() { 2 * pairs + t * n } else if device { 0 } else { pairs };
         let mut raw = vec![0u8; need * 4];
-        let open = {
+        let open = if device {
+            false
+        } else {
             let stage = self.stage(t)?;
             let dn = &stage.0;
             let pb = (pairs * 4) as u64;
@@ -1209,7 +1220,7 @@ impl<'g> InklingForward<'g> {
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let sel = &words[..pairs];
+        let sel = &words[..if device { 0 } else { pairs }];
         ensure!(
             sel.iter().all(|&e| (e as usize) < ne),
             "router id out of range"
@@ -1263,7 +1274,13 @@ impl<'g> InklingForward<'g> {
             dn_dims[0] == half && dn_dims[1] == n,
             "ffn_down_exps shape {dn_dims:?}"
         );
-        let gu_map = {
+        let gu_map = if device {
+            self.gemv(gu_ty, gu_rows, cols)?;
+            let g = &self.gemvs[&(gu_ty, gu_rows, cols)];
+            let m = Owned(gpu, gemv::alloc(gpu, (2 * g.rows(pairs) * 4) as u64)?);
+            self.moe_map.run(&ids, &m, g, pairs, 0, false)?;
+            m
+        } else {
             let g = self.gemv(gu_ty, gu_rows, cols)?;
             let words: Vec<u32> = sel.iter().map(|&e| e * g.blob_words()).collect();
             let mut map = g.map_for_blobs(&words, XLayout::PerExpert);
@@ -1276,7 +1293,13 @@ impl<'g> InklingForward<'g> {
             }
             Owned(gpu, gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?)
         };
-        let dn_map = {
+        let dn_map = if device {
+            self.gemv(dn_ty, n, half)?;
+            let g = &self.gemvs[&(dn_ty, n, half)];
+            let m = Owned(gpu, gemv::alloc(gpu, (2 * g.rows(pairs) * 4) as u64)?);
+            self.moe_map.run(&ids, &m, g, pairs, 0, true)?;
+            m
+        } else {
             let g = self.gemv(dn_ty, n, half)?;
             let words: Vec<u32> = sel.iter().map(|&e| e * g.blob_words()).collect();
             let map = g.map_for_blobs(&words, XLayout::PerExpert);
