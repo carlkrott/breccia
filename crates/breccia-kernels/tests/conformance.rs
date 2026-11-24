@@ -110,6 +110,17 @@ fn max_rel(got: &[f32], want: &[f64]) -> f64 {
 }
 
 fn shapes_for(ty: QuantType) -> Vec<(usize, usize)> {
+    // `BRECCIA_SHAPES=3072x2304,64x4608` (rows x cols) replaces the default set,
+    // so a new model's real cells can be checked a few at a time.
+    if let Ok(v) = std::env::var("BRECCIA_SHAPES") {
+        return v
+            .split(',')
+            .map(|s| {
+                let (r, c) = s.trim().split_once('x').expect("BRECCIA_SHAPES: RxC");
+                (r.parse().expect("rows"), c.parse().expect("cols"))
+            })
+            .collect();
+    }
     let qk = ty.block_elems();
     let mut v = vec![(1, qk * 10), (3, qk * 4), (640, 2560), (2560, 640)];
     // Tails: one partial block, and a shape that leaves several whole blocks
