@@ -561,7 +561,7 @@ fn stop<B: Backend>(live: &mut [Option<Live>], queue: VecDeque<Pending>, rx: &mp
 
 /// Decode share: feed again once decode's time since the last reset reaches `share` of the total.
 fn feed_now(share: Option<f64>, feed_s: f64, step_s: f64) -> bool {
-    share.map_or(true, |s| step_s >= feed_s * s / (1.0 - s))
+    share.is_none_or(|s| step_s >= feed_s * s / (1.0 - s))
 }
 
 #[test]

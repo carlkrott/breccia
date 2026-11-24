@@ -1414,7 +1414,7 @@ impl<'g> LowRankControl<'g> {
     /// `n`-wide states, `rank` gate width, RMS eps `eps`. `2n` and `rank` must be
     /// multiples of 8 so the batched GEMV's per-token input stride is the row width.
     pub fn new(gpu: &'g Gpu, n: usize, rank: usize, eps: f32) -> Result<Self> {
-        if n == 0 || rank == 0 || (2 * n) % 8 != 0 || rank % 8 != 0 {
+        if n == 0 || rank == 0 || !(2 * n).is_multiple_of(8) || !rank.is_multiple_of(8) {
             return Err(anyhow!(
                 "low-rank control: n {n}, rank {rank} (2n and rank multiples of 8)"
             ));
@@ -1690,7 +1690,7 @@ impl<'g> Router<'g> {
             n_expert,
             k,
             flags: 0,
-            eps: 6.103_515_625e-05,
+            eps: 6.103_515_6e-5,
             scale: 1.0,
         })
     }

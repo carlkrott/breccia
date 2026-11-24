@@ -18,7 +18,11 @@ use breccia_kernels::{cpu, Device};
 pub fn is_inkling(gguf: &str) -> bool {
     breccia_format::shard::ShardSet::open_glob(gguf)
         .ok()
-        .is_some_and(|s| s.primary().architecture().is_some_and(|a| a.starts_with("inkling")))
+        .is_some_and(|s| {
+            s.primary()
+                .architecture()
+                .is_some_and(|a| a.starts_with("inkling"))
+        })
 }
 
 struct InklingBackend<'g> {
@@ -62,7 +66,11 @@ impl InklingBackend<'_> {
     /// Give `slot` a fresh full-ctx sequence; returns the tokens it may generate.
     fn open(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<usize, String> {
         if prompt.is_empty() || prompt.len() >= self.ctx {
-            return Err(format!("prompt {} tokens, context {}", prompt.len(), self.ctx));
+            return Err(format!(
+                "prompt {} tokens, context {}",
+                prompt.len(),
+                self.ctx
+            ));
         }
         // shortcut: each request allocates its slot's full-ctx KV (a few ms); pool pages
         // across slots when many slots x long ctx stop fitting on the card.
@@ -70,10 +78,20 @@ impl InklingBackend<'_> {
         self.feeds[slot] = None;
         // the VRAM guard would put this slot's KV in host memory (slow steps, ring timeouts): refuse instead
         if let Some(why) = self.gpu.vram_short(self.seq_bytes) {
-            return Err(format!("no VRAM for another {} MiB slot: {why}", self.seq_bytes >> 20));
+            return Err(format!(
+                "no VRAM for another {} MiB slot: {why}",
+                self.seq_bytes >> 20
+            ));
         }
-        self.seqs[slot] = Some(self.fwd.new_seq(self.ctx, self.chunk).map_err(|e| format!("{e:#}"))?);
-        Ok(max_tokens.min(self.max_tokens).min(self.ctx - prompt.len()).max(1))
+        self.seqs[slot] = Some(
+            self.fwd
+                .new_seq(self.ctx, self.chunk)
+                .map_err(|e| format!("{e:#}"))?,
+        );
+        Ok(max_tokens
+            .min(self.max_tokens)
+            .min(self.ctx - prompt.len())
+            .max(1))
     }
 }
 
@@ -120,25 +138,45 @@ impl breccia_server::Backend for InklingBackend<'_> {
     fn slots(&self) -> usize {
         self.seqs.len()
     }
-    fn admit(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
+    fn admit(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        max_tokens: usize,
+    ) -> Result<Option<(u32, usize)>, String> {
         let n = self.open(slot, prompt, max_tokens)?;
         let seq = self.seqs[slot].as_mut().expect("opened");
-        let logits = self.fwd.forward(seq, prompt, None).map_err(|e| format!("{e:#}"))?;
+        let logits = self
+            .fwd
+            .forward(seq, prompt, None)
+            .map_err(|e| format!("{e:#}"))?;
         Ok(Some((argmax(&logits), n)))
     }
-    fn admit_start(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(Option<u32>, usize)>, String> {
+    fn admit_start(
+        &mut self,
+        slot: usize,
+        prompt: &[u32],
+        max_tokens: usize,
+    ) -> Result<Option<(Option<u32>, usize)>, String> {
         if std::env::var("BRECCIA_SERVE_FEED").is_ok_and(|v| v == "0") {
-            return Ok(self.admit(slot, prompt, max_tokens)?.map(|(t, n)| (Some(t), n)));
+            return Ok(self
+                .admit(slot, prompt, max_tokens)?
+                .map(|(t, n)| (Some(t), n)));
         }
         let n = self.open(slot, prompt, max_tokens)?;
         self.feeds[slot] = Some((prompt.to_vec(), 0));
         Ok(Some((None, n)))
     }
     fn feed(&mut self, slot: usize, _decoding: usize) -> Result<Option<u32>, String> {
-        let (ids, off) = self.feeds[slot].take().ok_or("no prompt pass on this slot")?;
+        let (ids, off) = self.feeds[slot]
+            .take()
+            .ok_or("no prompt pass on this slot")?;
         let end = (off + self.chunk).min(ids.len());
         let seq = self.seqs[slot].as_mut().ok_or("slot is not live")?;
-        let logits = self.fwd.forward(seq, &ids[off..end], None).map_err(|e| format!("{e:#}"))?;
+        let logits = self
+            .fwd
+            .forward(seq, &ids[off..end], None)
+            .map_err(|e| format!("{e:#}"))?;
         if end == ids.len() {
             return Ok(Some(argmax(&logits)));
         }
@@ -150,13 +188,21 @@ impl breccia_server::Backend for InklingBackend<'_> {
         slots.iter().map(|&s| self.feed(s, decoding)).collect()
     }
     fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
-        let mut by: Vec<Option<&mut InklingSeq>> = self.seqs.iter_mut().map(Option::as_mut).collect();
+        let mut by: Vec<Option<&mut InklingSeq>> =
+            self.seqs.iter_mut().map(Option::as_mut).collect();
         let mut refs = Vec::with_capacity(rows.len());
         for &(s, _) in rows {
-            refs.push(by.get_mut(s).and_then(Option::take).ok_or_else(|| format!("slot {s} is not live"))?);
+            refs.push(
+                by.get_mut(s)
+                    .and_then(Option::take)
+                    .ok_or_else(|| format!("slot {s} is not live"))?,
+            );
         }
         let ids: Vec<u32> = rows.iter().map(|r| r.1).collect();
-        let logits = self.fwd.forward_batch(&mut refs, &ids, None).map_err(|e| format!("{e:#}"))?;
+        let logits = self
+            .fwd
+            .forward_batch(&mut refs, &ids, None)
+            .map_err(|e| format!("{e:#}"))?;
         Ok(logits.iter().map(|l| argmax(l)).collect())
     }
     fn release(&mut self, slot: usize) {
@@ -169,7 +215,14 @@ impl breccia_server::Backend for InklingBackend<'_> {
 }
 
 /// Serve `gguf` on `device` (a Vulkan selector, e.g. a PCI address).
-pub fn serve(port: u16, gguf: &str, device: Option<&str>, ctx: usize, chunk: usize, max_tokens: usize) -> Result<()> {
+pub fn serve(
+    port: u16,
+    gguf: &str,
+    device: Option<&str>,
+    ctx: usize,
+    chunk: usize,
+    max_tokens: usize,
+) -> Result<()> {
     let dev = Device::open(device).context("opening the Vulkan device")?;
     let shards = Arc::new(ShardSet::open_family(gguf).with_context(|| format!("opening {gguf}"))?);
     let cfg = InklingConfig::from_metadata(&shards.metadata()?)?;
@@ -177,22 +230,42 @@ pub fn serve(port: u16, gguf: &str, device: Option<&str>, ctx: usize, chunk: usi
     let n_layers = cfg.n_layers;
     let mut fwd = InklingForward::new(dev.gpu(), &shards, cfg)?;
     let r = std::env::var("BRECCIA_INKLING_RESIDENT").unwrap_or_default();
-    fwd.set_residency(Residency { dense: r == "dense" || r == "all", experts: r == "all" });
+    fwd.set_residency(Residency {
+        dense: r == "dense" || r == "all",
+        experts: r == "all",
+    });
     let host = match std::env::var("BRECCIA_INKLING_HOST_LAYERS") {
         Ok(s) => layers(&s)?,
         Err(_) => Vec::new(),
     };
-    anyhow::ensure!(host.iter().all(|&l| l < n_layers), "BRECCIA_INKLING_HOST_LAYERS: a layer >= {n_layers}");
+    anyhow::ensure!(
+        host.iter().all(|&l| l < n_layers),
+        "BRECCIA_INKLING_HOST_LAYERS: a layer >= {n_layers}"
+    );
     if !host.is_empty() {
         let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
-        fwd.set_host_experts(cpu::ExpertPool::new(shards.clone(), threads, cpu::path()), &host)?;
+        fwd.set_host_experts(
+            cpu::ExpertPool::new(shards.clone(), threads, cpu::path()),
+            &host,
+        )?;
     }
-    let seqs = std::env::var("BRECCIA_SERVE_SEQS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+    let seqs = std::env::var("BRECCIA_SERVE_SEQS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
     let tok = Tokenizer::from_shards(&shards)?;
     let template = if std::env::var("BRECCIA_JINJA").as_deref() == Ok("1") {
-        let source = shards.primary().metadata_str("tokenizer.chat_template").context("BRECCIA_JINJA=1 but the model has no tokenizer.chat_template")?.to_string();
+        let source = shards
+            .primary()
+            .metadata_str("tokenizer.chat_template")
+            .context("BRECCIA_JINJA=1 but the model has no tokenizer.chat_template")?
+            .to_string();
         let text = |id: Option<u32>| id.map(|i| tok.decode(&[i])).unwrap_or_default();
-        Some(breccia_chat::ChatTemplate::new(&source, &text(tok.bos), &text(tok.eos)).map_err(|e| anyhow::anyhow!("chat template: {e}"))?)
+        Some(
+            breccia_chat::ChatTemplate::new(&source, &text(tok.bos), &text(tok.eos))
+                .map_err(|e| anyhow::anyhow!("chat template: {e}"))?,
+        )
     } else {
         None
     };
@@ -213,16 +286,35 @@ pub fn serve(port: u16, gguf: &str, device: Option<&str>, ctx: usize, chunk: usi
             (seq_bytes * seqs as u64) >> 20
         );
     }
-    println!("inkling  KV {} MiB per slot, {} MiB for {seqs}", seq_bytes >> 20, (seq_bytes * seqs as u64) >> 20);
-    let backend = InklingBackend { gpu: dev.gpu(), seq_bytes, fwd, seqs: (0..seqs).map(|_| None).collect(), feeds: (0..seqs).map(|_| None).collect(), tok, template, ctx, chunk, max_tokens };
-    breccia_server::serve(&format!("127.0.0.1:{port}"), backend).map_err(|e| anyhow::anyhow!("server: {e}"))
+    println!(
+        "inkling  KV {} MiB per slot, {} MiB for {seqs}",
+        seq_bytes >> 20,
+        (seq_bytes * seqs as u64) >> 20
+    );
+    let backend = InklingBackend {
+        gpu: dev.gpu(),
+        seq_bytes,
+        fwd,
+        seqs: (0..seqs).map(|_| None).collect(),
+        feeds: (0..seqs).map(|_| None).collect(),
+        tok,
+        template,
+        ctx,
+        chunk,
+        max_tokens,
+    };
+    breccia_server::serve(&format!("127.0.0.1:{port}"), backend)
+        .map_err(|e| anyhow::anyhow!("server: {e}"))
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn layer_ranges() {
-        assert_eq!(super::layers("0..3, 18,20..22").unwrap(), vec![0, 1, 2, 18, 20, 21]);
+        assert_eq!(
+            super::layers("0..3, 18,20..22").unwrap(),
+            vec![0, 1, 2, 18, 20, 21]
+        );
         assert!(super::layers("x").is_err());
         assert_eq!(super::argmax(&[0.0, 2.0, 1.0, 2.0]), 1);
     }
@@ -232,15 +324,24 @@ mod tests {
     #[test]
     #[ignore]
     fn inkling_template() {
-        let Ok(gguf) = std::env::var("BRECCIA_INKLING_GGUF") else { return };
+        let Ok(gguf) = std::env::var("BRECCIA_INKLING_GGUF") else {
+            return;
+        };
         let shards = breccia_format::ShardSet::open_family(&gguf).unwrap();
         let tok = breccia_format::tokenizer::Tokenizer::from_shards(&shards).unwrap();
-        let source = shards.primary().metadata_str("tokenizer.chat_template").unwrap().to_string();
+        let source = shards
+            .primary()
+            .metadata_str("tokenizer.chat_template")
+            .unwrap()
+            .to_string();
         let text = |id: Option<u32>| id.map(|i| tok.decode(&[i])).unwrap_or_default();
         let t = breccia_chat::ChatTemplate::new(&source, &text(tok.bos), &text(tok.eos)).unwrap();
         let r = t.render(&serde_json::json!({"messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "What is the capital of France?"}]})).unwrap();
         let ids = tok.encode_templated(&r.text, &[]);
-        println!("eos {:?} bos {:?} think_open {}\nTEXT<<{}>>\nIDS {:?}", tok.eos, tok.bos, r.think_open, r.text, ids);
+        println!(
+            "eos {:?} bos {:?} think_open {}\nTEXT<<{}>>\nIDS {:?}",
+            tok.eos, tok.bos, r.think_open, r.text, ids
+        );
         assert_eq!(tok.decode(&ids), r.text);
     }
 }

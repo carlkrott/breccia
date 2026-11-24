@@ -17,14 +17,15 @@ use std::rc::Rc;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use breccia_format::ShardSet;
-use breccia_kernels::ops::{
-    self, Act, ActMode, Add, AttnDense, AttnShape, KvAppend, PagedKv, ControlWeights, DepthMix, EmbGather, Glu,
-    ControlWs, GluMode, LowRankControl, RelBias, RmsNorm, Router, RowClip, ShortConv, Sink,
-};
 use breccia_kernels::cpu::{ChunkRoute, ExpertPool, GluAct, LayerPlan};
 use breccia_kernels::gemm::GemmMany;
-use breccia_kernels::{batch_cmd, gemv, proj, GemvBatch, MoeFanIn, MoeMap, QuantType, XLayout};
+use breccia_kernels::ops::{
+    self, Act, ActMode, Add, AttnDense, AttnShape, ControlWeights, ControlWs, DepthMix, EmbGather,
+    Glu, GluMode, KvAppend, LowRankControl, PagedKv, RelBias, RmsNorm, Router, RowClip, ShortConv,
+    Sink,
+};
 use breccia_kernels::qsa::VLayout;
+use breccia_kernels::{batch_cmd, gemv, proj, GemvBatch, MoeFanIn, MoeMap, QuantType, XLayout};
 use breccia_vk::ctx::{Buf, Gpu};
 
 use crate::inkling::InklingConfig;
@@ -47,7 +48,12 @@ impl Drop for Owned<'_> {
     fn drop(&mut self) {
         if batch_cmd::is_open_on(self.0) {
             let b = &self.1;
-            let dead = Buf { buf: b.buf, mem: b.mem, size: b.size, id: b.id };
+            let dead = Buf {
+                buf: b.buf,
+                mem: b.mem,
+                size: b.size,
+                id: b.id,
+            };
             GRAVE.with(|g| g.borrow_mut().push((key(self.0), dead)));
         } else {
             self.0.destroy_buf(&self.1);
@@ -249,7 +255,12 @@ pub fn hot_pick(heat: &[Vec<u64>], slots: usize) -> Vec<Vec<usize>> {
     let mut all: Vec<(u64, usize, usize)> = heat
         .iter()
         .enumerate()
-        .flat_map(|(l, c)| c.iter().enumerate().filter(|(_, &n)| n > 0).map(move |(e, &n)| (n, l, e)))
+        .flat_map(|(l, c)| {
+            c.iter()
+                .enumerate()
+                .filter(|(_, &n)| n > 0)
+                .map(move |(e, &n)| (n, l, e))
+        })
         .collect();
     all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
     let mut out = vec![Vec::new(); heat.len()];
@@ -294,7 +305,9 @@ impl<'g> InklingForward<'g> {
             attn: AttnDense::new(gpu)?,
             append: KvAppend::new(gpu)?,
             kv_layout: match VLayout::current() {
-                VLayout::Q8_0 => return Err(anyhow!("Inkling KV: BRECCIA_KV=f16|q6 (no q8v build)")),
+                VLayout::Q8_0 => {
+                    return Err(anyhow!("Inkling KV: BRECCIA_KV=f16|q6 (no q8v build)"))
+                }
                 l => l,
             },
             add: Add::new(gpu)?,
@@ -400,8 +413,15 @@ impl<'g> InklingForward<'g> {
         let mut data = Vec::new();
         let mut spans = Vec::new();
         for &(_, l, e, s) in &moves {
-            for (role, name) in ["ffn_gate_up_exps.weight", "ffn_down_exps.weight"].iter().enumerate() {
-                let b = self.shards.tensor(&format!("blk.{l}.{name}")).ok_or_else(|| anyhow!("missing {name}"))?.as_slice();
+            for (role, name) in ["ffn_gate_up_exps.weight", "ffn_down_exps.weight"]
+                .iter()
+                .enumerate()
+            {
+                let b = self
+                    .shards
+                    .tensor(&format!("blk.{l}.{name}"))
+                    .ok_or_else(|| anyhow!("missing {name}"))?
+                    .as_slice();
                 let pe = b.len() / ne;
                 data.extend_from_slice(&b[e * pe..][..pe]);
                 spans.push((l, role, (s * pe) as u64, pe as u64));
@@ -434,15 +454,33 @@ impl<'g> InklingForward<'g> {
     /// [`InklingForward::routed`] of a warm-up run). Misses still run on the
     /// lane; hits run on the GPU and the two are summed. Returns the slots held.
     pub fn set_hot_experts(&mut self, budget: u64, heat: &[Vec<u64>]) -> Result<usize> {
-        ensure!(heat.len() == self.cfg.n_layers, "heat has {} layers", heat.len());
+        ensure!(
+            heat.len() == self.cfg.n_layers,
+            "heat has {} layers",
+            heat.len()
+        );
         let ne = self.cfg.n_expert as u64;
         let bytes = |n: &str| -> Result<&'g [u8]> {
-            let t = self.shards.tensor(n).ok_or_else(|| anyhow!("missing tensor `{n}`"))?;
-            ensure!(t.as_slice().len() as u64 == t.n_bytes() && t.n_bytes() % ne == 0, "`{n}`: bad size");
+            let t = self
+                .shards
+                .tensor(n)
+                .ok_or_else(|| anyhow!("missing tensor `{n}`"))?;
+            ensure!(
+                t.as_slice().len() as u64 == t.n_bytes() && t.n_bytes() % ne == 0,
+                "`{n}`: bad size"
+            );
             Ok(t.as_slice())
         };
-        let names = |l: usize| [format!("blk.{l}.ffn_gate_up_exps.weight"), format!("blk.{l}.ffn_down_exps.weight")];
-        let per = names(0).iter().map(|n| bytes(n).map(|b| b.len() as u64 / ne)).sum::<Result<u64>>()?;
+        let names = |l: usize| {
+            [
+                format!("blk.{l}.ffn_gate_up_exps.weight"),
+                format!("blk.{l}.ffn_down_exps.weight"),
+            ]
+        };
+        let per = names(0)
+            .iter()
+            .map(|n| bytes(n).map(|b| b.len() as u64 / ne))
+            .sum::<Result<u64>>()?;
         let pick = hot_pick(heat, (budget / per) as usize);
         let mut held = 0;
         for (l, es) in pick.into_iter().enumerate() {
@@ -457,7 +495,10 @@ impl<'g> InklingForward<'g> {
             let [gu, dn] = names(l).map(|n| bytes(&n));
             let blobs = |b: &[u8]| -> Vec<u8> {
                 let pe = b.len() / ne as usize;
-                es.iter().flat_map(|&e| &b[e * pe..][..pe]).copied().collect()
+                es.iter()
+                    .flat_map(|&e| &b[e * pe..][..pe])
+                    .copied()
+                    .collect()
             };
             let (gu, dn) = (blobs(gu?), blobs(dn?));
             let mut slot_of = vec![MISS; ne as usize];
@@ -512,9 +553,11 @@ impl<'g> InklingForward<'g> {
                 act,
             )?);
         }
-        self.cache
-            .get_mut()
-            .retain(|name, _| !layers.iter().any(|l| name.starts_with(&format!("blk.{l}.ffn_")) && is_expert(name)));
+        self.cache.get_mut().retain(|name, _| {
+            !layers
+                .iter()
+                .any(|l| name.starts_with(&format!("blk.{l}.ffn_")) && is_expert(name))
+        });
         self.host = Some((pool, plans));
         Ok(())
     }
@@ -547,11 +590,16 @@ impl<'g> InklingForward<'g> {
         if self.stage.borrow().as_ref().is_none_or(|s| s.2 < t) {
             let (kx, n) = (self.cfg.n_expert_used, self.cfg.n_embd);
             let mk = |words: usize| -> Result<Owned<'g>> {
-                Ok(Owned(self.gpu, gemv::staging(self.gpu, (words * 4) as u64)?))
+                Ok(Owned(
+                    self.gpu,
+                    gemv::staging(self.gpu, (words * 4) as u64)?,
+                ))
             };
             *self.stage.borrow_mut() = Some((mk(2 * t * kx + t * n)?, mk(t * n)?, t));
         }
-        Ok(std::cell::Ref::map(self.stage.borrow(), |s| s.as_ref().expect("set above")))
+        Ok(std::cell::Ref::map(self.stage.borrow(), |s| {
+            s.as_ref().expect("set above")
+        }))
     }
 
     /// Raw GGUF bytes of `name` on the device (dims, type).
@@ -610,7 +658,10 @@ impl<'g> InklingForward<'g> {
         let out = self.buf(tokens * rows)?;
         let gpu = self.gpu;
         if std::env::var("BRECCIA_INKLING_GEMM").map_or(true, |v| v != "0") {
-            let g = self.gemm.entry(ty).or_insert_with(|| GemmMany::new(gpu, ty).ok());
+            let g = self
+                .gemm
+                .entry(ty)
+                .or_insert_with(|| GemmMany::new(gpu, ty).ok());
             if let Some(g) = g {
                 // every token count, 1 included: the per-user dot is the same
                 // whatever the batch, so batched decode stays bit-equal to sequential
@@ -754,7 +805,12 @@ impl<'g> InklingForward<'g> {
         let mut total = 0;
         for st in cfg.plan().steps() {
             let cells = self.slot_cells(st.layer, ctx, chunk);
-            let pool = KvAppend::pool_bytes(self.slot_layout(cfg.swa[st.layer]), cells, cfg.n_head_kv, cfg.head_dim)?;
+            let pool = KvAppend::pool_bytes(
+                self.slot_layout(cfg.swa[st.layer]),
+                cells,
+                cfg.n_head_kv,
+                cfg.head_dim,
+            )?;
             let pt = (cells.div_ceil(KvAppend::PAGE_CELLS) * 4) as u64;
             // five buffers per slot, each with the allocator's tail pad
             total += 2 * pool + pt + (cells * 4) as u64 + state + 5 * gemv::TAIL_PAD;
@@ -784,7 +840,8 @@ impl<'g> InklingForward<'g> {
         for &l in &layer_of {
             let ring = cfg.swa[l];
             let cells = self.slot_cells(l, ctx, chunk);
-            let bytes = KvAppend::pool_bytes(self.slot_layout(ring), cells, cfg.n_head_kv, cfg.head_dim)?;
+            let bytes =
+                KvAppend::pool_bytes(self.slot_layout(ring), cells, cfg.n_head_kv, cfg.head_dim)?;
             let pages = cells.div_ceil(KvAppend::PAGE_CELLS) as u32;
             slots.push(SlotKv {
                 k: Owned(self.gpu, gemv::alloc(self.gpu, bytes)?),
@@ -848,7 +905,10 @@ impl<'g> InklingForward<'g> {
         ids: &[u32],
         tap: Option<&mut Tap>,
     ) -> Result<Vec<Vec<f32>>> {
-        ensure!(!seqs.is_empty() && seqs.len() == ids.len(), "one id per stream");
+        ensure!(
+            !seqs.is_empty() && seqs.len() == ids.len(),
+            "one id per stream"
+        );
         for s in seqs.iter() {
             ensure!(s.pos < s.ctx, "context full: {} of {}", s.pos, s.ctx);
         }
@@ -970,7 +1030,12 @@ impl<'g> InklingForward<'g> {
             let streams: Vec<Stream<'_, 'g>> = seqs
                 .iter()
                 .zip(&spans)
-                .map(|(s, &(p0, row0, rows))| Stream { kv: &s.slots[st.slot], p0, row0, rows })
+                .map(|(s, &(p0, row0, rows))| Stream {
+                    kv: &s.slots[st.slot],
+                    p0,
+                    row0,
+                    rows,
+                })
                 .collect();
             cur = self.layer(
                 st.layer,
@@ -999,8 +1064,14 @@ impl<'g> InklingForward<'g> {
         let b = spans.len();
         let last = self.buf(b * n)?;
         for (i, &(_, row0, rows)) in spans.iter().enumerate() {
-            self.norm
-                .run_view(&mixed, (n, (row0 + rows - 1) * n), Some(&g), &last, (n, i * n), 1)?;
+            self.norm.run_view(
+                &mixed,
+                (n, (row0 + rows - 1) * n),
+                Some(&g),
+                &last,
+                (n, i * n),
+                1,
+            )?;
         }
         self.tap(&mut tap, "result_norm", -1, &last, n)?;
         let (logits, rows) = self.proj("output.weight", &last, b)?;
@@ -1011,13 +1082,19 @@ impl<'g> InklingForward<'g> {
         pause(self.gpu)?;
         // head rows can exceed the vocab (padded): logits are [b, rows]
         let all = ops::download_f32(self.gpu, &logits, b * rows)?;
-        Ok(Some(all.chunks(rows).map(|r| r[..cfg.vocab].to_vec()).collect()))
+        Ok(Some(
+            all.chunks(rows).map(|r| r[..cfg.vocab].to_vec()).collect(),
+        ))
     }
 
     /// KV layout of a slot: SWA rings stay f16 (q6 there cost greedy parity for
     /// ~100 MB a stream; ring reads are <= window + chunk cells), full slots follow `BRECCIA_KV`.
     fn slot_layout(&self, ring: bool) -> VLayout {
-        if ring { VLayout::F16 } else { self.kv_layout }
+        if ring {
+            VLayout::F16
+        } else {
+            self.kv_layout
+        }
     }
 
     /// A slot's paged pool view.
@@ -1180,8 +1257,19 @@ impl<'g> InklingForward<'g> {
             let (state, r) = (&*st.kv.state, st.rows);
             self.conv
                 .run_at(state, state_stride, 0, &kp, &kw, k, hk, &kp, kv, r, st.row0)?;
-            self.conv
-                .run_at(state, state_stride, kv, &vp, &vw, k, hv, &vp, kv, r, st.row0)?;
+            self.conv.run_at(
+                state,
+                state_stride,
+                kv,
+                &vp,
+                &vw,
+                k,
+                hv,
+                &vp,
+                kv,
+                r,
+                st.row0,
+            )?;
         }
         drop((dynk, dynv, kw, vw));
 
@@ -1242,8 +1330,18 @@ impl<'g> InklingForward<'g> {
             let live = st.kv.cells.min(st.p0 + st.rows);
             let pkv = self.paged(st.kv);
             let span = (st.row0, st.rows);
-            self.attn
-                .run_paged_at(&shape, &qcur, pos, span, &pkv, &st.kv.kpos, live, Some(&rel), Some(&sink), &kqv)?;
+            self.attn.run_paged_at(
+                &shape,
+                &qcur,
+                pos,
+                span,
+                &pkv,
+                &st.kv.kpos,
+                live,
+                Some(&rel),
+                Some(&sink),
+                &kqv,
+            )?;
         }
         drop((qcur, rcur, sinks, bias));
         self.tap(tap, "kqv_out", s, &kqv, t * qd)?;
@@ -1258,8 +1356,19 @@ impl<'g> InklingForward<'g> {
         self.tap(tap, "attn_wo", s, &wo, tn)?;
         let (pw, ..) = self.weight(&b("attn_post_conv"))?;
         for st in streams {
-            self.conv
-                .run_at(&st.kv.state, state_stride, 2 * kv, &wo, &pw, k, None, &wo, n, st.rows, st.row0)?;
+            self.conv.run_at(
+                &st.kv.state,
+                state_stride,
+                2 * kv,
+                &wo,
+                &pw,
+                k,
+                None,
+                &wo,
+                n,
+                st.rows,
+                st.row0,
+            )?;
         }
         drop(pw);
         self.tap(tap, "attn_out", s, &wo, tn)?;
@@ -1295,8 +1404,19 @@ impl<'g> InklingForward<'g> {
         self.tap(tap, "ffn_moe_out", s, &moe, tn)?;
         let (fw, ..) = self.weight(&b("ffn_post_conv"))?;
         for st in streams {
-            self.conv
-                .run_at(&st.kv.state, state_stride, 2 * kv + n, &moe, &fw, k, None, &moe, n, st.rows, st.row0)?;
+            self.conv.run_at(
+                &st.kv.state,
+                state_stride,
+                2 * kv + n,
+                &moe,
+                &fw,
+                k,
+                None,
+                &moe,
+                n,
+                st.rows,
+                st.row0,
+            )?;
         }
         drop(fw);
         self.tap(tap, "ffn_out", s, &moe, tn)?;
@@ -1336,7 +1456,13 @@ impl<'g> InklingForward<'g> {
         // readback (and no routed counts), so the per-layer host round trip goes
         let grouped = lane.is_none() && self.pf_grouped(layer, t);
         let device = lane.is_none() && !self.host_maps && !grouped;
-        let need = if lane.is_some() { 2 * pairs + t * n } else if device { 0 } else { pairs };
+        let need = if lane.is_some() {
+            2 * pairs + t * n
+        } else if device {
+            0
+        } else {
+            pairs
+        };
         let mut raw = vec![0u8; need * 4];
         let open = if device {
             false
@@ -1396,7 +1522,12 @@ impl<'g> InklingForward<'g> {
             }
             self.hot_stats.0 += hits.len() as u64;
             self.hot_stats.1 += if slot_of.is_some() { pairs as u64 } else { 0 };
-            let lane = Lane { plan, ids: &mid, weights: &mw, x: &xs };
+            let lane = Lane {
+                plan,
+                ids: &mid,
+                weights: &mw,
+                x: &xs,
+            };
             if !hits.is_empty() {
                 return self.moe_hot(layer, x, t, &w, &hits, lane, open);
             }
@@ -1439,7 +1570,10 @@ impl<'g> InklingForward<'g> {
                     map[rows + p * gu_rows + r] = stride * (p / kx) as u32;
                 }
             }
-            Owned(gpu, gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?)
+            Owned(
+                gpu,
+                gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?,
+            )
         };
         let dn_map = if device {
             self.gemv(dn_ty, n, half)?;
@@ -1451,7 +1585,10 @@ impl<'g> InklingForward<'g> {
             let g = self.gemv(dn_ty, n, half)?;
             let words: Vec<u32> = sel.iter().map(|&e| e * g.blob_words()).collect();
             let map = g.map_for_blobs(&words, XLayout::PerExpert);
-            Owned(gpu, gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?)
+            Owned(
+                gpu,
+                gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?,
+            )
         };
         if !self.fan.get_mut().contains_key(&t) {
             let fan = [
@@ -1489,20 +1626,34 @@ impl<'g> InklingForward<'g> {
     /// A multi-token step whose GPU experts can run grouped: both expert types
     /// have a multi-user GEMM. `BRECCIA_INKLING_PF_GROUPED=0` keeps the per-pair GEMV.
     fn pf_grouped(&mut self, layer: usize, t: usize) -> bool {
-        if t < Self::GROUP_MIN || std::env::var("BRECCIA_INKLING_PF_GROUPED").is_ok_and(|v| v == "0") {
+        if t < Self::GROUP_MIN
+            || std::env::var("BRECCIA_INKLING_PF_GROUPED").is_ok_and(|v| v == "0")
+        {
             return false;
         }
         let gpu = self.gpu;
         ["ffn_gate_up_exps", "ffn_down_exps"].iter().all(|r| {
-            Self::ty_of(self.shards, &format!("blk.{layer}.{r}.weight"))
-                .is_ok_and(|ty| self.gemm.entry(ty).or_insert_with(|| GemmMany::new(gpu, ty).ok()).is_some())
+            Self::ty_of(self.shards, &format!("blk.{layer}.{r}.weight")).is_ok_and(|ty| {
+                self.gemm
+                    .entry(ty)
+                    .or_insert_with(|| GemmMany::new(gpu, ty).ok())
+                    .is_some()
+            })
         })
     }
 
     /// Prefill experts as one GEMM per distinct expert (each weight block decoded
     /// once for all its rows) instead of one GEMV row per (token, expert) pair.
     /// Entered with the batch paused (`open`) and the ids read back as `sel`.
-    fn moe_grouped(&mut self, layer: usize, x: &Buf, t: usize, sel: &[u32], wts: &Buf, open: bool) -> Result<Owned<'g>> {
+    fn moe_grouped(
+        &mut self,
+        layer: usize,
+        x: &Buf,
+        t: usize,
+        sel: &[u32],
+        wts: &Buf,
+        open: bool,
+    ) -> Result<Owned<'g>> {
         let (kx, n) = (self.cfg.n_expert_used, self.cfg.n_embd);
         let ne = self.cfg.n_expert;
         let pairs = t * kx;
@@ -1511,14 +1662,27 @@ impl<'g> InklingForward<'g> {
         let (dn_w, dn_dims, dn_ty) = self.weight(&b("ffn_down_exps.weight"))?;
         let (gu_rows, cols) = (gu_dims[1], gu_dims[0]);
         let half = gu_rows / 2;
-        ensure!(cols == n && dn_dims[0] == half && dn_dims[1] == n, "expert shapes {gu_dims:?} {dn_dims:?}");
+        ensure!(
+            cols == n && dn_dims[0] == half && dn_dims[1] == n,
+            "expert shapes {gu_dims:?} {dn_dims:?}"
+        );
         // expert e's blob starts e x (tensor bytes / experts) in, in u16 words
         let words = |name: &str| -> Result<u32> {
-            let bytes = self.shards.tensor(name).ok_or_else(|| anyhow!("missing `{name}`"))?.n_bytes();
-            ensure!(bytes % ne as u64 == 0 && bytes / 2 <= u32::MAX as u64, "`{name}`: {bytes} bytes over {ne} experts");
+            let bytes = self
+                .shards
+                .tensor(name)
+                .ok_or_else(|| anyhow!("missing `{name}`"))?
+                .n_bytes();
+            ensure!(
+                bytes % ne as u64 == 0 && bytes / 2 <= u32::MAX as u64,
+                "`{name}`: {bytes} bytes over {ne} experts"
+            );
             Ok((bytes / ne as u64 / 2) as u32)
         };
-        let (gu_words, dn_words) = (words(&b("ffn_gate_up_exps.weight"))?, words(&b("ffn_down_exps.weight"))?);
+        let (gu_words, dn_words) = (
+            words(&b("ffn_gate_up_exps.weight"))?,
+            words(&b("ffn_down_exps.weight"))?,
+        );
         // pairs sorted by expert (stable): position i holds pair order[i]; slots[p] = its position
         let mut order: Vec<usize> = (0..pairs).collect();
         order.sort_by_key(|&p| sel[p]);
@@ -1569,7 +1733,16 @@ impl<'g> InklingForward<'g> {
         let gu = self.buf(pairs * gu_rows)?;
         let g = self.gemm[&gu_ty].as_ref().expect("checked by pf_grouped");
         for &(e, r, mu) in &groups {
-            g.run_at_off(&gu_w, &xs, &gu, gu_rows, cols, mu, e * gu_words, (r as u64 * nb, (r * gu_rows * 4) as u64))?;
+            g.run_at_off(
+                &gu_w,
+                &xs,
+                &gu,
+                gu_rows,
+                cols,
+                mu,
+                e * gu_words,
+                (r as u64 * nb, (r * gu_rows * 4) as u64),
+            )?;
         }
         drop((gu_w, xs));
         let situ = self.buf(pairs * half)?;
@@ -1578,12 +1751,22 @@ impl<'g> InklingForward<'g> {
         let down = self.buf(pairs * n)?;
         let g = self.gemm[&dn_ty].as_ref().expect("checked by pf_grouped");
         for &(e, r, mu) in &groups {
-            g.run_at_off(&dn_w, &situ, &down, n, half, mu, e * dn_words, ((r * half * 4) as u64, r as u64 * nb))?;
+            g.run_at_off(
+                &dn_w,
+                &situ,
+                &down,
+                n,
+                half,
+                mu,
+                e * dn_words,
+                ((r * half * 4) as u64, r as u64 * nb),
+            )?;
         }
         drop((dn_w, situ));
         let out = self.buf(t * n)?;
         let [_, shared, gate0] = &self.fan.get_mut()[&t];
-        self.fanin.run(&down, &slots, wts, shared, gate0, &out, t, kx, n)?;
+        self.fanin
+            .run(&down, &slots, wts, shared, gate0, &out, t, kx, n)?;
         Ok(out)
     }
 }
@@ -1633,8 +1816,14 @@ impl<'g> InklingForward<'g> {
         if st.len() <= i {
             st.resize_with(i + 1, || None);
         }
-        if st[i].as_ref().is_none_or(|s: &Owned| s.size < b.len() as u64) {
-            st[i] = Some(Owned(self.gpu, gemv::staging(self.gpu, (b.len() as u64).next_power_of_two())?));
+        if st[i]
+            .as_ref()
+            .is_none_or(|s: &Owned| s.size < b.len() as u64)
+        {
+            st[i] = Some(Owned(
+                self.gpu,
+                gemv::staging(self.gpu, (b.len() as u64).next_power_of_two())?,
+            ));
         }
         let s = st[i].as_ref().expect("set above");
         self.gpu.write_host(s, b).map_err(|e| anyhow!("{e}"))?;
@@ -1662,15 +1851,24 @@ impl<'g> InklingForward<'g> {
         let (pairs, h, gpu) = (t * kx, hits.len(), self.gpu);
         let b = |s: &str| format!("blk.{layer}.{s}");
         let dims = |name: &str| -> Result<Vec<usize>> {
-            let t = self.shards.tensor(name).ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
+            let t = self
+                .shards
+                .tensor(name)
+                .ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
             Ok(t.dims().iter().map(|&d| d as usize).collect())
         };
         let (gu_name, dn_name) = (b("ffn_gate_up_exps.weight"), b("ffn_down_exps.weight"));
         let (gu_dims, dn_dims) = (dims(&gu_name)?, dims(&dn_name)?);
-        let (gu_ty, dn_ty) = (Self::ty_of(self.shards, &gu_name)?, Self::ty_of(self.shards, &dn_name)?);
+        let (gu_ty, dn_ty) = (
+            Self::ty_of(self.shards, &gu_name)?,
+            Self::ty_of(self.shards, &dn_name)?,
+        );
         let (gu_rows, cols) = (gu_dims[1], gu_dims[0]);
         let half = gu_rows / 2;
-        ensure!(dn_dims[0] == half && dn_dims[1] == n, "ffn_down_exps shape {dn_dims:?}");
+        ensure!(
+            dn_dims[0] == half && dn_dims[1] == n,
+            "ffn_down_exps shape {dn_dims:?}"
+        );
         let gu_map = {
             let g = self.gemv(gu_ty, gu_rows, cols)?;
             let words: Vec<u32> = hits.iter().map(|&(_, s)| s * g.blob_words()).collect();
@@ -1710,7 +1908,11 @@ impl<'g> InklingForward<'g> {
         self.gemvs[&(dn_ty, n, half)].run(&hl.dn, &situ, &down, &dn_map, h)?;
         // overlap: the hits run while the lane computes the misses. Nothing
         // recorded above may drop before the wait (no batch open to defer it).
-        let seg = if open { Some(batch_cmd::end_submit(gpu, None)?) } else { None };
+        let seg = if open {
+            Some(batch_cmd::end_submit(gpu, None)?)
+        } else {
+            None
+        };
         let lane_out = self.run_lane(lane, t);
         if let Some(seg) = seg {
             batch_cmd::wait(&[gpu], seg)?;
@@ -1723,7 +1925,8 @@ impl<'g> InklingForward<'g> {
         let shared = self.buf(t * n)?;
         gemv::copy_at(gpu, &shared, 0, &self.stage(t)?.1, 0, (t * n * 4) as u64)?;
         let out = self.buf(t * n)?;
-        self.fanin.run(&down, &slots, &wv, &shared, &one, &out, t, kx, n)?;
+        self.fanin
+            .run(&down, &slots, &wv, &shared, &one, &out, t, kx, n)?;
         Ok(out)
     }
 }

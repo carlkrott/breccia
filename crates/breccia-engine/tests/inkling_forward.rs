@@ -103,13 +103,18 @@ fn placed(e: &Env) -> InklingForward<'_> {
         experts: r == "all",
     });
     if std::env::var("BRECCIA_INKLING_HOST").is_ok_and(|v| v == "1") {
-        let pool = cpu::ExpertPool::new(e.shards.clone(), std::thread::available_parallelism().map_or(8, |n| n.get().min(32)), cpu::path());
+        let pool = cpu::ExpertPool::new(
+            e.shards.clone(),
+            std::thread::available_parallelism().map_or(8, |n| n.get().min(32)),
+            cpu::path(),
+        );
         // BRECCIA_INKLING_HOST_LAYERS="0,1,18..24" keeps the other layers' experts on the GPU path
         let layers: Vec<usize> = match std::env::var("BRECCIA_INKLING_HOST_LAYERS") {
             Ok(s) => s
                 .split(',')
                 .flat_map(|p| match p.split_once("..") {
-                    Some((a, b)) => (a.trim().parse().unwrap()..b.trim().parse().unwrap()).collect::<Vec<usize>>(),
+                    Some((a, b)) => (a.trim().parse().unwrap()..b.trim().parse().unwrap())
+                        .collect::<Vec<usize>>(),
                     None => vec![p.trim().parse().unwrap()],
                 })
                 .collect(),
@@ -119,7 +124,12 @@ fn placed(e: &Env) -> InklingForward<'_> {
     }
     // BRECCIA_INKLING_HOST_MAPS=1: resident MoE builds its maps on the host (the pre-11-24 multi-row path)
     fwd.host_maps = std::env::var("BRECCIA_INKLING_HOST_MAPS").is_ok_and(|v| v == "1");
-    eprintln!("placement: resident={r:?} host={:?} layers={:?} host_maps={}", std::env::var("BRECCIA_INKLING_HOST").ok(), std::env::var("BRECCIA_INKLING_HOST_LAYERS").ok(), fwd.host_maps);
+    eprintln!(
+        "placement: resident={r:?} host={:?} layers={:?} host_maps={}",
+        std::env::var("BRECCIA_INKLING_HOST").ok(),
+        std::env::var("BRECCIA_INKLING_HOST_LAYERS").ok(),
+        fwd.host_maps
+    );
     fwd
 }
 
@@ -243,7 +253,11 @@ fn prefill_speed() {
     let ids: Vec<u32> = base.iter().copied().cycle().take(n).collect();
     let mut fwd = placed(&e);
     let mut seq = fwd.new_seq(n + 1, chunk).unwrap();
-    println!("seq {} MiB, process vram before {} MiB", seq.bytes() >> 20, e.dev.gpu().mem_budget().map_or(0, |b| b.usage >> 20));
+    println!(
+        "seq {} MiB, process vram before {} MiB",
+        seq.bytes() >> 20,
+        e.dev.gpu().mem_budget().map_or(0, |b| b.usage >> 20)
+    );
     let t0 = std::time::Instant::now();
     let mut done = 0;
     while done < n {
@@ -253,7 +267,10 @@ fn prefill_speed() {
         if done % (8 * chunk) == 0 || done == n {
             let s = t0.elapsed().as_secs_f64();
             let mib = e.dev.gpu().mem_budget().map_or(0, |b| b.usage >> 20);
-            println!("prefill {done}/{n} tokens: {s:.1} s, {:.0} tok/s, process vram {mib} MiB", done as f64 / s);
+            println!(
+                "prefill {done}/{n} tokens: {s:.1} s, {:.0} tok/s, process vram {mib} MiB",
+                done as f64 / s
+            );
         }
     }
 }
@@ -276,7 +293,12 @@ fn prefill_grouped_parity() {
     };
     let t = std::time::Instant::now();
     let a = fwd.prefill(&ids, Some(&mut rec)).unwrap();
-    eprintln!("per-pair: {} tokens in {:.2} s, {} nodes", ids.len(), t.elapsed().as_secs_f64(), nodes.len());
+    eprintln!(
+        "per-pair: {} tokens in {:.2} s, {} nodes",
+        ids.len(),
+        t.elapsed().as_secs_f64(),
+        nodes.len()
+    );
     std::env::set_var("BRECCIA_INKLING_PF_GROUPED", "1");
     let mut i = 0;
     let mut worst: std::collections::BTreeMap<String, (f64, i32)> = Default::default();
@@ -298,9 +320,20 @@ fn prefill_grouped_parity() {
     for (n, (r, sl)) in &worst {
         eprintln!("  max {n:<24} {r:.3e} (slot {sl})");
     }
-    eprintln!("logits max |d| {:.3e}, argmax {} vs {}", max_abs(&a, &b), argmax(&a), argmax(&b));
-    let (n, (r, _)) = worst.iter().max_by(|x, y| x.1 .0.total_cmp(&y.1 .0)).unwrap();
-    assert!(*r < 1e-4, "grouped prefill: node {n} off by {r:.3e} against the per-pair path");
+    eprintln!(
+        "logits max |d| {:.3e}, argmax {} vs {}",
+        max_abs(&a, &b),
+        argmax(&a),
+        argmax(&b)
+    );
+    let (n, (r, _)) = worst
+        .iter()
+        .max_by(|x, y| x.1 .0.total_cmp(&y.1 .0))
+        .unwrap();
+    assert!(
+        *r < 1e-4,
+        "grouped prefill: node {n} off by {r:.3e} against the per-pair path"
+    );
 }
 
 #[test]
@@ -335,7 +368,11 @@ fn incremental(ids: &[u32], chunk: usize, decode: usize) {
     let fresh = fwd.prefill(ids, None).unwrap();
     let t1 = t0.elapsed().as_secs_f64();
     let mut seq = fwd.new_seq(ids.len(), chunk).unwrap();
-    assert_eq!(seq.bytes(), fwd.seq_bytes(ids.len(), chunk).unwrap(), "seq_bytes drifted from new_seq");
+    assert_eq!(
+        seq.bytes(),
+        fwd.seq_bytes(ids.len(), chunk).unwrap(),
+        "seq_bytes drifted from new_seq"
+    );
     let split = ids.len() - decode;
     let mut l = fwd.forward(&mut seq, &ids[..split], None).unwrap();
     for &id in &ids[split..] {
@@ -379,7 +416,11 @@ fn incremental_long() {
     let ids = long_prompt();
     if ids.len() >= 1100 {
         let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
-        incremental(&ids[..env("INC_N", 1100)], env("INC_CHUNK", 64), env("INC_DEC", 4));
+        incremental(
+            &ids[..env("INC_N", 1100)],
+            env("INC_CHUNK", 64),
+            env("INC_DEC", 4),
+        );
     }
 }
 
@@ -495,7 +536,10 @@ fn expert_skew() {
         .map(|s| e.shards.tensor(&format!("blk.6.{s}")).unwrap().n_bytes())
         .sum::<u64>()
         / e.cfg.n_expert as u64;
-    eprintln!("bytes per expert {per} ({:.2} MiB)", per as f64 / (1 << 20) as f64);
+    eprintln!(
+        "bytes per expert {per} ({:.2} MiB)",
+        per as f64 / (1 << 20) as f64
+    );
     let prompt = long_prompt();
     let mut fwd = placed(&e);
     let mut seq = fwd.new_seq(prompt.len() + 64, 512).unwrap();
@@ -514,7 +558,12 @@ fn expert_skew() {
             .map(|p| v[..v.len() * p / 100].iter().sum::<u64>() as f64 / tot)
             .collect()
     };
-    let fmt = |v: Vec<f64>| v.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(" ");
+    let fmt = |v: Vec<f64>| {
+        v.iter()
+            .map(|x| format!("{:.2}", x))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     let (mut dsum, mut dtot) = (vec![0f64; 4], 0u64);
     for (layer, (all, p)) in fwd.routed().iter().zip(&pre).enumerate() {
         let dec: Vec<u64> = all.iter().zip(p).map(|(a, b)| a - b).collect();
@@ -524,9 +573,16 @@ fn expert_skew() {
             *s += x * n as f64;
         }
         dtot += n;
-        eprintln!("layer {layer:2}: prefill {} | decode {} ({n} picks)", fmt(cover(p)), fmt(c));
+        eprintln!(
+            "layer {layer:2}: prefill {} | decode {} ({n} picks)",
+            fmt(cover(p)),
+            fmt(c)
+        );
     }
-    eprintln!("decode weighted top10/20/30/50%: {}", fmt(dsum.iter().map(|s| s / dtot as f64).collect()));
+    eprintln!(
+        "decode weighted top10/20/30/50%: {}",
+        fmt(dsum.iter().map(|s| s / dtot as f64).collect())
+    );
 }
 
 /// Hot pool on top of the CPU lane: seeded from the long prompt's routed
@@ -540,7 +596,11 @@ fn hot_mixed() {
         return;
     };
     let s = std::fs::read_to_string(e.golden.join("greedy-32.txt")).expect("greedy-32.txt");
-    let want: Vec<u32> = s.trim().split(',').map(|x| x.trim().parse().unwrap()).collect();
+    let want: Vec<u32> = s
+        .trim()
+        .split(',')
+        .map(|x| x.trim().parse().unwrap())
+        .collect();
     let mut fwd = placed(&e);
     // the lane must cover every layer the pool may pick
     if std::env::var("BRECCIA_INKLING_HOST").ok().as_deref() != Some("1") {
@@ -551,18 +611,31 @@ fn hot_mixed() {
     let mut warm = fwd.new_seq(prompt.len(), 512).unwrap();
     fwd.forward(&mut warm, &prompt, None).unwrap();
     drop(warm);
-    let mib: u64 = std::env::var("BRECCIA_INKLING_HOT_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    let mib: u64 = std::env::var("BRECCIA_INKLING_HOT_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024);
     let heat = fwd.routed().to_vec();
     let held = fwd.set_hot_experts(mib << 20, &heat).unwrap();
-    let per_layer: Vec<usize> = breccia_engine::inkling_forward::hot_pick(&heat, held).iter().map(Vec::len).collect();
+    let per_layer: Vec<usize> = breccia_engine::inkling_forward::hot_pick(&heat, held)
+        .iter()
+        .map(Vec::len)
+        .collect();
     eprintln!("hot pool: {held} experts in {mib} MiB, per layer {per_layer:?}");
 
-    let every: usize = std::env::var("BRECCIA_INKLING_HOT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let every: usize = std::env::var("BRECCIA_INKLING_HOT_EVERY")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
     let mut runs = Vec::new();
     for pass in 0..3 {
         // passes 0/1 frozen (determinism gate), pass 2 with swaps
         let frozen = breccia_engine::inkling_forward::HotSwaps { every: 0, max: 32 };
-        fwd.set_hot_swaps(if pass < 2 { frozen } else { breccia_engine::inkling_forward::HotSwaps { every, max: 32 } });
+        fwd.set_hot_swaps(if pass < 2 {
+            frozen
+        } else {
+            breccia_engine::inkling_forward::HotSwaps { every, max: 32 }
+        });
         let before = fwd.hot_stats();
         fwd.prof = [0.0; 3];
         let mut seq = fwd.new_seq(PROMPT.len() + want.len(), 64).unwrap();
@@ -585,10 +658,18 @@ fn hot_mixed() {
         let (h, r) = fwd.hot_stats();
         let rate = (h - before.0) as f64 / (r - before.1).max(1) as f64;
         eprintln!("pass {pass}: {}/{} greedy match; decode {dt:.3} s/token; hit rate {rate:.2}; swapped {}", got.len(), want.len(), fwd.hot_swapped());
-        eprintln!("  prof (s, whole pass): cpu lane {:.2}, moe {:.2}, reload {:.2}", fwd.prof[0], fwd.prof[1], fwd.prof[2]);
+        eprintln!(
+            "  prof (s, whole pass): cpu lane {:.2}, moe {:.2}, reload {:.2}",
+            fwd.prof[0], fwd.prof[1], fwd.prof[2]
+        );
         runs.push(logits);
     }
-    assert!(runs[0].len() == runs[1].len() && runs[0].len() > 1 && runs[0].iter().zip(&runs[1]).all(|(a, b)| a == b), "hot pool not deterministic");
+    assert!(
+        runs[0].len() == runs[1].len()
+            && runs[0].len() > 1
+            && runs[0].iter().zip(&runs[1]).all(|(a, b)| a == b),
+        "hot pool not deterministic"
+    );
 }
 
 /// Debug: per-slot taps of the last chunk, incremental vs fresh (`INC_N`, `INC_CHUNK`).
@@ -624,16 +705,26 @@ fn incremental_taps() {
     }
     eprintln!("last chunk {last}..{n} ({t} tokens)");
     for (name, slot, d) in &inc {
-        let Some((_, _, f)) = fresh.iter().find(|(fname, fs, _)| fname == name && fs == slot) else { continue };
+        let Some((_, _, f)) = fresh
+            .iter()
+            .find(|(fname, fs, _)| fname == name && fs == slot)
+        else {
+            continue;
+        };
         let w = d.len() / t;
         if w == 0 || f.len() != w * n {
             continue;
         }
         let tail = &f[last * w..];
-        let rows: Vec<f32> = (0..t).map(|r| max_abs(&d[r * w..(r + 1) * w], &tail[r * w..(r + 1) * w])).collect();
+        let rows: Vec<f32> = (0..t)
+            .map(|r| max_abs(&d[r * w..(r + 1) * w], &tail[r * w..(r + 1) * w]))
+            .collect();
         let m = rows.iter().cloned().fold(0f32, f32::max);
         if m > 1e-4 {
-            eprintln!("  {name:<14} slot {slot:2}  max {m:.3e}  per row {:?}", rows.iter().map(|x| format!("{x:.1e}")).collect::<Vec<_>>());
+            eprintln!(
+                "  {name:<14} slot {slot:2}  max {m:.3e}  per row {:?}",
+                rows.iter().map(|x| format!("{x:.1e}")).collect::<Vec<_>>()
+            );
         }
     }
 }
@@ -652,11 +743,21 @@ fn lane_bench() {
     let cfg = InklingConfig::from_metadata(&shards.metadata().unwrap()).expect("config");
     let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
     let mut pool = cpu::ExpertPool::new(shards.clone(), threads, cpu::path());
-    let act = cpu::GluAct::Situ { beta: cfg.situ_beta, lb: cfg.situ_linear_beta };
+    let act = cpu::GluAct::Situ {
+        beta: cfg.situ_beta,
+        lb: cfg.situ_linear_beta,
+    };
     let plans: Vec<cpu::LayerPlan> = (0..cfg.n_layers)
         .map(|l| {
             let t = |s: &str| shards.tensor(&format!("blk.{l}.{s}")).unwrap();
-            cpu::LayerPlan::merged(&shards, l, &t("ffn_gate_up_exps.weight"), &t("ffn_down_exps.weight"), act).unwrap()
+            cpu::LayerPlan::merged(
+                &shards,
+                l,
+                &t("ffn_gate_up_exps.weight"),
+                &t("ffn_down_exps.weight"),
+                act,
+            )
+            .unwrap()
         })
         .collect();
     let (ne, k, n) = (cfg.n_expert, cfg.n_expert_used, cfg.n_embd);
@@ -671,7 +772,8 @@ fn lane_bench() {
     // warm the page cache once over every layer
     for p in &plans {
         let ids: Vec<usize> = (0..k).collect();
-        pool.moe_topk(p, &ids, &vec![0.1; k], &vec![0.01; n], &mut vec![0.0; n]).unwrap();
+        pool.moe_topk(p, &ids, &vec![0.1; k], &vec![0.01; n], &mut vec![0.0; n])
+            .unwrap();
     }
     for t in ts.split(',').map(|s| s.trim().parse::<usize>().unwrap()) {
         let x = vec![0.01f32; t * n];
@@ -692,7 +794,13 @@ fn lane_bench() {
                     })
                     .collect();
                 let w = vec![1.0 / k as f32; k];
-                let routes: Vec<cpu::ChunkRoute> = ids.iter().map(|i| cpu::ChunkRoute { ids: i, weights: &w }).collect();
+                let routes: Vec<cpu::ChunkRoute> = ids
+                    .iter()
+                    .map(|i| cpu::ChunkRoute {
+                        ids: i,
+                        weights: &w,
+                    })
+                    .collect();
                 let mut all: Vec<usize> = ids.concat();
                 all.sort_unstable();
                 all.dedup();
@@ -743,7 +851,11 @@ fn rows_timing() {
             fwd.forward(&mut seq, &ids, None).unwrap();
         }
         let s = t0.elapsed().as_secs_f64() / reps as f64;
-        eprintln!("rows T={t}: {:.1} ms per forward, {:.2} ms per row", 1e3 * s, 1e3 * s / t as f64);
+        eprintln!(
+            "rows T={t}: {:.1} ms per forward, {:.2} ms per row",
+            1e3 * s,
+            1e3 * s / t as f64
+        );
     }
 }
 
@@ -754,12 +866,18 @@ fn tap_diff(got: &[(String, i32, Vec<f32>)], want: &[Vec<(String, i32, Vec<f32>)
     let mut shown = 0;
     for (k, (name, slot, g)) in got.iter().enumerate() {
         for (i, w) in want.iter().enumerate() {
-            let Some((wn, ws, wv)) = w.get(k) else { continue };
+            let Some((wn, ws, wv)) = w.get(k) else {
+                continue;
+            };
             if wn != name || ws != slot {
                 eprintln!("tap order differs at {k}: {name}/{slot} vs {wn}/{ws}");
                 return;
             }
-            let row = if g.len() == b * wv.len() { &g[i * wv.len()..][..wv.len()] } else { &g[..wv.len().min(g.len())] };
+            let row = if g.len() == b * wv.len() {
+                &g[i * wv.len()..][..wv.len()]
+            } else {
+                &g[..wv.len().min(g.len())]
+            };
             let d = max_abs(row, &wv[..row.len()]);
             let m = wv.iter().fold(0f32, |a, x| a.max(x.abs()));
             if d > 1e-3 * m.max(1.0) && shown < 12 {
@@ -783,12 +901,16 @@ fn batch_decode() {
     };
     let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
     let (b, n) = (env("BATCH_B", 3), env("BATCH_N", 6));
-    let prompts: Vec<&[u32]> = (0..b).map(|i| &PROMPT[..PROMPT.len() - (i * 4) % 10]).collect();
+    let prompts: Vec<&[u32]> = (0..b)
+        .map(|i| &PROMPT[..PROMPT.len() - (i * 4) % 10])
+        .collect();
     // BATCH_CTX / BATCH_CHUNK: size slots like a server does (decode must not scale with them)
     let ctx = env("BATCH_CTX", PROMPT.len() + n + 1);
     let mut fwd = placed(&e);
 
-    let mut seqs: Vec<_> = (0..b).map(|_| fwd.new_seq(ctx, env("BATCH_CHUNK", 64)).unwrap()).collect();
+    let mut seqs: Vec<_> = (0..b)
+        .map(|_| fwd.new_seq(ctx, env("BATCH_CHUNK", 64)).unwrap())
+        .collect();
     let mut last: Vec<Vec<f32>> = prompts
         .iter()
         .zip(&mut seqs)
@@ -859,7 +981,10 @@ fn batch_decode() {
             let d = max_abs(g, w);
             worst = worst.max(d);
             assert_eq!(argmax(g), argmax(w), "step {step} stream {i}: argmax");
-            assert!(d <= tol, "step {step} stream {i}: max |dlogit| {d:.3e} over {tol:.0e}");
+            assert!(
+                d <= tol,
+                "step {step} stream {i}: max |dlogit| {d:.3e} over {tol:.0e}"
+            );
         }
     }
     let bat_s = t0.elapsed().as_secs_f64();
@@ -874,7 +999,10 @@ fn batch_decode() {
         toks / seq_s,
         toks / bat_s
     );
-    for (name, st, wall, per) in [("sequential", seq_st, seq_s, toks), ("batched", bat_st, bat_s, timed)] {
+    for (name, st, wall, per) in [
+        ("sequential", seq_st, seq_s, toks),
+        ("batched", bat_st, bat_s, timed),
+    ] {
         eprintln!(
             "  {name} per step: {:.1} ms wall, {:.1} ms fence wait, {:.1} submits, {:.1} waits",
             1e3 * wall / per,

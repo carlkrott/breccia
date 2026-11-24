@@ -1960,6 +1960,7 @@ fn inkling_rel_attn() {
     // (heads, kv_heads, hd, qpos, kpos, window, rel (rel_dim, extent), sink)
     let mut worst_ref = 0.0f64;
     let empty_kpos: Vec<i32> = (0..300).map(|j| if j % 37 == 5 { -1 } else { j }).collect();
+    #[allow(clippy::type_complexity)]
     let cases: Vec<(
         usize,
         usize,
