@@ -1048,6 +1048,12 @@ fn inkling_tanh_cap_and_row_clip() {
         let rel = max_rel(&got, &as_f64(&want));
         assert!(rel <= 1e-5, "row clip {label}: {rel:e} > 1e-5");
         println!("row_clip {label} {cols}x{heads}x{t} max rel {rel:.2e}");
+        // in place (out aliases x), as the engine will call it
+        clip.run(&xb, scaled.then_some(&sb), tau.then_some(&pb), &xb, t)
+            .expect("run in place");
+        let got = ops::download_f32(gpu, &xb, x.len()).expect("read");
+        let rel = max_rel(&got, &as_f64(&want));
+        assert!(rel <= 1e-5, "row clip {label} in place: {rel:e} > 1e-5");
         for b in [&xb, &sb, &ob] {
             gpu.destroy_buf(b);
         }
