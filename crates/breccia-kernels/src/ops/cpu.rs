@@ -366,6 +366,49 @@ pub fn sigmoid_vec(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| sigmoid(f64::from(*v)) as f32).collect()
 }
 
+/// `out[i] = s * tanh(x[i] / s)` (ggml `scale(tanh(scale(x, 1/s)), s)`).
+pub fn tanh_cap(x: &[f32], s: f32) -> Vec<f32> {
+    let s = f64::from(s);
+    x.iter()
+        .map(|v| (s * (f64::from(*v) / s).tanh()) as f32)
+        .collect()
+}
+
+/// Inkling log-position scale: `1 + alpha * ln(max(1, (pos + 1) / floor))`.
+pub fn inkling_tau(pos: i32, floor: f32, alpha: f32) -> f64 {
+    let t = ((f64::from(pos) + 1.0) / f64::from(floor)).max(1.0);
+    1.0 + f64::from(alpha) * t.ln()
+}
+
+/// Mirrors `ops_row_clip.comp`: rows of `cols` in `[cols, heads, T]` order,
+/// optional `[cols, heads]` scale, L2 clip to `thr` (norm + 1e-6), optional
+/// tau from `pos` (one per token) with `(floor, alpha)`.
+pub fn row_clip(
+    x: &[f32],
+    cols: usize,
+    heads: usize,
+    scale: Option<&[f32]>,
+    thr: f32,
+    tau: Option<(&[i32], f32, f32)>,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(x.len());
+    for (r, row) in x.chunks(cols).enumerate() {
+        let h = r % heads;
+        let v: Vec<f64> = row
+            .iter()
+            .enumerate()
+            .map(|(c, &a)| f64::from(a) * scale.map_or(1.0, |s| f64::from(s[h * cols + c])))
+            .collect();
+        let norm = v.iter().map(|a| a * a).sum::<f64>().sqrt() + 1e-6;
+        let mut f = (f64::from(thr) / norm).clamp(0.0, 1.0);
+        if let Some((pos, floor, alpha)) = tau {
+            f *= inkling_tau(pos[r / heads], floor, alpha);
+        }
+        out.extend(v.iter().map(|a| (a * f) as f32));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,6 @@
 #version 450
 //
-// Elementwise activation/rescale: one shader, five modes.
+// Elementwise activation/rescale: one shader, six modes.
 //
 // Built for the HC mixer (`docs/specs/qwen4exp-architecture.md` §4.1):
 //
@@ -15,6 +15,10 @@
 //   out = silu(x) * s    mode SiluScale
 //   out = sigmoid(x)     mode Sigmoid  (attention output gate, GDN output gate,
 //                                      GDN beta, the PLE signed-sqrt result)
+//
+//   out = s * tanh(x / s) mode TanhCap (Inkling: s = 1 is plain tanh for the
+//                                      loop gain/forget, s = 30 the final logit
+//                                      softcap, s = beta/linear_beta the SITU parts)
 //
 // The DIVIDE BEFORE THE SiLU is not a detail: `silu(x/hc)` and `silu(x)/hc`
 // differ, and §4.1 writes `silu( (xn @ w_down.T) / hc )`.  `s` is the divisor in
@@ -41,6 +45,7 @@ layout(push_constant) uniform Params {
 #define MODE_SIGMOID 2u
 #define MODE_SCALE 3u
 #define MODE_SILU_SCALE 4u
+#define MODE_TANH_CAP 5u
 
 void main() {
     uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
@@ -58,6 +63,8 @@ void main() {
         y = breccia_sigmoid(x);
     } else if (pc.mode == MODE_SCALE) {
         y = x * pc.s;
+    } else if (pc.mode == MODE_TANH_CAP) {
+        y = pc.s * breccia_tanh(x / pc.s);
     } else {
         y = breccia_silu(x) * pc.s;
     }

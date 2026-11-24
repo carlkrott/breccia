@@ -35,4 +35,19 @@ float breccia_silu(float x) {
     return x * breccia_sigmoid(x);
 }
 
+// tanh, with ggml's semantics (`tanhf`, ggml/src/ggml-cpu/vec.h ggml_vec_tanh_f32).
+// GLSL `tanh` has no precision bound in Vulkan, so: odd Taylor polynomial for
+// |x| < 0.25 (next term < 1e-8 relative), else (1 - e)/(1 + e) with
+// e = exp(-2|x|) <= 0.61, which has no cancellation and no overflow.
+float breccia_tanh(float x) {
+    float a = abs(x);
+    if (a < 0.25) {
+        float x2 = x * x;
+        return x * (1.0 + x2 * (-1.0 / 3.0 + x2 * (2.0 / 15.0 + x2 * (-17.0 / 315.0 + x2 * (62.0 / 2835.0)))));
+    }
+    float e = exp(-2.0 * a);
+    float t = (1.0 - e) / (1.0 + e);
+    return x < 0.0 ? -t : t;
+}
+
 #endif // BRECCIA_OPS_MATH_GLSL

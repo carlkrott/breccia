@@ -1,0 +1,72 @@
+#version 450
+//
+// Row L2 clip with optional per-channel scale and optional log-position tau
+// (Inkling q/k/rel clip, `docs/specs/inkling2-loop-port.md` S4).
+//
+// ggml reference (llama.cpp src/models/inkling2.cpp `clip` and the tau block):
+//
+//   x      = x * scale[h][c]                        if has_scale (scale is [cols, heads])
+//   norm   = sqrt(sum_c x^2) + 1e-6
+//   y      = x * clamp(thr / norm, 0, 1)
+//   y      = y * tau(pos[t])                        if tau on (full-attention q and r)
+//   tau(p) = 1 + alpha * log(max(1, (p + 1) * floor_inv))
+//
+// Rows are `[cols, heads, T]` flattened: row r is head r % heads of token
+// r / heads. One workgroup per row, rows wrapped over grid.y.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer XVec { float X[]; };
+layout(std430, binding = 1) readonly buffer SVec { float S[]; };
+layout(std430, binding = 2) readonly buffer PVec { int POS[]; };
+layout(std430, binding = 3) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint  rows;
+    uint  cols;      // <= 256
+    uint  heads;     // rows per token
+    uint  flags;     // bit 0: has_scale, bit 1: tau
+    float thr;
+    float floor_inv;
+    float alpha;
+    uint  pad0;
+} pc;
+
+#define WG_X_MAX 65535u
+shared float s_red[256];
+
+void main() {
+    uint row = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (row >= pc.rows) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.cols;
+    bool on = tid < pc.cols;
+
+    float v = 0.0;
+    if (on) {
+        v = X[base + tid];
+        if ((pc.flags & 1u) != 0u) {
+            v *= S[(row % pc.heads) * pc.cols + tid];
+        }
+    }
+    s_red[tid] = v * v;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_red[tid] += s_red[tid + off];
+        }
+        barrier();
+    }
+    if (!on) {
+        return;
+    }
+    float norm = sqrt(s_red[0]) + 1e-6;
+    float y = v * clamp(pc.thr / norm, 0.0, 1.0);
+    if ((pc.flags & 2u) != 0u) {
+        float t = max((float(POS[row / pc.heads]) + 1.0) * pc.floor_inv, 1.0);
+        y *= log(t) * pc.alpha + 1.0;
+    }
+    O[base + tid] = y;
+}

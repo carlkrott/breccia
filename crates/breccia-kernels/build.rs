@@ -85,6 +85,7 @@ const SHADERS: &[&str] = &[
     "ops_softmax",
     "ops_router",
     "ops_act",
+    "ops_row_clip",
     "ops_add",
     "ops_hc_gated_mean",
     "ops_hc_write",

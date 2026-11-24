@@ -16,7 +16,8 @@
 //! | [`Router`] | `ops_router.comp` | §5.4/§8 (softmax(all) → top-10 → `max(sum, 2^-14)`) |
 //! | [`EmbGather`] | `ops_gather_<type>.comp` | §6.5, §9.1 (`token_embd` IQ3_S, PLE IQ4_NL) |
 //! | [`HcMixer`] | `ops_hc_*.comp` + [`crate::GemvBatch`] | §4.1 (HC_READ / HC_WRITE, `hc = 4`, `hc_lr = 320`) |
-//! | [`Act`] | `ops_act.comp` | §4.1 (`silu(x/hc)`), §14 (sigmoid gates) |
+//! | [`Act`] | `ops_act.comp` | §4.1 (`silu(x/hc)`), §14 (sigmoid gates); `TanhCap` = Inkling tanh/softcap |
+//! | [`RowClip`] | `ops_row_clip.comp` | `docs/specs/inkling2-loop-port.md` S4 (q/k/rel clip + tau) |
 //! | [`Add`] | `ops_add.comp` | residual plumbing (§4.0) |
 //!
 //! # Calling convention
@@ -1213,7 +1214,7 @@ pub const MODEL_HC: usize = 4;
 /// Hyper-connection bottleneck rank (`hyper_connection.low_rank = 320`).
 pub const MODEL_HC_LR: usize = 320;
 
-/// The five elementwise modes of `ops_act.comp`.
+/// The six elementwise modes of `ops_act.comp`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActMode {
     /// `out = silu(x)`.
@@ -1226,6 +1227,9 @@ pub enum ActMode {
     Scale,
     /// `out = silu(x) * s`.
     SiluScale,
+    /// `out = s * tanh(x / s)`: plain tanh at `s = 1`, Inkling's logit softcap
+    /// at `s = 30`.
+    TanhCap,
 }
 
 impl ActMode {
@@ -1236,6 +1240,7 @@ impl ActMode {
             ActMode::Sigmoid => 2,
             ActMode::Scale => 3,
             ActMode::SiluScale => 4,
+            ActMode::TanhCap => 5,
         }
     }
 
@@ -1246,6 +1251,7 @@ impl ActMode {
             ActMode::Sigmoid => "sigmoid",
             ActMode::Scale => "scale",
             ActMode::SiluScale => "silu_scale",
+            ActMode::TanhCap => "tanh_cap",
         }
     }
 }
@@ -1313,6 +1319,100 @@ impl<'g> Act<'g> {
         }
         let (bufs, pc, grid) = self.launch(x, out, n, s);
         self.pipe.run_timed(&bufs, &pc, grid, target_s)
+    }
+}
+
+/// Row L2 clip (Inkling q/k/rel, `ops_row_clip.comp`): per row of `cols`
+/// values, optional per-channel `scale` (`[cols, heads]`), clip the L2 norm to
+/// `thr`, then optionally multiply by `tau(pos)`, the log-position scale of the
+/// full-attention layers. Rows are `[cols, heads, T]` flattened.
+pub struct RowClip<'g> {
+    pipe: Pipe<'g>,
+    cols: usize,
+    heads: usize,
+    thr: f32,
+    /// `Some((floor, alpha))` multiplies by tau.
+    tau: Option<(f32, f32)>,
+    /// Bound in place of the absent scale / positions.
+    dummy: Buf,
+}
+
+impl<'g> RowClip<'g> {
+    pub fn new(
+        gpu: &'g Gpu,
+        cols: usize,
+        heads: usize,
+        thr: f32,
+        tau: Option<(f32, f32)>,
+    ) -> Result<Self> {
+        if cols == 0 || cols > 256 || heads == 0 {
+            return Err(anyhow!("row clip needs 0 < cols <= 256 and heads > 0"));
+        }
+        let pipe = Pipe::new(
+            gpu,
+            include_bytes!(concat!(env!("OUT_DIR"), "/ops_row_clip.spv")),
+            4,
+            "row_clip",
+        )?;
+        let dummy = match empty_buf(gpu, "row clip dummy") {
+            Ok(b) => b,
+            Err(e) => {
+                drop(pipe);
+                return Err(e);
+            }
+        };
+        Ok(RowClip {
+            pipe,
+            cols,
+            heads,
+            thr,
+            tau,
+            dummy,
+        })
+    }
+
+    /// Clip `tokens * heads` rows. `scale` is `[cols, heads]` or `None`; `pos`
+    /// (one int32 per token) is required iff the pipeline has tau. `out` may
+    /// alias `x`.
+    pub fn run(
+        &self,
+        x: &Buf,
+        scale: Option<&Buf>,
+        pos: Option<&Buf>,
+        out: &Buf,
+        tokens: usize,
+    ) -> Result<()> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        if self.tau.is_some() != pos.is_some() {
+            return Err(anyhow!("row clip: pos must be given iff tau is on"));
+        }
+        let rows = tokens * self.heads;
+        let (floor, alpha) = self.tau.unwrap_or((1.0, 0.0));
+        let flags = u32::from(scale.is_some()) | (u32::from(self.tau.is_some()) << 1);
+        let pc = Pc::new()
+            .u(rows as u32)
+            .u(self.cols as u32)
+            .u(self.heads as u32)
+            .u(flags)
+            .f(self.thr)
+            .f(1.0 / floor)
+            .f(alpha);
+        let bufs = vec![
+            x,
+            scale.unwrap_or(&self.dummy),
+            pos.unwrap_or(&self.dummy),
+            out,
+        ];
+        let (gx, gy) = grid_for(rows, 1);
+        self.pipe.run(&bufs, &pc, (gx, gy, 1))
+    }
+}
+
+impl Drop for RowClip<'_> {
+    fn drop(&mut self) {
+        self.pipe.gpu.destroy_buf(&self.dummy);
     }
 }
 

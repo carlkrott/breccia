@@ -33,7 +33,7 @@
 
 use breccia_kernels::ops::{
     self, cpu, Act, ActMode, Add, EmbGather, HcMixer, HcWeights, RmsNorm, Rope, RopeTable, Router,
-    Softmax, SwiGlu,
+    RowClip, Softmax, SwiGlu,
 };
 use breccia_kernels::{Device, QuantType};
 
@@ -912,13 +912,15 @@ fn add_act_and_scale_match_the_cpu_reference() {
         }
     }
 
-    // Act: all five modes at 320 values (the HC bottleneck) and 10240 (a stream).
+    // Act: all six modes at 320 values (the HC bottleneck) and 10240 (a stream).
     for (mode, s) in [
         (ActMode::Silu, 0.0f32),
         (ActMode::SiluDiv, 4.0),
         (ActMode::Sigmoid, 0.0),
         (ActMode::Scale, 1.0 / (128.0f32).sqrt()),
         (ActMode::SiluScale, 0.125),
+        (ActMode::TanhCap, 1.0),
+        (ActMode::TanhCap, 30.0),
     ] {
         let act = Act::new(gpu, mode).expect("act pipeline");
         for n in [320usize, 10240] {
@@ -935,6 +937,7 @@ fn add_act_and_scale_match_the_cpu_reference() {
                     .iter()
                     .map(|v| (cpu::silu(f64::from(*v)) * f64::from(s)) as f32)
                     .collect(),
+                ActMode::TanhCap => cpu::tanh_cap(&x, s),
             };
             let xb = ops::upload_f32(gpu, &x).expect("x");
             let ob = breccia_kernels::gemv::alloc(gpu, (n * 4) as u64).expect("out");
@@ -950,6 +953,192 @@ fn add_act_and_scale_match_the_cpu_reference() {
             gpu.destroy_buf(&ob);
         }
     }
+}
+
+/// Inkling S4 (`docs/specs/inkling2-loop-port.md`): tanh/softcap and the row
+/// clip with channel scale and tau, against the f64 CPU reference; then, with
+/// `BRECCIA_INKLING_GOLDEN=<golden dir>`, against llama.cpp's own Q/K/R clip
+/// outputs for all 48 loop slots (input = the golden's pre-clip tensor).
+#[test]
+fn inkling_tanh_cap_and_row_clip() {
+    let fx = need_gpu!("inkling");
+    let gpu = fx.dev.gpu();
+
+    // tanh_cap: both branches, the 0.25 seam, saturation, and +-inf-ish inputs.
+    let mut x = normalish(0x515, 4096);
+    x.iter_mut().skip(2048).for_each(|v| *v *= 40.0);
+    x.extend_from_slice(&[
+        0.0,
+        0.2499999,
+        0.25,
+        -0.25,
+        9.0,
+        -9.0,
+        1e4,
+        -1e4,
+        1e-30,
+        f32::MAX,
+        -f32::MAX,
+    ]);
+    let n = x.len();
+    let xb = ops::upload_f32(gpu, &x).expect("x");
+    let ob = breccia_kernels::gemv::alloc(gpu, (n * 4) as u64).expect("out");
+    for s in [1.0f32, 30.0, 4.0, 25.0] {
+        let act = Act::new(gpu, ActMode::TanhCap).expect("act");
+        act.run(&xb, &ob, n, s).expect("tanh_cap");
+        let got = ops::download_f32(gpu, &ob, n).expect("read");
+        let rel = max_rel(&got, &as_f64(&cpu::tanh_cap(&x, s)));
+        assert!(rel <= 1e-6, "tanh_cap s={s}: {rel:e} > 1e-6");
+        println!("tanh_cap s={s:<5} n={n} max rel {rel:.2e}");
+    }
+    gpu.destroy_buf(&xb);
+    gpu.destroy_buf(&ob);
+
+    // degenerate: 1 col, 1 row, tau on at pos 0 (tau = 1, clip to thr).
+    {
+        let x = ops::upload_f32(gpu, &[50.0]).expect("x");
+        let p = breccia_kernels::gemv::upload(gpu, &i32_bytes(&[0])).expect("pos");
+        let o = breccia_kernels::gemv::alloc(gpu, 4).expect("out");
+        RowClip::new(gpu, 1, 1, 8.0, Some((8192.0, 0.1)))
+            .expect("row clip 1x1")
+            .run(&x, None, Some(&p), &o, 1)
+            .expect("row clip 1x1 run");
+        let got = ops::download_f32(gpu, &o, 1).expect("read")[0];
+        assert!((got - 8.0).abs() < 1e-5, "1x1 clip: {got}");
+        for b in [&x, &p, &o] {
+            gpu.destroy_buf(b);
+        }
+    }
+
+    // row clip vs CPU: q (128x24, scale, tau), k (128x8), r (16x24, scale, tau).
+    // Positions straddle the tau floor (8192) and reach 1M.
+    let pos: Vec<i32> = vec![0, 8190, 8191, 8192, 20000, 131071, 1_000_000];
+    let t = pos.len();
+    let pb = breccia_kernels::gemv::upload(gpu, &i32_bytes(&pos)).expect("pos");
+    for (label, cols, heads, thr, scaled, tau) in [
+        ("q", 128usize, 24usize, 22.627417f32, true, true),
+        ("k", 128, 8, 22.627417, false, false),
+        ("r", 16, 24, 8.0, true, true),
+    ] {
+        // spread 0.5..8 so some rows clip and some do not
+        let mut x = normalish(0x900 ^ cols as u64, cols * heads * t);
+        for (i, v) in x.iter_mut().enumerate() {
+            *v *= 0.5 + (i / cols % 16) as f32 * 0.5;
+        }
+        let sc: Vec<f32> = normalish(0x901, cols * heads)
+            .iter()
+            .map(|v| 1.0 + 0.3 * v)
+            .collect();
+        let tau_p = tau.then_some((8192.0f32, 0.1f32));
+        let want = cpu::row_clip(
+            &x,
+            cols,
+            heads,
+            scaled.then_some(&sc[..]),
+            thr,
+            tau_p.map(|(f, a)| (&pos[..], f, a)),
+        );
+        let xb = ops::upload_f32(gpu, &x).expect("x");
+        let sb = ops::upload_f32(gpu, &sc).expect("scale");
+        let ob = breccia_kernels::gemv::alloc(gpu, (x.len() * 4) as u64).expect("out");
+        let clip = RowClip::new(gpu, cols, heads, thr, tau_p).expect("row clip");
+        clip.run(&xb, scaled.then_some(&sb), tau.then_some(&pb), &ob, t)
+            .expect("run");
+        let got = ops::download_f32(gpu, &ob, x.len()).expect("read");
+        let rel = max_rel(&got, &as_f64(&want));
+        assert!(rel <= 1e-5, "row clip {label}: {rel:e} > 1e-5");
+        println!("row_clip {label} {cols}x{heads}x{t} max rel {rel:.2e}");
+        for b in [&xb, &sb, &ob] {
+            gpu.destroy_buf(b);
+        }
+    }
+
+    let Ok(golden) = std::env::var("BRECCIA_INKLING_GOLDEN") else {
+        eprintln!("inkling golden parity: SKIPPED (set BRECCIA_INKLING_GOLDEN)");
+        gpu.destroy_buf(&pb);
+        return;
+    };
+    let golden = std::path::PathBuf::from(golden);
+    let find = |dir: &str, stem: &str| -> Vec<f32> {
+        let d = golden.join(dir);
+        let hit = std::fs::read_dir(&d)
+            .expect("golden dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name().into_string().unwrap()))
+            .find(|f| {
+                f.starts_with(stem)
+                    || f.split_once('_')
+                        .is_some_and(|(_, rest)| rest.starts_with(stem))
+            })
+            .unwrap_or_else(|| panic!("{stem} not in {}", d.display()));
+        std::fs::read(d.join(hit))
+            .expect("read")
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    };
+    let tok = 13usize; // golden prompt, positions 0..12 (tau = 1 below 8192)
+    let gpos: Vec<i32> = (0..tok as i32).collect();
+    let gpb = breccia_kernels::gemv::upload(gpu, &i32_bytes(&gpos)).expect("pos");
+    let pipes = [
+        RowClip::new(gpu, 128, 24, 22.627417, None).expect("q swa"),
+        RowClip::new(gpu, 128, 24, 22.627417, Some((8192.0, 0.1))).expect("q full"),
+        RowClip::new(gpu, 128, 8, 22.627417, None).expect("k"),
+        RowClip::new(gpu, 16, 24, 8.0, None).expect("r swa"),
+        RowClip::new(gpu, 16, 24, 8.0, Some((8192.0, 0.1))).expect("r full"),
+    ];
+    let mut worst = 0.0f64;
+    for slot in 0..48usize {
+        let phys = match slot {
+            0..=23 => slot,
+            _ => 6 + (slot - 24) % 12,
+        };
+        let full = phys % 6 == 5;
+        for (pre, post, scale, pipe) in [
+            (
+                "Qproj",
+                "Qcur",
+                Some("attn_q_clip"),
+                &pipes[usize::from(full)],
+            ),
+            ("Kconv", "Kcur", None, &pipes[2]),
+            (
+                "Rproj",
+                "Rcur",
+                Some("attn_rel_clip"),
+                &pipes[3 + usize::from(full)],
+            ),
+        ] {
+            let x = find("dump-s4", &format!("{pre}-{slot}_"));
+            let want = find(
+                if post == "Rcur" { "dump-s4" } else { "dump" },
+                &format!("{post}-{slot}_"),
+            );
+            let sc = scale.map(|w| find("weights", &format!("blk.{phys}.{w}.weight_")));
+            let xb = ops::upload_f32(gpu, &x).expect("x");
+            let sb = sc.as_ref().map(|s| ops::upload_f32(gpu, s).expect("scale"));
+            let ob = breccia_kernels::gemv::alloc(gpu, (x.len() * 4) as u64).expect("out");
+            pipe.run(
+                &xb,
+                sb.as_ref(),
+                full.then_some(&gpb).filter(|_| post != "Kcur"),
+                &ob,
+                tok,
+            )
+            .expect("run");
+            let got = ops::download_f32(gpu, &ob, x.len()).expect("read");
+            let rel = max_rel(&got, &as_f64(&want));
+            assert!(rel <= 1e-5, "golden {post}-{slot}: {rel:e} > 1e-5");
+            worst = worst.max(rel);
+            gpu.destroy_buf(&xb);
+            gpu.destroy_buf(&ob);
+            if let Some(b) = sb {
+                gpu.destroy_buf(&b);
+            }
+        }
+    }
+    println!("golden Qcur/Kcur/Rcur, 48 slots: worst max rel {worst:.2e}");
+    gpu.destroy_buf(&gpb);
+    gpu.destroy_buf(&pb);
 }
 
 /// The op kernels must never read outside their bound storage buffers: every
