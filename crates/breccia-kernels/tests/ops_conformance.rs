@@ -2189,3 +2189,56 @@ fn inkling_loop_control() {
     }
     lc.release(gpu, ws);
 }
+
+/// Decode-time cost of `AttnDense` (Inkling's full-attention shape, T = 1) at
+/// long context; `BRECCIA_ATTN_CELLS=4096,32768,...` picks the lengths.
+#[test]
+#[ignore]
+fn attn_dense_decode_bench() {
+    let fx = need_gpu!("attn_dense_decode_bench");
+    let gpu = fx.dev.gpu();
+    let mut at = AttnDense::new(gpu).expect("attn");
+    let (heads, kvh, hd, rd, ext) = (24usize, 8usize, 128usize, 16usize, 1024usize);
+    let cells: Vec<usize> = std::env::var("BRECCIA_ATTN_CELLS")
+        .unwrap_or_else(|_| "4096,32768,100000,150000".into())
+        .split(',')
+        .map(|v| v.trim().parse().expect("cells"))
+        .collect();
+    let s = AttnShape { heads, kv_heads: kvh, head_dim: hd, window: 0, scale: 1.0 / (hd as f32).sqrt() };
+    let up = |v: &[f32]| ops::upload_f32(gpu, v).expect("upload");
+    let upi = |v: &[i32]| breccia_kernels::gemv::upload(gpu, &i32_bytes(v)).expect("upload");
+    let q = up(&vec![0.01; heads * hd]);
+    let r = up(&vec![0.1; heads * rd]);
+    let bias = up(&vec![0.05; ext * rd]);
+    let sink = up(&vec![0.5; heads]);
+    let o = breccia_kernels::gemv::alloc(gpu, (heads * hd * 4) as u64).expect("out");
+    for &n in &cells {
+        let k = up(&vec![0.02; n * kvh * hd]);
+        let v = up(&vec![0.03; n * kvh * hd]);
+        let kpos = upi(&(0..n as i32).collect::<Vec<_>>());
+        let qpos = upi(&[n as i32 - 1]);
+        let rel = RelBias { r: &r, bias: &bias, rel_dim: rd, extent: ext };
+        let sk = Sink { sink: &sink, per_token: false, scale: 1.0 };
+        let mut ms = [0.0; 2];
+        let mut outs = Vec::new();
+        for (i, split) in [false, true].into_iter().enumerate() {
+            at.split = split;
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let t0 = std::time::Instant::now();
+                at.run(&s, &q, &qpos, 1, &k, &v, &kpos, n, Some(&rel), Some(&sk), &o).expect("run");
+                let _ = ops::download_f32(gpu, &o, 1).expect("read");
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            // uniform V averages to itself, whatever the sink takes
+            let out = ops::download_f32(gpu, &o, heads * hd).expect("read");
+            assert!(out.iter().all(|x| x.is_finite() && *x > 0.0 && *x <= 0.03 * 1.005), "split {split}: {:?}", &out[..4]);
+            outs.push(out);
+            ms[i] = best * 1e3;
+        }
+        let worst = outs[0].iter().zip(&outs[1]).map(|(a, b)| ((a - b) / a).abs()).fold(0.0f32, f32::max);
+        // the serial path's f32 sums over 100k+ cells drift (it overshoots 0.03); the split's shorter sums are closer
+        assert!(worst < 5e-3, "split vs serial rel {worst}");
+        eprintln!("cells {n}: {:.2} ms serial, {:.2} ms split per full-attention layer", ms[0], ms[1]);
+    }
+}

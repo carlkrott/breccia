@@ -1,0 +1,51 @@
+#version 450
+//
+// Merge of the `ops_attn_dense.comp` splits: one workgroup per (token, head)
+// row, PART [row][split][hd + 2] = (m, l, acc[hd]) partial online softmaxes;
+// the sink logit (if any) joins here as a value-less term.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer PB { float PART[]; };
+layout(std430, binding = 1) readonly buffer SB { float SINK[]; };
+layout(std430, binding = 2) writeonly buffer OB { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint  rows;
+    uint  heads;
+    uint  head_dim;
+    uint  nsplit;
+    uint  flags;      // as ops_attn_dense: bit 0 sink, bit 1 per token
+    float sink_scale;
+} pc;
+
+#define WG_X_MAX 65535u
+#define NEG -3.0e38
+
+void main() {
+    uint row = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint hd = pc.head_dim;
+    if (row >= pc.rows || tid >= hd) {
+        return;
+    }
+    uint st = hd + 2u;
+    uint base = row * pc.nsplit * st;
+    bool sink = (pc.flags & 1u) != 0u;
+    float z = sink ? pc.sink_scale * SINK[(pc.flags & 2u) != 0u ? row : row % pc.heads] : NEG;
+    float mx = z;
+    for (uint s = 0u; s < pc.nsplit; s++) {
+        mx = max(mx, PART[base + s * st]);
+    }
+    float l = sink ? exp(z - mx) : 0.0;
+    float acc = 0.0;
+    for (uint s = 0u; s < pc.nsplit; s++) {
+        float mi = PART[base + s * st];
+        if (mi > NEG) {
+            float e = exp(mi - mx);
+            l += PART[base + s * st + 1u] * e;
+            acc += PART[base + s * st + 2u + tid] * e;
+        }
+    }
+    O[row * hd + tid] = l > 0.0 ? acc / l : 0.0;
+}

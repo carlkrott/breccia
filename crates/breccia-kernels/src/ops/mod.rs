@@ -1058,21 +1058,60 @@ pub struct Sink<'b> {
 /// optional [`RelBias`] and [`Sink`]. Model-agnostic; Inkling S9 is one caller.
 pub struct AttnDense<'g> {
     pipe: Pipe<'g>,
+    reduce: Pipe<'g>,
+    /// Split partials, `[rows * splits][head_dim + 2]`, fixed size (see `SPLIT_ROWS`).
+    part: Buf,
+    /// Flash-decoding split for few rows over many cells (default on).
+    pub split: bool,
+}
+
+impl Drop for AttnDense<'_> {
+    fn drop(&mut self) {
+        self.pipe.gpu.destroy_buf(&self.part);
+    }
 }
 
 impl<'g> AttnDense<'g> {
     pub const MAX_HEAD_DIM: usize = 256;
     pub const MAX_REL_DIM: usize = 64;
+    /// Query heads per kv head (the shader holds the group's queries in registers).
+    pub const MAX_GROUP: usize = 8;
+    /// Splits are sized so `rows * splits` stays near this many workgroups
+    /// (a few per CU); rows at or above half of it never split.
+    const SPLIT_ROWS: usize = 640;
+    const TILE: usize = 256;
 
     pub fn new(gpu: &'g Gpu) -> Result<Self> {
         Ok(AttnDense {
             pipe: Pipe::new(
                 gpu,
                 include_bytes!(concat!(env!("OUT_DIR"), "/ops_attn_dense.spv")),
-                9,
+                10,
                 "attn_dense",
             )?,
+            reduce: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_attn_dense_reduce.spv")),
+                3,
+                "attn_dense_reduce",
+            )?,
+            // workgroups < SPLIT_ROWS/2 and splits <= ceil(SPLIT_ROWS/workgroups):
+            // workgroups*splits < 2*SPLIT_ROWS, each writing up to MAX_GROUP head rows
+            part: crate::gemv::alloc(
+                gpu,
+                (2 * Self::SPLIT_ROWS * Self::MAX_GROUP * (Self::MAX_HEAD_DIM + 2) * 4) as u64,
+            )?,
+            split: true,
         })
+    }
+
+    /// Cells per split for `rows` (token, kv head) workgroups over `cells`; 0 = no split.
+    fn chunk(&self, rows: usize, cells: usize) -> usize {
+        if !self.split || rows >= Self::SPLIT_ROWS / 2 || cells <= 2 * Self::TILE {
+            return 0;
+        }
+        let want = Self::SPLIT_ROWS.div_ceil(rows);
+        cells.div_ceil(want).next_multiple_of(Self::TILE)
     }
 
     /// `q`/`out` `[tokens, heads, head_dim]` at positions `qpos` (i32),
@@ -1096,12 +1135,13 @@ impl<'g> AttnDense<'g> {
         let rel_dim = rel.map_or(0, |r| r.rel_dim);
         if s.kv_heads == 0
             || !s.heads.is_multiple_of(s.kv_heads)
+            || s.heads / s.kv_heads > Self::MAX_GROUP
             || s.head_dim == 0
             || s.head_dim > Self::MAX_HEAD_DIM
             || rel_dim > Self::MAX_REL_DIM
         {
             return Err(anyhow!(
-                "attn_dense: {} heads / {} kv heads, head_dim {} (<= {}), rel_dim {rel_dim} (<= {})",
+                "attn_dense: {} heads / {} kv heads (group <= 8), head_dim {} (<= {}), rel_dim {rel_dim} (<= {})",
                 s.heads,
                 s.kv_heads,
                 s.head_dim,
@@ -1113,6 +1153,10 @@ impl<'g> AttnDense<'g> {
             return Ok(());
         }
         let flags = sink.map_or(0u32, |k| 1 | if k.per_token { 2 } else { 0 });
+        let rows = tokens * s.heads;
+        let wgs = tokens * s.kv_heads;
+        let chunk = self.chunk(wgs, cells);
+        let nsplit = if chunk == 0 { 1 } else { cells.div_ceil(chunk) };
         let pc = Pc::new()
             .u(tokens as u32)
             .u(s.heads as u32)
@@ -1125,12 +1169,27 @@ impl<'g> AttnDense<'g> {
             .u(flags)
             .f(s.scale)
             .f(sink.map_or(0.0, |k| k.scale))
-            .u(0);
+            .u(chunk as u32);
         let (rb, bb) = rel.map_or((q, q), |r| (r.r, r.bias));
         let sb = sink.map_or(q, |k| k.sink);
-        let (gx, gy) = grid_for(tokens * s.heads, 1);
-        self.pipe
-            .run(&[q, k, v, qpos, kpos, rb, bb, sb, out], &pc, (gx, gy, 1))
+        let (gx, gy) = grid_for(wgs * nsplit, 1);
+        self.pipe.run(
+            &[q, k, v, qpos, kpos, rb, bb, sb, out, &self.part],
+            &pc,
+            (gx, gy, 1),
+        )?;
+        if chunk == 0 {
+            return Ok(());
+        }
+        let pc = Pc::new()
+            .u(rows as u32)
+            .u(s.heads as u32)
+            .u(s.head_dim as u32)
+            .u(nsplit as u32)
+            .u(flags)
+            .f(sink.map_or(0.0, |k| k.scale));
+        let (gx, gy) = grid_for(rows, 1);
+        self.reduce.run(&[&self.part, sb, out], &pc, (gx, gy, 1))
     }
 }
 

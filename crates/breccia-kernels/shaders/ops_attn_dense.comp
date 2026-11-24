@@ -1,7 +1,11 @@
 #version 450
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
 //
-// Generic dense attention, one workgroup per (query token, q head), online
-// softmax over 256-cell tiles (`docs/specs/inkling2-loop-port.md` S9).
+// Generic dense attention (`docs/specs/inkling2-loop-port.md` S9), online
+// softmax over 256-cell tiles. One workgroup per (query token, kv head, split):
+// the GQA group's queries share each K/V read (the `qsa_attn_flash_gqa` layout).
 //
 //   score(t, j) = scale * q[t,h] . k[j,h/group] + rel(t, h, d)   d = qpos[t] - kpos[j]
 //   rel         = R[t,h] . BIAS[d]  if rel_dim > 0 and d < extent, else 0 (added after scale)
@@ -12,8 +16,19 @@
 // scale * qk + rel - s plus a zero logit; exp(a - s) / (1 + sum exp(b - s)) is
 // the same softmax as a sink logit s (sink_scale 1), which is what this kernel takes.
 //
+// Per tile: (1) each subgroup dots whole K rows (lanes split head_dim, coalesced)
+// with the group's queries held in registers; (2) one subgroup per head updates
+// the running max/sum and turns scores into p once; (3) invocation (part, d)
+// adds p * V[d] for every `parts`-th cell, parts = 256 / head_dim, merged at the end.
+//
 // Layouts: Q/O [T, heads, hd], K/V [cells, kv_heads, hd], R [T, heads, rel_dim],
-// BIAS [extent, rel_dim]. Workgroups wrap over grid.y.
+// BIAS [extent, rel_dim]. Workgroups wrap over grid.y. Host contract:
+// heads / kv_heads <= MAX_GROUP, head_dim <= 256, rel_dim <= 64.
+//
+// Split (flash decoding, `chunk` > 0): split s walks cells [s*chunk, +chunk) and
+// writes its partial (m, l, acc[hd]) to PART [row][split][hd + 2];
+// `ops_attn_dense_reduce.comp` merges the splits and adds the sink. chunk 0 =
+// one split over every cell, writing O.
 
 layout(local_size_x = 256) in;
 
@@ -26,6 +41,7 @@ layout(std430, binding = 5) readonly buffer RB { float R[]; };
 layout(std430, binding = 6) readonly buffer BB { float BIAS[]; };
 layout(std430, binding = 7) readonly buffer SB { float SINK[]; };
 layout(std430, binding = 8) writeonly buffer OB { float O[]; };
+layout(std430, binding = 9) writeonly buffer PB { float PART[]; };
 
 layout(push_constant) uniform Params {
     uint  tokens;
@@ -39,97 +55,180 @@ layout(push_constant) uniform Params {
     uint  flags;      // bit 0: sink, bit 1: sink is per token ([T, heads])
     float scale;
     float sink_scale;
-    uint  pad0;
+    uint  chunk;      // cells per split, 0 = no split
 } pc;
 
 #define WG_X_MAX 65535u
 #define TILE 256u
-#define NEG -3.0e38
+#define MAX_GROUP 8u
+#define LOCAL_MAX 8u   // head_dim / subgroup size, subgroups >= 32
+#define NEG (-3.0e38)
 
-shared float s_q[256];
-shared float s_r[64];
-shared float s_s[TILE];
+shared float PS[TILE * MAX_GROUP];  // [cell][head] scores, then p; the merge at the end
+shared float SR[MAX_GROUP * 64u];   // the group's rel vectors
+shared float M[MAX_GROUP];
+shared float L[MAX_GROUP];
+shared float ALPHA[MAX_GROUP];
 
 void main() {
-    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
-    if (wg >= pc.tokens * pc.heads) {
-        return;
+    uint gid = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint nsplit = pc.chunk == 0u ? 1u : (pc.cells + pc.chunk - 1u) / pc.chunk;
+    if (gid >= pc.tokens * pc.kv_heads * nsplit) {
+        return; // whole workgroup
     }
-    uint tid = gl_LocalInvocationID.x;
-    uint t = wg / pc.heads;
-    uint h = wg % pc.heads;
-    uint kh = h / (pc.heads / pc.kv_heads);
+    uint wg = gid / nsplit;  // (token, kv head)
+    uint sp = gid % nsplit;
+    uint lo = sp * pc.chunk;
+    uint hi = pc.chunk == 0u ? pc.cells : min(pc.cells, lo + pc.chunk);
+    uint t = wg / pc.kv_heads;
+    uint kh = wg % pc.kv_heads;
+    uint group = pc.heads / pc.kv_heads;
+    uint h0 = kh * group;
     uint hd = pc.head_dim;
     uint kstride = pc.kv_heads * hd;
+    uint d = gl_LocalInvocationID.x;
+    uint sg_size = gl_SubgroupSize;
+    uint sgs = 256u / sg_size;
+    uint sg_id = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint qrow = t * pc.heads + h0;
+    uint parts = 256u / hd;
+    uint part = d / hd;
+    uint dim = d % hd;
+    bool applies = part < parts;
 
-    if (tid < hd) {
-        s_q[tid] = Q[wg * hd + tid];
+    float q[MAX_GROUP][LOCAL_MAX];
+    [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
+        [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+            uint e = lane + m * sg_size;
+            q[g][m] = g < group && e < hd ? Q[(qrow + g) * hd + e] * pc.scale : 0.0;
+        }
     }
-    if (tid < pc.rel_dim) {
-        s_r[tid] = R[wg * pc.rel_dim + tid];
+    for (uint i = d; i < group * pc.rel_dim; i += 256u) {
+        SR[i] = R[qrow * pc.rel_dim + i];
+    }
+    if (d < group) {
+        bool sink = (pc.flags & 1u) != 0u && pc.chunk == 0u;
+        M[d] = sink ? pc.sink_scale * SINK[(pc.flags & 2u) != 0u ? qrow + d : h0 + d] : NEG;
+        L[d] = sink ? 1.0 : 0.0;
+    }
+    float acc[MAX_GROUP];
+    [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
+        acc[g] = 0.0;
     }
     int qp = QPOS[t];
 
-    float m = NEG;
-    float l = 0.0;
-    if ((pc.flags & 1u) != 0u) {
-        m = pc.sink_scale * SINK[(pc.flags & 2u) != 0u ? wg : h];
-        l = 1.0;
+    // shortcut: walks every cell even under a sliding window; bound the range when SWA rings grow.
+    for (uint base = lo; base < hi; base += TILE) {
+        barrier();
+        uint n = min(TILE, hi - base);
+        for (uint j = sg_id; j < n; j += sgs) {
+            int kp = KPOS[base + j];
+            int dd = qp - kp;
+            if (kp < 0 || dd < 0 || (pc.window != 0u && uint(dd) >= pc.window)) {
+                if (lane < group) {
+                    PS[j * MAX_GROUP + lane] = NEG;
+                }
+                continue;
+            }
+            uint kb = (base + j) * kstride + kh * hd;
+            float k[LOCAL_MAX];
+            [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+                uint e = lane + m * sg_size;
+                k[m] = e < hd ? K[kb + e] : 0.0;
+            }
+            bool rel = pc.rel_dim > 0u && uint(dd) < pc.extent;
+            [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
+                if (g >= group) {
+                    break;
+                }
+                float a = 0.0;
+                [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
+                    a += q[g][m] * k[m];
+                }
+                if (rel) {
+                    for (uint i = lane; i < pc.rel_dim; i += sg_size) {
+                        a += SR[g * pc.rel_dim + i] * BIAS[uint(dd) * pc.rel_dim + i];
+                    }
+                }
+                for (uint off = sg_size >> 1; off > 0u; off >>= 1u) {
+                    a += subgroupShuffleXor(a, off);
+                }
+                if (lane == 0u) {
+                    PS[j * MAX_GROUP + g] = a;
+                }
+            }
+        }
+        barrier();
+
+        for (uint g = sg_id; g < group; g += sgs) {
+            float mx = NEG;
+            for (uint j = lane; j < n; j += sg_size) {
+                mx = max(mx, PS[j * MAX_GROUP + g]);
+            }
+            float m_old = M[g];
+            float m_new = max(m_old, subgroupMax(mx));
+            float sum = 0.0;
+            for (uint j = lane; j < n; j += sg_size) {
+                float sc = PS[j * MAX_GROUP + g];
+                float p = sc > 0.5 * NEG ? exp(sc - m_new) : 0.0;
+                PS[j * MAX_GROUP + g] = p;
+                sum += p;
+            }
+            float alpha = exp(m_old - m_new); // 1 while both are NEG
+            sum = subgroupAdd(sum);
+            if (lane == 0u) {
+                M[g] = m_new;
+                L[g] = L[g] * alpha + sum;
+                ALPHA[g] = alpha;
+            }
+        }
+        barrier();
+
+        if (applies) {
+            [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
+                acc[g] *= g < group ? ALPHA[g] : 1.0;
+            }
+            for (uint j = part; j < n; j += parts) {
+                float v = V[(base + j) * kstride + kh * hd + dim];
+                [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
+                    if (g < group) {
+                        float pg = PS[j * MAX_GROUP + g];
+                        acc[g] += pg == 0.0 ? 0.0 : pg * v; // empty cells may hold NaN
+                    }
+                }
+            }
+        }
     }
-    float acc = 0.0;
+
+    // merge the parts: PS[g][part * hd + dim]
     barrier();
-
-    // shortcut: walks every cell even under a sliding window; bound the range in S14.
-    for (uint base = 0u; base < pc.cells; base += TILE) {
-        uint j = base + tid;
-        float s = NEG;
-        if (j < pc.cells) {
-            int kp = KPOS[j];
-            int d = qp - kp;
-            if (kp >= 0 && d >= 0 && (pc.window == 0u || uint(d) < pc.window)) {
-                uint kb = j * kstride + kh * hd;
-                float dot = 0.0;
-                for (uint i = 0u; i < hd; i++) {
-                    dot += s_q[i] * K[kb + i];
-                }
-                dot *= pc.scale;
-                if (pc.rel_dim > 0u && uint(d) < pc.extent) {
-                    uint bb = uint(d) * pc.rel_dim;
-                    for (uint i = 0u; i < pc.rel_dim; i++) {
-                        dot += s_r[i] * BIAS[bb + i];
-                    }
-                }
-                s = dot;
+    if (applies) {
+        [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
+            if (g < group) {
+                PS[g * 256u + d] = acc[g];
             }
         }
-        s_s[tid] = s;
-        barrier();
-
-        uint n = min(TILE, pc.cells - base);
-        float mt = m;
-        for (uint k = 0u; k < n; k++) {
-            mt = max(mt, s_s[k]);
-        }
-        if (mt > NEG) {
-            float corr = exp(m - mt);
-            l *= corr;
-            acc *= corr;
-            for (uint k = 0u; k < n; k++) {
-                float sk = s_s[k];
-                if (sk > NEG) {
-                    float p = exp(sk - mt);
-                    l += p;
-                    if (tid < hd) {
-                        acc += p * V[(base + k) * kstride + kh * hd + tid];
-                    }
-                }
-            }
-            m = mt;
-        }
-        barrier();
     }
-
-    if (tid < hd) {
-        O[wg * hd + tid] = l > 0.0 ? acc / l : 0.0;
+    barrier();
+    if (d >= hd) {
+        return;
+    }
+    for (uint g = 0u; g < group; ++g) {
+        float tot = 0.0;
+        for (uint p = 0u; p < parts; ++p) {
+            tot += PS[g * 256u + p * hd + d];
+        }
+        uint row = qrow + g;
+        if (pc.chunk != 0u) {
+            uint pb = (row * nsplit + sp) * (hd + 2u);
+            if (d == 0u) {
+                PART[pb] = M[g];
+                PART[pb + 1u] = L[g];
+            }
+            PART[pb + 2u + d] = tot;
+        } else {
+            O[row * hd + d] = L[g] > 0.0 ? tot / L[g] : 0.0;
+        }
     }
 }
