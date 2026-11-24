@@ -345,3 +345,36 @@ fn resident_bitwise() {
         );
     }
 }
+
+/// Batched dispatch (default) gives the same bits as one submit per op, for a
+/// chunked prefill and greedy decode steps, under the env placement.
+#[test]
+fn batched_bitwise() {
+    let Some(e) = env() else {
+        eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
+        return;
+    };
+    let mut fwd = placed(&e);
+    let run = |fwd: &mut InklingForward, on: bool| -> Vec<Vec<f32>> {
+        fwd.set_batching(on);
+        let mut seq = fwd.new_seq(64, 8).unwrap();
+        let mut out = vec![fwd.forward(&mut seq, &PROMPT, None).unwrap()];
+        for _ in 0..3 {
+            let l = out.last().unwrap();
+            let top = (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap() as u32;
+            out.push(fwd.forward(&mut seq, &[top], None).unwrap());
+        }
+        out
+    };
+    let base = run(&mut fwd, false);
+    let t0 = std::time::Instant::now();
+    let got = run(&mut fwd, true);
+    eprintln!("batched run {:.3} s", t0.elapsed().as_secs_f64());
+    for (i, (a, b)) in got.iter().zip(&base).enumerate() {
+        assert!(
+            a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()),
+            "step {i}: batched logits differ, max {:.3e}",
+            max_abs(a, b)
+        );
+    }
+}

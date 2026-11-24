@@ -19,10 +19,10 @@ use anyhow::{anyhow, ensure, Context, Result};
 use breccia_format::ShardSet;
 use breccia_kernels::ops::{
     self, Act, ActMode, Add, AttnDense, AttnShape, ControlWeights, DepthMix, EmbGather, Glu,
-    GluMode, LowRankControl, RelBias, RmsNorm, Router, RowClip, ShortConv, Sink,
+    ControlWs, GluMode, LowRankControl, RelBias, RmsNorm, Router, RowClip, ShortConv, Sink,
 };
 use breccia_kernels::cpu::{ChunkRoute, ExpertPool, GluAct, LayerPlan};
-use breccia_kernels::{gemv, proj, GemvBatch, MoeFanIn, QuantType, XLayout};
+use breccia_kernels::{batch_cmd, gemv, proj, GemvBatch, MoeFanIn, QuantType, XLayout};
 use breccia_vk::ctx::{Buf, Gpu};
 
 use crate::inkling::InklingConfig;
@@ -43,8 +43,64 @@ impl Deref for Owned<'_> {
 
 impl Drop for Owned<'_> {
     fn drop(&mut self) {
-        self.0.destroy_buf(&self.1);
+        if batch_cmd::is_open_on(self.0) {
+            let b = &self.1;
+            let dead = Buf { buf: b.buf, mem: b.mem, size: b.size, id: b.id };
+            GRAVE.with(|g| g.borrow_mut().push((key(self.0), dead)));
+        } else {
+            self.0.destroy_buf(&self.1);
+        }
     }
+}
+
+thread_local! {
+    /// Buffers dropped while their device's batch was open: recorded commands
+    /// still use them, so they are destroyed once that batch has completed.
+    static GRAVE: RefCell<Vec<(usize, Buf)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn key(gpu: &Gpu) -> usize {
+    gpu as *const Gpu as usize
+}
+
+/// Destroy `gpu`'s deferred buffers (its batch must be closed and waited for).
+fn bury(gpu: &Gpu) {
+    let dead: Vec<(usize, Buf)> = GRAVE.with(|g| {
+        let mut g = g.borrow_mut();
+        let (dead, keep) = g.drain(..).partition(|(k, _)| *k == key(gpu));
+        *g = keep;
+        dead
+    });
+    for (_, b) in dead {
+        gpu.destroy_buf(&b);
+    }
+}
+
+/// Close `gpu`'s open batch (submit + wait) so the host can read or upload;
+/// returns whether one was open, for [`resume`].
+fn pause(gpu: &Gpu) -> Result<bool> {
+    if !batch_cmd::is_open_on(gpu) {
+        return Ok(false);
+    }
+    let r = batch_cmd::end(gpu);
+    bury(gpu);
+    r?;
+    Ok(true)
+}
+
+fn resume(gpu: &Gpu, was_open: bool) -> Result<()> {
+    if was_open {
+        batch_cmd::begin(gpu)?;
+    }
+    Ok(())
+}
+
+/// Run host transfers `f` with `gpu`'s batch closed around them.
+fn host<T>(gpu: &Gpu, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let open = pause(gpu)?;
+    let r = f();
+    resume(gpu, open)?;
+    r
 }
 
 const CTRL: [&str; 4] = ["q", "k", "v", "ffn"];
@@ -104,6 +160,24 @@ pub struct InklingForward<'g> {
     residency: Residency,
     /// CPU expert lane and its per-layer plan (`None` = layer runs on the GPU).
     host: Option<(ExpertPool, Vec<Option<LayerPlan>>)>,
+    /// Record each step into dispatch batches (one submit per MoE readback)
+    /// instead of one submit per op.
+    batching: bool,
+    /// Per-token-count device scratch reused across steps: GEMV maps by
+    /// `(type, rows, cols, tokens)`, control workspaces, fan-in inputs.
+    maps: RefCell<HashMap<(QuantType, usize, usize, usize), Owned<'g>>>,
+    ctrl_ws: RefCell<HashMap<usize, ControlWs>>,
+    fan: RefCell<HashMap<usize, [Owned<'g>; 3]>>,
+    /// Host-visible staging (readback, upload) and its capacity in tokens.
+    stage: RefCell<Option<(Owned<'g>, Owned<'g>, usize)>>,
+}
+
+impl Drop for InklingForward<'_> {
+    fn drop(&mut self) {
+        for (_, ws) in self.ctrl_ws.get_mut().drain() {
+            self.ctrl.release(self.gpu, ws);
+        }
+    }
 }
 
 /// Which weights stay on the device between steps. Default: none (upload per use).
@@ -156,12 +230,22 @@ impl<'g> InklingForward<'g> {
             cache: RefCell::new(HashMap::new()),
             residency: Residency::default(),
             host: None,
+            batching: true,
+            maps: RefCell::new(HashMap::new()),
+            ctrl_ws: RefCell::new(HashMap::new()),
+            fan: RefCell::new(HashMap::new()),
+            stage: RefCell::new(None),
             cfg,
         })
     }
 
     pub fn config(&self) -> &InklingConfig {
         &self.cfg
+    }
+
+    /// Batch dispatches (default on); off submits every op on its own.
+    pub fn set_batching(&mut self, on: bool) {
+        self.batching = on;
     }
 
     /// Keep weights on the device between steps; turning a class off drops its copies.
@@ -226,6 +310,18 @@ impl<'g> InklingForward<'g> {
         self.bytes(&ops::u32_to_bytes(v))
     }
 
+    /// Readback / upload staging big enough for a `t`-token MoE step.
+    fn stage(&self, t: usize) -> Result<std::cell::Ref<'_, (Owned<'g>, Owned<'g>, usize)>> {
+        if self.stage.borrow().as_ref().is_none_or(|s| s.2 < t) {
+            let (kx, n) = (self.cfg.n_expert_used, self.cfg.n_embd);
+            let mk = |words: usize| -> Result<Owned<'g>> {
+                Ok(Owned(self.gpu, gemv::staging(self.gpu, (words * 4) as u64)?))
+            };
+            *self.stage.borrow_mut() = Some((mk(2 * t * kx + t * n)?, mk(t * n)?, t));
+        }
+        Ok(std::cell::Ref::map(self.stage.borrow(), |s| s.as_ref().expect("set above")))
+    }
+
     /// Raw GGUF bytes of `name` on the device (dims, type).
     fn weight(&self, name: &str) -> Result<(Rc<Owned<'g>>, Vec<usize>, QuantType)> {
         let t = self
@@ -240,8 +336,7 @@ impl<'g> InklingForward<'g> {
             return Ok((w.clone(), dims, ty));
         }
         let w = Rc::new(
-            self.bytes(bytes)
-                .with_context(|| format!("uploading {name}"))?,
+            host(self.gpu, || self.bytes(bytes)).with_context(|| format!("uploading {name}"))?,
         );
         let keep = if is_expert(name) {
             self.residency.experts
@@ -282,9 +377,14 @@ impl<'g> InklingForward<'g> {
         let (cols, rows) = (dims[0], dims[1]);
         let out = self.buf(tokens * rows)?;
         let gpu = self.gpu;
-        let g = self.gemv(ty, rows, cols)?;
-        let map = Owned(gpu, proj::batch_map_buf(gpu, g, tokens)?);
-        g.run(&w, x, &out, &map, tokens)?;
+        let k = (ty, rows, cols, tokens);
+        if !self.maps.get_mut().contains_key(&k) {
+            let g = self.gemv(ty, rows, cols)?;
+            let m = Owned(gpu, host(gpu, || proj::batch_map_buf(gpu, g, tokens))?);
+            self.maps.get_mut().insert(k, m);
+        }
+        let map = &self.maps.get_mut()[&k];
+        self.gemvs[&(ty, rows, cols)].run(&w, x, &out, map, tokens)?;
         Ok((out, rows))
     }
 
@@ -297,7 +397,10 @@ impl<'g> InklingForward<'g> {
         b: &Buf,
         n: usize,
     ) -> Result<()> {
-        if let Some(t) = tap.as_mut() {
+        let Some(t) = tap.as_mut() else {
+            return Ok(());
+        };
+        host(self.gpu, || {
             let v = ops::download_f32(self.gpu, b, n)?;
             if let Some(r) = t(name, slot, &v) {
                 ensure!(
@@ -307,8 +410,8 @@ impl<'g> InklingForward<'g> {
                 );
                 gemv::upload_into(self.gpu, b, bytemuck_f32(&r))?;
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn copy(&self, dst: &Buf, dst_floats: usize, src: &Buf, floats: usize) -> Result<()> {
@@ -372,9 +475,13 @@ impl<'g> InklingForward<'g> {
         let (gain, ..) = self.weight(&format!("{p}gain.weight"))?;
         let (forget, ..) = self.weight(&format!("{p}forget.weight"))?;
         let out = self.buf(tokens * n)?;
-        let ws = self.ctrl.workspace(self.gpu, tokens)?;
-        let r = self.ctrl.run(
-            &ws,
+        if !self.ctrl_ws.borrow().contains_key(&tokens) {
+            let ws = host(self.gpu, || self.ctrl.workspace(self.gpu, tokens))?;
+            self.ctrl_ws.borrow_mut().insert(tokens, ws);
+        }
+        let wss = self.ctrl_ws.borrow();
+        self.ctrl.run(
+            &wss[&tokens],
             cur,
             cv,
             msgs,
@@ -385,9 +492,7 @@ impl<'g> InklingForward<'g> {
                 forget: &forget,
             },
             &out,
-        );
-        self.ctrl.release(self.gpu, ws);
-        r?;
+        )?;
         Ok(out)
     }
 
@@ -461,8 +566,24 @@ impl<'g> InklingForward<'g> {
         unreachable!("the last chunk returns logits")
     }
 
-    /// One chunk at positions `seq.pos..`; logits only when `head`.
+    /// One chunk at positions `seq.pos..`; logits only when `head`. The batch
+    /// opened here is always closed (and its dropped buffers freed) on return.
     fn step(
+        &mut self,
+        seq: &mut InklingSeq<'g>,
+        ids: &[u32],
+        tap: Option<&mut Tap>,
+        head: bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let r = self.step_inner(seq, ids, tap, head);
+        let closed = pause(self.gpu);
+        bury(self.gpu);
+        let out = r?;
+        closed?;
+        Ok(out)
+    }
+
+    fn step_inner(
         &mut self,
         seq: &mut InklingSeq<'g>,
         ids: &[u32],
@@ -486,14 +607,16 @@ impl<'g> InklingForward<'g> {
             .emb
             .gather_staged(self.gpu, emb_table.as_slice(), ids, &raw)?;
         self.emb.release(self.gpu, &stage);
+        let pos: Vec<i32> = (p0 as i32..(p0 + t) as i32).collect();
+        let pos = self.bytes(bytemuck_i32(&pos))?;
+        if self.batching {
+            batch_cmd::begin(self.gpu)?;
+        }
         let (g, ..) = self.weight("token_embd_norm.weight")?;
         let mut cur = self.buf(tn)?;
         self.norm.run(&raw, Some(&g), &cur, t)?;
         drop((raw, g));
         self.tap(&mut tap, "inp_norm", -1, &cur, tn)?;
-
-        let pos: Vec<i32> = (p0 as i32..(p0 + t) as i32).collect();
-        let pos = self.bytes(bytemuck_i32(&pos))?;
 
         // block stack (oldest first) and the previous pass's bank
         let max_blocks = DepthMix::MAX_STATES - 1;
@@ -571,6 +694,7 @@ impl<'g> InklingForward<'g> {
             self.act.run(&logits, &logits, rows, cfg.softcap)?;
         }
         self.tap(&mut tap, "result_output", -1, &logits, cfg.vocab)?;
+        pause(self.gpu)?;
         ops::download_f32(self.gpu, &logits, cfg.vocab).map(Some)
     }
 
@@ -872,16 +996,42 @@ impl<'g> InklingForward<'g> {
         self.router.run_biased(&logits, &bias, &ids, &wts, t)?;
         drop((logits, bias));
         let pairs = t * kx;
-        let sel = ops::download_u32(self.gpu, &ids, pairs)?;
+        let gpu = self.gpu;
+        let lane = self.host.as_ref().and_then(|(_, v)| v[layer]);
+
+        // readback through staging (recorded into the batch): ids, then for the
+        // host lane the weights and x; one pause covers it and every upload below
+        let need = if lane.is_some() { 2 * pairs + t * n } else { pairs };
+        let mut raw = vec![0u8; need * 4];
+        let open = {
+            let stage = self.stage(t)?;
+            let dn = &stage.0;
+            let pb = (pairs * 4) as u64;
+            gemv::copy_at(gpu, dn, 0, &ids, 0, pb)?;
+            if lane.is_some() {
+                gemv::copy_at(gpu, dn, pb, &wts, 0, pb)?;
+                gemv::copy_at(gpu, dn, 2 * pb, x, 0, (t * n * 4) as u64)?;
+            }
+            let open = pause(gpu)?;
+            gpu.read_host(dn, &mut raw).map_err(|e| anyhow!("{e}"))?;
+            open
+        };
+        let words: Vec<u32> = raw
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let sel = &words[..pairs];
         ensure!(
             sel.iter().all(|&e| (e as usize) < ne),
             "router id out of range"
         );
-        if let Some((pool, Some(plan))) = self.host.as_mut().map(|(p, v)| (p, v[layer])) {
-            let w = ops::download_f32(self.gpu, &wts, pairs)?;
-            let xs = ops::download_f32(self.gpu, x, t * n)?;
+        if let Some(plan) = lane {
+            let f = |w: &[u32]| -> Vec<f32> { w.iter().map(|&b| f32::from_bits(b)).collect() };
+            let w = f(&words[pairs..2 * pairs]);
+            let xs = f(&words[2 * pairs..]);
             let ids: Vec<usize> = sel.iter().map(|&e| e as usize).collect();
             let mut out = vec![0f32; t * n];
+            let pool = &mut self.host.as_mut().expect("lane").0;
             if t == 1 {
                 pool.moe_topk(&plan, &ids, &w, &xs, &mut out)?;
             } else {
@@ -893,61 +1043,68 @@ impl<'g> InklingForward<'g> {
                     .collect();
                 pool.moe_topk_chunk(&plan, &routes, &xs, &mut out)?;
             }
-            return self.f32s(&out);
+            let stage = self.stage(t)?;
+            gpu.write_host(&stage.1, bytemuck_f32(&out))
+                .map_err(|e| anyhow!("{e}"))?;
+            resume(gpu, open)?;
+            let o = self.buf(t * n)?;
+            gemv::copy_at(gpu, &o, 0, &stage.1, 0, (t * n * 4) as u64)?;
+            return Ok(o);
         }
 
-        // gate_up: pair p = t*k + j reads activation row t
+        // GPU experts: maps from the ids, uploaded while the batch is closed
         let (gu_w, gu_dims, gu_ty) = self.weight(&b("ffn_gate_up_exps.weight"))?;
         let (gu_rows, cols) = (gu_dims[1], gu_dims[0]);
-        let gpu = self.gpu;
-        let gu = self.buf(pairs * gu_rows)?;
-        {
-            let g = self.gemv(gu_ty, gu_rows, cols)?;
-            let words: Vec<u32> = sel.iter().map(|&e| e * g.blob_words()).collect();
-            let mut map = g.map_for_blobs(&words, XLayout::PerExpert);
-            let (rows, stride) = (g.rows(pairs), (g.padded_cols() / 4) as u32);
-            for p in 0..pairs {
-                for r in 0..gu_rows {
-                    map[rows + p * gu_rows + r] = stride * (p / kx) as u32;
-                }
-            }
-            let map = Owned(
-                gpu,
-                gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?,
-            );
-            g.run(&gu_w, x, &gu, &map, pairs)?;
-        }
-        drop(gu_w);
         let half = gu_rows / 2;
-        let situ = self.buf(pairs * half)?;
-        self.glu.run_fused(&gu, &situ, pairs, half)?;
-        drop(gu);
-
-        // down: pair p reads SITU row p
         let (dn_w, dn_dims, dn_ty) = self.weight(&b("ffn_down_exps.weight"))?;
         ensure!(
             dn_dims[0] == half && dn_dims[1] == n,
             "ffn_down_exps shape {dn_dims:?}"
         );
-        let down = self.buf(pairs * n)?;
-        {
+        let gu_map = {
+            let g = self.gemv(gu_ty, gu_rows, cols)?;
+            let words: Vec<u32> = sel.iter().map(|&e| e * g.blob_words()).collect();
+            let mut map = g.map_for_blobs(&words, XLayout::PerExpert);
+            let (rows, stride) = (g.rows(pairs), (g.padded_cols() / 4) as u32);
+            // gate_up: pair p = t*k + j reads activation row t
+            for p in 0..pairs {
+                for r in 0..gu_rows {
+                    map[rows + p * gu_rows + r] = stride * (p / kx) as u32;
+                }
+            }
+            Owned(gpu, gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?)
+        };
+        let dn_map = {
             let g = self.gemv(dn_ty, n, half)?;
             let words: Vec<u32> = sel.iter().map(|&e| e * g.blob_words()).collect();
             let map = g.map_for_blobs(&words, XLayout::PerExpert);
-            let map = Owned(
-                gpu,
-                gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?,
-            );
-            g.run(&dn_w, &situ, &down, &map, pairs)?;
+            Owned(gpu, gemv::upload(gpu, &breccia_kernels::batch::map_to_bytes(&map))?)
+        };
+        if !self.fan.get_mut().contains_key(&t) {
+            let fan = [
+                self.u32s(&(0..pairs as u32).collect::<Vec<_>>())?,
+                self.f32s(&vec![0.0; t * n])?,
+                self.f32s(&vec![0.0; t])?,
+            ];
+            self.fan.get_mut().insert(t, fan);
         }
+        resume(gpu, open)?;
+
+        let gu = self.buf(pairs * gu_rows)?;
+        self.gemvs[&(gu_ty, gu_rows, cols)].run(&gu_w, x, &gu, &gu_map, pairs)?;
+        drop(gu_w);
+        let situ = self.buf(pairs * half)?;
+        self.glu.run_fused(&gu, &situ, pairs, half)?;
+        drop(gu);
+        // down: pair p reads SITU row p
+        let down = self.buf(pairs * n)?;
+        self.gemvs[&(dn_ty, n, half)].run(&dn_w, &situ, &down, &dn_map, pairs)?;
         drop((dn_w, situ));
 
-        let slots = self.u32s(&(0..pairs as u32).collect::<Vec<_>>())?;
-        let shared = self.f32s(&vec![0.0; t * n])?;
-        let gate0 = self.f32s(&vec![0.0; t])?;
         let out = self.buf(t * n)?;
+        let [slots, shared, gate0] = &self.fan.get_mut()[&t];
         self.fanin
-            .run(&down, &slots, &wts, &shared, &gate0, &out, t, kx, n)?;
+            .run(&down, slots, &wts, shared, gate0, &out, t, kx, n)?;
         Ok(out)
     }
 }
