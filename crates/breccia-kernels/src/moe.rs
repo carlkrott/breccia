@@ -70,7 +70,28 @@ impl<'g> MoeMap<'g> {
             .u(rows as u32)
             .u(batch.blocks_per_row() as u32)
             .u(crate::batch::block_words(batch.ty()))
+            .u(0)
             .u(0);
+        let (gx, gy) = grid_for(rows, 64);
+        self.pipe.run(&[ids, map], &pc, (gx, gy, 1))
+    }
+
+    /// As [`run`](Self::run) for `tokens x group` routed ids (row-major): id `j`
+    /// reads activation row `j / group`, i.e. the gate/up role of a multi-token
+    /// batch (`group` = top-k). `group` 1 is the `per_expert` layout.
+    pub fn run_grouped(&self, ids: &Buf, map: &Buf, batch: &crate::GemvBatch<'_>, experts: usize, group: usize) -> Result<()> {
+        let rows = batch.rows(experts);
+        let pc = Pc::new()
+            .u(experts as u32)
+            .u(batch.rows_per_expert() as u32)
+            .u(batch.blob_words())
+            .u(0)
+            .u((batch.padded_cols() / 4) as u32)
+            .u(rows as u32)
+            .u(batch.blocks_per_row() as u32)
+            .u(crate::batch::block_words(batch.ty()))
+            .u(0)
+            .u(group.max(1) as u32);
         let (gx, gy) = grid_for(rows, 64);
         self.pipe.run(&[ids, map], &pc, (gx, gy, 1))
     }
@@ -88,7 +109,8 @@ impl<'g> MoeMap<'g> {
             .u(rows as u32)
             .u(batch.blocks_per_row() as u32)
             .u(crate::batch::block_words(batch.ty()))
-            .u(1);
+            .u(1)
+            .u(0);
         let (gx, gy) = grid_for(rows, 64);
         self.pipe.run(&[ids, map], &pc, (gx, gy, 1))
     }

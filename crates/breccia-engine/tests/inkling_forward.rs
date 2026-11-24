@@ -117,7 +117,9 @@ fn placed(e: &Env) -> InklingForward<'_> {
         };
         fwd.set_host_experts(pool, &layers).unwrap();
     }
-    eprintln!("placement: resident={r:?} host={:?} layers={:?}", std::env::var("BRECCIA_INKLING_HOST").ok(), std::env::var("BRECCIA_INKLING_HOST_LAYERS").ok());
+    // BRECCIA_INKLING_HOST_MAPS=1: resident MoE builds its maps on the host (the pre-11-24 multi-row path)
+    fwd.host_maps = std::env::var("BRECCIA_INKLING_HOST_MAPS").is_ok_and(|v| v == "1");
+    eprintln!("placement: resident={r:?} host={:?} layers={:?} host_maps={}", std::env::var("BRECCIA_INKLING_HOST").ok(), std::env::var("BRECCIA_INKLING_HOST_LAYERS").ok(), fwd.host_maps);
     fwd
 }
 
@@ -562,5 +564,114 @@ fn incremental_taps() {
         if m > 1e-4 {
             eprintln!("  {name:<14} slot {slot:2}  max {m:.3e}  per row {:?}", rows.iter().map(|x| format!("{x:.1e}")).collect::<Vec<_>>());
         }
+    }
+}
+
+/// CPU-lane cost by rows per call (no GPU): T random-routed rows through
+/// `moe_topk_chunk` on every layer, the planner's cost-model input for batched
+/// streams and prefill. Random routing is the upper bound on distinct experts.
+/// `BRECCIA_INKLING_LANE_BENCH=1` runs it; `LANE_T="1,4,8,512"`.
+#[test]
+fn lane_bench() {
+    if std::env::var("BRECCIA_INKLING_LANE_BENCH").as_deref() != Ok("1") {
+        return;
+    }
+    let gguf = std::env::var("BRECCIA_INKLING_GGUF").expect("BRECCIA_INKLING_GGUF");
+    let shards = Arc::new(ShardSet::open_family(&gguf).expect("open gguf"));
+    let cfg = InklingConfig::from_metadata(&shards.metadata().unwrap()).expect("config");
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get().min(32));
+    let mut pool = cpu::ExpertPool::new(shards.clone(), threads, cpu::path());
+    let act = cpu::GluAct::Situ { beta: cfg.situ_beta, lb: cfg.situ_linear_beta };
+    let plans: Vec<cpu::LayerPlan> = (0..cfg.n_layers)
+        .map(|l| {
+            let t = |s: &str| shards.tensor(&format!("blk.{l}.{s}")).unwrap();
+            cpu::LayerPlan::merged(&shards, l, &t("ffn_gate_up_exps.weight"), &t("ffn_down_exps.weight"), act).unwrap()
+        })
+        .collect();
+    let (ne, k, n) = (cfg.n_expert, cfg.n_expert_used, cfg.n_embd);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let ts = std::env::var("LANE_T").unwrap_or_else(|_| "1,4,8,512".into());
+    // warm the page cache once over every layer
+    for p in &plans {
+        let ids: Vec<usize> = (0..k).collect();
+        pool.moe_topk(p, &ids, &vec![0.1; k], &vec![0.01; n], &mut vec![0.0; n]).unwrap();
+    }
+    for t in ts.split(',').map(|s| s.trim().parse::<usize>().unwrap()) {
+        let x = vec![0.01f32; t * n];
+        let mut out = vec![0f32; t * n];
+        let (mut secs, mut distinct, mut calls) = (0f64, 0usize, 0usize);
+        for _rep in 0..3 {
+            for p in &plans {
+                let ids: Vec<Vec<usize>> = (0..t)
+                    .map(|_| {
+                        let mut v: Vec<usize> = Vec::with_capacity(k);
+                        while v.len() < k {
+                            let e = (rnd() % ne as u64) as usize;
+                            if !v.contains(&e) {
+                                v.push(e);
+                            }
+                        }
+                        v
+                    })
+                    .collect();
+                let w = vec![1.0 / k as f32; k];
+                let routes: Vec<cpu::ChunkRoute> = ids.iter().map(|i| cpu::ChunkRoute { ids: i, weights: &w }).collect();
+                let mut all: Vec<usize> = ids.concat();
+                all.sort_unstable();
+                all.dedup();
+                distinct += all.len();
+                let t0 = std::time::Instant::now();
+                if t == 1 {
+                    pool.moe_topk(p, &ids[0], &w, &x, &mut out).unwrap();
+                } else {
+                    pool.moe_topk_chunk(p, &routes, &x, &mut out).unwrap();
+                }
+                secs += t0.elapsed().as_secs_f64();
+                calls += 1;
+            }
+        }
+        eprintln!(
+            "lane T={t:4}: {:.3} ms per layer call, {:.3} ms per row, {:.1} distinct experts ({threads} threads)",
+            1e3 * secs / calls as f64,
+            1e3 * secs / (calls * t) as f64,
+            distinct as f64 / calls as f64
+        );
+    }
+}
+
+/// Seconds per `forward` call at T rows (`ROWS_T="1,8"`), after the prompt: what
+/// every row-wise op costs at the row count batched decode would run.
+/// `BRECCIA_INKLING_ROWS_TIMING=1` runs it.
+#[test]
+fn rows_timing() {
+    if std::env::var("BRECCIA_INKLING_ROWS_TIMING").as_deref() != Ok("1") {
+        return;
+    }
+    let Some(e) = env() else { return };
+    let ts: Vec<usize> = std::env::var("ROWS_T")
+        .unwrap_or_else(|_| "1,8".into())
+        .split(',')
+        .map(|s| s.trim().parse().unwrap())
+        .collect();
+    let reps = 8;
+    let mut fwd = placed(&e);
+    let total = PROMPT.len() + ts.iter().map(|t| t * (reps + 1)).sum::<usize>();
+    let mut seq = fwd.new_seq(total, 64).unwrap();
+    fwd.forward(&mut seq, &PROMPT, None).unwrap();
+    for &t in &ts {
+        let ids: Vec<u32> = PROMPT.iter().cycle().take(t).copied().collect();
+        fwd.forward(&mut seq, &ids, None).unwrap(); // warm this shape
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            fwd.forward(&mut seq, &ids, None).unwrap();
+        }
+        let s = t0.elapsed().as_secs_f64() / reps as f64;
+        eprintln!("rows T={t}: {:.1} ms per forward, {:.2} ms per row", 1e3 * s, 1e3 * s / t as f64);
     }
 }

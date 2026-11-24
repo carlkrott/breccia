@@ -84,6 +84,36 @@ fn device_map_equals_the_host_map() -> Result<()> {
     Ok(())
 }
 
+/// `run_grouped`: `tokens x k` ids, id `j` reads activation row `j / k` — the host
+/// map Inkling builds for a multi-token gate/up batch.
+#[test]
+fn grouped_map_equals_the_host_map() -> Result<()> {
+    let Some(dev) = device() else { return Ok(()) };
+    let gpu = dev.gpu();
+    let map_pipe = MoeMap::new(gpu)?;
+    let (k, tokens) = (4usize, 3usize);
+    let ids: Vec<u32> = vec![7, 0, 127, 3, 9, 64, 100, 1, 40, 42, 5, 6];
+    let ids_buf = breccia_kernels::gemv::upload(gpu, &breccia_kernels::ops::u32_to_bytes(&ids))?;
+    let batch = GemvBatch::new(gpu, QuantType::Iq4Nl, 640, 2560)?;
+    let rows = batch.rows(ids.len());
+    let map = breccia_kernels::gemv::alloc(gpu, batch.map_bytes(ids.len()))?;
+    map_pipe.run_grouped(&ids_buf, &map, &batch, ids.len(), k)?;
+    let blobs: Vec<u32> = ids.iter().map(|&id| id * batch.blob_words()).collect();
+    let mut want = batch.map_for_blobs(&blobs, XLayout::PerExpert);
+    let stride = (batch.padded_cols() / 4) as u32;
+    for p in 0..tokens * k {
+        for r in 0..640 {
+            want[rows + p * 640 + r] = stride * (p / k) as u32;
+        }
+    }
+    let got = breccia_kernels::ops::download_u32(gpu, &map, rows * 2)?;
+    assert_eq!(got, want[..rows * 2], "grouped map");
+    println!("grouped map: {} entries identical", got.len());
+    gpu.destroy_buf(&map);
+    gpu.destroy_buf(&ids_buf);
+    Ok(())
+}
+
 /// `MoeCombine` must equal `Σ w_j·in_j + shared·sigmoid(g)` computed on the host.
 #[test]
 fn device_combine_equals_the_host_expression() -> Result<()> {

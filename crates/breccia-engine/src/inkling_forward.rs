@@ -1257,9 +1257,9 @@ impl<'g> InklingForward<'g> {
 
         // readback through staging (recorded into the batch): ids, then for the
         // host lane the weights and x; one pause covers it and every upload below
-        // decode on an all-resident layer: maps built on the device from the ids,
-        // no readback (and no routed counts), so the per-layer host round trip goes
-        let device = lane.is_none() && t == 1 && !self.host_maps;
+        // an all-resident layer: maps built on the device from the ids, no
+        // readback (and no routed counts), so the per-layer host round trip goes
+        let device = lane.is_none() && !self.host_maps;
         let need = if lane.is_some() { 2 * pairs + t * n } else if device { 0 } else { pairs };
         let mut raw = vec![0u8; need * 4];
         let open = if device {
@@ -1339,7 +1339,7 @@ impl<'g> InklingForward<'g> {
             self.gemv(gu_ty, gu_rows, cols)?;
             let g = &self.gemvs[&(gu_ty, gu_rows, cols)];
             let m = Owned(gpu, gemv::alloc(gpu, (2 * g.rows(pairs) * 4) as u64)?);
-            self.moe_map.run(&ids, &m, g, pairs, 0, false)?;
+            self.moe_map.run_grouped(&ids, &m, g, pairs, kx)?;
             m
         } else {
             let g = self.gemv(gu_ty, gu_rows, cols)?;
