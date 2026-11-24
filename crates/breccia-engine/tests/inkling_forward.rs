@@ -260,3 +260,36 @@ fn incremental_long() {
         incremental(&ids[..1100], 64, 4);
     }
 }
+
+/// S13: 32 greedy tokens through `InklingSeq` decode vs llama.cpp (`golden/greedy-32.txt`,
+/// CPU build). A mismatch passes only as a near-tie (reference logit within 0.1 of the
+/// top; the CPU golden quantizes activations to Q8_K), and the comparison stops there.
+#[test]
+fn greedy_32() {
+    let Some(e) = env() else {
+        eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
+        return;
+    };
+    let s = std::fs::read_to_string(e.golden.join("greedy-32.txt")).expect("greedy-32.txt");
+    let want: Vec<u32> = s
+        .trim()
+        .split(',')
+        .map(|x| x.trim().parse().unwrap())
+        .collect();
+    let mut fwd = InklingForward::new(e.dev.gpu(), &e.shards, e.cfg.clone()).unwrap();
+    let mut seq = fwd.new_seq(PROMPT.len() + want.len(), 64).unwrap();
+    let mut l = fwd.forward(&mut seq, &PROMPT, None).unwrap();
+    let mut got = Vec::new();
+    for &w in &want {
+        let top = argmax(&l) as u32;
+        if top != w {
+            let gap = l[top as usize] - l[w as usize];
+            eprintln!("diverged at {}: {top} vs {w}, gap {gap:.4}", got.len());
+            assert!(gap <= 0.1, "not a near-tie: got {got:?}");
+            break;
+        }
+        got.push(top);
+        l = fwd.forward(&mut seq, &[top], None).unwrap();
+    }
+    eprintln!("{}/{} greedy tokens match", got.len(), want.len());
+}
