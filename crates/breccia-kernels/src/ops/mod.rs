@@ -1100,15 +1100,17 @@ impl<'g> KvAppend<'g> {
         Ok((rows * Self::row_words(layout, head_dim)? * 4) as u64)
     }
 
-    /// Write `tokens` rows of `k`/`v` (`[tokens, n_kv_head, head_dim]` f32) at
-    /// logical cells `pos0..pos0 + tokens`.
-    pub fn run(&self, kv: &PagedKv, k: &Buf, v: &Buf, tokens: usize, pos0: usize) -> Result<()> {
+    /// Write rows `src_row..src_row + tokens` of `k`/`v` (`[rows, n_kv_head, head_dim]`
+    /// f32) at logical cells `pos0..pos0 + tokens`.
+    pub fn run(&self, kv: &PagedKv, k: &Buf, v: &Buf, src_row: usize, tokens: usize, pos0: usize) -> Result<()> {
         ensure!(
             pos0 + tokens <= kv.cells,
             "kv append: cells {pos0}..{} past the {} the page table maps",
             pos0 + tokens,
             kv.cells
         );
+        let need = ((src_row + tokens) * kv.n_kv_head * kv.head_dim * 4) as u64;
+        ensure!(k.size >= need && v.size >= need, "kv append: rows {src_row}+{tokens} past the k/v buffers");
         let words = Self::row_words(kv.layout, kv.head_dim)?;
         let (pipe, units) = match kv.layout {
             VLayout::Q6_0 => (&self.q6, tokens * kv.n_kv_head * (kv.head_dim / 64)),
@@ -1120,7 +1122,8 @@ impl<'g> KvAppend<'g> {
             .u(kv.n_kv_head as u32)
             .u(kv.head_dim as u32)
             .u(Self::PAGE_CELLS as u32)
-            .u(0);
+            .u(0)
+            .u(src_row as u32);
         let (gx, gy) = grid_for(units, 128);
         pipe.run(&[kv.k, kv.v, kv.pt, k, v], &pc, (gx, gy, 1))
     }

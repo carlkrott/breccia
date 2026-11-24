@@ -68,7 +68,7 @@ layout(push_constant) uniform Params {
     uint head_dim;  // 256
     uint page_cells; // 16
     uint pad0;
-    uint pad1;
+    uint src_row;   // KC/VC row of token 0 (0 = start of the buffer)
     uint pad2;
 } pc;
 
@@ -118,7 +118,7 @@ void main() {
     uint in_page = cell % pc.page_cells;
     uint row = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
     uint at = row * kv6_row_words(pc.head_dim) + sb * KV6_SB_WORDS;
-    uint src = t * (pc.n_kv_head * pc.head_dim) + kvh * pc.head_dim + sb * 64u;
+    uint src = (pc.src_row + t) * (pc.n_kv_head * pc.head_dim) + kvh * pc.head_dim + sb * 64u;
 
     uint w[6];
     float d[2];
@@ -163,7 +163,7 @@ void main() {
     uint in_page = cell % pc.page_cells;
     uint row = (page * pc.n_kv_head + kvh) * pc.page_cells + in_page;
 
-    uint src = t * (pc.n_kv_head * pc.head_dim) + kvh * pc.head_dim + blk * Q8_BLOCK_ELEMS;
+    uint src = (pc.src_row + t) * (pc.n_kv_head * pc.head_dim) + kvh * pc.head_dim + blk * Q8_BLOCK_ELEMS;
 
     // K: still f16, and this block covers exactly head_dim/32 x 2 words of the row.
     uint kword = row * (pc.head_dim / 2u) + blk * (Q8_BLOCK_ELEMS / 2u);
@@ -337,7 +337,7 @@ void main() {
     uint in_page = cell % pc.page_cells;
     uint pairs = OCT_D / 2u;
     uint word = ((page * pc.n_kv_head + kvh) * pc.page_cells + in_page) * pairs;
-    uint src = t * (pc.n_kv_head * OCT_D) + kvh * OCT_D;
+    uint src = (pc.src_row + t) * (pc.n_kv_head * OCT_D) + kvh * OCT_D;
 
     for (uint d = 0u; d < OCT_D; ++d) { row[d] = KC[src + d]; }
     bool gg = (pc.pad0 & 256u) != 0u;
@@ -369,7 +369,7 @@ void main() {
     uint in_page = cell % pc.page_cells;
     uint word = ((page * pc.n_kv_head + kvh) * pc.page_cells + in_page) * pairs + pair;
 
-    uint src = t * (pc.n_kv_head * pc.head_dim) + kvh * pc.head_dim + pair * 2u;
+    uint src = (pc.src_row + t) * (pc.n_kv_head * pc.head_dim) + kvh * pc.head_dim + pair * 2u;
     // The engine's own round-to-nearest-even encoding, not `packHalf2x16` (see
     // f16_storage.glsl: this device's packer truncates, which would bias every
     // cached |K| and |V| toward zero by up to 1 ulp).

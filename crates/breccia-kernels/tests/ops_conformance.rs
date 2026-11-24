@@ -1803,7 +1803,7 @@ fn inkling_shortconv() {
 }
 
 /// Paged f16 / q6_0 KV (`KvAppend` + `AttnDense::run_paged`) against the CPU
-/// reference on the same rounded K/V: reversed page table, two append calls,
+/// reference on the same rounded K/V: reversed page table, two append calls (one at src_row > 0),
 /// never-written cells (kpos -1 over an uninitialised pool), serial and split.
 #[test]
 fn attn_dense_paged() {
@@ -1863,10 +1863,11 @@ fn attn_dense_paged() {
             head_dim: hd,
             cells: pages * KvAppend::PAGE_CELLS,
         };
-        for (lo, hi) in [(0, 1000), (1000, filled)] {
-            let (kc, vc) = (up(&k[lo * row..hi * row]), up(&v[lo * row..hi * row]));
-            app.run(&kv, &kc, &vc, hi - lo, lo).expect("append");
-        }
+        // first call from a sliced buffer, second from row `lo` of the whole one (src_row)
+        let (kc, vc) = (up(&k[..1000 * row]), up(&v[..1000 * row]));
+        app.run(&kv, &kc, &vc, 0, 1000, 0).expect("append");
+        let (kc, vc) = (up(&k), up(&v));
+        app.run(&kv, &kc, &vc, 1000, filled - 1000, 1000).expect("append");
         let round = |x: &[f32]| -> Vec<f32> {
             let mut o = match layout {
                 VLayout::F16 => x.iter().map(|v| breccia_kernels::qsa::cpu::to_f16(*v)).collect(),
@@ -2342,7 +2343,7 @@ fn attn_dense_decode_bench() {
             let bytes = KvAppend::pool_bytes(layout, n, kvh, hd).expect("size");
             let (kp, vp) = (breccia_kernels::gemv::alloc(gpu, bytes).expect("k"), breccia_kernels::gemv::alloc(gpu, bytes).expect("v"));
             let kv = PagedKv { k: &kp, v: &vp, pt: &pt, layout, n_kv_head: kvh, head_dim: hd, cells: pages * KvAppend::PAGE_CELLS };
-            KvAppend::new(gpu).expect("append").run(&kv, &k, &v, n, 0).expect("append");
+            KvAppend::new(gpu).expect("append").run(&kv, &k, &v, 0, n, 0).expect("append");
             let mut best = f64::MAX;
             for _ in 0..4 {
                 let t0 = std::time::Instant::now();

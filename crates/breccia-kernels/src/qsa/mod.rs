@@ -1667,7 +1667,8 @@ impl<'g> Qsa<'g> {
             .u(MODEL_N_KV_HEAD as u32)
             .u(MODEL_HEAD_DIM as u32)
             .u(PAGE_CELLS as u32)
-            .u(oct);
+            .u(oct)
+            .u(0);
         let (pipe, gx, gy) = self.kv_append_target(state, ws.tokens, oct);
         pipe.run(
             &[

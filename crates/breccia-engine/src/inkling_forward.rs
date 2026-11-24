@@ -109,11 +109,11 @@ const CTRL: [&str; 4] = ["q", "k", "v", "ffn"];
 /// One slot's cache: K/V `[cells, kv_dim]`, cell positions (i32, -1 = empty)
 /// and the short-conv state.
 struct SlotKv<'g> {
-    /// f32 `[cells, kv]` on ring slots; a paged pool (`pt` set) on full slots.
+    /// Paged pool ([`InklingForward::slot_layout`]); ring slots address it modulo `cells`.
     k: Owned<'g>,
     v: Owned<'g>,
-    /// Identity page table of a full slot's paged pool.
-    pt: Option<Owned<'g>>,
+    /// Identity page table of the pool.
+    pt: Owned<'g>,
     kpos: Owned<'g>,
     cells: usize,
     ring: bool,
@@ -121,7 +121,6 @@ struct SlotKv<'g> {
 }
 
 /// One sequence's state between [`InklingForward::forward`] calls.
-// shortcut: SWA rings stay f32 (window + chunk cells each); page them (modulo page table) if rings grow.
 pub struct InklingSeq<'g> {
     pos: usize,
     ctx: usize,
@@ -133,6 +132,14 @@ impl InklingSeq<'_> {
     /// Tokens consumed so far (the next position).
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// Device bytes this sequence holds (KV pools, page tables, positions, conv state).
+    pub fn bytes(&self) -> u64 {
+        self.slots
+            .iter()
+            .map(|s| s.k.size + s.v.size + s.pt.size + s.kpos.size + s.state.size)
+            .sum()
     }
 }
 
@@ -150,6 +157,7 @@ pub struct InklingForward<'g> {
     attn: AttnDense<'g>,
     append: KvAppend<'g>,
     /// Full slots' paged KV layout (`BRECCIA_KV`, default q6_0; f16 = llama.cpp parity).
+    /// SWA rings are always f16, see [`Self::slot_layout`].
     kv_layout: VLayout,
     add: Add<'g>,
     act: Act<'g>,
@@ -697,6 +705,37 @@ impl<'g> InklingForward<'g> {
         Ok(out)
     }
 
+    /// KV cells of a slot on `layer`: a ring of `window + chunk - 1` on SWA layers.
+    fn slot_cells(&self, layer: usize, ctx: usize, chunk: usize) -> usize {
+        if self.cfg.swa[layer] {
+            (self.cfg.sliding_window + chunk - 1).min(ctx)
+        } else {
+            ctx
+        }
+    }
+
+    /// Device bytes [`Self::new_seq`] allocates for `(ctx, chunk)`; the budget unit
+    /// for placing streams.
+    pub fn seq_bytes(&self, ctx: usize, chunk: usize) -> Result<u64> {
+        let cfg = &self.cfg;
+        let state = ((cfg.n_conv - 1) * (2 * cfg.kv_dim() + 2 * cfg.n_embd) * 4) as u64;
+        let mut total = 0;
+        for st in cfg.plan().steps() {
+            let cells = self.slot_cells(st.layer, ctx, chunk);
+            let pool = KvAppend::pool_bytes(self.slot_layout(cfg.swa[st.layer]), cells, cfg.n_head_kv, cfg.head_dim)?;
+            let pt = (cells.div_ceil(KvAppend::PAGE_CELLS) * 4) as u64;
+            // five buffers per slot, each with the allocator's tail pad
+            total += 2 * pool + pt + (cells * 4) as u64 + state + 5 * gemv::TAIL_PAD;
+        }
+        Ok(total)
+    }
+
+    /// Flash-decoding split on/off for dense attention (on by default). Off fixes the
+    /// summation order, so chunked and one-shot prefill agree to rounding.
+    pub fn set_attn_split(&mut self, on: bool) {
+        self.attn.split = on;
+    }
+
     /// An empty sequence for up to `ctx` tokens, fed at most `chunk` tokens per
     /// [`Self::forward`] step (the SWA ring holds `window + chunk - 1` cells).
     pub fn new_seq(&self, ctx: usize, chunk: usize) -> Result<InklingSeq<'g>> {
@@ -712,26 +751,13 @@ impl<'g> InklingForward<'g> {
         let mut slots = Vec::with_capacity(layer_of.len());
         for &l in &layer_of {
             let ring = cfg.swa[l];
-            let cells = if ring {
-                (cfg.sliding_window + chunk - 1).min(ctx)
-            } else {
-                ctx
-            };
-            let (k, v, pt) = if ring {
-                (self.buf(cells * kv)?, self.buf(cells * kv)?, None)
-            } else {
-                let bytes = KvAppend::pool_bytes(self.kv_layout, cells, cfg.n_head_kv, cfg.head_dim)?;
-                let pages = cells.div_ceil(KvAppend::PAGE_CELLS) as u32;
-                (
-                    Owned(self.gpu, gemv::alloc(self.gpu, bytes)?),
-                    Owned(self.gpu, gemv::alloc(self.gpu, bytes)?),
-                    Some(self.u32s(&(0..pages).collect::<Vec<_>>())?),
-                )
-            };
+            let cells = self.slot_cells(l, ctx, chunk);
+            let bytes = KvAppend::pool_bytes(self.slot_layout(ring), cells, cfg.n_head_kv, cfg.head_dim)?;
+            let pages = cells.div_ceil(KvAppend::PAGE_CELLS) as u32;
             slots.push(SlotKv {
-                k,
-                v,
-                pt,
+                k: Owned(self.gpu, gemv::alloc(self.gpu, bytes)?),
+                v: Owned(self.gpu, gemv::alloc(self.gpu, bytes)?),
+                pt: self.u32s(&(0..pages).collect::<Vec<_>>())?,
                 kpos: self.bytes(bytemuck_i32(&vec![-1i32; cells]))?,
                 cells,
                 ring,
@@ -915,28 +941,30 @@ impl<'g> InklingForward<'g> {
         ops::download_f32(self.gpu, &logits, cfg.vocab).map(Some)
     }
 
-    /// Write this step's K/V rows and positions into the slot's cells
-    /// (two segments when the ring wraps).
-    /// A full slot's paged pool view.
-    fn paged<'a>(&self, s: &'a SlotKv) -> Option<PagedKv<'a>> {
-        Some(PagedKv {
+    /// KV layout of a slot: SWA rings stay f16 (q6 there cost greedy parity for
+    /// ~100 MB a stream; ring reads are <= window + chunk cells), full slots follow `BRECCIA_KV`.
+    fn slot_layout(&self, ring: bool) -> VLayout {
+        if ring { VLayout::F16 } else { self.kv_layout }
+    }
+
+    /// A slot's paged pool view.
+    fn paged<'a>(&self, s: &'a SlotKv) -> PagedKv<'a> {
+        PagedKv {
             k: &s.k,
             v: &s.v,
-            pt: s.pt.as_deref()?,
-            layout: self.kv_layout,
+            pt: &s.pt,
+            layout: self.slot_layout(s.ring),
             n_kv_head: self.cfg.n_head_kv,
             head_dim: self.cfg.head_dim,
             cells: s.cells,
-        })
+        }
     }
 
+    /// Write this step's K/V rows and positions into the slot's cells
+    /// (two segments when the ring wraps).
     fn store(&self, s: &SlotKv, k: &Buf, v: &Buf, pos: &Buf, p0: usize, t: usize) -> Result<()> {
-        let kvb = self.cfg.kv_dim() * 4;
         ensure!(s.ring || p0 + t <= s.cells, "slot cache full");
-        if let Some(kv) = self.paged(s) {
-            self.append.run(&kv, k, v, t, p0)?;
-            return gemv::copy_at(self.gpu, &s.kpos, (p0 * 4) as u64, pos, 0, (t * 4) as u64);
-        }
+        let kv = self.paged(s);
         // a wrapping write must not evict a cell this chunk's first query still sees
         ensure!(
             p0 + t <= s.cells || t + self.cfg.sliding_window - 1 <= s.cells,
@@ -946,9 +974,7 @@ impl<'g> InklingForward<'g> {
         while done < t {
             let cell = (p0 + done) % s.cells;
             let m = (t - done).min(s.cells - cell);
-            let (dst, src, len) = ((cell * kvb) as u64, (done * kvb) as u64, (m * kvb) as u64);
-            gemv::copy_at(self.gpu, &s.k, dst, k, src, len)?;
-            gemv::copy_at(self.gpu, &s.v, dst, v, src, len)?;
+            self.append.run(&kv, k, v, done, m, cell)?;
             gemv::copy_at(
                 self.gpu,
                 &s.kpos,
@@ -1135,14 +1161,9 @@ impl<'g> InklingForward<'g> {
             scale: 1.0,
         };
         let live = kvs.cells.min(p0 + t);
-        match self.paged(kvs) {
-            Some(kv) => self.attn.run_paged(
-                &shape, &qcur, pos, t, &kv, &kvs.kpos, live, Some(&rel), Some(&sink), &kqv,
-            )?,
-            None => self.attn.run(
-                &shape, &qcur, pos, t, &kvs.k, &kvs.v, &kvs.kpos, live, Some(&rel), Some(&sink), &kqv,
-            )?,
-        }
+        let pkv = self.paged(kvs);
+        self.attn
+            .run_paged(&shape, &qcur, pos, t, &pkv, &kvs.kpos, live, Some(&rel), Some(&sink), &kqv)?;
         drop((qcur, rcur, sinks, bias));
         self.tap(tap, "kqv_out", s, &kqv, t * qd)?;
 
