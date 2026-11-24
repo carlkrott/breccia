@@ -22,7 +22,10 @@ pub fn is_inkling(gguf: &str) -> bool {
 }
 
 struct InklingBackend<'g> {
+    gpu: &'g breccia_vk::ctx::Gpu,
     fwd: InklingForward<'g>,
+    /// Device bytes of one slot's KV at `ctx`.
+    seq_bytes: u64,
     seqs: Vec<Option<InklingSeq<'g>>>,
     tok: Tokenizer,
     template: Option<breccia_chat::ChatTemplate>,
@@ -102,6 +105,10 @@ impl breccia_server::Backend for InklingBackend<'_> {
         // shortcut: each request allocates its slot's full-ctx KV (a few ms); pool pages
         // across slots when many slots x long ctx stop fitting on the card.
         self.seqs[slot] = None;
+        // the VRAM guard would put this slot's KV in host memory (slow steps, ring timeouts): refuse instead
+        if let Some(why) = self.gpu.vram_short(self.seq_bytes) {
+            return Err(format!("no VRAM for another {} MiB slot: {why}", self.seq_bytes >> 20));
+        }
         let mut seq = self.fwd.new_seq(self.ctx, self.chunk).map_err(|e| format!("{e:#}"))?;
         let logits = self.fwd.forward(&mut seq, prompt, None).map_err(|e| format!("{e:#}"))?;
         self.seqs[slot] = Some(seq);
@@ -159,7 +166,20 @@ pub fn serve(port: u16, gguf: &str, device: Option<&str>, ctx: usize, chunk: usi
         tok.eos,
         template.is_some()
     );
-    let backend = InklingBackend { fwd, seqs: (0..seqs).map(|_| None).collect(), tok, template, ctx, chunk, max_tokens };
+    // warm-up: one token loads the resident weights, so the slot check below sees them
+    let mut warm = fwd.new_seq(chunk, chunk)?;
+    fwd.forward(&mut warm, &[tok.bos.unwrap_or(0)], None)?;
+    drop(warm);
+    let seq_bytes = fwd.seq_bytes(ctx, chunk)?;
+    if let Some(why) = dev.gpu().vram_short(seq_bytes * seqs as u64) {
+        anyhow::bail!(
+            "{seqs} slots x ctx {ctx} need {} MiB of KV that this card does not have ({why}); \
+             lower --ctx or BRECCIA_SERVE_SEQS, or move layers off with BRECCIA_INKLING_HOST_LAYERS",
+            (seq_bytes * seqs as u64) >> 20
+        );
+    }
+    println!("inkling  KV {} MiB per slot, {} MiB for {seqs}", seq_bytes >> 20, (seq_bytes * seqs as u64) >> 20);
+    let backend = InklingBackend { gpu: dev.gpu(), seq_bytes, fwd, seqs: (0..seqs).map(|_| None).collect(), tok, template, ctx, chunk, max_tokens };
     breccia_server::serve(&format!("127.0.0.1:{port}"), backend).map_err(|e| anyhow::anyhow!("server: {e}"))
 }
 

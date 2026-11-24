@@ -1334,7 +1334,8 @@ impl<'g> InklingForward<'g> {
         // host lane the weights and x; one pause covers it and every upload below
         // an all-resident layer: maps built on the device from the ids, no
         // readback (and no routed counts), so the per-layer host round trip goes
-        let device = lane.is_none() && !self.host_maps;
+        let grouped = lane.is_none() && self.pf_grouped(layer, t);
+        let device = lane.is_none() && !self.host_maps && !grouped;
         let need = if lane.is_some() { 2 * pairs + t * n } else if device { 0 } else { pairs };
         let mut raw = vec![0u8; need * 4];
         let open = if device {
@@ -1408,6 +1409,10 @@ impl<'g> InklingForward<'g> {
             return Ok(o);
         }
 
+        if grouped {
+            return self.moe_grouped(layer, x, t, sel, &wts, open);
+        }
+
         // GPU experts: maps from the ids, uploaded while the batch is closed
         let (gu_w, gu_dims, gu_ty) = self.weight(&b("ffn_gate_up_exps.weight"))?;
         let (gu_rows, cols) = (gu_dims[1], gu_dims[0]);
@@ -1473,6 +1478,112 @@ impl<'g> InklingForward<'g> {
         let [slots, shared, gate0] = &self.fan.get_mut()[&t];
         self.fanin
             .run(&down, slots, &wts, shared, gate0, &out, t, kx, n)?;
+        Ok(out)
+    }
+}
+
+impl<'g> InklingForward<'g> {
+    /// Fewest tokens a step needs before its GPU experts run as grouped GEMMs.
+    const GROUP_MIN: usize = 16;
+
+    /// A multi-token step whose GPU experts can run grouped: both expert types
+    /// have a multi-user GEMM. `BRECCIA_INKLING_PF_GROUPED=0` keeps the per-pair GEMV.
+    fn pf_grouped(&mut self, layer: usize, t: usize) -> bool {
+        if t < Self::GROUP_MIN || std::env::var("BRECCIA_INKLING_PF_GROUPED").is_ok_and(|v| v == "0") {
+            return false;
+        }
+        let gpu = self.gpu;
+        ["ffn_gate_up_exps", "ffn_down_exps"].iter().all(|r| {
+            Self::ty_of(self.shards, &format!("blk.{layer}.{r}.weight"))
+                .is_ok_and(|ty| self.gemm.entry(ty).or_insert_with(|| GemmMany::new(gpu, ty).ok()).is_some())
+        })
+    }
+
+    /// Prefill experts as one GEMM per distinct expert (each weight block decoded
+    /// once for all its rows) instead of one GEMV row per (token, expert) pair.
+    /// Entered with the batch paused (`open`) and the ids read back as `sel`.
+    fn moe_grouped(&mut self, layer: usize, x: &Buf, t: usize, sel: &[u32], wts: &Buf, open: bool) -> Result<Owned<'g>> {
+        let (kx, n) = (self.cfg.n_expert_used, self.cfg.n_embd);
+        let ne = self.cfg.n_expert;
+        let pairs = t * kx;
+        let b = |s: &str| format!("blk.{layer}.{s}");
+        let (gu_w, gu_dims, gu_ty) = self.weight(&b("ffn_gate_up_exps.weight"))?;
+        let (dn_w, dn_dims, dn_ty) = self.weight(&b("ffn_down_exps.weight"))?;
+        let (gu_rows, cols) = (gu_dims[1], gu_dims[0]);
+        let half = gu_rows / 2;
+        ensure!(cols == n && dn_dims[0] == half && dn_dims[1] == n, "expert shapes {gu_dims:?} {dn_dims:?}");
+        // expert e's blob starts e x (tensor bytes / experts) in, in u16 words
+        let words = |name: &str| -> Result<u32> {
+            let bytes = self.shards.tensor(name).ok_or_else(|| anyhow!("missing `{name}`"))?.n_bytes();
+            ensure!(bytes % ne as u64 == 0 && bytes / 2 <= u32::MAX as u64, "`{name}`: {bytes} bytes over {ne} experts");
+            Ok((bytes / ne as u64 / 2) as u32)
+        };
+        let (gu_words, dn_words) = (words(&b("ffn_gate_up_exps.weight"))?, words(&b("ffn_down_exps.weight"))?);
+        // pairs sorted by expert (stable): position i holds pair order[i]; slots[p] = its position
+        let mut order: Vec<usize> = (0..pairs).collect();
+        order.sort_by_key(|&p| sel[p]);
+        let mut slots = vec![0u32; pairs];
+        for (i, &p) in order.iter().enumerate() {
+            slots[p] = i as u32;
+        }
+        let slots = self.u32s(&slots)?;
+        if !self.fan.get_mut().contains_key(&t) {
+            let fan = [
+                self.u32s(&(0..pairs as u32).collect::<Vec<_>>())?,
+                self.f32s(&vec![0.0; t * n])?,
+                self.f32s(&vec![0.0; t])?,
+            ];
+            self.fan.get_mut().insert(t, fan);
+        }
+        resume(self.gpu, open)?;
+
+        // gather: grouped row i = x row order[i] / k, contiguous runs as one region
+        let (gpu, nb) = (self.gpu, (n * 4) as u64);
+        let xs = self.buf(pairs * n)?;
+        let mut runs: Vec<(&Buf, u64, &Buf, u64, u64)> = Vec::new();
+        let mut i = 0;
+        while i < pairs {
+            let r0 = order[i] / kx;
+            let mut j = i + 1;
+            while j < pairs && order[j] / kx == r0 + (j - i) {
+                j += 1;
+            }
+            runs.push((&xs, i as u64 * nb, x, r0 as u64 * nb, (j - i) as u64 * nb));
+            i = j;
+        }
+        if batch_cmd::is_open_on(gpu) {
+            batch_cmd::record_copies(gpu, &runs)?;
+        } else {
+            for &(d, doff, s, soff, len) in &runs {
+                gemv::copy_at(gpu, d, doff, s, soff, len)?;
+            }
+        }
+        // (expert, first grouped row, rows)
+        let mut groups: Vec<(u32, usize, usize)> = Vec::new();
+        for (i, &p) in order.iter().enumerate() {
+            match groups.last_mut() {
+                Some(g) if g.0 == sel[p] => g.2 += 1,
+                _ => groups.push((sel[p], i, 1)),
+            }
+        }
+        let gu = self.buf(pairs * gu_rows)?;
+        let g = self.gemm[&gu_ty].as_ref().expect("checked by pf_grouped");
+        for &(e, r, mu) in &groups {
+            g.run_at_off(&gu_w, &xs, &gu, gu_rows, cols, mu, e * gu_words, (r as u64 * nb, (r * gu_rows * 4) as u64))?;
+        }
+        drop((gu_w, xs));
+        let situ = self.buf(pairs * half)?;
+        self.glu.run_fused(&gu, &situ, pairs, half)?;
+        drop(gu);
+        let down = self.buf(pairs * n)?;
+        let g = self.gemm[&dn_ty].as_ref().expect("checked by pf_grouped");
+        for &(e, r, mu) in &groups {
+            g.run_at_off(&dn_w, &situ, &down, n, half, mu, e * dn_words, ((r * half * 4) as u64, r as u64 * nb))?;
+        }
+        drop((dn_w, situ));
+        let out = self.buf(t * n)?;
+        let [_, shared, gate0] = &self.fan.get_mut()[&t];
+        self.fanin.run(&down, &slots, wts, shared, gate0, &out, t, kx, n)?;
         Ok(out)
     }
 }

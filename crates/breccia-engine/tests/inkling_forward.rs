@@ -232,6 +232,77 @@ fn long_forced() {
     }
 }
 
+/// PF_N=<tokens> PF_CHUNK=<chunk>: chunked prefill speed through `InklingSeq`
+/// (the serve path), the long golden prompt repeated up to PF_N tokens.
+#[test]
+fn prefill_speed() {
+    let Some(e) = env() else { return };
+    let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
+    let (n, chunk) = (env("PF_N", 8192), env("PF_CHUNK", 512));
+    let base = long_prompt();
+    let ids: Vec<u32> = base.iter().copied().cycle().take(n).collect();
+    let mut fwd = placed(&e);
+    let mut seq = fwd.new_seq(n + 1, chunk).unwrap();
+    println!("seq {} MiB, process vram before {} MiB", seq.bytes() >> 20, e.dev.gpu().mem_budget().map_or(0, |b| b.usage >> 20));
+    let t0 = std::time::Instant::now();
+    let mut done = 0;
+    while done < n {
+        let m = (n - done).min(chunk);
+        fwd.forward(&mut seq, &ids[done..done + m], None).unwrap();
+        done += m;
+        if done % (8 * chunk) == 0 || done == n {
+            let s = t0.elapsed().as_secs_f64();
+            let mib = e.dev.gpu().mem_budget().map_or(0, |b| b.usage >> 20);
+            println!("prefill {done}/{n} tokens: {s:.1} s, {:.0} tok/s, process vram {mib} MiB", done as f64 / s);
+        }
+    }
+}
+
+/// Grouped expert prefill (one GEMM per distinct expert) against the per-pair GEMV
+/// path, node by node: the grouped run is forced onto the reference's nodes, so each
+/// node's error is its own op's (summation order only, ~1e-6), not accumulated drift.
+#[test]
+fn prefill_grouped_parity() {
+    let Some(e) = env() else { return };
+    // 512 tokens: every node of the reference run is held in host RAM
+    let ids = long_prompt()[..512].to_vec();
+    let mut fwd = placed(&e);
+    fwd.set_attn_split(false);
+    std::env::set_var("BRECCIA_INKLING_PF_GROUPED", "0");
+    let mut nodes: Vec<(String, i32, Vec<f32>)> = Vec::new();
+    let mut rec = |n: &str, s: i32, v: &[f32]| -> Option<Vec<f32>> {
+        nodes.push((n.to_string(), s, v.to_vec()));
+        None
+    };
+    let t = std::time::Instant::now();
+    let a = fwd.prefill(&ids, Some(&mut rec)).unwrap();
+    eprintln!("per-pair: {} tokens in {:.2} s, {} nodes", ids.len(), t.elapsed().as_secs_f64(), nodes.len());
+    std::env::set_var("BRECCIA_INKLING_PF_GROUPED", "1");
+    let mut i = 0;
+    let mut worst: std::collections::BTreeMap<String, (f64, i32)> = Default::default();
+    let mut cmp = |n: &str, s: i32, v: &[f32]| -> Option<Vec<f32>> {
+        let (rn, rs, r) = &nodes[i];
+        i += 1;
+        assert_eq!((rn.as_str(), *rs), (n, s), "node order differs");
+        let d = rel(v, r);
+        let w = worst.entry(n.to_string()).or_insert((0.0, 0));
+        if d > w.0 || d.is_nan() {
+            *w = (d, s);
+        }
+        Some(r.clone())
+    };
+    let t = std::time::Instant::now();
+    let b = fwd.prefill(&ids, Some(&mut cmp)).unwrap();
+    eprintln!("grouped: {:.2} s", t.elapsed().as_secs_f64());
+    std::env::remove_var("BRECCIA_INKLING_PF_GROUPED");
+    for (n, (r, sl)) in &worst {
+        eprintln!("  max {n:<24} {r:.3e} (slot {sl})");
+    }
+    eprintln!("logits max |d| {:.3e}, argmax {} vs {}", max_abs(&a, &b), argmax(&a), argmax(&b));
+    let (n, (r, _)) = worst.iter().max_by(|x, y| x.1 .0.total_cmp(&y.1 .0)).unwrap();
+    assert!(*r < 1e-4, "grouped prefill: node {n} off by {r:.3e} against the per-pair path");
+}
+
 #[test]
 fn long_free() {
     run("dump-long", &long_prompt(), false, Some(1e-1));
@@ -713,10 +784,11 @@ fn batch_decode() {
     let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
     let (b, n) = (env("BATCH_B", 3), env("BATCH_N", 6));
     let prompts: Vec<&[u32]> = (0..b).map(|i| &PROMPT[..PROMPT.len() - (i * 4) % 10]).collect();
-    let ctx = PROMPT.len() + n + 1;
+    // BATCH_CTX / BATCH_CHUNK: size slots like a server does (decode must not scale with them)
+    let ctx = env("BATCH_CTX", PROMPT.len() + n + 1);
     let mut fwd = placed(&e);
 
-    let mut seqs: Vec<_> = (0..b).map(|_| fwd.new_seq(ctx, 64).unwrap()).collect();
+    let mut seqs: Vec<_> = (0..b).map(|_| fwd.new_seq(ctx, env("BATCH_CHUNK", 64)).unwrap()).collect();
     let mut last: Vec<Vec<f32>> = prompts
         .iter()
         .zip(&mut seqs)
