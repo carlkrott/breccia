@@ -34,7 +34,7 @@
 Date: 2026-11-23. Read-only analysis. No edits, builds, GPU runs or commits in the Breccia repo. The GGUF was only read.
 
 Sources:
-- llama.cpp reference: /home/korphaus/llama.cpp-inkling at commit dbcb52e8e (clean tree when checked). Short names: `inkling2.cpp` = src/models/inkling2.cpp, `loop.cpp` = src/models/inkling2-loop.cpp, `llama-graph.cpp` = src/llama-graph.cpp.
+- llama.cpp reference: ~/llama.cpp-inkling at commit dbcb52e8e (clean tree when checked). Short names: `inkling2.cpp` = src/models/inkling2.cpp, `loop.cpp` = src/models/inkling2-loop.cpp, `llama-graph.cpp` = src/llama-graph.cpp.
 - GGUF: /srv/strata-data/models/inkling2-unbound-v2/Inkling-2-Mini-Unbound-v2-Q4_K_M.gguf. Still being written. Header parsed with a local script (hdr.py, dump hdr.txt in the scratchpad ggufdump folder). Tensor data offsets and checksums NOT validated.
 - Breccia: /var/tmp/breccia-coord/wt, branch claude/tools.
 
