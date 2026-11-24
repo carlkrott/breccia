@@ -197,3 +197,66 @@ fn long_forced() {
 fn long_free() {
     run("dump-long", &long_prompt(), false, Some(1e-1));
 }
+
+fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
+}
+
+fn argmax(l: &[f32]) -> usize {
+    (0..l.len()).max_by(|&a, &b| l[a].total_cmp(&l[b])).unwrap()
+}
+
+/// S13: chunked prefill + one-token decode steps through `InklingSeq` must give
+/// the logits of one fresh prefill of the same ids. `ctx`/`chunk` make the SWA
+/// ring (window + chunk - 1 cells) wrap when `ids` is past it.
+fn incremental(ids: &[u32], chunk: usize, decode: usize) {
+    let Some(e) = env() else {
+        eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
+        return;
+    };
+    let mut fwd = InklingForward::new(e.dev.gpu(), &e.shards, e.cfg.clone()).unwrap();
+    let t0 = std::time::Instant::now();
+    let fresh = fwd.prefill(ids, None).unwrap();
+    let t1 = t0.elapsed().as_secs_f64();
+    let mut seq = fwd.new_seq(ids.len(), chunk).unwrap();
+    let split = ids.len() - decode;
+    let mut l = fwd.forward(&mut seq, &ids[..split], None).unwrap();
+    for &id in &ids[split..] {
+        let t = std::time::Instant::now();
+        l = fwd.forward(&mut seq, &[id], None).unwrap();
+        eprintln!(
+            "decode step at {} in {:.2} s",
+            seq.pos(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+    assert_eq!(seq.pos(), ids.len());
+    let d = max_abs(&l, &fresh);
+    let span = fresh.iter().fold(0f32, |m, x| m.max(x.abs()));
+    eprintln!(
+        "{} ids, chunk {chunk}, {decode} decode steps: max |dlogit| {d:.3e} (|logit| <= {span:.2}), \
+         argmax {} vs {}; fresh prefill {t1:.1} s",
+        ids.len(),
+        argmax(&l),
+        argmax(&fresh)
+    );
+    assert_eq!(argmax(&l), argmax(&fresh), "incremental argmax");
+    assert!(d <= 1e-3, "incremental logits drift {d:.3e}");
+}
+
+#[test]
+fn incremental_short() {
+    incremental(&PROMPT, 4, 3);
+}
+
+/// 1100 ids with chunk 64: the SWA ring (1087 cells) wraps, positions cross 1024.
+#[test]
+fn incremental_long() {
+    let ids = long_prompt();
+    if ids.len() >= 1100 {
+        incremental(&ids[..1100], 64, 4);
+    }
+}

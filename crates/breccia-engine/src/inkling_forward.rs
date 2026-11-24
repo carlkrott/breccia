@@ -2,8 +2,10 @@
 //!
 //! A straight port of llama.cpp `src/models/inkling2.cpp` `build_layer` /
 //! `build_output` and `inkling2-loop.cpp`'s pass driver onto the generic
-//! Breccia ops (S4-S10). Prefill only: one fresh sequence, positions `0..T`,
-//! f32 K/V held for the call (KV append for decode is S13).
+//! Breccia ops (S4-S10). [`InklingSeq`] carries one sequence between calls
+//! (S13): per-slot K/V (SWA slots in a ring of `window + chunk - 1` cells,
+//! full slots linear up to `ctx`) and the short-conv states, so prefill and
+//! decode are the same `forward` over the next positions.
 //!
 //! Every shape comes from [`InklingConfig`] or the tensor dims, so a sibling
 //! checkpoint with other widths, loop bounds or block size runs unchanged.
@@ -43,6 +45,33 @@ impl Drop for Owned<'_> {
 }
 
 const CTRL: [&str; 4] = ["q", "k", "v", "ffn"];
+
+/// One slot's cache: K/V `[cells, kv_dim]`, cell positions (i32, -1 = empty)
+/// and the short-conv state.
+struct SlotKv<'g> {
+    k: Owned<'g>,
+    v: Owned<'g>,
+    kpos: Owned<'g>,
+    cells: usize,
+    ring: bool,
+    state: Owned<'g>,
+}
+
+/// One sequence's state between [`InklingForward::forward`] calls.
+// shortcut: f32 K/V only (64 KiB/token on the 8 full slots); f16/q6 KV is the S14 memory step.
+pub struct InklingSeq<'g> {
+    pos: usize,
+    ctx: usize,
+    chunk: usize,
+    slots: Vec<SlotKv<'g>>,
+}
+
+impl InklingSeq<'_> {
+    /// Tokens consumed so far (the next position).
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+}
 
 pub struct InklingForward<'g> {
     gpu: &'g Gpu,
@@ -293,10 +322,86 @@ impl<'g> InklingForward<'g> {
         Ok(out)
     }
 
-    /// Prefill `ids` and return the last token's logits (`vocab` values).
-    pub fn prefill(&mut self, ids: &[u32], mut tap: Option<&mut Tap>) -> Result<Vec<f32>> {
+    /// An empty sequence for up to `ctx` tokens, fed at most `chunk` tokens per
+    /// [`Self::forward`] step (the SWA ring holds `window + chunk - 1` cells).
+    pub fn new_seq(&self, ctx: usize, chunk: usize) -> Result<InklingSeq<'g>> {
+        ensure!(ctx > 0 && chunk > 0, "ctx and chunk must be > 0");
+        let cfg = &self.cfg;
+        let kv = cfg.kv_dim();
+        let plan = cfg.plan();
+        let mut layer_of = vec![0; plan.n_slots()];
+        for st in plan.steps() {
+            layer_of[st.slot] = st.layer;
+        }
+        let zeros = vec![0f32; (cfg.n_conv - 1) * (2 * kv + 2 * cfg.n_embd)];
+        let mut slots = Vec::with_capacity(layer_of.len());
+        for &l in &layer_of {
+            let ring = cfg.swa[l];
+            let cells = if ring {
+                (cfg.sliding_window + chunk - 1).min(ctx)
+            } else {
+                ctx
+            };
+            slots.push(SlotKv {
+                k: self.buf(cells * kv)?,
+                v: self.buf(cells * kv)?,
+                kpos: self.bytes(bytemuck_i32(&vec![-1i32; cells]))?,
+                cells,
+                ring,
+                state: self.f32s(&zeros)?,
+            });
+        }
+        Ok(InklingSeq {
+            pos: 0,
+            ctx,
+            chunk,
+            slots,
+        })
+    }
+
+    /// Prefill `ids` as one fresh sequence and return the last token's logits.
+    pub fn prefill(&mut self, ids: &[u32], tap: Option<&mut Tap>) -> Result<Vec<f32>> {
+        let mut seq = self.new_seq(ids.len().max(1), ids.len().max(1))?;
+        self.forward(&mut seq, ids, tap)
+    }
+
+    /// Feed `ids` at the sequence's next positions (in steps of `seq.chunk`) and
+    /// return the last token's logits (`vocab` values).
+    pub fn forward(
+        &mut self,
+        seq: &mut InklingSeq<'g>,
+        ids: &[u32],
+        mut tap: Option<&mut Tap>,
+    ) -> Result<Vec<f32>> {
+        ensure!(!ids.is_empty(), "empty input");
+        ensure!(
+            seq.pos + ids.len() <= seq.ctx,
+            "context full: {} + {} > {}",
+            seq.pos,
+            ids.len(),
+            seq.ctx
+        );
+        let chunks: Vec<&[u32]> = ids.chunks(seq.chunk).collect();
+        let last = chunks.len() - 1;
+        for (i, c) in chunks.into_iter().enumerate() {
+            let logits = self.step(seq, c, tap.as_deref_mut(), i == last)?;
+            if let Some(l) = logits {
+                return Ok(l);
+            }
+        }
+        unreachable!("the last chunk returns logits")
+    }
+
+    /// One chunk at positions `seq.pos..`; logits only when `head`.
+    fn step(
+        &mut self,
+        seq: &mut InklingSeq<'g>,
+        ids: &[u32],
+        mut tap: Option<&mut Tap>,
+        head: bool,
+    ) -> Result<Option<Vec<f32>>> {
         let t = ids.len();
-        ensure!(t > 0, "empty prompt");
+        let p0 = seq.pos;
         let cfg = self.cfg.clone();
         let n = cfg.n_embd;
         let plan = cfg.plan();
@@ -318,14 +423,8 @@ impl<'g> InklingForward<'g> {
         drop((raw, g));
         self.tap(&mut tap, "inp_norm", -1, &cur, tn)?;
 
-        let pos: Vec<i32> = (0..t as i32).collect();
+        let pos: Vec<i32> = (p0 as i32..(p0 + t) as i32).collect();
         let pos = self.bytes(bytemuck_i32(&pos))?;
-        let state_stride = 2 * cfg.kv_dim() + 2 * n;
-        let zeros = vec![0f32; (cfg.n_conv - 1) * state_stride];
-        let mut states = Vec::with_capacity(plan.n_slots());
-        for _ in 0..plan.n_slots() {
-            states.push(self.f32s(&zeros)?);
-        }
 
         // block stack (oldest first) and the previous pass's bank
         let max_blocks = DepthMix::MAX_STATES - 1;
@@ -379,11 +478,15 @@ impl<'g> InklingForward<'g> {
                 &stack,
                 &mut nblocks,
                 msgs.as_deref(),
-                &states[st.slot],
-                &pos,
+                &seq.slots[st.slot],
+                (&pos, p0),
                 t,
                 &mut tap,
             )?;
+        }
+        seq.pos += t;
+        if !head {
+            return Ok(None);
         }
 
         // output head on the last token
@@ -399,7 +502,37 @@ impl<'g> InklingForward<'g> {
             self.act.run(&logits, &logits, rows, cfg.softcap)?;
         }
         self.tap(&mut tap, "result_output", -1, &logits, cfg.vocab)?;
-        ops::download_f32(self.gpu, &logits, cfg.vocab)
+        ops::download_f32(self.gpu, &logits, cfg.vocab).map(Some)
+    }
+
+    /// Write this step's K/V rows and positions into the slot's cells
+    /// (two segments when the ring wraps).
+    fn store(&self, s: &SlotKv, k: &Buf, v: &Buf, pos: &Buf, p0: usize, t: usize) -> Result<()> {
+        let kvb = self.cfg.kv_dim() * 4;
+        ensure!(s.ring || p0 + t <= s.cells, "slot cache full");
+        // a wrapping write must not evict a cell this chunk's first query still sees
+        ensure!(
+            p0 + t <= s.cells || t + self.cfg.sliding_window - 1 <= s.cells,
+            "chunk over the ring"
+        );
+        let mut done = 0;
+        while done < t {
+            let cell = (p0 + done) % s.cells;
+            let m = (t - done).min(s.cells - cell);
+            let (dst, src, len) = ((cell * kvb) as u64, (done * kvb) as u64, (m * kvb) as u64);
+            gemv::copy_at(self.gpu, &s.k, dst, k, src, len)?;
+            gemv::copy_at(self.gpu, &s.v, dst, v, src, len)?;
+            gemv::copy_at(
+                self.gpu,
+                &s.kpos,
+                (cell * 4) as u64,
+                pos,
+                (done * 4) as u64,
+                (m * 4) as u64,
+            )?;
+            done += m;
+        }
+        Ok(())
     }
 
     /// llama.cpp `build_layer(il = slot, ip = layer, ...)`.
@@ -412,11 +545,12 @@ impl<'g> InklingForward<'g> {
         stack: &Buf,
         nblocks: &mut usize,
         msgs: Option<&Buf>,
-        state: &Buf,
-        pos: &Buf,
+        kvs: &SlotKv,
+        (pos, p0): (&Buf, usize),
         t: usize,
         tap: &mut Option<&mut Tap>,
     ) -> Result<Owned<'g>> {
+        let state = &*kvs.state;
         let cfg = self.cfg.clone();
         let (n, hd, h, hkv) = (cfg.n_embd, cfg.head_dim, cfg.n_head, cfg.n_head_kv);
         let (kv, qd) = (cfg.kv_dim(), cfg.q_dim());
@@ -547,6 +681,8 @@ impl<'g> InklingForward<'g> {
         self.tap(tap, "Kcur", s, &kcur, t * kv)?;
         self.tap(tap, "Vcur", s, &vcur, t * kv)?;
         self.tap(tap, "Rcur", s, &rcur, t * cfg.n_rel * h)?;
+        self.store(kvs, &kcur, &vcur, pos, p0, t)?;
+        drop((kcur, vcur));
 
         // attention: rel bias + per-token sink logit
         let (sinks, _) = self.proj(&b("attn_sink_proj"), in_q, t)?;
@@ -564,10 +700,10 @@ impl<'g> InklingForward<'g> {
             &qcur,
             pos,
             t,
-            &kcur,
-            &vcur,
-            pos,
-            t,
+            &kvs.k,
+            &kvs.v,
+            &kvs.kpos,
+            kvs.cells.min(p0 + t),
             Some(&RelBias {
                 r: &rcur,
                 bias: &bias,
@@ -581,7 +717,7 @@ impl<'g> InklingForward<'g> {
             }),
             &kqv,
         )?;
-        drop((qcur, kcur, vcur, rcur, sinks, bias));
+        drop((qcur, rcur, sinks, bias));
         self.tap(tap, "kqv_out", s, &kqv, t * qd)?;
 
         let (gate, _) = self.proj(&b("attn_gate"), in_q, t)?;
