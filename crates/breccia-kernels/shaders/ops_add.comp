@@ -10,8 +10,12 @@
 // `docs/specs/qwen4exp-architecture.md` §4.5/§9.2).
 //
 // Kept deliberately trivial and separate from `ops_act` so a residual update is
-// one dispatch over `n` floats with no mode branch in the inner loop. Every
-// element is read/written once, so `out` may alias `a` or `b`.
+// one dispatch over `n` floats. Every element is read/written once, so `out`
+// may alias `a` or `b`.
+//
+// `mode` 1 is the sigmoid-gated product `out = a * sigmoid(b)` (Inkling's
+// attention output gate, `docs/specs/inkling2-loop-port.md` S11); `beta` is
+// ignored there. One uniform branch per dispatch, not per element in practice.
 
 layout(local_size_x = 256) in;
 
@@ -22,7 +26,7 @@ layout(std430, binding = 2) writeonly buffer OVec { float O[]; };
 layout(push_constant) uniform Params {
     uint  n;
     float beta;
-    uint  pad0;
+    uint  mode;   // 0: a + beta*b, 1: a * sigmoid(b)
     uint  pad1;
 } pc;
 
@@ -34,5 +38,5 @@ void main() {
     if (i >= pc.n) {
         return;
     }
-    O[i] = A[i] + pc.beta * B[i];
+    O[i] = pc.mode == 1u ? A[i] / (1.0 + exp(-B[i])) : A[i] + pc.beta * B[i];
 }

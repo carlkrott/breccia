@@ -3064,7 +3064,17 @@ impl<'g> Add<'g> {
         beta: f32,
     ) -> (Vec<&'a Buf>, Pc, (u32, u32, u32)) {
         let (gx, gy) = grid_for(n, 256);
-        (vec![a, b, out], Pc::new().u(n as u32).f(beta), (gx, gy, 1))
+        (vec![a, b, out], Pc::new().u(n as u32).f(beta).u(0), (gx, gy, 1))
+    }
+
+    /// `out = a * sigmoid(gate)` over `n` floats (attention output gates). `out`
+    /// may alias either input.
+    pub fn run_gated(&self, a: &Buf, gate: &Buf, out: &Buf, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let (gx, gy) = grid_for(n, 256);
+        self.pipe.run(&[a, gate, out], &Pc::new().u(n as u32).f(0.0).u(1), (gx, gy, 1))
     }
 
     pub fn run(&self, a: &Buf, b: &Buf, out: &Buf, n: usize, beta: f32) -> Result<()> {

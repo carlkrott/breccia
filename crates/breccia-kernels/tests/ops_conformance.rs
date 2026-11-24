@@ -914,6 +914,21 @@ fn add_act_and_scale_match_the_cpu_reference() {
                 gpu.destroy_buf(x);
             }
         }
+        // Gated mode: out = a * sigmoid(b), written in place over a.
+        let want: Vec<f64> = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &g)| f64::from(x) / (1.0 + (-f64::from(g)).exp()))
+            .collect();
+        let ab = ops::upload_f32(gpu, &a).expect("a");
+        let bb = ops::upload_f32(gpu, &b).expect("b");
+        add.run_gated(&ab, &bb, &ab, n).expect("gated");
+        let got = ops::download_f32(gpu, &ab, n).expect("read");
+        let rel = max_rel(&got, &want);
+        assert!(rel <= 1e-6 && got.iter().all(|v| v.is_finite()), "gated {label}: {rel:e}");
+        println!("gated    {label:<14}             max rel {rel:.2e}");
+        gpu.destroy_buf(&ab);
+        gpu.destroy_buf(&bb);
     }
 
     // Act: all six modes at 320 values (the HC bottleneck) and 10240 (a stream).
