@@ -376,6 +376,11 @@ impl Model {
             }
             .with_context(|| format!("opening the shard family {model_glob}"))?,
         );
+        if shards.architecture() == Some(crate::inkling::ARCH) {
+            let cfg = crate::inkling::InklingConfig::from_metadata(&shards.metadata()?)?;
+            let n = crate::inkling::bind(&shards, &cfg)?;
+            bail!("`{}` binds ({n} tensors) but its graph is not implemented yet (port stage S1)", crate::inkling::ARCH);
+        }
         let layout = shards.layout()?;
         let emb = layout
             .embedding
