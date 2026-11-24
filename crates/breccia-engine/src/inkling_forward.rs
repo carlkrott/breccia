@@ -861,6 +861,21 @@ impl<'g> InklingForward<'g> {
         })
     }
 
+    /// Empty `seq` for a new request, keeping its KV pools: a server slot reuses its
+    /// device memory instead of freeing and reallocating it, which the kernel books as
+    /// "other processes" for a while and the VRAM guard then refused or spilled.
+    /// Stale K/V cells stay masked by `kpos = -1`; conv state is zeroed.
+    pub fn reset_seq(&self, seq: &mut InklingSeq<'g>) -> Result<()> {
+        let cfg = &self.cfg;
+        let zeros = vec![0f32; (cfg.n_conv - 1) * (2 * cfg.kv_dim() + 2 * cfg.n_embd)];
+        for s in &mut seq.slots {
+            s.kpos = self.bytes(bytemuck_i32(&vec![-1i32; s.cells]))?;
+            s.state = self.f32s(&zeros)?;
+        }
+        seq.pos = 0;
+        Ok(())
+    }
+
     /// Prefill `ids` as one fresh sequence and return the last token's logits.
     pub fn prefill(&mut self, ids: &[u32], tap: Option<&mut Tap>) -> Result<Vec<f32>> {
         let mut seq = self.new_seq(ids.len().max(1), ids.len().max(1))?;

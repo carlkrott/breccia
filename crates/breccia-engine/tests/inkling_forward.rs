@@ -464,6 +464,29 @@ fn greedy_32() {
     );
 }
 
+/// A reset sequence (server slot reuse) gives the same logits as a fresh one, bitwise.
+#[test]
+fn reset_reuse_bitwise() {
+    let Some(e) = env() else {
+        eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
+        return;
+    };
+    let mut fwd = placed(&e);
+    let mut fresh = fwd.new_seq(PROMPT.len() + 8, 64).unwrap();
+    let want = fwd.forward(&mut fresh, &PROMPT, None).unwrap();
+    let mut seq = fwd.new_seq(PROMPT.len() + 8, 64).unwrap();
+    let other: Vec<u32> = PROMPT.iter().rev().copied().collect();
+    fwd.forward(&mut seq, &other, None).unwrap();
+    fwd.reset_seq(&mut seq).unwrap();
+    assert_eq!(seq.pos(), 0);
+    let got = fwd.forward(&mut seq, &PROMPT, None).unwrap();
+    assert_eq!(
+        max_abs(&got, &want),
+        0.0,
+        "reset sequence differs from a fresh one"
+    );
+}
+
 /// Resident weights are the same bytes as per-use uploads: logits bitwise equal.
 #[test]
 fn resident_bitwise() {

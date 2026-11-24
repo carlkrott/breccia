@@ -72,22 +72,25 @@ impl InklingBackend<'_> {
                 self.ctx
             ));
         }
-        // shortcut: each request allocates its slot's full-ctx KV (a few ms); pool pages
-        // across slots when many slots x long ctx stop fitting on the card.
-        self.seqs[slot] = None;
+        // shortcut: each slot keeps its full-ctx KV once allocated; pool pages across
+        // slots when many slots x long ctx stop fitting on the card.
         self.feeds[slot] = None;
-        // the VRAM guard would put this slot's KV in host memory (slow steps, ring timeouts): refuse instead
-        if let Some(why) = self.gpu.vram_short(self.seq_bytes) {
-            return Err(format!(
-                "no VRAM for another {} MiB slot: {why}",
-                self.seq_bytes >> 20
-            ));
+        if let Some(seq) = self.seqs[slot].as_mut() {
+            self.fwd.reset_seq(seq).map_err(|e| format!("{e:#}"))?;
+        } else {
+            // the VRAM guard would put this slot's KV in host memory (slow steps, ring timeouts): refuse instead
+            if let Some(why) = self.gpu.vram_short(self.seq_bytes) {
+                return Err(format!(
+                    "no VRAM for another {} MiB slot: {why}",
+                    self.seq_bytes >> 20
+                ));
+            }
+            self.seqs[slot] = Some(
+                self.fwd
+                    .new_seq(self.ctx, self.chunk)
+                    .map_err(|e| format!("{e:#}"))?,
+            );
         }
-        self.seqs[slot] = Some(
-            self.fwd
-                .new_seq(self.ctx, self.chunk)
-                .map_err(|e| format!("{e:#}"))?,
-        );
         Ok(max_tokens
             .min(self.max_tokens)
             .min(self.ctx - prompt.len())
@@ -206,7 +209,7 @@ impl breccia_server::Backend for InklingBackend<'_> {
         Ok(logits.iter().map(|l| argmax(l)).collect())
     }
     fn release(&mut self, slot: usize) {
-        self.seqs[slot] = None;
+        // keeps the slot's KV for the next request (see `reset_seq`)
         self.feeds[slot] = None;
     }
     fn context(&self) -> Option<usize> {
