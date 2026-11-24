@@ -16,6 +16,7 @@
 //! | [`DepthMix`] | `ops_depth_mix.comp` | Inkling AttnRes / message-bank mix |
 //! | [`ShortConv`] | `ops_shortconv.comp` | causal short conv + residual, optional dynamic taps |
 //! | [`AttnDense`] | `ops_attn_dense.comp` | dense GQA attention: causal/window mask, rel-position bias, sink logit |
+//! | [`LowRankControl`] | `ops_rmsnorm.comp` (row views) + [`crate::GemvBatch`] F32 + `ops_gated_update.comp` | low-rank gated control `cur - tanh(f)*cur + tanh(g)*msg` (Inkling loop messages, S10) |
 //! | [`Softmax`] | `ops_softmax.comp` | §5.4 (512 router), §10.4 (512..2048 attention) |
 //! | [`Router`] | `ops_router.comp` | §5.4/§8 (softmax(all) → top-10 → `max(sum, 2^-14)`) |
 //! | [`EmbGather`] | `ops_gather_<type>.comp` | §6.5, §9.1 (`token_embd` IQ3_S, PLE IQ4_NL) |
@@ -394,11 +395,14 @@ impl<'g> RmsNorm<'g> {
         self.wgroups * self.cols
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn launch<'a>(
         &'a self,
         x: &'a Buf,
+        xv: (usize, usize),
         gamma: Option<&'a Buf>,
         out: &'a Buf,
+        ov: (usize, usize),
         rows: usize,
     ) -> (Vec<&'a Buf>, Pc, (u32, u32, u32)) {
         let g = match self.wgroups {
@@ -410,17 +414,46 @@ impl<'g> RmsNorm<'g> {
             .u(rows as u32)
             .u(self.cols as u32)
             .u(self.wgroups as u32)
-            .f(self.eps);
-        (bufs, pc, (rows.max(1) as u32, 1, 1))
+            .f(self.eps)
+            .u(xv.0 as u32)
+            .u(xv.1 as u32)
+            .u(ov.0 as u32)
+            .u(ov.1 as u32);
+        let (gx, gy) = grid_for(rows, 1);
+        (bufs, pc, (gx, gy, 1))
     }
 
     /// Normalise `rows` rows of `cols` values. `gamma` must be `Some` iff
     /// `wgroups > 0`; `out` may alias `x`.
     pub fn run(&self, x: &Buf, gamma: Option<&Buf>, out: &Buf, rows: usize) -> Result<()> {
+        self.run_view(x, (self.cols, 0), gamma, out, (self.cols, 0), rows)
+    }
+
+    /// [`RmsNorm::run`] over row views: row `r` reads `x[r*xv.0 + xv.1 ..]` and
+    /// writes `out[r*ov.0 + ov.1 ..]` (`(stride, offset)` in floats, stride >= cols).
+    /// Normalises one column of a `[T, k, cols]` tensor, or fills half of a concat
+    /// row, without a copy. `out` may alias `x` only with equal views.
+    pub fn run_view(
+        &self,
+        x: &Buf,
+        xv: (usize, usize),
+        gamma: Option<&Buf>,
+        out: &Buf,
+        ov: (usize, usize),
+        rows: usize,
+    ) -> Result<()> {
         if rows == 0 {
             return Ok(());
         }
-        let (bufs, pc, grid) = self.launch(x, gamma, out, rows);
+        if xv.0 < self.cols || ov.0 < self.cols {
+            return Err(anyhow!(
+                "rmsnorm view strides {}/{} below cols {}",
+                xv.0,
+                ov.0,
+                self.cols
+            ));
+        }
+        let (bufs, pc, grid) = self.launch(x, xv, gamma, out, ov, rows);
         self.pipe.run(&bufs, &pc, grid)
     }
 
@@ -436,7 +469,8 @@ impl<'g> RmsNorm<'g> {
         if rows == 0 {
             return Err(anyhow!("rmsnorm rows must be non-zero"));
         }
-        let (bufs, pc, grid) = self.launch(x, gamma, out, rows);
+        let v = (self.cols, 0);
+        let (bufs, pc, grid) = self.launch(x, v, gamma, out, v, rows);
         self.pipe.run_timed(&bufs, &pc, grid, target_s)
     }
 }
@@ -1097,6 +1131,155 @@ impl<'g> AttnDense<'g> {
         let (gx, gy) = grid_for(tokens * s.heads, 1);
         self.pipe
             .run(&[q, k, v, qpos, kpos, rb, bb, sb, out], &pc, (gx, gy, 1))
+    }
+}
+
+/// F32 weights of one [`LowRankControl`], row-major: `down` `[rank, 2n]`
+/// (GGUF ne `[2n, rank]`), `gain`/`forget` `[n, rank]` (ne `[rank, n]`).
+pub struct ControlWeights<'a> {
+    pub down: &'a Buf,
+    pub gain: &'a Buf,
+    pub forget: &'a Buf,
+}
+
+/// Per-batch [`LowRankControl`] scratch; the row maps fix `tokens`.
+pub struct ControlWs {
+    pub tokens: usize,
+    /// `[T, 2n]` = `rms(cur) | rms(msg)`.
+    cat: Buf,
+    /// `[T, rank]`.
+    gate: Buf,
+    /// `[T, n]` gain / forget logits (pre-tanh).
+    g: Buf,
+    f: Buf,
+    map_down: Buf,
+    map_up: Buf,
+}
+
+/// Low-rank gated control (llama.cpp inkling2.cpp `control`, the loop message
+/// injection): `gate = down . [rms(cur) | rms(msg)]` (weightless RMS),
+/// `out = cur - tanh(forget . gate) * cur + tanh(gain . gate) * msg`.
+/// RMSNorm row views + two batched F32 GEMVs + `ops_gated_update.comp`.
+pub struct LowRankControl<'g> {
+    rms: RmsNorm<'g>,
+    down: crate::GemvBatch<'g>,
+    up: crate::GemvBatch<'g>,
+    upd: Pipe<'g>,
+    n: usize,
+    rank: usize,
+}
+
+impl<'g> LowRankControl<'g> {
+    /// `n`-wide states, `rank` gate width, RMS eps `eps`. `2n` and `rank` must be
+    /// multiples of 8 so the batched GEMV's per-token input stride is the row width.
+    pub fn new(gpu: &'g Gpu, n: usize, rank: usize, eps: f32) -> Result<Self> {
+        if n == 0 || rank == 0 || (2 * n) % 8 != 0 || rank % 8 != 0 {
+            return Err(anyhow!(
+                "low-rank control: n {n}, rank {rank} (2n and rank multiples of 8)"
+            ));
+        }
+        Ok(LowRankControl {
+            rms: RmsNorm::with_eps(gpu, n, 0, eps)?,
+            down: crate::GemvBatch::new(gpu, QuantType::F32, rank, 2 * n)?,
+            up: crate::GemvBatch::new(gpu, QuantType::F32, n, rank)?,
+            upd: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_gated_update.spv")),
+                5,
+                "gated_update",
+            )?,
+            n,
+            rank,
+        })
+    }
+
+    /// Scratch for exactly `tokens` tokens.
+    pub fn workspace(&self, gpu: &Gpu, tokens: usize) -> Result<ControlWs> {
+        if tokens == 0 {
+            return Err(anyhow!("control workspace needs tokens >= 1"));
+        }
+        let blobs = vec![0u32; tokens];
+        let maps = [
+            self.down.map_for_blobs(&blobs, crate::XLayout::PerExpert),
+            self.up.map_for_blobs(&blobs, crate::XLayout::PerExpert),
+        ];
+        let (n, r) = (self.n, self.rank);
+        let sizes = [
+            2 * n * tokens,
+            r * tokens,
+            n * tokens,
+            n * tokens,
+            maps[0].len(),
+            maps[1].len(),
+        ];
+        let mut bufs: Vec<Buf> = Vec::with_capacity(sizes.len());
+        let fail = |bufs: &[Buf], e: anyhow::Error, what: &str| {
+            for b in bufs {
+                gpu.destroy_buf(b);
+            }
+            e.context(format!("control workspace: {what}"))
+        };
+        for (i, n) in sizes.iter().enumerate() {
+            match alloc(gpu, ((n * 4).max(8)) as u64) {
+                Ok(b) => bufs.push(b),
+                Err(e) => return Err(fail(&bufs, e, &format!("slot {i}"))),
+            }
+        }
+        for (buf, map) in bufs[4..6].iter().zip(maps.iter()) {
+            if let Err(e) = crate::gemv::upload_into(gpu, buf, &u32_to_bytes(map)) {
+                return Err(fail(&bufs, e, "row map"));
+            }
+        }
+        let mut it = bufs.into_iter();
+        let mut take = || it.next().expect("six control buffers were allocated");
+        Ok(ControlWs {
+            tokens,
+            cat: take(),
+            gate: take(),
+            g: take(),
+            f: take(),
+            map_down: take(),
+            map_up: take(),
+        })
+    }
+
+    pub fn release(&self, gpu: &Gpu, ws: ControlWs) {
+        for b in [&ws.cat, &ws.gate, &ws.g, &ws.f, &ws.map_down, &ws.map_up] {
+            gpu.destroy_buf(b);
+        }
+    }
+
+    /// `out[T, n]` from `cur` and `msg` row views (`(stride, offset)` floats, so a
+    /// column of `[T, k, n]` needs no copy). `out` must not alias `cur` or `msg`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        ws: &ControlWs,
+        cur: &Buf,
+        cv: (usize, usize),
+        msg: &Buf,
+        mv: (usize, usize),
+        w: &ControlWeights,
+        out: &Buf,
+    ) -> Result<()> {
+        let (t, n) = (ws.tokens, self.n);
+        self.rms.run_view(cur, cv, None, &ws.cat, (2 * n, 0), t)?;
+        self.rms.run_view(msg, mv, None, &ws.cat, (2 * n, n), t)?;
+        self.down.run(w.down, &ws.cat, &ws.gate, &ws.map_down, t)?;
+        self.up.run(w.gain, &ws.gate, &ws.g, &ws.map_up, t)?;
+        self.up.run(w.forget, &ws.gate, &ws.f, &ws.map_up, t)?;
+        let pc = Pc::new()
+            .u(t as u32)
+            .u(n as u32)
+            .u(cv.0 as u32)
+            .u(cv.1 as u32)
+            .u(mv.0 as u32)
+            .u(mv.1 as u32)
+            .u(0)
+            .u(0);
+        let (gx, gy) = grid_for(t * n, 256);
+        self.upd
+            .run(&[cur, msg, &ws.g, &ws.f, out], &pc, (gx, gy, 1))
     }
 }
 

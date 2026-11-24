@@ -20,6 +20,11 @@
 // for the sum of squares, then reduced in shared memory.  Rows are wrapped over
 // grid.y so `grid.x` stays inside the guaranteed 65535 workgroups.
 //
+// Row views: row `r` reads `X[r*x_stride + x_off ..]` and writes
+// `O[r*o_stride + o_off ..]` (the plain case is stride = cols, offset 0). This is
+// how a caller normalises one column of a `[T, k, cols]` tensor or writes into
+// half of a concat row without a copy. In place is safe only with equal views.
+//
 // The reduction is a shared-memory tree, so it is deterministic for a fixed
 // workgroup size but not bit-identical to a serial scan; conformance is held to
 // 1e-5 relative against an f64 CPU reference (`crates/.../src/ops/cpu.rs`).
@@ -35,6 +40,10 @@ layout(push_constant) uniform Params {
     uint  cols;    // row length
     uint  wgroups; // gamma slices (0 = no gamma)
     float eps;     // added to the mean square, inside the rsqrt
+    uint  x_stride;
+    uint  x_off;
+    uint  o_stride;
+    uint  o_off;
 } pc;
 
 #define WG_X_MAX 65535u
@@ -46,7 +55,8 @@ void main() {
         return;
     }
     uint tid = gl_LocalInvocationID.x;
-    uint base = row * pc.cols;
+    uint base = row * pc.x_stride + pc.x_off;
+    uint obase = row * pc.o_stride + pc.o_off;
 
     float ss = 0.0;
     for (uint i = tid; i < pc.cols; i += 256u) {
@@ -66,6 +76,6 @@ void main() {
     uint gbase = pc.wgroups == 0u ? 0u : (row % pc.wgroups) * pc.cols;
     for (uint i = tid; i < pc.cols; i += 256u) {
         float w = pc.wgroups == 0u ? 1.0 : G[gbase + i];
-        O[base + i] = X[base + i] * inv * w;
+        O[obase + i] = X[base + i] * inv * w;
     }
 }

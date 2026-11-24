@@ -1,0 +1,45 @@
+#version 450
+//
+// Gated update: `out = cur * (1 - tanh(f)) + tanh(g) * msg`, elementwise over
+// `[T, n]`. The tail of a low-rank control (llama.cpp inkling2.cpp `control`:
+// `cur - forget*cur + gain*msg` with `gain = tanh(g)`, `forget = tanh(f)`);
+// `g` and `f` are the gain/forget projections before the tanh.
+//
+// `cur` and `msg` are row views (`[t*stride + off + i]`) so a column of a
+// `[T, k, n]` tensor needs no copy; `g`, `f` and `out` are contiguous `[T, n]`.
+
+#include "ops_math.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer CB { float CUR[]; };
+layout(std430, binding = 1) readonly buffer MB { float MSG[]; };
+layout(std430, binding = 2) readonly buffer GB { float G[]; };
+layout(std430, binding = 3) readonly buffer FB { float F[]; };
+layout(std430, binding = 4) writeonly buffer OB { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint tokens;
+    uint n;
+    uint cur_stride;
+    uint cur_off;
+    uint msg_stride;
+    uint msg_off;
+    uint pad0;
+    uint pad1;
+} pc;
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint idx = wg * 256u + gl_LocalInvocationID.x;
+    if (idx >= pc.tokens * pc.n) {
+        return;
+    }
+    uint t = idx / pc.n;
+    uint i = idx % pc.n;
+    float c = CUR[t * pc.cur_stride + pc.cur_off + i];
+    float m = MSG[t * pc.msg_stride + pc.msg_off + i];
+    O[idx] = c - breccia_tanh(F[idx]) * c + breccia_tanh(G[idx]) * m;
+}

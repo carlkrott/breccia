@@ -399,6 +399,49 @@ pub fn sigmoid_vec(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| sigmoid(f64::from(*v)) as f32).collect()
 }
 
+/// Low-rank gated control, `f64`: `cur`/`msg` `[T, n]`, `down` `[rank, 2n]`,
+/// `gain`/`forget` `[n, rank]` (row-major); weightless RMS with `eps`.
+pub fn low_rank_control(
+    cur: &[f32],
+    msg: &[f32],
+    down: &[f32],
+    gain: &[f32],
+    forget: &[f32],
+    n: usize,
+    eps: f64,
+) -> Vec<f32> {
+    let rank = down.len() / (2 * n);
+    let rms = |row: &[f32]| -> Vec<f64> {
+        let ms = row.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / n as f64;
+        let r = 1.0 / (ms + eps).sqrt();
+        row.iter().map(|v| f64::from(*v) * r).collect()
+    };
+    let mut out = vec![0f32; cur.len()];
+    for t in 0..cur.len() / n {
+        let (c, m) = (&cur[t * n..][..n], &msg[t * n..][..n]);
+        let cat: Vec<f64> = [rms(c), rms(m)].concat();
+        let gate: Vec<f64> = (0..rank)
+            .map(|r| {
+                cat.iter()
+                    .zip(&down[r * 2 * n..][..2 * n])
+                    .map(|(a, b)| a * f64::from(*b))
+                    .sum()
+            })
+            .collect();
+        let proj = |w: &[f32], i: usize| -> f64 {
+            gate.iter()
+                .zip(&w[i * rank..][..rank])
+                .map(|(a, b)| a * f64::from(*b))
+                .sum()
+        };
+        for i in 0..n {
+            let (ci, mi) = (f64::from(c[i]), f64::from(m[i]));
+            out[t * n + i] = (ci - proj(forget, i).tanh() * ci + proj(gain, i).tanh() * mi) as f32;
+        }
+    }
+    out
+}
+
 /// Depth mix, `f64`: `states` in mix order (newest block first, cur last), each
 /// `tokens * n`; `query` is `[nq, n]`; returns `[tokens, nq, n]`.
 pub fn depth_mix(states: &[&[f32]], query: &[f32], nq: usize, n: usize, eps: f64) -> Vec<f32> {

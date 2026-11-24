@@ -36,7 +36,8 @@ use breccia_kernels::ops::{
     RowClip, Softmax, SwiGlu,
 };
 use breccia_kernels::ops::{
-    AttnDense, AttnShape, DepthMix, Glu, GluMode, RelBias, ShortConv, Sink,
+    AttnDense, AttnShape, ControlWeights, DepthMix, Glu, GluMode, LowRankControl, RelBias,
+    ShortConv, Sink,
 };
 use breccia_kernels::{Device, QuantType};
 
@@ -2018,4 +2019,158 @@ fn inkling_rel_attn() {
     println!(
         "inkling rel attn: {runs} calls, golden worst {worst_gold:.2e}, reference worst {worst_ref:.2e}"
     );
+}
+
+/// Inkling S10 loop control (`LowRankControl`): random cases with strided
+/// row views vs the f64 CPU reference; then with `BRECCIA_INKLING_GOLDEN`,
+/// llama.cpp's `loop_ctrl_{q,k,v,ffn}` on all 24 looped slots, once from the
+/// golden `loop_msgs` (direct) and once from messages this suite's DepthMix
+/// builds out of the golden `l_out` bank (chained).
+#[test]
+fn inkling_loop_control() {
+    let fx = need_gpu!("inkling_loop_control");
+    let gpu = fx.dev.gpu();
+    let up = |v: &[f32]| ops::upload_f32(gpu, v).expect("upload");
+    let read = |b: &breccia_vk::ctx::Buf, n: usize| ops::download_f32(gpu, b, n).expect("read");
+    let rank = 64usize;
+    for (n, tokens) in [(2304usize, 1usize), (2304, 13), (1000, 5)] {
+        let lc = LowRankControl::new(gpu, n, rank, 1e-6).expect("control");
+        let ws = lc.workspace(gpu, tokens).expect("ws");
+        // cur is column 1 of [T, 3, n], msg column 2 of [T, 4, n].
+        let cur = normalish(0xc0de, tokens * 3 * n);
+        let msg: Vec<f32> = normalish(0x3e5, tokens * 4 * n)
+            .into_iter()
+            .map(|v| v * 0.3)
+            .collect();
+        let scaled = |seed, len, k: usize| -> Vec<f32> {
+            let s = 1.0 / (k as f32).sqrt();
+            // normalish has mean ~1.73; centre it or every tanh saturates.
+            normalish(seed, len)
+                .into_iter()
+                .map(|v| (v - 1.732) * s)
+                .collect()
+        };
+        let down = scaled(0xd0, rank * 2 * n, 2 * n);
+        let gain = scaled(0x6a, n * rank, rank);
+        let forget = scaled(0xf0, n * rank, rank);
+        let col = |v: &[f32], k: usize, j: usize| -> Vec<f32> {
+            (0..tokens)
+                .flat_map(|t| v[(t * k + j) * n..][..n].to_vec())
+                .collect()
+        };
+        let want = cpu::low_rank_control(
+            &col(&cur, 3, 1),
+            &col(&msg, 4, 2),
+            &down,
+            &gain,
+            &forget,
+            n,
+            1e-6,
+        );
+        let (cb, mb, db, gb, fb) = (up(&cur), up(&msg), up(&down), up(&gain), up(&forget));
+        let ob = breccia_kernels::gemv::alloc(gpu, (tokens * n * 4) as u64).expect("out");
+        let w = ControlWeights {
+            down: &db,
+            gain: &gb,
+            forget: &fb,
+        };
+        lc.run(&ws, &cb, (3 * n, n), &mb, (4 * n, 2 * n), &w, &ob)
+            .expect("control");
+        let got = read(&ob, tokens * n);
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "loop control: non-finite output"
+        );
+        let e = max_rel(&got, &as_f64(&want));
+        println!("loop control n={n:<4} T={tokens:<2} rank {rank}: max rel {e:.2e}");
+        assert!(e <= 1e-5, "loop control n={n} T={tokens}: {e:e}");
+        for b in [&cb, &mb, &db, &gb, &fb, &ob] {
+            gpu.destroy_buf(b);
+        }
+        lc.release(gpu, ws);
+    }
+
+    let Ok(golden) = std::env::var("BRECCIA_INKLING_GOLDEN") else {
+        eprintln!("inkling loop control golden parity: SKIPPED (set BRECCIA_INKLING_GOLDEN)");
+        return;
+    };
+    let golden = std::path::PathBuf::from(golden);
+    let (n, t) = (2304usize, 13usize);
+    let dump = |name: &str| golden_f32(&golden, "dump", &format!("{name}_"));
+    let weight = |name: &str| golden_f32(&golden, "weights", &format!("{name}_"));
+    let lc = LowRankControl::new(gpu, n, rank, 1e-6).expect("control");
+    let ws = lc.workspace(gpu, t).expect("ws");
+    let dm = DepthMix::new(gpu, n, 1e-6).expect("depth mix");
+    let ob = breccia_kernels::gemv::alloc(gpu, (t * n * 4) as u64).expect("out");
+    let chained = breccia_kernels::gemv::alloc(gpu, (t * 4 * n * 4) as u64).expect("msgs");
+    let (mut worst_d, mut worst_c, mut checked) = (0.0f64, 0.0f64, 0usize);
+    for slot in 24..48usize {
+        let ip = 6 + (slot - 24) % 12;
+        let is_swa = slot % 6 != 5;
+        // Pass p's bank = [input of pass p-1's ip-12 slot], cur = pass p-1's output.
+        let (bank, bank_out) = if slot < 36 {
+            ("l_out-11", "l_out-17")
+        } else {
+            ("l_out-29", "l_out-35")
+        };
+        let (sb, bob, qb) = (
+            up(&dump(bank)),
+            up(&dump(bank_out)),
+            up(&weight(&format!("blk.{ip}.loop_msg_query.weight"))),
+        );
+        dm.run(&sb, 0, 1, t * n, &bob, &qb, 4, &chained, t)
+            .expect("bank mix");
+        let direct = up(&dump(&format!("loop_msgs-{slot}")));
+        let attn = up(&dump(&format!("attn_res_mix-{slot}")));
+        let ffn = up(&dump(&format!("ffn_res_mix-{slot}")));
+        let k_attn = if is_swa { 1 } else { 3 };
+        for (j, c) in ["q", "k", "v", "ffn"].iter().enumerate() {
+            let wd = up(&weight(&format!("blk.{ip}.loop_{c}_ctrl_down.weight")));
+            let wg = up(&weight(&format!("blk.{ip}.loop_{c}_ctrl_gain.weight")));
+            let wf = up(&weight(&format!("blk.{ip}.loop_{c}_ctrl_forget.weight")));
+            let w = ControlWeights {
+                down: &wd,
+                gain: &wg,
+                forget: &wf,
+            };
+            let (cur, cv) = if j == 3 {
+                (&ffn, (n, 0))
+            } else {
+                (&attn, (k_attn * n, if is_swa { 0 } else { j * n }))
+            };
+            let want = as_f64(&dump(&format!("loop_ctrl_{c}-{slot}")));
+            for (msgs, worst, how) in [
+                (&direct, &mut worst_d, "direct"),
+                (&chained, &mut worst_c, "chained"),
+            ] {
+                lc.run(&ws, cur, cv, msgs, (4 * n, j * n), &w, &ob)
+                    .expect("control");
+                let got = read(&ob, t * n);
+                assert!(
+                    got.iter().all(|v| v.is_finite()),
+                    "loop_ctrl_{c}-{slot}: non-finite"
+                );
+                let e = max_rel(&got, &want);
+                assert!(
+                    e <= 1e-4,
+                    "golden loop_ctrl_{c}-{slot} ({how}): {e:e} > 1e-4"
+                );
+                *worst = worst.max(e);
+            }
+            checked += 1;
+            for b in [&wd, &wg, &wf] {
+                gpu.destroy_buf(b);
+            }
+        }
+        for b in [&sb, &bob, &qb, &direct, &attn, &ffn] {
+            gpu.destroy_buf(b);
+        }
+    }
+    println!(
+        "golden loop control ({checked} controls, 24 slots): direct worst {worst_d:.2e}, chained worst {worst_c:.2e}"
+    );
+    for b in [&ob, &chained] {
+        gpu.destroy_buf(b);
+    }
+    lc.release(gpu, ws);
 }
