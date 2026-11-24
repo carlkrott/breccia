@@ -115,7 +115,7 @@ pub fn read_strp(path: &std::path::Path) -> Result<Vec<(usize, usize)>> {
 
 pub(crate) fn blob<'a>(shards: &'a ShardSet, r: &RolePlan, e: usize) -> &'a [u8] {
     let s = shards.parts()[r.shard].bytes();
-    &s[r.offset + e * r.per_expert..][..r.per_expert]
+    &s[r.offset + e * r.stride..][..r.per_expert]
 }
 
 fn per_expert(p: &LayerPlan) -> u64 {

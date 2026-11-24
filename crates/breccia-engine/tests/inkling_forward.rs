@@ -7,14 +7,19 @@
 //! `forced`: every golden node is compared, then replaced with the golden
 //! value, so each error is that node's own (teacher forcing).
 //! `free`: compare only; the prompt's top-1 must be llama.cpp's.
+//!
+//! Placement knobs for the decode tests: `BRECCIA_INKLING_RESIDENT=dense|all`
+//! keeps weights on the device, `BRECCIA_INKLING_HOST=1` runs every layer's
+//! experts on the CPU lane.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use breccia_engine::inkling::{self, InklingConfig};
-use breccia_engine::inkling_forward::InklingForward;
+use breccia_engine::inkling_forward::{InklingForward, Residency};
 use breccia_format::ShardSet;
-use breccia_kernels::Device;
+use breccia_kernels::{cpu, Device};
 
 const PROMPT: [u32; 13] = [
     371, 151451, 149879, 151194, 149884, 152717, 11, 149880, 149876, 151451, 149879, 153067, 149884,
@@ -69,7 +74,7 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
 
 struct Env {
     dev: Device,
-    shards: ShardSet,
+    shards: Arc<ShardSet>,
     cfg: InklingConfig,
     golden: PathBuf,
 }
@@ -78,7 +83,7 @@ fn env() -> Option<Env> {
     let gguf = std::env::var("BRECCIA_INKLING_GGUF").ok()?;
     let golden = std::env::var("BRECCIA_INKLING_GOLDEN").ok()?;
     let dev = Device::open(std::env::var("BRECCIA_KERNEL_DEVICE").ok().as_deref()).ok()?;
-    let shards = ShardSet::open_family(&gguf).expect("open gguf");
+    let shards = Arc::new(ShardSet::open_family(&gguf).expect("open gguf"));
     let cfg = InklingConfig::from_metadata(&shards.metadata().unwrap()).expect("config");
     inkling::bind(&shards, &cfg).expect("bind");
     Some(Env {
@@ -87,6 +92,23 @@ fn env() -> Option<Env> {
         cfg,
         golden: PathBuf::from(golden),
     })
+}
+
+/// A forward with the placement the env knobs ask for.
+fn placed(e: &Env) -> InklingForward<'_> {
+    let mut fwd = InklingForward::new(e.dev.gpu(), &e.shards, e.cfg.clone()).unwrap();
+    let r = std::env::var("BRECCIA_INKLING_RESIDENT").unwrap_or_default();
+    fwd.set_residency(Residency {
+        dense: r == "dense" || r == "all",
+        experts: r == "all",
+    });
+    if std::env::var("BRECCIA_INKLING_HOST").is_ok_and(|v| v == "1") {
+        let pool = cpu::ExpertPool::new(e.shards.clone(), std::thread::available_parallelism().map_or(8, |n| n.get().min(32)), cpu::path());
+        let layers: Vec<usize> = (0..e.cfg.n_layers).collect();
+        fwd.set_host_experts(pool, &layers).unwrap();
+    }
+    eprintln!("placement: resident={r:?} host={:?}", std::env::var("BRECCIA_INKLING_HOST").ok());
+    fwd
 }
 
 /// Run `prompt` against golden `dir`; `tol` = worst allowed node error, if any.
@@ -217,7 +239,7 @@ fn incremental(ids: &[u32], chunk: usize, decode: usize) {
         eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
         return;
     };
-    let mut fwd = InklingForward::new(e.dev.gpu(), &e.shards, e.cfg.clone()).unwrap();
+    let mut fwd = placed(&e);
     let t0 = std::time::Instant::now();
     let fresh = fwd.prefill(ids, None).unwrap();
     let t1 = t0.elapsed().as_secs_f64();
@@ -276,10 +298,11 @@ fn greedy_32() {
         .split(',')
         .map(|x| x.trim().parse().unwrap())
         .collect();
-    let mut fwd = InklingForward::new(e.dev.gpu(), &e.shards, e.cfg.clone()).unwrap();
+    let mut fwd = placed(&e);
     let mut seq = fwd.new_seq(PROMPT.len() + want.len(), 64).unwrap();
     let mut l = fwd.forward(&mut seq, &PROMPT, None).unwrap();
     let mut got = Vec::new();
+    let t0 = std::time::Instant::now();
     for &w in &want {
         let top = argmax(&l) as u32;
         if top != w {
@@ -291,5 +314,34 @@ fn greedy_32() {
         got.push(top);
         l = fwd.forward(&mut seq, &[top], None).unwrap();
     }
-    eprintln!("{}/{} greedy tokens match", got.len(), want.len());
+    let dt = t0.elapsed().as_secs_f64();
+    eprintln!(
+        "{}/{} greedy tokens match; decode {:.3} s/token",
+        got.len(),
+        want.len(),
+        dt / got.len().max(1) as f64
+    );
+}
+
+/// Resident weights are the same bytes as per-use uploads: logits bitwise equal.
+#[test]
+fn resident_bitwise() {
+    let Some(e) = env() else {
+        eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
+        return;
+    };
+    let mut fwd = InklingForward::new(e.dev.gpu(), &e.shards, e.cfg.clone()).unwrap();
+    let base = fwd.prefill(&PROMPT, None).unwrap();
+    fwd.set_residency(Residency {
+        dense: true,
+        experts: std::env::var("BRECCIA_INKLING_RESIDENT").is_ok_and(|v| v == "all"),
+    });
+    for pass in 0..2 {
+        let l = fwd.prefill(&PROMPT, None).unwrap();
+        assert!(
+            l.iter().zip(&base).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "pass {pass}: resident logits differ, max {:.3e}",
+            max_abs(&l, &base)
+        );
+    }
 }

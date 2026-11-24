@@ -10,8 +10,10 @@
 //! Every shape comes from [`InklingConfig`] or the tensor dims, so a sibling
 //! checkpoint with other widths, loop bounds or block size runs unchanged.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Deref;
+use std::rc::Rc;
 
 use anyhow::{anyhow, ensure, Context, Result};
 use breccia_format::ShardSet;
@@ -19,6 +21,7 @@ use breccia_kernels::ops::{
     self, Act, ActMode, Add, AttnDense, AttnShape, ControlWeights, DepthMix, EmbGather, Glu,
     GluMode, LowRankControl, RelBias, RmsNorm, Router, RowClip, ShortConv, Sink,
 };
+use breccia_kernels::cpu::{ChunkRoute, ExpertPool, GluAct, LayerPlan};
 use breccia_kernels::{gemv, proj, GemvBatch, MoeFanIn, QuantType, XLayout};
 use breccia_vk::ctx::{Buf, Gpu};
 
@@ -96,6 +99,20 @@ pub struct InklingForward<'g> {
     clip_k: RowClip<'g>,
     clip_r: RowClip<'g>,
     clip_r_tau: RowClip<'g>,
+    /// Device copies kept between steps, by tensor name.
+    cache: RefCell<HashMap<String, Rc<Owned<'g>>>>,
+    residency: Residency,
+    /// CPU expert lane and its per-layer plan (`None` = layer runs on the GPU).
+    host: Option<(ExpertPool, Vec<Option<LayerPlan>>)>,
+}
+
+/// Which weights stay on the device between steps. Default: none (upload per use).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Residency {
+    /// Every non-expert tensor (dense projections, norms, embeddings' helpers).
+    pub dense: bool,
+    /// The `*_exps` tensors of layers not on the host lane.
+    pub experts: bool,
 }
 
 impl<'g> InklingForward<'g> {
@@ -136,12 +153,54 @@ impl<'g> InklingForward<'g> {
             clip_k: RowClip::new(gpu, hd, hkv, cfg.qk_clip, None)?,
             clip_r: RowClip::new(gpu, cfg.n_rel, h, cfg.rel_clip, None)?,
             clip_r_tau: RowClip::new(gpu, cfg.n_rel, h, cfg.rel_clip, tau)?,
+            cache: RefCell::new(HashMap::new()),
+            residency: Residency::default(),
+            host: None,
             cfg,
         })
     }
 
     pub fn config(&self) -> &InklingConfig {
         &self.cfg
+    }
+
+    /// Keep weights on the device between steps; turning a class off drops its copies.
+    pub fn set_residency(&mut self, r: Residency) {
+        self.residency = r;
+        self.cache
+            .get_mut()
+            .retain(|name, _| if is_expert(name) { r.experts } else { r.dense });
+    }
+
+    /// Run the routed experts of `layers` on the CPU lane (straight out of the
+    /// mmap) instead of uploading them; the rest stay on the GPU path.
+    pub fn set_host_experts(&mut self, pool: ExpertPool, layers: &[usize]) -> Result<()> {
+        let act = GluAct::Situ {
+            beta: self.cfg.situ_beta,
+            lb: self.cfg.situ_linear_beta,
+        };
+        let mut plans = vec![None; self.cfg.n_layers];
+        for &l in layers {
+            ensure!(l < plans.len(), "host layer {l} out of range");
+            let t = |s: &str| {
+                let name = format!("blk.{l}.{s}");
+                self.shards
+                    .tensor(&name)
+                    .ok_or_else(|| anyhow!("missing tensor `{name}`"))
+            };
+            plans[l] = Some(LayerPlan::merged(
+                self.shards,
+                l,
+                &t("ffn_gate_up_exps.weight")?,
+                &t("ffn_down_exps.weight")?,
+                act,
+            )?);
+        }
+        self.cache
+            .get_mut()
+            .retain(|name, _| !layers.iter().any(|l| name.starts_with(&format!("blk.{l}.ffn_")) && is_expert(name)));
+        self.host = Some((pool, plans));
+        Ok(())
     }
 
     fn ty_of(shards: &ShardSet, name: &str) -> Result<QuantType> {
@@ -168,7 +227,7 @@ impl<'g> InklingForward<'g> {
     }
 
     /// Raw GGUF bytes of `name` on the device (dims, type).
-    fn weight(&self, name: &str) -> Result<(Owned<'g>, Vec<usize>, QuantType)> {
+    fn weight(&self, name: &str) -> Result<(Rc<Owned<'g>>, Vec<usize>, QuantType)> {
         let t = self
             .shards
             .tensor(name)
@@ -177,12 +236,22 @@ impl<'g> InklingForward<'g> {
         let bytes = t.as_slice();
         ensure!(bytes.len() as u64 == t.n_bytes(), "`{name}` is truncated");
         let dims = t.dims().iter().map(|&d| d as usize).collect();
-        Ok((
+        if let Some(w) = self.cache.borrow().get(name) {
+            return Ok((w.clone(), dims, ty));
+        }
+        let w = Rc::new(
             self.bytes(bytes)
                 .with_context(|| format!("uploading {name}"))?,
-            dims,
-            ty,
-        ))
+        );
+        let keep = if is_expert(name) {
+            self.residency.experts
+        } else {
+            self.residency.dense
+        };
+        if keep {
+            self.cache.borrow_mut().insert(name.to_string(), w.clone());
+        }
+        Ok((w, dims, ty))
     }
 
     fn has(&self, name: &str) -> bool {
@@ -808,6 +877,24 @@ impl<'g> InklingForward<'g> {
             sel.iter().all(|&e| (e as usize) < ne),
             "router id out of range"
         );
+        if let Some((pool, Some(plan))) = self.host.as_mut().map(|(p, v)| (p, v[layer])) {
+            let w = ops::download_f32(self.gpu, &wts, pairs)?;
+            let xs = ops::download_f32(self.gpu, x, t * n)?;
+            let ids: Vec<usize> = sel.iter().map(|&e| e as usize).collect();
+            let mut out = vec![0f32; t * n];
+            if t == 1 {
+                pool.moe_topk(&plan, &ids, &w, &xs, &mut out)?;
+            } else {
+                let routes: Vec<ChunkRoute> = (0..t)
+                    .map(|i| ChunkRoute {
+                        ids: &ids[i * kx..][..kx],
+                        weights: &w[i * kx..][..kx],
+                    })
+                    .collect();
+                pool.moe_topk_chunk(&plan, &routes, &xs, &mut out)?;
+            }
+            return self.f32s(&out);
+        }
 
         // gate_up: pair p = t*k + j reads activation row t
         let (gu_w, gu_dims, gu_ty) = self.weight(&b("ffn_gate_up_exps.weight"))?;
@@ -863,6 +950,10 @@ impl<'g> InklingForward<'g> {
             .run(&down, &slots, &wts, &shared, &gate0, &out, t, kx, n)?;
         Ok(out)
     }
+}
+
+fn is_expert(name: &str) -> bool {
+    name.ends_with("_exps.weight")
 }
 
 fn bytemuck_f32(v: &[f32]) -> &[u8] {

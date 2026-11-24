@@ -55,7 +55,7 @@ pub use bench::{
     PARITY_BAR_GBPS,
 };
 pub use expert::{
-    expert_ffn, expert_prefetch_on, lane_stats_on, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch,
+    expert_ffn, expert_prefetch_on, lane_stats_on, moe_topk_sequential, silu, ChunkRoute, ExpertPool, FfnScratch, GluAct,
     LaneStats, LayerPlan, RolePlan,
 };
 

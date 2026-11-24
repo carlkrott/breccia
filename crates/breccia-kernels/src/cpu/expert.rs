@@ -26,7 +26,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use breccia_format::{ExpertBlock, ExpertRole, ExpertSlices, ShardSet};
+use breccia_format::{ExpertBlock, ExpertRole, ExpertSlices, ShardSet, TensorView};
 
 use crate::cpu::{gemv_into, Path};
 use crate::quant::QuantType;
@@ -38,6 +38,35 @@ pub fn silu(x: f32) -> f32 {
         0.0
     } else {
         x / (1.0 + (-x).exp())
+    }
+}
+
+/// The gated activation between the gate/up and down GEMVs, matching the GPU
+/// `ops_glu.comp` modes (`GluMode`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GluAct {
+    /// `silu(g) * u` (SwiGLU).
+    Silu,
+    /// Inkling SITU: `beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)`.
+    Situ { beta: f32, lb: f32 },
+}
+
+impl GluAct {
+    #[inline]
+    pub fn apply(self, g: f32, u: f32) -> f32 {
+        match self {
+            GluAct::Silu => silu(g) * u,
+            GluAct::Situ { beta, lb } => {
+                let sig = if g >= 0.0 {
+                    1.0 / (1.0 + (-g).exp())
+                } else {
+                    let e = g.exp();
+                    e / (1.0 + e)
+                };
+                let u = if lb > 0.0 { lb * (u * (1.0 / lb)).tanh() } else { u };
+                beta * (g * (1.0 / beta)).tanh() * sig * u
+            }
+        }
     }
 }
 
@@ -56,6 +85,9 @@ pub struct RolePlan {
     pub offset: usize,
     /// Bytes of one expert's slice.
     pub per_expert: usize,
+    /// Bytes from one expert's slice to the next: `per_expert`, or the whole
+    /// merged `gate_up` blob when gate and up are halves of one tensor.
+    pub stride: usize,
 }
 
 impl RolePlan {
@@ -76,6 +108,7 @@ pub struct LayerPlan {
     pub gate: RolePlan,
     pub up: RolePlan,
     pub down: RolePlan,
+    pub act: GluAct,
 }
 
 impl LayerPlan {
@@ -94,6 +127,7 @@ impl LayerPlan {
                 shard: shard_of(set, t.as_slice())?,
                 offset: t.file_range().start as usize,
                 per_expert: block.bytes_per_expert(role) as usize,
+                stride: block.bytes_per_expert(role) as usize,
             })
         };
         let gate = plan(ExpertRole::Gate)?;
@@ -115,6 +149,74 @@ impl LayerPlan {
             gate,
             up,
             down,
+            act: GluAct::Silu,
+        })
+    }
+
+    /// The plan for a block whose gate and up are one merged tensor
+    /// `[cols, 2*n_ff, n_experts]`, each expert's rows `[gate | up]` (llama.cpp
+    /// `ffn_gate_up_exps`), with its `down` `[n_ff, cols, n_experts]`.
+    pub fn merged(
+        set: &ShardSet,
+        block: usize,
+        gate_up: &TensorView<'_>,
+        down: &TensorView<'_>,
+        act: GluAct,
+    ) -> Result<Self> {
+        let ty_of = |t: &TensorView<'_>| {
+            QuantType::from_ggml(t.ty()).with_context(|| {
+                format!("{}: ggml type {} has no CPU kernel", t.name(), t.ty().id())
+            })
+        };
+        let (gu_ty, dn_ty) = (ty_of(gate_up)?, ty_of(down)?);
+        let (gd, dd) = (gate_up.dims(), down.dims());
+        if gd.len() != 3 || dd.len() != 3 || gd[1] % 2 != 0 || gd[2] != dd[2] {
+            bail!("blk.{block}: gate_up {gd:?} / down {dd:?} are not merged expert tensors");
+        }
+        let (cols, n_ff, n_experts) = (gd[0] as usize, gd[1] as usize / 2, gd[2] as usize);
+        if dd[0] as usize != n_ff || dd[1] as usize != cols {
+            bail!("blk.{block}: down {dd:?} does not match gate_up {gd:?}");
+        }
+        let stride = gate_up.n_bytes() as usize / n_experts;
+        let half = n_ff * crate::cpu::row_bytes(gu_ty, cols);
+        if 2 * half != stride {
+            bail!("blk.{block}: gate_up rows are not whole blocks ({stride} vs 2x{half})");
+        }
+        let gate = RolePlan {
+            role: ExpertRole::Gate,
+            ty: gu_ty,
+            rows: n_ff,
+            cols,
+            shard: shard_of(set, gate_up.as_slice())?,
+            offset: gate_up.file_range().start as usize,
+            per_expert: half,
+            stride,
+        };
+        let up = RolePlan {
+            role: ExpertRole::Up,
+            offset: gate.offset + half,
+            ..gate
+        };
+        let dn_per = down.n_bytes() as usize / n_experts;
+        let down = RolePlan {
+            role: ExpertRole::Down,
+            ty: dn_ty,
+            rows: cols,
+            cols: n_ff,
+            shard: shard_of(set, down.as_slice())?,
+            offset: down.file_range().start as usize,
+            per_expert: dn_per,
+            stride: dn_per,
+        };
+        Ok(Self {
+            block,
+            n_experts,
+            n_embd: cols,
+            n_ff,
+            gate,
+            up,
+            down,
+            act,
         })
     }
 
@@ -178,7 +280,7 @@ impl LayerPlan {
                 .get(r.shard)
                 .with_context(|| format!("blk.{}: no shard {}", self.block, r.shard))?
                 .bytes();
-            let start = r.offset + expert * r.per_expert;
+            let start = r.offset + expert * r.stride;
             bytes.get(start..start + r.per_expert).with_context(|| {
                 format!(
                     "blk.{}: {} slice [{start}, +{}) outside shard {}",
@@ -273,7 +375,7 @@ pub fn expert_ffn(
         &mut scratch.up,
     );
     for k in 0..plan.n_ff {
-        scratch.act[k] = silu(scratch.gate[k]) * scratch.up[k];
+        scratch.act[k] = plan.act.apply(scratch.gate[k], scratch.up[k]);
     }
     gemv_into(
         path,
@@ -877,7 +979,7 @@ fn run_shard(set: &ShardSet, path: Path, shard: &Shard) -> Option<Vec<f32>> {
         crate::cpu::gemv_into_many(path, g.ty, gv, rows, g.cols, &xs, &mut values);
         crate::cpu::gemv_into_many(path, up.ty, uv, rows, up.cols, &xs, &mut ups);
         for (v, u) in values.iter_mut().zip(&ups) {
-            *v = silu(*v) * u;
+            *v = plan.act.apply(*v, *u);
         }
         return Some(values);
     }
@@ -934,7 +1036,7 @@ fn one_user(
             };
             gemv_into(path, u.ty, uv, rows, u.cols, xs, &mut up);
             for (v, u) in values.iter_mut().zip(&up) {
-                *v = silu(*v) * u;
+                *v = plan.act.apply(*v, *u);
             }
         }
         ShardKind::Down => {
