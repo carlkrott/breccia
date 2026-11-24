@@ -27,6 +27,9 @@ struct InklingBackend<'g> {
     /// Device bytes of one slot's KV at `ctx`.
     seq_bytes: u64,
     seqs: Vec<Option<InklingSeq<'g>>>,
+    /// Prompt still going in per slot (ids, next offset): one chunk per `feed`, so live
+    /// slots keep decoding and a client that hangs up stops its prompt pass.
+    feeds: Vec<Option<(Vec<u32>, usize)>>,
     tok: Tokenizer,
     template: Option<breccia_chat::ChatTemplate>,
     ctx: usize,
@@ -53,6 +56,25 @@ fn layers(s: &str) -> Result<Vec<usize>> {
         }
     }
     Ok(v)
+}
+
+impl InklingBackend<'_> {
+    /// Give `slot` a fresh full-ctx sequence; returns the tokens it may generate.
+    fn open(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<usize, String> {
+        if prompt.is_empty() || prompt.len() >= self.ctx {
+            return Err(format!("prompt {} tokens, context {}", prompt.len(), self.ctx));
+        }
+        // shortcut: each request allocates its slot's full-ctx KV (a few ms); pool pages
+        // across slots when many slots x long ctx stop fitting on the card.
+        self.seqs[slot] = None;
+        self.feeds[slot] = None;
+        // the VRAM guard would put this slot's KV in host memory (slow steps, ring timeouts): refuse instead
+        if let Some(why) = self.gpu.vram_short(self.seq_bytes) {
+            return Err(format!("no VRAM for another {} MiB slot: {why}", self.seq_bytes >> 20));
+        }
+        self.seqs[slot] = Some(self.fwd.new_seq(self.ctx, self.chunk).map_err(|e| format!("{e:#}"))?);
+        Ok(max_tokens.min(self.max_tokens).min(self.ctx - prompt.len()).max(1))
+    }
 }
 
 impl breccia_server::Backend for InklingBackend<'_> {
@@ -99,21 +121,29 @@ impl breccia_server::Backend for InklingBackend<'_> {
         self.seqs.len()
     }
     fn admit(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(u32, usize)>, String> {
-        if prompt.is_empty() || prompt.len() >= self.ctx {
-            return Err(format!("prompt {} tokens, context {}", prompt.len(), self.ctx));
-        }
-        // shortcut: each request allocates its slot's full-ctx KV (a few ms); pool pages
-        // across slots when many slots x long ctx stop fitting on the card.
-        self.seqs[slot] = None;
-        // the VRAM guard would put this slot's KV in host memory (slow steps, ring timeouts): refuse instead
-        if let Some(why) = self.gpu.vram_short(self.seq_bytes) {
-            return Err(format!("no VRAM for another {} MiB slot: {why}", self.seq_bytes >> 20));
-        }
-        let mut seq = self.fwd.new_seq(self.ctx, self.chunk).map_err(|e| format!("{e:#}"))?;
-        let logits = self.fwd.forward(&mut seq, prompt, None).map_err(|e| format!("{e:#}"))?;
-        self.seqs[slot] = Some(seq);
-        let n = max_tokens.min(self.max_tokens).min(self.ctx - prompt.len()).max(1);
+        let n = self.open(slot, prompt, max_tokens)?;
+        let seq = self.seqs[slot].as_mut().expect("opened");
+        let logits = self.fwd.forward(seq, prompt, None).map_err(|e| format!("{e:#}"))?;
         Ok(Some((argmax(&logits), n)))
+    }
+    fn admit_start(&mut self, slot: usize, prompt: &[u32], max_tokens: usize) -> Result<Option<(Option<u32>, usize)>, String> {
+        if std::env::var("BRECCIA_SERVE_FEED").is_ok_and(|v| v == "0") {
+            return Ok(self.admit(slot, prompt, max_tokens)?.map(|(t, n)| (Some(t), n)));
+        }
+        let n = self.open(slot, prompt, max_tokens)?;
+        self.feeds[slot] = Some((prompt.to_vec(), 0));
+        Ok(Some((None, n)))
+    }
+    fn feed(&mut self, slot: usize, _decoding: usize) -> Result<Option<u32>, String> {
+        let (ids, off) = self.feeds[slot].take().ok_or("no prompt pass on this slot")?;
+        let end = (off + self.chunk).min(ids.len());
+        let seq = self.seqs[slot].as_mut().ok_or("slot is not live")?;
+        let logits = self.fwd.forward(seq, &ids[off..end], None).map_err(|e| format!("{e:#}"))?;
+        if end == ids.len() {
+            return Ok(Some(argmax(&logits)));
+        }
+        self.feeds[slot] = Some((ids, end));
+        Ok(None)
     }
     fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
         let mut by: Vec<Option<&mut InklingSeq>> = self.seqs.iter_mut().map(Option::as_mut).collect();
@@ -127,6 +157,7 @@ impl breccia_server::Backend for InklingBackend<'_> {
     }
     fn release(&mut self, slot: usize) {
         self.seqs[slot] = None;
+        self.feeds[slot] = None;
     }
     fn context(&self) -> Option<usize> {
         Some(self.ctx)
@@ -179,7 +210,7 @@ pub fn serve(port: u16, gguf: &str, device: Option<&str>, ctx: usize, chunk: usi
         );
     }
     println!("inkling  KV {} MiB per slot, {} MiB for {seqs}", seq_bytes >> 20, (seq_bytes * seqs as u64) >> 20);
-    let backend = InklingBackend { gpu: dev.gpu(), seq_bytes, fwd, seqs: (0..seqs).map(|_| None).collect(), tok, template, ctx, chunk, max_tokens };
+    let backend = InklingBackend { gpu: dev.gpu(), seq_bytes, fwd, seqs: (0..seqs).map(|_| None).collect(), feeds: (0..seqs).map(|_| None).collect(), tok, template, ctx, chunk, max_tokens };
     breccia_server::serve(&format!("127.0.0.1:{port}"), backend).map_err(|e| anyhow::anyhow!("server: {e}"))
 }
 
