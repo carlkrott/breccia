@@ -210,8 +210,13 @@ fn free() {
 #[test]
 fn long_forced() {
     let seen = run("dump-long", &long_prompt(), true, Some(1e-1));
+    // q6_0 KV (the default) rounds K/V harder than the golden's f16: 4.4e-2 measured.
+    let floor = match breccia_kernels::qsa::VLayout::current() {
+        breccia_kernels::qsa::VLayout::F16 => 5e-3,
+        _ => 1e-1,
+    };
     for (n, s, r) in seen.iter().filter(|x| x.0 == "kqv_out") {
-        assert!(*r <= 5e-3, "{n}-{s} {r:.3e} over the f16 KV floor");
+        assert!(*r <= floor, "{n}-{s} {r:.3e} over the KV floor {floor:.0e}");
     }
 }
 

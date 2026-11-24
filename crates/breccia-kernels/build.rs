@@ -408,6 +408,11 @@ fn main() {
         if KV_Q6_SHADERS.contains(name) {
             compile(&glslc, &out_dir, name, &format!("{name}_q6"), &["BRECCIA_KV_Q6"]);
         }
+        // Dense attention over the paged f16 / q6_0 pool (Inkling full slots).
+        if *name == "ops_attn_dense" {
+            compile(&glslc, &out_dir, name, "ops_attn_dense_f16", &["BRECCIA_KV_F16"]);
+            compile(&glslc, &out_dir, name, "ops_attn_dense_q6", &["BRECCIA_KV_Q6"]);
+        }
         // Octave KV fake-quant (quality gate only, `BRECCIA_KV_OCTAVE_FQ` env).
         if *name == "qsa_kv_append" {
             compile(&glslc, &out_dir, name, "qsa_kv_append_octfq", &["BRECCIA_KV_OCTAVE_FQ"]);

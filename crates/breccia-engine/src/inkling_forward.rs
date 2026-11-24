@@ -18,11 +18,12 @@ use std::rc::Rc;
 use anyhow::{anyhow, ensure, Context, Result};
 use breccia_format::ShardSet;
 use breccia_kernels::ops::{
-    self, Act, ActMode, Add, AttnDense, AttnShape, ControlWeights, DepthMix, EmbGather, Glu,
+    self, Act, ActMode, Add, AttnDense, AttnShape, KvAppend, PagedKv, ControlWeights, DepthMix, EmbGather, Glu,
     ControlWs, GluMode, LowRankControl, RelBias, RmsNorm, Router, RowClip, ShortConv, Sink,
 };
 use breccia_kernels::cpu::{ChunkRoute, ExpertPool, GluAct, LayerPlan};
 use breccia_kernels::{batch_cmd, gemv, proj, GemvBatch, MoeFanIn, MoeMap, QuantType, XLayout};
+use breccia_kernels::qsa::VLayout;
 use breccia_vk::ctx::{Buf, Gpu};
 
 use crate::inkling::InklingConfig;
@@ -108,8 +109,11 @@ const CTRL: [&str; 4] = ["q", "k", "v", "ffn"];
 /// One slot's cache: K/V `[cells, kv_dim]`, cell positions (i32, -1 = empty)
 /// and the short-conv state.
 struct SlotKv<'g> {
+    /// f32 `[cells, kv]` on ring slots; a paged pool (`pt` set) on full slots.
     k: Owned<'g>,
     v: Owned<'g>,
+    /// Identity page table of a full slot's paged pool.
+    pt: Option<Owned<'g>>,
     kpos: Owned<'g>,
     cells: usize,
     ring: bool,
@@ -117,7 +121,7 @@ struct SlotKv<'g> {
 }
 
 /// One sequence's state between [`InklingForward::forward`] calls.
-// shortcut: f32 K/V only (64 KiB/token on the 8 full slots); f16/q6 KV is the S14 memory step.
+// shortcut: SWA rings stay f32 (window + chunk cells each); page them (modulo page table) if rings grow.
 pub struct InklingSeq<'g> {
     pos: usize,
     ctx: usize,
@@ -144,6 +148,9 @@ pub struct InklingForward<'g> {
     ctrl: LowRankControl<'g>,
     conv: ShortConv<'g>,
     attn: AttnDense<'g>,
+    append: KvAppend<'g>,
+    /// Full slots' paged KV layout (`BRECCIA_KV`, default q6_0; f16 = llama.cpp parity).
+    kv_layout: VLayout,
     add: Add<'g>,
     act: Act<'g>,
     glu: Glu<'g>,
@@ -261,6 +268,11 @@ impl<'g> InklingForward<'g> {
             ctrl: LowRankControl::new(gpu, n, cfg.loop_rank, 1e-6)?,
             conv: ShortConv::new(gpu)?,
             attn: AttnDense::new(gpu)?,
+            append: KvAppend::new(gpu)?,
+            kv_layout: match VLayout::current() {
+                VLayout::Q8_0 => return Err(anyhow!("Inkling KV: BRECCIA_KV=f16|q6 (no q8v build)")),
+                l => l,
+            },
             add: Add::new(gpu)?,
             act: Act::new(gpu, ActMode::TanhCap)?,
             glu: Glu::new(
@@ -705,9 +717,21 @@ impl<'g> InklingForward<'g> {
             } else {
                 ctx
             };
+            let (k, v, pt) = if ring {
+                (self.buf(cells * kv)?, self.buf(cells * kv)?, None)
+            } else {
+                let bytes = KvAppend::pool_bytes(self.kv_layout, cells, cfg.n_head_kv, cfg.head_dim)?;
+                let pages = cells.div_ceil(KvAppend::PAGE_CELLS) as u32;
+                (
+                    Owned(self.gpu, gemv::alloc(self.gpu, bytes)?),
+                    Owned(self.gpu, gemv::alloc(self.gpu, bytes)?),
+                    Some(self.u32s(&(0..pages).collect::<Vec<_>>())?),
+                )
+            };
             slots.push(SlotKv {
-                k: self.buf(cells * kv)?,
-                v: self.buf(cells * kv)?,
+                k,
+                v,
+                pt,
                 kpos: self.bytes(bytemuck_i32(&vec![-1i32; cells]))?,
                 cells,
                 ring,
@@ -893,9 +917,26 @@ impl<'g> InklingForward<'g> {
 
     /// Write this step's K/V rows and positions into the slot's cells
     /// (two segments when the ring wraps).
+    /// A full slot's paged pool view.
+    fn paged<'a>(&self, s: &'a SlotKv) -> Option<PagedKv<'a>> {
+        Some(PagedKv {
+            k: &s.k,
+            v: &s.v,
+            pt: s.pt.as_deref()?,
+            layout: self.kv_layout,
+            n_kv_head: self.cfg.n_head_kv,
+            head_dim: self.cfg.head_dim,
+            cells: s.cells,
+        })
+    }
+
     fn store(&self, s: &SlotKv, k: &Buf, v: &Buf, pos: &Buf, p0: usize, t: usize) -> Result<()> {
         let kvb = self.cfg.kv_dim() * 4;
         ensure!(s.ring || p0 + t <= s.cells, "slot cache full");
+        if let Some(kv) = self.paged(s) {
+            self.append.run(&kv, k, v, t, p0)?;
+            return gemv::copy_at(self.gpu, &s.kpos, (p0 * 4) as u64, pos, 0, (t * 4) as u64);
+        }
         // a wrapping write must not evict a cell this chunk's first query still sees
         ensure!(
             p0 + t <= s.cells || t + self.cfg.sliding_window - 1 <= s.cells,
@@ -1075,34 +1116,33 @@ impl<'g> InklingForward<'g> {
         self.tap(tap, "attn_sink", s, &sinks, t * h)?;
         let (bias, bdims, _) = self.weight(&b("attn_rel_bias"))?;
         let kqv = self.buf(t * qd)?;
-        self.attn.run(
-            &AttnShape {
-                heads: h,
-                kv_heads: hkv,
-                head_dim: hd,
-                window: if swa { cfg.sliding_window } else { 0 },
-                scale: 1.0 / (hd as f32).sqrt(),
-            },
-            &qcur,
-            pos,
-            t,
-            &kvs.k,
-            &kvs.v,
-            &kvs.kpos,
-            kvs.cells.min(p0 + t),
-            Some(&RelBias {
-                r: &rcur,
-                bias: &bias,
-                rel_dim: cfg.n_rel,
-                extent: bdims[1],
-            }),
-            Some(&Sink {
-                sink: &sinks,
-                per_token: true,
-                scale: 1.0,
-            }),
-            &kqv,
-        )?;
+        let shape = AttnShape {
+            heads: h,
+            kv_heads: hkv,
+            head_dim: hd,
+            window: if swa { cfg.sliding_window } else { 0 },
+            scale: 1.0 / (hd as f32).sqrt(),
+        };
+        let rel = RelBias {
+            r: &rcur,
+            bias: &bias,
+            rel_dim: cfg.n_rel,
+            extent: bdims[1],
+        };
+        let sink = Sink {
+            sink: &sinks,
+            per_token: true,
+            scale: 1.0,
+        };
+        let live = kvs.cells.min(p0 + t);
+        match self.paged(kvs) {
+            Some(kv) => self.attn.run_paged(
+                &shape, &qcur, pos, t, &kv, &kvs.kpos, live, Some(&rel), Some(&sink), &kqv,
+            )?,
+            None => self.attn.run(
+                &shape, &qcur, pos, t, &kvs.k, &kvs.v, &kvs.kpos, live, Some(&rel), Some(&sink), &kqv,
+            )?,
+        }
         drop((qcur, rcur, sinks, bias));
         self.tap(tap, "kqv_out", s, &kqv, t * qd)?;
 

@@ -36,9 +36,10 @@ use breccia_kernels::ops::{
     RowClip, Softmax, SwiGlu,
 };
 use breccia_kernels::ops::{
-    AttnDense, AttnShape, ControlWeights, DepthMix, Glu, GluMode, LowRankControl, RelBias,
-    ShortConv, Sink,
+    AttnDense, AttnShape, ControlWeights, DepthMix, Glu, GluMode, KvAppend, LowRankControl,
+    PagedKv, RelBias, ShortConv, Sink,
 };
+use breccia_kernels::qsa::VLayout;
 use breccia_kernels::{Device, QuantType};
 
 /// One device for the whole test binary, serialised: `ctx::Gpu` owns a single
@@ -1801,6 +1802,101 @@ fn inkling_shortconv() {
     );
 }
 
+/// Paged f16 / q6_0 KV (`KvAppend` + `AttnDense::run_paged`) against the CPU
+/// reference on the same rounded K/V: reversed page table, two append calls,
+/// never-written cells (kpos -1 over an uninitialised pool), serial and split.
+#[test]
+fn attn_dense_paged() {
+    let fx = need_gpu!("attn_dense_paged");
+    let gpu = fx.dev.gpu();
+    let mut at = AttnDense::new(gpu).expect("attn");
+    let app = KvAppend::new(gpu).expect("append");
+    let up = |v: &[f32]| ops::upload_f32(gpu, v).expect("upload");
+    let upb = |b: &[u8]| breccia_kernels::gemv::upload(gpu, b).expect("upload");
+    let (heads, kvh, hd, cells, filled, t) = (24usize, 8usize, 128usize, 1500usize, 1400usize, 3usize);
+    let row = kvh * hd;
+    let pages = cells.div_ceil(KvAppend::PAGE_CELLS);
+    let pt: Vec<u32> = (0..pages as u32).rev().collect(); // nothing may assume identity
+    let k = normalish(0x9a6e, filled * row);
+    let v = normalish(0x9a6f, filled * row);
+    let kpos: Vec<i32> = (0..cells).map(|j| if j < filled { j as i32 } else { -1 }).collect();
+    let qpos = vec![1399i32, 700, 3];
+    let q: Vec<f32> = normalish(0x9a70, t * heads * hd).iter().map(|x| x * 2.0).collect();
+    let (rd, ext) = (16usize, 1024usize);
+    let r = normalish(0x9a71, t * heads * rd);
+    let b = normalish(0x9a72, ext * rd);
+    let snk = normalish(0x9a73, t * heads);
+    let s = AttnShape {
+        heads,
+        kv_heads: kvh,
+        head_dim: hd,
+        window: 0,
+        scale: 1.0 / (hd as f32).sqrt(),
+    };
+    let (qb, rb, bb, sb) = (up(&q), up(&r), up(&b), up(&snk));
+    let qpb = upb(&i32_bytes(&qpos));
+    let kpb = upb(&i32_bytes(&kpos));
+    let ptb = upb(&ops::u32_to_bytes(&pt));
+    let rel = RelBias {
+        r: &rb,
+        bias: &bb,
+        rel_dim: rd,
+        extent: ext,
+    };
+    let sink = Sink {
+        sink: &sb,
+        per_token: true,
+        scale: 1.0,
+    };
+    let n = t * heads * hd;
+    let ob = breccia_kernels::gemv::alloc(gpu, (n * 4) as u64).expect("out");
+    for layout in [VLayout::F16, VLayout::Q6_0] {
+        let bytes = KvAppend::pool_bytes(layout, cells, kvh, hd).expect("pool size");
+        let kp = breccia_kernels::gemv::alloc(gpu, bytes).expect("k pool");
+        let vp = breccia_kernels::gemv::alloc(gpu, bytes).expect("v pool");
+        let kv = PagedKv {
+            k: &kp,
+            v: &vp,
+            pt: &ptb,
+            layout,
+            n_kv_head: kvh,
+            head_dim: hd,
+            cells: pages * KvAppend::PAGE_CELLS,
+        };
+        for (lo, hi) in [(0, 1000), (1000, filled)] {
+            let (kc, vc) = (up(&k[lo * row..hi * row]), up(&v[lo * row..hi * row]));
+            app.run(&kv, &kc, &vc, hi - lo, lo).expect("append");
+        }
+        let round = |x: &[f32]| -> Vec<f32> {
+            let mut o = match layout {
+                VLayout::F16 => x.iter().map(|v| breccia_kernels::qsa::cpu::to_f16(*v)).collect(),
+                _ => breccia_kernels::qsa::cpu::to_q6_0(x),
+            };
+            o.resize(cells * row, 0.0);
+            o
+        };
+        let want = ops::cpu::attn_dense(
+            &s,
+            &q,
+            &qpos,
+            &round(&k),
+            &round(&v),
+            &kpos,
+            Some((&r, &b, rd, ext)),
+            Some((&snk, true, 1.0)),
+        );
+        for split in [false, true] {
+            at.split = split;
+            at.run_paged(&s, &qb, &qpb, t, &kv, &kpb, cells, Some(&rel), Some(&sink), &ob)
+                .expect("paged attn");
+            let got = ops::download_f32(gpu, &ob, n).expect("read");
+            let e = max_rel(&got, &as_f64(&want));
+            println!("paged attn {layout:?} split={split}: max rel {e:.2e}");
+            assert!(got.iter().all(|x| x.is_finite()) && e < 1e-4, "paged {layout:?} split={split}: {e:e}");
+        }
+    }
+}
+
 /// Generic dense attention (S9): random cases against the CPU reference (window,
 /// rel bias, per-head / per-token / no sink, empty cells, an all-masked row,
 /// several tiles), then Inkling's golden `kqv_out` on 48 slots at 13 tokens and
@@ -2239,6 +2335,31 @@ fn attn_dense_decode_bench() {
         let worst = outs[0].iter().zip(&outs[1]).map(|(a, b)| ((a - b) / a).abs()).fold(0.0f32, f32::max);
         // the serial path's f32 sums over 100k+ cells drift (it overshoots 0.03); the split's shorter sums are closer
         assert!(worst < 5e-3, "split vs serial rel {worst}");
-        eprintln!("cells {n}: {:.2} ms serial, {:.2} ms split per full-attention layer", ms[0], ms[1]);
+        let pages = n.div_ceil(KvAppend::PAGE_CELLS);
+        let pt = breccia_kernels::gemv::upload(gpu, &ops::u32_to_bytes(&(0..pages as u32).collect::<Vec<_>>())).expect("pt");
+        let mut paged = Vec::new();
+        for layout in [VLayout::F16, VLayout::Q6_0] {
+            let bytes = KvAppend::pool_bytes(layout, n, kvh, hd).expect("size");
+            let (kp, vp) = (breccia_kernels::gemv::alloc(gpu, bytes).expect("k"), breccia_kernels::gemv::alloc(gpu, bytes).expect("v"));
+            let kv = PagedKv { k: &kp, v: &vp, pt: &pt, layout, n_kv_head: kvh, head_dim: hd, cells: pages * KvAppend::PAGE_CELLS };
+            KvAppend::new(gpu).expect("append").run(&kv, &k, &v, n, 0).expect("append");
+            let mut best = f64::MAX;
+            for _ in 0..4 {
+                let t0 = std::time::Instant::now();
+                at.run_paged(&s, &q, &qpos, 1, &kv, &kpos, n, Some(&rel), Some(&sk), &o).expect("run");
+                let _ = ops::download_f32(gpu, &o, 1).expect("read");
+                best = best.min(t0.elapsed().as_secs_f64());
+            }
+            let out = ops::download_f32(gpu, &o, heads * hd).expect("read");
+            let worst = out.iter().zip(&outs[1]).map(|(a, b)| ((a - b) / b).abs()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-3, "{layout:?} vs f32 rel {worst}");
+            paged.push(best * 1e3);
+            gpu.destroy_buf(&kp);
+            gpu.destroy_buf(&vp);
+        }
+        eprintln!(
+            "cells {n}: {:.2} ms serial, {:.2} ms split, paged f16 {:.2} ms, q6 {:.2} ms per full-attention layer",
+            ms[0], ms[1], paged[0], paged[1]
+        );
     }
 }

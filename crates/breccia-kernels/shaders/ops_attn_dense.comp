@@ -29,12 +29,23 @@
 // writes its partial (m, l, acc[hd]) to PART [row][split][hd + 2];
 // `ops_attn_dense_reduce.comp` merges the splits and adds the sink. chunk 0 =
 // one split over every cell, writing O.
+//
+// Paged KV (wired variants, one `-D`): `BRECCIA_KV_F16` / `BRECCIA_KV_Q6` read K/V
+// from the Qwen paged pool (`qsa_kv_append.comp` layout, 16-cell pages, PT =
+// logical page -> physical page) instead of f32 [cells, kv_heads, hd]; KPOS stays
+// indexed by logical cell. The f32 build ignores binding 10.
 
 layout(local_size_x = 256) in;
 
 layout(std430, binding = 0) readonly buffer QB { float Q[]; };
+#if defined(BRECCIA_KV_F16) || defined(BRECCIA_KV_Q6)
+#define KV_PAGED
+layout(std430, binding = 1) readonly buffer KB { uint K[]; };
+layout(std430, binding = 2) readonly buffer VB { uint V[]; };
+#else
 layout(std430, binding = 1) readonly buffer KB { float K[]; };
 layout(std430, binding = 2) readonly buffer VB { float V[]; };
+#endif
 layout(std430, binding = 3) readonly buffer QP { int QPOS[]; };
 layout(std430, binding = 4) readonly buffer KP { int KPOS[]; };
 layout(std430, binding = 5) readonly buffer RB { float R[]; };
@@ -42,6 +53,7 @@ layout(std430, binding = 6) readonly buffer BB { float BIAS[]; };
 layout(std430, binding = 7) readonly buffer SB { float SINK[]; };
 layout(std430, binding = 8) writeonly buffer OB { float O[]; };
 layout(std430, binding = 9) writeonly buffer PB { float PART[]; };
+layout(std430, binding = 10) readonly buffer PTB { uint PT[]; };
 
 layout(push_constant) uniform Params {
     uint  tokens;
@@ -59,6 +71,26 @@ layout(push_constant) uniform Params {
 } pc;
 
 #define WG_X_MAX 65535u
+#define PAGE_CELLS 16u
+
+#ifdef KV_PAGED
+uint kv_row(uint cell, uint kh) {
+    return (PT[cell / PAGE_CELLS] * pc.kv_heads + kh) * PAGE_CELLS + cell % PAGE_CELLS;
+}
+#ifdef BRECCIA_KV_Q6
+#include "kv_q6.glsl"
+KV6_DEFINE_LOAD(k_at, K)
+KV6_DEFINE_LOAD(v_at, V)
+#else
+#include "f16_storage.glsl"
+float k_at(uint row, uint e) { uint i = row * pc.head_dim + e; return breccia_load_f16(K[i >> 1], i); }
+float v_at(uint row, uint e) { uint i = row * pc.head_dim + e; return breccia_load_f16(V[i >> 1], i); }
+#endif
+#else
+uint kv_row(uint cell, uint kh) { return cell * pc.kv_heads + kh; }
+float k_at(uint row, uint e) { return K[row * pc.head_dim + e]; }
+float v_at(uint row, uint e) { return V[row * pc.head_dim + e]; }
+#endif
 #define TILE 256u
 #define MAX_GROUP 8u
 #define LOCAL_MAX 8u   // head_dim / subgroup size, subgroups >= 32
@@ -85,7 +117,6 @@ void main() {
     uint group = pc.heads / pc.kv_heads;
     uint h0 = kh * group;
     uint hd = pc.head_dim;
-    uint kstride = pc.kv_heads * hd;
     uint d = gl_LocalInvocationID.x;
     uint sg_size = gl_SubgroupSize;
     uint sgs = 256u / sg_size;
@@ -131,11 +162,11 @@ void main() {
                 }
                 continue;
             }
-            uint kb = (base + j) * kstride + kh * hd;
+            uint kr = kv_row(base + j, kh);
             float k[LOCAL_MAX];
             [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
                 uint e = lane + m * sg_size;
-                k[m] = e < hd ? K[kb + e] : 0.0;
+                k[m] = e < hd ? k_at(kr, e) : 0.0;
             }
             bool rel = pc.rel_dim > 0u && uint(dd) < pc.extent;
             [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
@@ -190,7 +221,7 @@ void main() {
                 acc[g] *= g < group ? ALPHA[g] : 1.0;
             }
             for (uint j = part; j < n; j += parts) {
-                float v = V[(base + j) * kstride + kh * hd + dim];
+                float v = v_at(kv_row(base + j, kh), dim);
                 [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
                     if (g < group) {
                         float pg = PS[j * MAX_GROUP + g];

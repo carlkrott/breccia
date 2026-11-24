@@ -47,12 +47,13 @@
 //! * Dispatches wrap over `grid.y` so `grid.x` never exceeds the guaranteed
 //!   65535 workgroups (`docs/phase-3/01` §1).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use ash::vk;
 use breccia_vk::ctx::{Buf, Gpu, Kernel, Qc};
 
 use crate::gemv::{alloc, table_bytes, upload, GemvTiming, TAIL_PAD, WG_X_MAX};
 use crate::quant::QuantType;
+use crate::qsa::VLayout;
 
 pub mod bench;
 pub mod cpu;
@@ -1053,11 +1054,85 @@ pub struct Sink<'b> {
     pub scale: f32,
 }
 
+/// A paged K/V pool in the Qwen cache layout (`qsa_kv_append.comp`): 16-cell
+/// pages, `pt` = logical page -> physical page (u32), rows of
+/// [`KvAppend::row_words`] words. Model-agnostic: any `n_kv_head` / `head_dim`.
+pub struct PagedKv<'b> {
+    pub k: &'b Buf,
+    pub v: &'b Buf,
+    pub pt: &'b Buf,
+    pub layout: VLayout,
+    pub n_kv_head: usize,
+    pub head_dim: usize,
+    /// Logical cells the page table maps (`pt` entries x 16).
+    pub cells: usize,
+}
+
+/// f32 K/V rows -> a [`PagedKv`] pool (f16 or q6_0), the generic face of
+/// `qsa_kv_append.comp` (Qwen's `Qsa::kv_append` passes its own constants).
+pub struct KvAppend<'g> {
+    f16: Pipe<'g>,
+    q6: Pipe<'g>,
+}
+
+impl<'g> KvAppend<'g> {
+    pub const PAGE_CELLS: usize = 16;
+
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Ok(KvAppend {
+            f16: Pipe::new(gpu, include_bytes!(concat!(env!("OUT_DIR"), "/qsa_kv_append.spv")), 5, "kv append (f16)")?,
+            q6: Pipe::new(gpu, include_bytes!(concat!(env!("OUT_DIR"), "/qsa_kv_append_q6.spv")), 5, "kv append (q6_0)")?,
+        })
+    }
+
+    /// u32 words of one cell row of one kv head.
+    pub fn row_words(layout: VLayout, head_dim: usize) -> Result<usize> {
+        match layout {
+            VLayout::F16 if head_dim.is_multiple_of(2) => Ok(head_dim / 2),
+            VLayout::Q6_0 if head_dim.is_multiple_of(64) => Ok(head_dim / 64 * 13),
+            _ => Err(anyhow!("paged kv: no {layout:?} rows for head_dim {head_dim}")),
+        }
+    }
+
+    /// Bytes of one K (or V) pool holding `cells` (rounded up to whole pages).
+    pub fn pool_bytes(layout: VLayout, cells: usize, n_kv_head: usize, head_dim: usize) -> Result<u64> {
+        let rows = cells.div_ceil(Self::PAGE_CELLS) * n_kv_head * Self::PAGE_CELLS;
+        Ok((rows * Self::row_words(layout, head_dim)? * 4) as u64)
+    }
+
+    /// Write `tokens` rows of `k`/`v` (`[tokens, n_kv_head, head_dim]` f32) at
+    /// logical cells `pos0..pos0 + tokens`.
+    pub fn run(&self, kv: &PagedKv, k: &Buf, v: &Buf, tokens: usize, pos0: usize) -> Result<()> {
+        ensure!(
+            pos0 + tokens <= kv.cells,
+            "kv append: cells {pos0}..{} past the {} the page table maps",
+            pos0 + tokens,
+            kv.cells
+        );
+        let words = Self::row_words(kv.layout, kv.head_dim)?;
+        let (pipe, units) = match kv.layout {
+            VLayout::Q6_0 => (&self.q6, tokens * kv.n_kv_head * (kv.head_dim / 64)),
+            _ => (&self.f16, tokens * kv.n_kv_head * words),
+        };
+        let pc = Pc::new()
+            .u(tokens as u32)
+            .i(pos0 as i32)
+            .u(kv.n_kv_head as u32)
+            .u(kv.head_dim as u32)
+            .u(Self::PAGE_CELLS as u32)
+            .u(0);
+        let (gx, gy) = grid_for(units, 128);
+        pipe.run(&[kv.k, kv.v, kv.pt, k, v], &pc, (gx, gy, 1))
+    }
+}
+
 /// Dense attention (`ops_attn_dense.comp`): online softmax over KV cells with
 /// per-cell positions (`kpos < 0` = empty), causal + optional sliding window,
 /// optional [`RelBias`] and [`Sink`]. Model-agnostic; Inkling S9 is one caller.
 pub struct AttnDense<'g> {
     pipe: Pipe<'g>,
+    pipe_f16: Pipe<'g>,
+    pipe_q6: Pipe<'g>,
     reduce: Pipe<'g>,
     /// Split partials, `[rows * splits][head_dim + 2]`, fixed size (see `SPLIT_ROWS`).
     part: Buf,
@@ -1086,8 +1161,20 @@ impl<'g> AttnDense<'g> {
             pipe: Pipe::new(
                 gpu,
                 include_bytes!(concat!(env!("OUT_DIR"), "/ops_attn_dense.spv")),
-                10,
+                11,
                 "attn_dense",
+            )?,
+            pipe_f16: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_attn_dense_f16.spv")),
+                11,
+                "attn_dense (paged f16)",
+            )?,
+            pipe_q6: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_attn_dense_q6.spv")),
+                11,
+                "attn_dense (paged q6_0)",
             )?,
             reduce: Pipe::new(
                 gpu,
@@ -1125,6 +1212,56 @@ impl<'g> AttnDense<'g> {
         tokens: usize,
         k: &Buf,
         v: &Buf,
+        kpos: &Buf,
+        cells: usize,
+        rel: Option<&RelBias>,
+        sink: Option<&Sink>,
+        out: &Buf,
+    ) -> Result<()> {
+        self.dispatch(&self.pipe, shape, q, qpos, tokens, (k, v, k), kpos, cells, rel, sink, out)
+    }
+
+    /// [`Self::run`] over a [`PagedKv`] pool (logical cells `0..cells`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_paged(
+        &self,
+        shape: &AttnShape,
+        q: &Buf,
+        qpos: &Buf,
+        tokens: usize,
+        kv: &PagedKv,
+        kpos: &Buf,
+        cells: usize,
+        rel: Option<&RelBias>,
+        sink: Option<&Sink>,
+        out: &Buf,
+    ) -> Result<()> {
+        ensure!(
+            kv.n_kv_head == shape.kv_heads && kv.head_dim == shape.head_dim && cells <= kv.cells,
+            "attn_dense: paged pool is {} kv heads x {} for {} cells, asked {} x {} for {cells}",
+            kv.n_kv_head,
+            kv.head_dim,
+            kv.cells,
+            shape.kv_heads,
+            shape.head_dim
+        );
+        let pipe = match kv.layout {
+            VLayout::F16 => &self.pipe_f16,
+            VLayout::Q6_0 => &self.pipe_q6,
+            VLayout::Q8_0 => return Err(anyhow!("attn_dense: no q8_0 V paged build")),
+        };
+        self.dispatch(pipe, shape, q, qpos, tokens, (kv.k, kv.v, kv.pt), kpos, cells, rel, sink, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch(
+        &self,
+        pipe: &Pipe<'g>,
+        shape: &AttnShape,
+        q: &Buf,
+        qpos: &Buf,
+        tokens: usize,
+        (k, v, pt): (&Buf, &Buf, &Buf),
         kpos: &Buf,
         cells: usize,
         rel: Option<&RelBias>,
@@ -1173,8 +1310,8 @@ impl<'g> AttnDense<'g> {
         let (rb, bb) = rel.map_or((q, q), |r| (r.r, r.bias));
         let sb = sink.map_or(q, |k| k.sink);
         let (gx, gy) = grid_for(wgs * nsplit, 1);
-        self.pipe.run(
-            &[q, k, v, qpos, kpos, rb, bb, sb, out, &self.part],
+        pipe.run(
+            &[q, k, v, qpos, kpos, rb, bb, sb, out, &self.part, pt],
             &pc,
             (gx, gy, 1),
         )?;
