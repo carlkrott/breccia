@@ -51,6 +51,7 @@ pub mod graph;
 pub mod head;
 pub mod host_arena;
 pub mod inkling;
+pub mod inkling_forward;
 pub mod kcal;
 pub mod model;
 pub mod mtp_draft;

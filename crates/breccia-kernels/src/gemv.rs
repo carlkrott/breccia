@@ -1075,6 +1075,30 @@ pub fn upload_scatter(gpu: &Gpu, stage: &Buf, parts: &[(&Buf, u64, u64)], data: 
     Ok(())
 }
 
+/// Copy `len` bytes `src[src_off..]` -> `dst[dst_off..]` on the device: recorded
+/// into `gpu`'s open dispatch batch if there is one, else one fenced submit.
+pub fn copy_at(gpu: &Gpu, dst: &Buf, dst_off: u64, src: &Buf, src_off: u64, len: u64) -> Result<()> {
+    if crate::dispatch_batch::is_open_on(gpu) {
+        return crate::dispatch_batch::record_copy(gpu, dst, dst_off, src, src_off, len);
+    }
+    anyhow::ensure!(
+        src_off.saturating_add(len) <= src.size && dst_off.saturating_add(len) <= dst.size,
+        "copy_at: {len} bytes at {src_off} -> {dst_off} out of range ({} / {})",
+        src.size,
+        dst.size
+    );
+    if len == 0 {
+        return Ok(());
+    }
+    gpu.wall_run(Qc::X, |d, cmd| unsafe {
+        Gpu::barrier_all(d, cmd);
+        d.cmd_copy_buffer(cmd, src.buf, dst.buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: dst_off, size: len }]);
+        Gpu::barrier_all(d, cmd);
+    })
+    .map_err(|e| anyhow!("{e}"))?;
+    Ok(())
+}
+
 /// Read `n` bytes back from a device-local buffer.
 pub fn download(gpu: &Gpu, src: &Buf, n: usize) -> Result<Vec<u8>> {
     let stage = staging(gpu, n as u64)?;
