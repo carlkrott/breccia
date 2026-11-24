@@ -68,6 +68,7 @@ layout(push_constant) uniform Params {
     float scale;
     float sink_scale;
     uint  chunk;      // cells per split, 0 = no split
+    uint  row0;       // first token row of Q/R/SINK/QPOS/O (batched streams); PART stays local
 } pc;
 
 #define WG_X_MAX 65535u
@@ -123,6 +124,7 @@ void main() {
     uint sg_id = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
     uint qrow = t * pc.heads + h0;
+    uint qg = (pc.row0 + t) * pc.heads + h0;
     uint parts = 256u / hd;
     uint part = d / hd;
     uint dim = d % hd;
@@ -132,22 +134,22 @@ void main() {
     [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
         [[unroll]] for (uint m = 0u; m < LOCAL_MAX; ++m) {
             uint e = lane + m * sg_size;
-            q[g][m] = g < group && e < hd ? Q[(qrow + g) * hd + e] * pc.scale : 0.0;
+            q[g][m] = g < group && e < hd ? Q[(qg + g) * hd + e] * pc.scale : 0.0;
         }
     }
     for (uint i = d; i < group * pc.rel_dim; i += 256u) {
-        SR[i] = R[qrow * pc.rel_dim + i];
+        SR[i] = R[qg * pc.rel_dim + i];
     }
     if (d < group) {
         bool sink = (pc.flags & 1u) != 0u && pc.chunk == 0u;
-        M[d] = sink ? pc.sink_scale * SINK[(pc.flags & 2u) != 0u ? qrow + d : h0 + d] : NEG;
+        M[d] = sink ? pc.sink_scale * SINK[(pc.flags & 2u) != 0u ? qg + d : h0 + d] : NEG;
         L[d] = sink ? 1.0 : 0.0;
     }
     float acc[MAX_GROUP];
     [[unroll]] for (uint g = 0u; g < MAX_GROUP; ++g) {
         acc[g] = 0.0;
     }
-    int qp = QPOS[t];
+    int qp = QPOS[pc.row0 + t];
 
     // shortcut: walks every cell even under a sliding window; bound the range when SWA rings grow.
     for (uint base = lo; base < hi; base += TILE) {
@@ -259,7 +261,7 @@ void main() {
             }
             PART[pb + 2u + d] = tot;
         } else {
-            O[row * hd + d] = L[g] > 0.0 ? tot / L[g] : 0.0;
+            O[(qg + g) * hd + d] = L[g] > 0.0 ? tot / L[g] : 0.0;
         }
     }
 }

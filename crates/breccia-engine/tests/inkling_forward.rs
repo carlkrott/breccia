@@ -675,3 +675,120 @@ fn rows_timing() {
         eprintln!("rows T={t}: {:.1} ms per forward, {:.2} ms per row", 1e3 * s, 1e3 * s / t as f64);
     }
 }
+
+/// Prints the first nodes where a stream's rows of the batched tap differ from
+/// its own one-row tap (rows assumed `[streams, ..]`; other layouts show as diffs too).
+fn tap_diff(got: &[(String, i32, Vec<f32>)], want: &[Vec<(String, i32, Vec<f32>)>]) {
+    let b = want.len();
+    let mut shown = 0;
+    for (k, (name, slot, g)) in got.iter().enumerate() {
+        for (i, w) in want.iter().enumerate() {
+            let Some((wn, ws, wv)) = w.get(k) else { continue };
+            if wn != name || ws != slot {
+                eprintln!("tap order differs at {k}: {name}/{slot} vs {wn}/{ws}");
+                return;
+            }
+            let row = if g.len() == b * wv.len() { &g[i * wv.len()..][..wv.len()] } else { &g[..wv.len().min(g.len())] };
+            let d = max_abs(row, &wv[..row.len()]);
+            let m = wv.iter().fold(0f32, |a, x| a.max(x.abs()));
+            if d > 1e-3 * m.max(1.0) && shown < 12 {
+                eprintln!("tap {k} {name} slot {slot} stream {i}: max |d| {d:.3e} (|x| <= {m:.2}), got len {} want {}", g.len(), wv.len());
+                shown += 1;
+            }
+        }
+    }
+    eprintln!("tap_diff: {} nodes, {shown} diffs shown", got.len());
+}
+
+/// Batched decode: `forward_batch` over B streams (different prompt lengths, so
+/// different positions per row) gives each stream the logits of its own
+/// one-token `forward`, teacher-forced on the sequential greedy ids.
+/// `BATCH_B` (3) streams, `BATCH_N` (6) steps; prints both paths' tokens/s.
+#[test]
+fn batch_decode() {
+    let Some(e) = env() else {
+        eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
+        return;
+    };
+    let env = |k: &str, d: usize| std::env::var(k).map_or(d, |v| v.parse().unwrap());
+    let (b, n) = (env("BATCH_B", 3), env("BATCH_N", 6));
+    let prompts: Vec<&[u32]> = (0..b).map(|i| &PROMPT[..PROMPT.len() - (i * 4) % 10]).collect();
+    let ctx = PROMPT.len() + n + 1;
+    let mut fwd = placed(&e);
+
+    let mut seqs: Vec<_> = (0..b).map(|_| fwd.new_seq(ctx, 64).unwrap()).collect();
+    let mut last: Vec<Vec<f32>> = prompts
+        .iter()
+        .zip(&mut seqs)
+        .map(|(p, s)| fwd.forward(s, p, None).unwrap())
+        .collect();
+    let (mut fed, mut want) = (Vec::new(), Vec::new());
+    // BATCH_TAPS=1: per-node diff of step 0, each stream's rows vs its own forward
+    let taps = env("BATCH_TAPS", 0) == 1;
+    let mut want_taps: Vec<Vec<(String, i32, Vec<f32>)>> = vec![Vec::new(); b];
+    let t0 = std::time::Instant::now();
+    for step in 0..n {
+        let ids: Vec<u32> = last.iter().map(|l| argmax(l) as u32).collect();
+        last = ids
+            .iter()
+            .zip(&mut seqs)
+            .zip(&mut want_taps)
+            .map(|((&id, s), wt)| {
+                if step > 0 || !taps {
+                    return fwd.forward(s, &[id], None).unwrap();
+                }
+                let mut tap = |name: &str, slot: i32, v: &[f32]| -> Option<Vec<f32>> {
+                    wt.push((name.to_string(), slot, v.to_vec()));
+                    None
+                };
+                fwd.forward(s, &[id], Some(&mut tap)).unwrap()
+            })
+            .collect();
+        fed.push(ids);
+        want.push(last.clone());
+    }
+    let seq_s = t0.elapsed().as_secs_f64();
+    drop(seqs);
+
+    let mut seqs: Vec<_> = (0..b).map(|_| fwd.new_seq(ctx, 64).unwrap()).collect();
+    for (p, s) in prompts.iter().zip(&mut seqs) {
+        fwd.forward(s, p, None).unwrap();
+    }
+    let tol = match breccia_kernels::qsa::VLayout::current() {
+        breccia_kernels::qsa::VLayout::F16 => 1e-2,
+        _ => 3e-2,
+    };
+    let mut worst = 0f32;
+    let t0 = std::time::Instant::now();
+    for (step, ids) in fed.iter().enumerate() {
+        let mut refs: Vec<&mut _> = seqs.iter_mut().collect();
+        let got = if step == 0 && taps {
+            let mut got_taps = Vec::new();
+            let mut tap = |name: &str, slot: i32, v: &[f32]| -> Option<Vec<f32>> {
+                got_taps.push((name.to_string(), slot, v.to_vec()));
+                None
+            };
+            let got = fwd.forward_batch(&mut refs, ids, Some(&mut tap)).unwrap();
+            tap_diff(&got_taps, &want_taps);
+            got
+        } else {
+            fwd.forward_batch(&mut refs, ids, None).unwrap()
+        };
+        for (i, (g, w)) in got.iter().zip(&want[step]).enumerate() {
+            let d = max_abs(g, w);
+            worst = worst.max(d);
+            assert_eq!(argmax(g), argmax(w), "step {step} stream {i}: argmax");
+            assert!(d <= tol, "step {step} stream {i}: max |dlogit| {d:.3e} over {tol:.0e}");
+        }
+    }
+    let bat_s = t0.elapsed().as_secs_f64();
+    for (s, p) in seqs.iter().zip(&prompts) {
+        assert_eq!(s.pos(), p.len() + n);
+    }
+    let toks = (b * n) as f64;
+    eprintln!(
+        "batch_decode B={b} N={n}: max |dlogit| {worst:.3e}; sequential {:.1} tok/s, batched {:.1} tok/s",
+        toks / seq_s,
+        toks / bat_s
+    );
+}

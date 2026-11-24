@@ -17,6 +17,7 @@ layout(push_constant) uniform Params {
     uint  nsplit;
     uint  flags;      // as ops_attn_dense: bit 0 sink, bit 1 per token
     float sink_scale;
+    uint  row0;       // first token row of SINK/O (batched streams); PART stays local
 } pc;
 
 #define WG_X_MAX 65535u
@@ -32,7 +33,7 @@ void main() {
     uint st = hd + 2u;
     uint base = row * pc.nsplit * st;
     bool sink = (pc.flags & 1u) != 0u;
-    float z = sink ? pc.sink_scale * SINK[(pc.flags & 2u) != 0u ? row : row % pc.heads] : NEG;
+    float z = sink ? pc.sink_scale * SINK[(pc.flags & 2u) != 0u ? pc.row0 * pc.heads + row : row % pc.heads] : NEG;
     float mx = z;
     for (uint s = 0u; s < pc.nsplit; s++) {
         mx = max(mx, PART[base + s * st]);
@@ -47,5 +48,5 @@ void main() {
             acc += PART[base + s * st + 2u + tid] * e;
         }
     }
-    O[row * hd + tid] = l > 0.0 ? acc / l : 0.0;
+    O[(pc.row0 * pc.heads + row) * hd + tid] = l > 0.0 ? acc / l : 0.0;
 }

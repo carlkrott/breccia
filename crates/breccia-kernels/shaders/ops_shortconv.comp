@@ -33,7 +33,7 @@ layout(push_constant) uniform Params {
     uint  state_stride;
     uint  state_off;
     float scale;
-    uint  pad0;
+    uint  row0;         // first row of X/O/DYN (batched streams)
 } pc;
 
 #define MAX_K 8u
@@ -62,7 +62,7 @@ void main() {
     uint hd = pc.heads == 0u ? 0u : c / (pc.channels / pc.heads);
 
     for (uint t = 0u; t < pc.tokens; ++t) {
-        uint at = t * pc.channels + c;
+        uint at = (pc.row0 + t) * pc.channels + c;
         float xn = X[at];
         win[0] = xn;
         float y = 0.0;
@@ -70,7 +70,7 @@ void main() {
             y += win[j] * w[j];
         }
         if (pc.heads != 0u) {
-            uint db = (t * pc.heads + hd) * K;
+            uint db = ((pc.row0 + t) * pc.heads + hd) * K;
             for (uint j = 0u; j < MAX_K; ++j) {
                 if (j < K) {
                     y += win[j] * DYN[db + j];

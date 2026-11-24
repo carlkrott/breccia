@@ -1091,11 +1091,9 @@ impl ExpertPool {
     /// # Determinism
     ///
     /// Each row's dot product is bit-identical to the per-token path (same
-    /// kernel, same slice, same order). The *sum over an expert set* is
-    /// accumulated in **expert-id order** rather than the router's `j` order,
-    /// because grouping reorders the work; that changes the routed sum in the
-    /// last ulp (the same class of deviation the split-K `hc_down` takes, §8n).
-    /// The greedy-token parity gate is what decides whether that is acceptable.
+    /// kernel, same slice, same order), and each token's routed sum is added in
+    /// the router's `j` order like the per-token path, so a token's output does
+    /// not depend on what else shares the chunk.
     pub fn moe_topk_chunk(
         &mut self,
         plan: &LayerPlan,
@@ -1208,12 +1206,22 @@ impl ExpertPool {
             })
             .collect();
         let done2 = self.run_phase(heaviest_first(tasks2))?;
+        // add in router j order per token, as moe_topk does, so a token's sum is
+        // bit-identical whatever else shares its chunk (batched decode == sequential)
+        let mut parts: Vec<Vec<(usize, usize, usize, usize)>> = vec![Vec::new(); t * k];
         for (seq, &(_, r0, r1, ref users)) in second.iter().enumerate() {
-            let values = done2[seq]
-                .as_ref()
-                .with_context(|| format!("chunk phase-2 shard {seq} never returned"))?;
-            let rows = r1 - r0;
-            for (u, &(token, _, w)) in users.iter().enumerate() {
+            for (u, &(_, act_off, _)) in users.iter().enumerate() {
+                parts[act_off / n_ff].push((seq, u, r0, r1));
+            }
+        }
+        for (slot, list) in parts.iter().enumerate() {
+            let (token, j) = (slot / k, slot % k);
+            let w = routes[token].weights.get(j).copied().unwrap_or(0.0);
+            for &(seq, u, r0, r1) in list {
+                let values = done2[seq]
+                    .as_ref()
+                    .with_context(|| format!("chunk phase-2 shard {seq} never returned"))?;
+                let rows = r1 - r0;
                 let dst = &mut out[token * n_embd + r0..token * n_embd + r1];
                 for (o, v) in dst.iter_mut().zip(&values[u * rows..(u + 1) * rows]) {
                     *o += w * v;

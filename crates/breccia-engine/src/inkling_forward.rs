@@ -120,6 +120,14 @@ struct SlotKv<'g> {
     state: Owned<'g>,
 }
 
+/// One sequence's rows in a step: its slot, first position, first row, row count.
+struct Stream<'a, 'g> {
+    kv: &'a SlotKv<'g>,
+    p0: usize,
+    row0: usize,
+    rows: usize,
+}
+
 /// One sequence's state between [`InklingForward::forward`] calls.
 pub struct InklingSeq<'g> {
     pos: usize,
@@ -797,29 +805,48 @@ impl<'g> InklingForward<'g> {
         let chunks: Vec<&[u32]> = ids.chunks(seq.chunk).collect();
         let last = chunks.len() - 1;
         for (i, c) in chunks.into_iter().enumerate() {
-            let logits = self.step(seq, c, tap.as_deref_mut(), i == last)?;
-            if let Some(l) = logits {
-                return Ok(l);
+            let logits = self.step(&mut [&mut *seq], &[c], tap.as_deref_mut(), i == last)?;
+            if let Some(mut l) = logits {
+                return Ok(l.pop().expect("one stream"));
             }
         }
         unreachable!("the last chunk returns logits")
+    }
+
+    /// One decode step for several sequences at once: `ids[i]` is fed to
+    /// `seqs[i]` at its next position, and each stream's logits come back in
+    /// order. The row-wise work (projections, MoE, depth mix) runs once over all
+    /// rows; conv state, KV stores and attention run per stream at its row.
+    /// `tap` sees every node with all streams' rows, stream order.
+    pub fn forward_batch(
+        &mut self,
+        seqs: &mut [&mut InklingSeq<'g>],
+        ids: &[u32],
+        tap: Option<&mut Tap>,
+    ) -> Result<Vec<Vec<f32>>> {
+        ensure!(!seqs.is_empty() && seqs.len() == ids.len(), "one id per stream");
+        for s in seqs.iter() {
+            ensure!(s.pos < s.ctx, "context full: {} of {}", s.pos, s.ctx);
+        }
+        let per: Vec<&[u32]> = ids.chunks(1).collect();
+        Ok(self.step(seqs, &per, tap, true)?.expect("head"))
     }
 
     /// One chunk at positions `seq.pos..`; logits only when `head`. The batch
     /// opened here is always closed (and its dropped buffers freed) on return.
     fn step(
         &mut self,
-        seq: &mut InklingSeq<'g>,
-        ids: &[u32],
+        seqs: &mut [&mut InklingSeq<'g>],
+        ids: &[&[u32]],
         tap: Option<&mut Tap>,
         head: bool,
-    ) -> Result<Option<Vec<f32>>> {
-        let r = self.step_inner(seq, ids, tap, head);
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        let r = self.step_inner(seqs, ids, tap, head);
         let closed = pause(self.gpu);
         bury(self.gpu);
         let out = r?;
         closed?;
-        self.hot_tokens += ids.len();
+        self.hot_tokens += ids.iter().map(|c| c.len()).sum::<usize>();
         let t0 = std::time::Instant::now();
         self.hot_reload()?;
         self.prof[2] += t0.elapsed().as_secs_f64();
@@ -828,13 +855,20 @@ impl<'g> InklingForward<'g> {
 
     fn step_inner(
         &mut self,
-        seq: &mut InklingSeq<'g>,
-        ids: &[u32],
+        seqs: &mut [&mut InklingSeq<'g>],
+        ids: &[&[u32]],
         mut tap: Option<&mut Tap>,
         head: bool,
-    ) -> Result<Option<Vec<f32>>> {
-        let t = ids.len();
-        let p0 = seq.pos;
+    ) -> Result<Option<Vec<Vec<f32>>>> {
+        // (p0, row0, rows) per stream; rows are the streams' tokens back to back
+        let mut spans = Vec::with_capacity(seqs.len());
+        let mut t = 0;
+        for (s, c) in seqs.iter().zip(ids) {
+            spans.push((s.pos, t, c.len()));
+            t += c.len();
+        }
+        let flat: Vec<u32> = ids.concat();
+        let ids = &flat[..];
         let cfg = self.cfg.clone();
         let n = cfg.n_embd;
         let plan = cfg.plan();
@@ -850,7 +884,10 @@ impl<'g> InklingForward<'g> {
             .emb
             .gather_staged(self.gpu, emb_table.as_slice(), ids, &raw)?;
         self.emb.release(self.gpu, &stage);
-        let pos: Vec<i32> = (p0 as i32..(p0 + t) as i32).collect();
+        let pos: Vec<i32> = spans
+            .iter()
+            .flat_map(|&(p0, _, r)| p0 as i32..(p0 + r) as i32)
+            .collect();
         let pos = self.bytes(bytemuck_i32(&pos))?;
         if self.batching {
             batch_cmd::begin(self.gpu)?;
@@ -906,6 +943,11 @@ impl<'g> InklingForward<'g> {
             } else {
                 None
             };
+            let streams: Vec<Stream<'_, 'g>> = seqs
+                .iter()
+                .zip(&spans)
+                .map(|(s, &(p0, row0, rows))| Stream { kv: &s.slots[st.slot], p0, row0, rows })
+                .collect();
             cur = self.layer(
                 st.layer,
                 st.slot,
@@ -913,32 +955,39 @@ impl<'g> InklingForward<'g> {
                 &stack,
                 &mut nblocks,
                 msgs.as_deref(),
-                &seq.slots[st.slot],
-                (&pos, p0),
+                &streams,
+                &pos,
                 t,
                 &mut tap,
             )?;
         }
-        seq.pos += t;
+        for (s, &(_, _, rows)) in seqs.iter_mut().zip(&spans) {
+            s.pos += rows;
+        }
         if !head {
             return Ok(None);
         }
 
-        // output head on the last token
+        // output head on each stream's last token
         let (mixed, _) = self.depth_mix(&stack, 0, nblocks, &cur, "output_res_query.weight", t)?;
         self.tap(&mut tap, "out_res_mix", -1, &mixed, tn)?;
         let (g, ..) = self.weight("output_norm.weight")?;
-        let last = self.buf(n)?;
-        self.norm
-            .run_view(&mixed, (n, (t - 1) * n), Some(&g), &last, (n, 0), 1)?;
+        let b = spans.len();
+        let last = self.buf(b * n)?;
+        for (i, &(_, row0, rows)) in spans.iter().enumerate() {
+            self.norm
+                .run_view(&mixed, (n, (row0 + rows - 1) * n), Some(&g), &last, (n, i * n), 1)?;
+        }
         self.tap(&mut tap, "result_norm", -1, &last, n)?;
-        let (logits, rows) = self.proj("output.weight", &last, 1)?;
+        let (logits, rows) = self.proj("output.weight", &last, b)?;
         if cfg.softcap != 0.0 {
-            self.act.run(&logits, &logits, rows, cfg.softcap)?;
+            self.act.run(&logits, &logits, b * rows, cfg.softcap)?;
         }
         self.tap(&mut tap, "result_output", -1, &logits, cfg.vocab)?;
         pause(self.gpu)?;
-        ops::download_f32(self.gpu, &logits, cfg.vocab).map(Some)
+        // head rows can exceed the vocab (padded): logits are [b, rows]
+        let all = ops::download_f32(self.gpu, &logits, b * rows)?;
+        Ok(Some(all.chunks(rows).map(|r| r[..cfg.vocab].to_vec()).collect()))
     }
 
     /// KV layout of a slot: SWA rings stay f16 (q6 there cost greedy parity for
@@ -962,7 +1011,8 @@ impl<'g> InklingForward<'g> {
 
     /// Write this step's K/V rows and positions into the slot's cells
     /// (two segments when the ring wraps).
-    fn store(&self, s: &SlotKv, k: &Buf, v: &Buf, pos: &Buf, p0: usize, t: usize) -> Result<()> {
+    fn store(&self, st: &Stream, k: &Buf, v: &Buf, pos: &Buf) -> Result<()> {
+        let (s, p0, row0, t) = (st.kv, st.p0, st.row0, st.rows);
         ensure!(s.ring || p0 + t <= s.cells, "slot cache full");
         let kv = self.paged(s);
         // a wrapping write must not evict a cell this chunk's first query still sees
@@ -974,13 +1024,13 @@ impl<'g> InklingForward<'g> {
         while done < t {
             let cell = (p0 + done) % s.cells;
             let m = (t - done).min(s.cells - cell);
-            self.append.run(&kv, k, v, done, m, cell)?;
+            self.append.run(&kv, k, v, row0 + done, m, cell)?;
             gemv::copy_at(
                 self.gpu,
                 &s.kpos,
                 (cell * 4) as u64,
                 pos,
-                (done * 4) as u64,
+                ((row0 + done) * 4) as u64,
                 (m * 4) as u64,
             )?;
             done += m;
@@ -998,12 +1048,11 @@ impl<'g> InklingForward<'g> {
         stack: &Buf,
         nblocks: &mut usize,
         msgs: Option<&Buf>,
-        kvs: &SlotKv,
-        (pos, p0): (&Buf, usize),
+        streams: &[Stream<'_, 'g>],
+        pos: &Buf,
         t: usize,
         tap: &mut Option<&mut Tap>,
     ) -> Result<Owned<'g>> {
-        let state = &*kvs.state;
         let cfg = self.cfg.clone();
         let (n, hd, h, hkv) = (cfg.n_embd, cfg.head_dim, cfg.n_head, cfg.n_head_kv);
         let (kv, qd) = (cfg.kv_dim(), cfg.q_dim());
@@ -1103,10 +1152,13 @@ impl<'g> InklingForward<'g> {
         self.tap(tap, "Vproj", s, &vp, t * kv)?;
         let hk = dynk.as_ref().map(|(d, rows)| (&**d, rows / k));
         let hv = dynv.as_ref().map(|(d, rows)| (&**d, rows / k));
-        self.conv
-            .run(state, state_stride, 0, &kp, &kw, k, hk, &kp, kv, t)?;
-        self.conv
-            .run(state, state_stride, kv, &vp, &vw, k, hv, &vp, kv, t)?;
+        for st in streams {
+            let (state, r) = (&*st.kv.state, st.rows);
+            self.conv
+                .run_at(state, state_stride, 0, &kp, &kw, k, hk, &kp, kv, r, st.row0)?;
+            self.conv
+                .run_at(state, state_stride, kv, &vp, &vw, k, hv, &vp, kv, r, st.row0)?;
+        }
         drop((dynk, dynv, kw, vw));
 
         // clips: Q/R by channel scale (+ tau on full layers), K plain, V per-head RMS
@@ -1134,7 +1186,9 @@ impl<'g> InklingForward<'g> {
         self.tap(tap, "Kcur", s, &kcur, t * kv)?;
         self.tap(tap, "Vcur", s, &vcur, t * kv)?;
         self.tap(tap, "Rcur", s, &rcur, t * cfg.n_rel * h)?;
-        self.store(kvs, &kcur, &vcur, pos, p0, t)?;
+        for st in streams {
+            self.store(st, &kcur, &vcur, pos)?;
+        }
         drop((kcur, vcur));
 
         // attention: rel bias + per-token sink logit
@@ -1160,10 +1214,13 @@ impl<'g> InklingForward<'g> {
             per_token: true,
             scale: 1.0,
         };
-        let live = kvs.cells.min(p0 + t);
-        let pkv = self.paged(kvs);
-        self.attn
-            .run_paged(&shape, &qcur, pos, t, &pkv, &kvs.kpos, live, Some(&rel), Some(&sink), &kqv)?;
+        for st in streams {
+            let live = st.kv.cells.min(st.p0 + st.rows);
+            let pkv = self.paged(st.kv);
+            let span = (st.row0, st.rows);
+            self.attn
+                .run_paged_at(&shape, &qcur, pos, span, &pkv, &st.kv.kpos, live, Some(&rel), Some(&sink), &kqv)?;
+        }
         drop((qcur, rcur, sinks, bias));
         self.tap(tap, "kqv_out", s, &kqv, t * qd)?;
 
@@ -1176,8 +1233,10 @@ impl<'g> InklingForward<'g> {
         drop(kqv);
         self.tap(tap, "attn_wo", s, &wo, tn)?;
         let (pw, ..) = self.weight(&b("attn_post_conv"))?;
-        self.conv
-            .run(state, state_stride, 2 * kv, &wo, &pw, k, None, &wo, n, t)?;
+        for st in streams {
+            self.conv
+                .run_at(&st.kv.state, state_stride, 2 * kv, &wo, &pw, k, None, &wo, n, st.rows, st.row0)?;
+        }
         drop(pw);
         self.tap(tap, "attn_out", s, &wo, tn)?;
 
@@ -1211,18 +1270,10 @@ impl<'g> InklingForward<'g> {
         drop(fin);
         self.tap(tap, "ffn_moe_out", s, &moe, tn)?;
         let (fw, ..) = self.weight(&b("ffn_post_conv"))?;
-        self.conv.run(
-            state,
-            state_stride,
-            2 * kv + n,
-            &moe,
-            &fw,
-            k,
-            None,
-            &moe,
-            n,
-            t,
-        )?;
+        for st in streams {
+            self.conv
+                .run_at(&st.kv.state, state_stride, 2 * kv + n, &moe, &fw, k, None, &moe, n, st.rows, st.row0)?;
+        }
         drop(fw);
         self.tap(tap, "ffn_out", s, &moe, tn)?;
         self.add.run(&ffn_inp, &moe, &ffn_inp, tn, 1.0)?;

@@ -1734,11 +1734,12 @@ impl Gpu {
             // prefix they read, and `cmd_push_constants` may push a prefix of the
             // range. It was 32 bytes (8 words): the QSA attention tiling needs a
             // ninth word (`tok0`), and a shader block larger than the range reads
-            // undefined constants, so the range is 48 bytes now.
+            // undefined constants, so it grew to 48, and to 64 for attn_dense's
+            // batched-stream `row0` (13th word). Keep in step with `ops::Pc`.
             let pcr = vk::PushConstantRange::default()
                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                 .offset(0)
-                .size(48);
+                .size(64);
             let layouts = [dsl];
             let pcrs = [pcr];
             let plci = vk::PipelineLayoutCreateInfo::default()

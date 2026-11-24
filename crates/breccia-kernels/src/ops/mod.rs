@@ -124,17 +124,17 @@ pub(crate) fn grid_for(units: usize, per_wg: usize) -> (u32, u32) {
 /// A 32-byte push-constant block builder (every op uses four words or fewer).
 #[derive(Clone, Copy)]
 pub(crate) struct Pc {
-    /// Room for 12 words. It was 8; the QSA attention tiling's ninth word (`tok0`)
-    /// was silently dropped by `u()` until this grew (and the pipeline layout's
-    /// range grew with it, `ctx.rs`).
-    bytes: [u8; 48],
+    /// Room for 16 words. It was 8, then 12 (the QSA tiling's `tok0`; attn_dense's
+    /// batched-stream `row0` is the 13th); the pipeline layout's range in `ctx.rs`
+    /// must match, and a word past it is dropped by `u()`.
+    bytes: [u8; 64],
     len: usize,
 }
 
 impl Pc {
     pub(crate) fn new() -> Self {
         Pc {
-            bytes: [0u8; 48],
+            bytes: [0u8; 64],
             len: 0,
         }
     }
@@ -144,7 +144,7 @@ impl Pc {
     pub(crate) fn from_bytes(bytes: &[u8; 32]) -> Self {
         Pc {
             bytes: {
-                let mut b = [0u8; 48];
+                let mut b = [0u8; 64];
                 b[..32].copy_from_slice(bytes);
                 b
             },
@@ -154,7 +154,8 @@ impl Pc {
 
     pub(crate) fn u(mut self, v: u32) -> Self {
         let at = self.len;
-        if at + 4 <= 48 {
+        debug_assert!(at + 4 <= 64, "push constants past the 64-byte range");
+        if at + 4 <= 64 {
             self.bytes[at..at + 4].copy_from_slice(&v.to_le_bytes());
             self.len = at + 4;
         }
@@ -999,6 +1000,26 @@ impl<'g> ShortConv<'g> {
         channels: usize,
         tokens: usize,
     ) -> Result<()> {
+        self.run_at(state, state_stride, state_off, x, w, k, dyn_taps, out, channels, tokens, 0)
+    }
+
+    /// [`Self::run`] on rows `row0..row0 + tokens` of `x`/`out`/the dynamic taps
+    /// (one stream of a batched step; `state` is that stream's).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_at(
+        &self,
+        state: &Buf,
+        state_stride: usize,
+        state_off: usize,
+        x: &Buf,
+        w: &Buf,
+        k: usize,
+        dyn_taps: Option<(&Buf, usize)>,
+        out: &Buf,
+        channels: usize,
+        tokens: usize,
+        row0: usize,
+    ) -> Result<()> {
         let heads = dyn_taps.map_or(0, |(_, h)| h);
         if k == 0 || k > Self::MAX_K || (heads != 0 && !channels.is_multiple_of(heads)) {
             return Err(anyhow!(
@@ -1018,7 +1039,7 @@ impl<'g> ShortConv<'g> {
             .u(state_stride as u32)
             .u(state_off as u32)
             .f(scale)
-            .u(0);
+            .u(row0 as u32);
         let dynb = dyn_taps.map_or(w, |(b, _)| b);
         let (gx, gy) = grid_for(channels, 128);
         self.pipe.run(&[state, x, w, dynb, out], &pc, (gx, gy, 1))
@@ -1221,7 +1242,7 @@ impl<'g> AttnDense<'g> {
         sink: Option<&Sink>,
         out: &Buf,
     ) -> Result<()> {
-        self.dispatch(&self.pipe, shape, q, qpos, tokens, (k, v, k), kpos, cells, rel, sink, out)
+        self.dispatch(&self.pipe, shape, q, qpos, (0, tokens), (k, v, k), kpos, cells, rel, sink, out)
     }
 
     /// [`Self::run`] over a [`PagedKv`] pool (logical cells `0..cells`).
@@ -1232,6 +1253,25 @@ impl<'g> AttnDense<'g> {
         q: &Buf,
         qpos: &Buf,
         tokens: usize,
+        kv: &PagedKv,
+        kpos: &Buf,
+        cells: usize,
+        rel: Option<&RelBias>,
+        sink: Option<&Sink>,
+        out: &Buf,
+    ) -> Result<()> {
+        self.run_paged_at(shape, q, qpos, (0, tokens), kv, kpos, cells, rel, sink, out)
+    }
+
+    /// [`Self::run_paged`] on token rows `row0..row0 + tokens` of `q`/`qpos`/the
+    /// rel and per-token sink rows/`out` (one stream of a batched step).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_paged_at(
+        &self,
+        shape: &AttnShape,
+        q: &Buf,
+        qpos: &Buf,
+        (row0, tokens): (usize, usize),
         kv: &PagedKv,
         kpos: &Buf,
         cells: usize,
@@ -1253,7 +1293,7 @@ impl<'g> AttnDense<'g> {
             VLayout::Q6_0 => &self.pipe_q6,
             VLayout::Q8_0 => return Err(anyhow!("attn_dense: no q8_0 V paged build")),
         };
-        self.dispatch(pipe, shape, q, qpos, tokens, (kv.k, kv.v, kv.pt), kpos, cells, rel, sink, out)
+        self.dispatch(pipe, shape, q, qpos, (row0, tokens), (kv.k, kv.v, kv.pt), kpos, cells, rel, sink, out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1263,7 +1303,7 @@ impl<'g> AttnDense<'g> {
         shape: &AttnShape,
         q: &Buf,
         qpos: &Buf,
-        tokens: usize,
+        (row0, tokens): (usize, usize),
         (k, v, pt): (&Buf, &Buf, &Buf),
         kpos: &Buf,
         cells: usize,
@@ -1309,7 +1349,8 @@ impl<'g> AttnDense<'g> {
             .u(flags)
             .f(s.scale)
             .f(sink.map_or(0.0, |k| k.scale))
-            .u(chunk as u32);
+            .u(chunk as u32)
+            .u(row0 as u32);
         let (rb, bb) = rel.map_or((q, q), |r| (r.r, r.bias));
         let sb = sink.map_or(q, |k| k.sink);
         let (gx, gy) = grid_for(wgs * nsplit, 1);
@@ -1327,7 +1368,8 @@ impl<'g> AttnDense<'g> {
             .u(s.head_dim as u32)
             .u(nsplit as u32)
             .u(flags)
-            .f(sink.map_or(0.0, |k| k.scale));
+            .f(sink.map_or(0.0, |k| k.scale))
+            .u(row0 as u32);
         let (gx, gy) = grid_for(rows, 1);
         self.reduce.run(&[&self.part, sb, out], &pc, (gx, gy, 1))
     }

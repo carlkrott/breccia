@@ -365,9 +365,8 @@ fn topk_pool_is_bit_identical_to_the_single_threaded_path() {
 ///
 /// The grouped path reads each expert's rows once and serves every token that
 /// routed to it, so the work is reordered: each row's dot product must still be
-/// **bit**-identical to the per-token path, and the routed sum may differ only in
-/// the last ulp (the accumulation order over an expert set is expert-id order, not
-/// router order — stated in `moe_topk_chunk`).
+/// **bit**-identical to the per-token path, and so is the routed sum (added in
+/// router order per token, like `moe_topk`): batched decode relies on it.
 #[test]
 fn grouped_chunk_lane_matches_the_per_token_lane() {
     let Some(set) = open_model() else { return };
@@ -442,11 +441,9 @@ fn grouped_chunk_lane_matches_the_per_token_lane() {
             "blk.{}: grouped vs per-token over {} tokens, worst relative {worst:.3e}",
             plan.block, t
         );
-        assert!(
-            worst <= 1e-6,
-            "blk.{}: grouped lane differs by {worst:.3e} (bit-identical rows expected)",
-            plan.block
-        );
+        for (k2, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(a.to_bits(), b.to_bits(), "blk.{}: grouped element {k2}", plan.block);
+        }
         // Determinism.
         let mut again = vec![0f32; t * n_embd];
         let mut pool = ExpertPool::new(Arc::clone(&set), 8, Path::Avx2);
