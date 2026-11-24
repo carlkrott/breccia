@@ -26,6 +26,7 @@ use std::path::PathBuf;
 
 use breccia_vk::DeviceSelector;
 
+mod inkling_serve;
 mod prefix_disk;
 
 #[derive(Parser)]
@@ -6536,6 +6537,10 @@ fn open_serve_draft<'m>(
 const SERVE_DISPLAY_RESERVE_MIB: u64 = 768;
 
 fn serve_http(mut a: ServeArgs) -> Result<()> {
+    if inkling_serve::is_inkling(&a.gguf) {
+        anyhow::ensure!(a.mmproj.is_none(), "inkling serve takes no --mmproj");
+        return inkling_serve::serve(a.port, &a.gguf, a.devices.first().map(String::as_str), a.ctx, a.prefill_chunk, a.max_tokens);
+    }
     a.devices = serve_devices(&a.devices, a.ctx);
     // MTP spec decode runs on one card or the dual split (replay verify, `Session::spec_enable`)
     // BRECCIA_MTP=0 off, =1 every text request, default auto: code requests only (`wants_code`)

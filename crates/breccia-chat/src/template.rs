@@ -191,6 +191,13 @@ fn mutation(tag: &str) -> Option<String> {
     let open = if tag.starts_with("{%-") { "{%-" } else { "{%" };
     let close = if tag.ends_with("-%}") { "-%}" } else { "%}" };
     let body = tag.strip_prefix(open)?.strip_suffix(close)?.trim();
+    // transformers' assistant-mask block (llama.cpp parses it as a no-op); a tag stays so
+    // trim_blocks / lstrip_blocks eat the same whitespace
+    match body {
+        "generation" => return Some(format!("{open} if true {close}")),
+        "endgeneration" => return Some(format!("{open} endif {close}")),
+        _ => {}
+    }
     let (var, call) = body.strip_prefix("set ")?.split_once('=')?;
     let (var, call) = (var.trim(), call.trim());
     let (path, args) = call.strip_suffix(')')?.split_once('(')?;
@@ -331,6 +338,12 @@ mod tests {
         let t = ChatTemplate::new("{{ tools[0] | tojson(ensure_ascii=True, sort_keys=True) }}", "", "").unwrap();
         let r = t.render(&json!({"messages": [], "tools": [{"z": "é😀", "a": {"y": 1, "b": 2}}]})).unwrap();
         assert_eq!(r.text, r#"{"a": {"b": 2, "y": 1}, "z": "\u00e9\ud83d\ude00"}"#);
+    }
+
+    #[test]
+    fn generation_block_is_a_noop() {
+        let t = ChatTemplate::new("{%- for m in messages %}\n{% generation %}\n{{ m.content }}\n{%- endgeneration %}|{% endfor %}", "", "").unwrap();
+        assert_eq!(t.render(&json!({"messages": [{"role": "user", "content": "a"}]})).unwrap().text, "a|");
     }
 
     #[test]

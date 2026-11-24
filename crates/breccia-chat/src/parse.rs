@@ -29,6 +29,8 @@ pub enum Format {
     HermesJson,
     /// Llama 3.x: `<|python_tag|>{..}` or a bare `{"name": N, "parameters": {..}}`
     Llama3,
+    /// Inkling 1/2: `<|message_model|>[N]<|content_thinking|>|<|content_text|>|<|content_invoke_tool_json|>…<|end_message|>` blocks
+    Inkling,
     /// Unknown template: try every format but the bare-JSON one.
     Generic,
 }
@@ -44,6 +46,8 @@ impl Format {
         let has = |s: &str| src.contains(s);
         if has("<|channel|>") {
             Format::Harmony
+        } else if has("<|message_model|>") && has("<|end_message|>") {
+            Format::Inkling
         } else if has("DSML") {
             Format::DeepSeekDsml
         } else if has("tool▁calls▁begin") || has("tool▁call▁begin") {
@@ -96,6 +100,9 @@ pub fn parse(format: Format, text: &str, think_open: bool, tools: Option<&Json>)
     let tools = tools.and_then(|t| t.as_array()).filter(|a| !a.is_empty());
     if format == Format::Harmony {
         return harmony(text, tools.is_some());
+    }
+    if format == Format::Inkling {
+        return inkling(text, tools.is_some());
     }
     let (reasoning, rest) = split_reasoning(text, think_open);
     let Some(tools) = tools else {
@@ -193,7 +200,7 @@ fn calls_in(f: Format, text: &str, tools: &[Json]) -> Option<(String, Vec<Call>)
                 })
             }
         }
-        Format::Harmony | Format::Generic => None,
+        Format::Harmony | Format::Inkling | Format::Generic => None,
     }
 }
 
@@ -414,6 +421,35 @@ fn harmony(text: &str, tools: bool) -> Parsed {
     p
 }
 
+/// Inkling's assistant turn (llama.cpp `common_chat_params_init_inkling`): a list of
+/// `<|message_model|>` blocks, each closed by `<|end_message|>` (the last may be cut off).
+/// Text before the first header counts as a text block.
+fn inkling(text: &str, tools: bool) -> Parsed {
+    let mut p = Parsed::default();
+    let mut reasoning = Vec::new();
+    for blk in text.split("<|message_model|>") {
+        let blk = blk.split("<|end_message|>").next().unwrap_or("");
+        if let Some(r) = blk.split_once("<|content_thinking|>").map(|x| x.1) {
+            reasoning.push(r.trim().to_string());
+        } else if let Some(j) = blk.split_once("<|content_invoke_tool_json|>").map(|x| x.1) {
+            let call = first_json(j).filter(|_| tools);
+            match call.as_ref().and_then(|v| Some((v.get("name")?.as_str()?, v.get("args")))) {
+                Some((name, args)) => p.calls.push(ToolCall {
+                    id: call_id(p.calls.len()),
+                    name: name.to_string(),
+                    arguments: args_text(args.cloned().unwrap_or(Json::Null)),
+                }),
+                None => p.content.push_str(j),
+            }
+        } else {
+            p.content.push_str(blk.split_once("<|content_text|>").map_or(blk, |x| x.1));
+        }
+    }
+    p.reasoning = (!reasoning.is_empty()).then(|| reasoning.join("\n"));
+    p.content = p.content.trim().to_string();
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +535,19 @@ mod tests {
         assert_eq!(p.calls.len(), 1);
         let p = parse(Format::Harmony, "<|channel|>analysis<|message|>hm<|end|><|start|>assistant<|channel|>final<|message|>Hello", false, None);
         assert_eq!((p.reasoning.as_deref(), p.content.as_str()), (Some("hm"), "Hello"));
+    }
+
+    #[test]
+    fn inkling_blocks() {
+        let t = "<|message_model|><|content_thinking|>hmm<|end_message|><|message_model|><|content_text|>Paris.<|end_message|>";
+        let p = parse(Format::Inkling, t, false, None);
+        assert_eq!((p.content.as_str(), p.reasoning.as_deref()), ("Paris.", Some("hmm")));
+        let t = "<|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{\"city\":\"Oslo\"}}<|end_message|>";
+        let c = one(Format::Inkling, t, false);
+        assert_eq!((c.calls[0].name.as_str(), c.calls[0].arguments.as_str()), ("get_time", r#"{"city":"Oslo"}"#));
+        // cut off mid-text, no tools: plain content
+        assert_eq!(parse(Format::Inkling, "<|message_model|><|content_text|>Par", false, None).content, "Par");
+        assert_eq!(Format::detect("{{ '<|message_model|>' }}<|end_message|>"), Format::Inkling);
     }
 
     #[test]
