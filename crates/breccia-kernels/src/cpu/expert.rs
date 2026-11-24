@@ -1210,7 +1210,7 @@ impl ExpertPool {
         // bit-identical whatever else shares its chunk (batched decode == sequential)
         // (one flat sort: shards of one slot cover disjoint rows, so their order is free)
         let mut parts: Vec<(usize, usize, usize, usize, usize, f32)> = Vec::new();
-        for (seq, &(_, r0, r1, ref users)) in second.iter().enumerate() {
+        for (seq, &(_, r0, _, ref users)) in second.iter().enumerate() {
             for (u, &(token, act_off, w)) in users.iter().enumerate() {
                 parts.push((act_off / n_ff, token, seq, u, r0, w));
             }

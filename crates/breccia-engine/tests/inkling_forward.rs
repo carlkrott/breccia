@@ -726,8 +726,12 @@ fn batch_decode() {
     // BATCH_TAPS=1: per-node diff of step 0, each stream's rows vs its own forward
     let taps = env("BATCH_TAPS", 0) == 1;
     let mut want_taps: Vec<Vec<(String, i32, Vec<f32>)>> = vec![Vec::new(); b];
-    let t0 = std::time::Instant::now();
+    // timing and submit stats cover steps 1.. (step 0 sizes staging/maps for t = B)
+    let (mut t0, mut s0) = (std::time::Instant::now(), breccia_vk::ctx::submit_stats());
     for step in 0..n {
+        if step == 1 {
+            (t0, s0) = (std::time::Instant::now(), breccia_vk::ctx::submit_stats());
+        }
         let ids: Vec<u32> = last.iter().map(|l| argmax(l) as u32).collect();
         last = ids
             .iter()
@@ -748,6 +752,7 @@ fn batch_decode() {
         want.push(last.clone());
     }
     let seq_s = t0.elapsed().as_secs_f64();
+    let seq_st = breccia_vk::ctx::submit_stats().since(&s0);
     drop(seqs);
 
     let mut seqs: Vec<_> = (0..b).map(|_| fwd.new_seq(ctx, 64).unwrap()).collect();
@@ -759,8 +764,11 @@ fn batch_decode() {
         _ => 3e-2,
     };
     let mut worst = 0f32;
-    let t0 = std::time::Instant::now();
+    let (mut t0, mut s0) = (std::time::Instant::now(), breccia_vk::ctx::submit_stats());
     for (step, ids) in fed.iter().enumerate() {
+        if step == 1 {
+            (t0, s0) = (std::time::Instant::now(), breccia_vk::ctx::submit_stats());
+        }
         let mut refs: Vec<&mut _> = seqs.iter_mut().collect();
         let got = if step == 0 && taps {
             let mut got_taps = Vec::new();
@@ -782,13 +790,24 @@ fn batch_decode() {
         }
     }
     let bat_s = t0.elapsed().as_secs_f64();
+    let bat_st = breccia_vk::ctx::submit_stats().since(&s0);
     for (s, p) in seqs.iter().zip(&prompts) {
         assert_eq!(s.pos(), p.len() + n);
     }
-    let toks = (b * n) as f64;
+    let timed = n.saturating_sub(1).max(1) as f64;
+    let toks = b as f64 * timed;
     eprintln!(
-        "batch_decode B={b} N={n}: max |dlogit| {worst:.3e}; sequential {:.1} tok/s, batched {:.1} tok/s",
+        "batch_decode B={b} N={n}: max |dlogit| {worst:.3e}; steps 1..: sequential {:.1} tok/s, batched {:.1} tok/s",
         toks / seq_s,
         toks / bat_s
     );
+    for (name, st, wall, per) in [("sequential", seq_st, seq_s, toks), ("batched", bat_st, bat_s, timed)] {
+        eprintln!(
+            "  {name} per step: {:.1} ms wall, {:.1} ms fence wait, {:.1} submits, {:.1} waits",
+            1e3 * wall / per,
+            1e3 * st.wait_s / per,
+            st.submits as f64 / per,
+            st.waits as f64 / per
+        );
+    }
 }
