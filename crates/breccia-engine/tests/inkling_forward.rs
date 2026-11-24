@@ -104,10 +104,20 @@ fn placed(e: &Env) -> InklingForward<'_> {
     });
     if std::env::var("BRECCIA_INKLING_HOST").is_ok_and(|v| v == "1") {
         let pool = cpu::ExpertPool::new(e.shards.clone(), std::thread::available_parallelism().map_or(8, |n| n.get().min(32)), cpu::path());
-        let layers: Vec<usize> = (0..e.cfg.n_layers).collect();
+        // BRECCIA_INKLING_HOST_LAYERS="0,1,18..24" keeps the other layers' experts on the GPU path
+        let layers: Vec<usize> = match std::env::var("BRECCIA_INKLING_HOST_LAYERS") {
+            Ok(s) => s
+                .split(',')
+                .flat_map(|p| match p.split_once("..") {
+                    Some((a, b)) => (a.trim().parse().unwrap()..b.trim().parse().unwrap()).collect::<Vec<usize>>(),
+                    None => vec![p.trim().parse().unwrap()],
+                })
+                .collect(),
+            Err(_) => (0..e.cfg.n_layers).collect(),
+        };
         fwd.set_host_experts(pool, &layers).unwrap();
     }
-    eprintln!("placement: resident={r:?} host={:?}", std::env::var("BRECCIA_INKLING_HOST").ok());
+    eprintln!("placement: resident={r:?} host={:?} layers={:?}", std::env::var("BRECCIA_INKLING_HOST").ok(), std::env::var("BRECCIA_INKLING_HOST_LAYERS").ok());
     fwd
 }
 
