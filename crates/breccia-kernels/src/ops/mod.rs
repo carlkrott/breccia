@@ -13,6 +13,7 @@
 //! | [`Rope`] + [`RopeTable`] | `ops_rope.comp` | §13 op 13, §10.2-§10.3 (NEOX-paired partial rope, `n_rot = 64` of 256, base 1e7) |
 //! | [`SwiGlu`] | `ops_swiglu.comp` | §5.4 (`silu(gate) * up`, 640-wide) |
 //! | [`Glu`] | `ops_glu.comp` | SwiGLU / SITU, split or fused gate_up rows |
+//! | [`DepthMix`] | `ops_depth_mix.comp` | Inkling AttnRes / message-bank mix |
 //! | [`Softmax`] | `ops_softmax.comp` | §5.4 (512 router), §10.4 (512..2048 attention) |
 //! | [`Router`] | `ops_router.comp` | §5.4/§8 (softmax(all) → top-10 → `max(sum, 2^-14)`) |
 //! | [`EmbGather`] | `ops_gather_<type>.comp` | §6.5, §9.1 (`token_embd` IQ3_S, PLE IQ4_NL) |
@@ -843,6 +844,79 @@ impl<'g> Glu<'g> {
         }
         let (bufs, pc, grid) = self.launch(gate_up, gate_up, out, rows * half, half);
         self.pipe.run(&bufs, &pc, grid)
+    }
+}
+
+/// Depth mix (`ops_depth_mix.comp`): softmax attention over a few whole-token
+/// states with learned queries, llama.cpp inkling2.cpp `mix` (AttnRes inputs,
+/// the FFN/output residual mix and the loop message bank).
+///
+/// States are `[stack[first+count-1], .., stack[first], cur]`, each weightless
+/// RMS-normalised; `out[t][q] = sum_s softmax_s(scale * x_s . query[q]) * x_s`.
+pub struct DepthMix<'g> {
+    pipe: Pipe<'g>,
+    n: usize,
+    eps: f32,
+    scale: f32,
+}
+
+impl<'g> DepthMix<'g> {
+    /// Most states (blocks + cur) and queries one dispatch takes.
+    pub const MAX_STATES: usize = 8;
+    pub const MAX_QUERIES: usize = 4;
+
+    /// `n`-wide states, softmax scale `1/sqrt(n)` and RMS eps `eps`.
+    pub fn new(gpu: &'g Gpu, n: usize, eps: f32) -> Result<Self> {
+        Ok(DepthMix {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_depth_mix.spv")),
+                4,
+                "depth_mix",
+            )?,
+            n,
+            eps,
+            scale: 1.0 / (n as f32).sqrt(),
+        })
+    }
+
+    /// `stack` slots `first..first+count` (each `tokens * n` at `slot_stride`
+    /// floats apart) plus `cur` (`tokens * n`) mixed by `nq` queries
+    /// (`query` is `[nq, n]`) into `out` (`[tokens, nq, n]`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        stack: &Buf,
+        first: usize,
+        count: usize,
+        slot_stride: usize,
+        cur: &Buf,
+        query: &Buf,
+        nq: usize,
+        out: &Buf,
+        tokens: usize,
+    ) -> Result<()> {
+        if count + 1 > Self::MAX_STATES || nq == 0 || nq > Self::MAX_QUERIES {
+            return Err(anyhow!(
+                "depth mix: {count} blocks (max {}) / {nq} queries (1..={})",
+                Self::MAX_STATES - 1,
+                Self::MAX_QUERIES
+            ));
+        }
+        if tokens == 0 {
+            return Ok(());
+        }
+        let pc = Pc::new()
+            .u(self.n as u32)
+            .u(tokens as u32)
+            .u(nq as u32)
+            .u(first as u32)
+            .u(count as u32)
+            .u(slot_stride as u32)
+            .f(self.eps)
+            .f(self.scale);
+        let (gx, gy) = grid_for(tokens * 256, 256);
+        self.pipe.run(&[stack, cur, query, out], &pc, (gx, gy, 1))
     }
 }
 

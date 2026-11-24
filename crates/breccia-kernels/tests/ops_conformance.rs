@@ -35,7 +35,7 @@ use breccia_kernels::ops::{
     self, cpu, Act, ActMode, Add, EmbGather, HcMixer, HcWeights, RmsNorm, Rope, RopeTable, Router,
     RowClip, Softmax, SwiGlu,
 };
-use breccia_kernels::ops::{Glu, GluMode};
+use breccia_kernels::ops::{DepthMix, Glu, GluMode};
 use breccia_kernels::{Device, QuantType};
 
 /// One device for the whole test binary, serialised: `ctx::Gpu` owns a single
@@ -1187,6 +1187,145 @@ fn inkling_situ() {
         }
     }
     println!("golden ffn_moe_situ from fused gate_up, 48 slots: worst max rel {worst:.2e}");
+}
+
+/// Inkling S7: the depth mix (AttnRes inputs, FFN/output residual mix, loop
+/// message bank) against the f64 reference; then, with `BRECCIA_INKLING_GOLDEN`,
+/// a replay of llama.cpp's block bookkeeping over the golden layer inputs:
+/// `attn_res_mix`, `ffn_res_mix`, `loop_msgs` for every slot and `out_res_mix`.
+#[test]
+fn inkling_depth_mix() {
+    let fx = need_gpu!("inkling_depth_mix");
+    let gpu = fx.dev.gpu();
+    let read = |b: &breccia_vk::ctx::Buf, n: usize| ops::download_f32(gpu, b, n).expect("read");
+    // Runs one mix; `blocks` oldest first (stack order), `cur` last.
+    let mix = |dm: &DepthMix,
+               n: usize,
+               blocks: &[&[f32]],
+               cur: &[f32],
+               query: &[f32],
+               nq: usize,
+               pad: usize,
+               first: usize| {
+        let tokens = cur.len() / n;
+        let stride = tokens * n + pad;
+        let mut st = vec![0f32; (first + blocks.len()).max(1) * stride];
+        for (i, b) in blocks.iter().enumerate() {
+            st[(first + i) * stride..][..tokens * n].copy_from_slice(b);
+        }
+        let (sb, cb, qb) = (
+            ops::upload_f32(gpu, &st).expect("stack"),
+            ops::upload_f32(gpu, cur).expect("cur"),
+            ops::upload_f32(gpu, query).expect("query"),
+        );
+        let ob = breccia_kernels::gemv::alloc(gpu, (tokens * nq * n * 4) as u64).expect("out");
+        dm.run(&sb, first, blocks.len(), stride, &cb, &qb, nq, &ob, tokens)
+            .expect("depth mix");
+        let got = read(&ob, tokens * nq * n);
+        for b in [&sb, &cb, &qb, &ob] {
+            gpu.destroy_buf(b);
+        }
+        let mut order: Vec<&[f32]> = blocks.iter().rev().copied().collect();
+        order.push(cur);
+        let want = cpu::depth_mix(&order, query, nq, n, 1e-6);
+        (got, want)
+    };
+    for (n, tokens) in [(2304usize, 5usize), (1000, 3)] {
+        let dm = DepthMix::new(gpu, n, 1e-6).expect("depth mix");
+        for (count, nq) in [(0usize, 1usize), (2, 3), (4, 4), (7, 1)] {
+            let blocks: Vec<Vec<f32>> = (0..count)
+                .map(|i| {
+                    normalish(0xb10c + i as u64, tokens * n)
+                        .into_iter()
+                        .map(|v| v * (1.0 + i as f32))
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[f32]> = blocks.iter().map(|b| b.as_slice()).collect();
+            let cur = normalish(0xc0, tokens * n);
+            // Model scale: real AttnRes / message queries have std ~0.2-0.55.
+            let query: Vec<f32> = normalish(0x9e, nq * n)
+                .into_iter()
+                .map(|v| v * 0.5)
+                .collect();
+            let (got, want) = mix(&dm, n, &refs, &cur, &query, nq, 37, 1);
+            let e = max_rel(&got, &as_f64(&want));
+            println!("depth mix n={n:<4} T={tokens} blocks={count} nq={nq}: max rel {e:.2e}");
+            assert!(e <= 1e-5, "depth mix n={n} blocks={count} nq={nq}: {e:e}");
+        }
+    }
+
+    let Ok(golden) = std::env::var("BRECCIA_INKLING_GOLDEN") else {
+        eprintln!("inkling depth mix golden parity: SKIPPED (set BRECCIA_INKLING_GOLDEN)");
+        return;
+    };
+    let golden = std::path::PathBuf::from(golden);
+    let n = 2304usize;
+    let dm = DepthMix::new(gpu, n, 1e-6).expect("depth mix");
+    let dump = |name: &str| golden_f32(&golden, "dump", &format!("{name}_"));
+    let weight = |name: &str| golden_f32(&golden, "weights", &format!("{name}_"));
+    let mut worst = 0.0f64;
+    let mut checked = 0usize;
+    let mut check = |label: String, blocks: &[String], cur: &[f32], query: &[f32]| {
+        let nq = query.len() / n;
+        let bv: Vec<Vec<f32>> = blocks.iter().map(|b| dump(b)).collect();
+        let refs: Vec<&[f32]> = bv.iter().map(|b| b.as_slice()).collect();
+        let (got, _) = mix(&dm, n, &refs, cur, query, nq, 0, 0);
+        let want = dump(&label);
+        let e = max_rel(&got, &as_f64(&want));
+        assert!(
+            e <= 1e-5,
+            "golden {label}: {e:e} > 1e-5 (blocks {blocks:?})"
+        );
+        worst = worst.max(e);
+        checked += 1;
+    };
+    // Execution order: prelude + core pass 0, loop passes 1 and 2, post.
+    let phys = |slot: usize| {
+        if slot < 24 {
+            slot
+        } else {
+            6 + (slot - 24) % 12
+        }
+    };
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur = "inp_norm".to_string();
+    let mut bank: (Vec<String>, String) = (Vec::new(), String::new());
+    for slot in (0..18).chain(24..48).chain(18..24) {
+        let ip = phys(slot);
+        if slot == 24 || slot == 36 {
+            // The bank: the previous pass's blocks after the first core block, and its output.
+            bank = (blocks[2..].to_vec(), cur.clone());
+            blocks = vec!["inp_norm".to_string()];
+            cur = "l_out-5".to_string();
+        }
+        if slot >= 24 {
+            let q = weight(&format!("blk.{ip}.loop_msg_query.weight"));
+            check(format!("loop_msgs-{slot}"), &bank.0, &dump(&bank.1), &q);
+        }
+        if ip > 0 {
+            let q = weight(&format!("blk.{ip}.attn_res_query.weight"));
+            check(format!("attn_res_mix-{slot}"), &blocks, &dump(&cur), &q);
+        }
+        if ip % 6 == 0 {
+            blocks.push(cur.clone());
+        }
+        let q = weight(&format!("blk.{ip}.ffn_res_query.weight"));
+        check(
+            format!("ffn_res_mix-{slot}"),
+            &blocks,
+            &dump(&format!("ffn_inp-{slot}")),
+            &q,
+        );
+        cur = format!("l_out-{slot}");
+    }
+    check(
+        "out_res_mix".to_string(),
+        &blocks,
+        &dump(&cur),
+        &weight("output_res_query.weight"),
+    );
+    println!("golden depth mix ({checked} mixes: attn_res, ffn_res, loop_msgs, out_res): worst max rel {worst:.2e}");
 }
 
 #[test]

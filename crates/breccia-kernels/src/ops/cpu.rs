@@ -399,6 +399,46 @@ pub fn sigmoid_vec(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| sigmoid(f64::from(*v)) as f32).collect()
 }
 
+/// Depth mix, `f64`: `states` in mix order (newest block first, cur last), each
+/// `tokens * n`; `query` is `[nq, n]`; returns `[tokens, nq, n]`.
+pub fn depth_mix(states: &[&[f32]], query: &[f32], nq: usize, n: usize, eps: f64) -> Vec<f32> {
+    let tokens = states[0].len() / n;
+    let scale = 1.0 / (n as f64).sqrt();
+    let mut out = vec![0f32; tokens * nq * n];
+    for t in 0..tokens {
+        let xs: Vec<Vec<f64>> = states
+            .iter()
+            .map(|st| {
+                let row = &st[t * n..(t + 1) * n];
+                let ms = row.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / n as f64;
+                let r = 1.0 / (ms + eps).sqrt();
+                row.iter().map(|v| f64::from(*v) * r).collect()
+            })
+            .collect();
+        for q in 0..nq {
+            let qw = &query[q * n..(q + 1) * n];
+            let z: Vec<f64> = xs
+                .iter()
+                .map(|x| {
+                    x.iter()
+                        .zip(qw)
+                        .map(|(a, b)| a * f64::from(*b))
+                        .sum::<f64>()
+                        * scale
+                })
+                .collect();
+            let m = z.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let e: Vec<f64> = z.iter().map(|v| (v - m).exp()).collect();
+            let sum: f64 = e.iter().sum();
+            for c in 0..n {
+                let v: f64 = xs.iter().zip(&e).map(|(x, w)| x[c] * w / sum).sum();
+                out[(t * nq + q) * n + c] = v as f32;
+            }
+        }
+    }
+    out
+}
+
 /// SITU (llama.cpp `LLM_FFN_SITU`), `f64`:
 /// `beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)`.
 pub fn situ(gate: &[f32], up: &[f32], beta: f32, lb: f32) -> Vec<f32> {

@@ -1,0 +1,124 @@
+#version 450
+//
+// Depth mix (Inkling AttnRes / loop message bank, llama.cpp inkling2.cpp `mix`):
+//
+//   states = [stack[first+count-1], ..., stack[first], cur]   (newest block first, cur last)
+//   x_s    = rms_norm(states[s], eps)                          (weightless, per token)
+//   w[q]   = softmax_s(scale * dot(x_s, query[q]))             (no mask)
+//   out[t][q] = sum_s w[q][s] * x_s
+//
+// One workgroup per token. `stack` holds block states at `slot_stride` floats
+// per slot, each `[tokens, n]`; `query` is `[nq, n]`; out is `[tokens, nq, n]`.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer StackVec { float ST[]; };
+layout(std430, binding = 1) readonly buffer CurVec { float CUR[]; };
+layout(std430, binding = 2) readonly buffer QVec { float QW[]; };
+layout(std430, binding = 3) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint  n;
+    uint  tokens;
+    uint  nq;          // <= MAX_Q
+    uint  first;
+    uint  count;       // block states; count + 1 <= MAX_S
+    uint  slot_stride; // floats between stack slots
+    float eps;
+    float scale;
+} pc;
+
+#define MAX_S 8u
+#define MAX_Q 4u
+#define WG_X_MAX 65535u
+
+shared float s_red[256];
+shared float s_rinv[MAX_S];
+shared float s_w[MAX_Q * MAX_S];
+shared float s_dot[MAX_Q * MAX_S];
+
+float reduce(float v, uint tid) {
+    s_red[tid] = v;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1u) {
+        if (tid < off) {
+            s_red[tid] += s_red[tid + off];
+        }
+        barrier();
+    }
+    float r = s_red[0];
+    barrier();
+    return r;
+}
+
+uint state_base(uint s, uint t) {
+    return s < pc.count ? (pc.first + pc.count - 1u - s) * pc.slot_stride + t * pc.n : t * pc.n;
+}
+
+float state_at(uint s, uint idx) {
+    return s < pc.count ? ST[idx] : CUR[idx];
+}
+
+void main() {
+    uint t = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (t >= pc.tokens) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint ns = pc.count + 1u;
+
+    for (uint s = 0u; s < ns; ++s) {
+        uint b = state_base(s, t);
+        float ss = 0.0;
+        float d[MAX_Q] = float[MAX_Q](0.0, 0.0, 0.0, 0.0);
+        for (uint c = tid; c < pc.n; c += 256u) {
+            float x = state_at(s, b + c);
+            ss += x * x;
+            for (uint q = 0u; q < pc.nq; ++q) {
+                d[q] += x * QW[q * pc.n + c];
+            }
+        }
+        float tot = reduce(ss, tid);
+        if (tid == 0u) {
+            s_rinv[s] = 1.0 / sqrt(tot / float(pc.n) + pc.eps);
+        }
+        for (uint q = 0u; q < pc.nq; ++q) {
+            float dq = reduce(d[q], tid);
+            if (tid == 0u) {
+                s_dot[q * MAX_S + s] = dq;
+            }
+        }
+    }
+    barrier();
+    if (tid < pc.nq) {
+        uint q = tid;
+        float m = -1.0 / 0.0;
+        for (uint s = 0u; s < ns; ++s) {
+            float z = s_dot[q * MAX_S + s] * s_rinv[s] * pc.scale;
+            s_w[q * MAX_S + s] = z;
+            m = max(m, z);
+        }
+        float sum = 0.0;
+        for (uint s = 0u; s < ns; ++s) {
+            float e = exp(s_w[q * MAX_S + s] - m);
+            s_w[q * MAX_S + s] = e;
+            sum += e;
+        }
+        for (uint s = 0u; s < ns; ++s) {
+            s_w[q * MAX_S + s] /= sum;
+        }
+    }
+    barrier();
+    for (uint c = tid; c < pc.n; c += 256u) {
+        float acc[MAX_Q] = float[MAX_Q](0.0, 0.0, 0.0, 0.0);
+        for (uint s = 0u; s < ns; ++s) {
+            float x = state_at(s, state_base(s, t) + c) * s_rinv[s];
+            for (uint q = 0u; q < pc.nq; ++q) {
+                acc[q] += s_w[q * MAX_S + s] * x;
+            }
+        }
+        for (uint q = 0u; q < pc.nq; ++q) {
+            O[(t * pc.nq + q) * pc.n + c] = acc[q];
+        }
+    }
+}
