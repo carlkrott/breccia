@@ -959,6 +959,156 @@ fn add_act_and_scale_match_the_cpu_reference() {
 /// clip with channel scale and tau, against the f64 CPU reference; then, with
 /// `BRECCIA_INKLING_GOLDEN=<golden dir>`, against llama.cpp's own Q/K/R clip
 /// outputs for all 48 loop slots (input = the golden's pre-clip tensor).
+/// A golden dump (`ffn_in-3_2304x13.f32`, with or without a `SEQ_` prefix) or
+/// weight file (`blk.3.exp_probs_b.bias_128.f32`) under `golden/dir`, as raw words.
+fn golden_f32(golden: &std::path::Path, dir: &str, stem: &str) -> Vec<f32> {
+    let d = golden.join(dir);
+    let hit = std::fs::read_dir(&d)
+        .expect("golden dir")
+        .filter_map(|e| e.ok().map(|e| e.file_name().into_string().unwrap()))
+        .find(|f| {
+            f.starts_with(stem)
+                || f.split_once('_')
+                    .is_some_and(|(_, rest)| rest.starts_with(stem))
+        })
+        .unwrap_or_else(|| panic!("{stem} not in {}", d.display()));
+    std::fs::read(d.join(hit))
+        .expect("read")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
+
+/// A route's (ids, weights) sorted by id, for order-free comparison.
+fn by_id<T: Copy>(ids: &[u32], w: &[T]) -> (Vec<u32>, Vec<T>) {
+    let mut p: Vec<(u32, T)> = ids.iter().copied().zip(w.iter().copied()).collect();
+    p.sort_by_key(|x| x.0);
+    p.into_iter().unzip()
+}
+
+/// Inkling's router (S5): sigmoid gate, selection-only bias, `sum + 1e-20`
+/// renorm, `* 8`. The id SET is contractual and each id's weight is within 1e-5;
+/// the order is not: f32 sigmoid saturates, so near-equal scores can swap (seen
+/// on random data), and the expert sum does not depend on it.
+#[test]
+fn inkling_router() {
+    let fx = need_gpu!("inkling_router");
+    let gpu = fx.dev.gpu();
+    let (n, k) = (128usize, 8usize);
+    let r = Router::sigmoid(gpu, n, k, 1e-20, 8.0).expect("router");
+    let check =
+        |logits: &[f32], bias: Option<&[f32]>, rows: usize, label: &str| -> (Vec<u32>, Vec<f32>) {
+            let lb = ops::upload_f32(gpu, logits).expect("logits");
+            let bb = bias.map(|b| ops::upload_f32(gpu, b).expect("bias"));
+            let idb = breccia_kernels::gemv::alloc(gpu, r.ids_bytes(rows)).expect("ids");
+            let wb = breccia_kernels::gemv::alloc(gpu, r.weights_bytes(rows)).expect("weights");
+            match &bb {
+                Some(b) => r.run_biased(&lb, b, &idb, &wb, rows),
+                None => r.run(&lb, &idb, &wb, rows),
+            }
+            .expect("router");
+            let (ids, w) = ops::bench::read_route(gpu, &idb, &wb, rows, k).expect("read");
+            let mut worst = 0.0f64;
+            for t in 0..rows {
+                let want = cpu::router_sigmoid(&logits[t * n..(t + 1) * n], bias, n, k, 1e-20, 8.0);
+                let (gi, gw) = by_id(&ids[t * k..(t + 1) * k], &w[t * k..(t + 1) * k]);
+                let (wi, ww) = by_id(&want.ids, &want.weights);
+                assert_eq!(gi, wi, "router {label} row {t} id sets");
+                worst = worst.max(max_rel(&gw, &ww));
+            }
+            assert!(
+                worst <= 1e-5,
+                "router {label}: weight max rel {worst:e} > 1e-5"
+            );
+            println!("inkling router {label:<18} rows={rows:<3} weight max rel {worst:.2e}");
+            for b in [Some(&lb), bb.as_ref(), Some(&idb), Some(&wb)]
+                .into_iter()
+                .flatten()
+            {
+                gpu.destroy_buf(b);
+            }
+            (ids, w)
+        };
+
+    // Random logits, with and without a bias of the model's range (-0.76..0.07).
+    let rows = 37;
+    let logits: Vec<f32> = normalish(0x5e1, rows * n)
+        .into_iter()
+        .map(|v| v * 3.0)
+        .collect();
+    let bias: Vec<f32> = normalish(0xb1a5, n)
+        .into_iter()
+        .map(|v| v * 0.3 - 0.2)
+        .collect();
+    check(&logits, None, rows, "random");
+    check(&logits, Some(&bias), rows, "random + bias");
+    // The bias must decide selection but not weights: a big bias on expert 100
+    // with a very negative logit gets it picked at a near-zero weight.
+    let mut l1 = vec![0.0f32; n];
+    l1[100] = -20.0;
+    let mut b1 = vec![0.0f32; n];
+    b1[100] = 5.0;
+    let (ids, w) = check(&l1, Some(&b1), 1, "bias steers only");
+    assert_eq!(
+        ids,
+        [100, 0, 1, 2, 3, 4, 5, 6],
+        "bias picks 100, then ties by id"
+    );
+    assert!(
+        w[0] < 1e-7,
+        "biased pick keeps its unbiased weight: {}",
+        w[0]
+    );
+
+    let Ok(golden) = std::env::var("BRECCIA_INKLING_GOLDEN") else {
+        eprintln!("inkling router golden parity: SKIPPED (set BRECCIA_INKLING_GOLDEN)");
+        return;
+    };
+    let golden = std::path::PathBuf::from(golden);
+    let tok = 13usize;
+    let mut worst = 0.0f64;
+    for slot in 0..48usize {
+        let phys = match slot {
+            0..=23 => slot,
+            _ => 6 + (slot - 24) % 12,
+        };
+        let logits = golden_f32(&golden, "dump", &format!("ffn_moe_logits-{slot}_"));
+        let order = golden_f32(&golden, "dump", &format!("ffn_moe_argsort-{slot}_"));
+        let want_w = golden_f32(&golden, "dump", &format!("ffn_moe_weights_scaled-{slot}_"));
+        let bias = golden_f32(&golden, "weights", &format!("blk.{phys}.exp_probs_b.bias_"));
+        assert_eq!(
+            (logits.len(), order.len(), want_w.len()),
+            (n * tok, n * tok, k * tok)
+        );
+        let lb = ops::upload_f32(gpu, &logits).expect("logits");
+        let bb = ops::upload_f32(gpu, &bias).expect("bias");
+        let idb = breccia_kernels::gemv::alloc(gpu, r.ids_bytes(tok)).expect("ids");
+        let wb = breccia_kernels::gemv::alloc(gpu, r.weights_bytes(tok)).expect("weights");
+        r.run_biased(&lb, &bb, &idb, &wb, tok).expect("router");
+        let (ids, w) = ops::bench::read_route(gpu, &idb, &wb, tok, k).expect("read");
+        for t in 0..tok {
+            // ggml's argsort is i32; the dump stores the raw words.
+            let want: Vec<u32> = order[t * n..t * n + k]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            let (gi, gw) = by_id(&ids[t * k..(t + 1) * k], &w[t * k..(t + 1) * k]);
+            let (wi, ww) = by_id(&want, &want_w[t * k..(t + 1) * k]);
+            assert_eq!(gi, wi, "golden id sets slot {slot} token {t}");
+            let rel = max_rel(&gw, &as_f64(&ww));
+            assert!(
+                rel <= 1e-5,
+                "golden weights slot {slot} token {t}: {rel:e} > 1e-5"
+            );
+            worst = worst.max(rel);
+        }
+        for b in [&lb, &bb, &idb, &wb] {
+            gpu.destroy_buf(b);
+        }
+    }
+    println!("golden ffn_moe ids + weights_scaled, 48 slots: worst max rel {worst:.2e}");
+}
+
 #[test]
 fn inkling_tanh_cap_and_row_clip() {
     let fx = need_gpu!("inkling");
@@ -1065,23 +1215,7 @@ fn inkling_tanh_cap_and_row_clip() {
         return;
     };
     let golden = std::path::PathBuf::from(golden);
-    let find = |dir: &str, stem: &str| -> Vec<f32> {
-        let d = golden.join(dir);
-        let hit = std::fs::read_dir(&d)
-            .expect("golden dir")
-            .filter_map(|e| e.ok().map(|e| e.file_name().into_string().unwrap()))
-            .find(|f| {
-                f.starts_with(stem)
-                    || f.split_once('_')
-                        .is_some_and(|(_, rest)| rest.starts_with(stem))
-            })
-            .unwrap_or_else(|| panic!("{stem} not in {}", d.display()));
-        std::fs::read(d.join(hit))
-            .expect("read")
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
-            .collect()
-    };
+    let find = |dir: &str, stem: &str| golden_f32(&golden, dir, stem);
     let tok = 13usize; // golden prompt, positions 0..12 (tau = 1 below 8192)
     let gpos: Vec<i32> = (0..tok as i32).collect();
     let gpb = breccia_kernels::gemv::upload(gpu, &i32_bytes(&gpos)).expect("pos");

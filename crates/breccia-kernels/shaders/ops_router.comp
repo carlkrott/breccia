@@ -35,29 +35,48 @@
 // Conformance therefore requires the **id sets to match exactly** and the
 // weights to match to 1e-5 (`docs/phase-3/04`).
 //
+// SIGMOID GATING (Inkling / DeepSeek-V3 family; llama-graph.cpp build_moe_ffn
+// with LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, exp_probs_b, norm_w, w_scale):
+//
+//     p    = sigmoid(logits)                        flag SIGMOID
+//     q    = p + bias                               flag BIAS (selection ONLY)
+//     ids  = argsort(-q)[:k]                        same lowest-index tie rule
+//     w    = gather(p, ids)                         unbiased
+//     s    = sum(w) + eps                           flag EPS_ADD (else max(sum, eps))
+//     emit (ids, w / s * scale)
+//
+// With flags = 0, eps = 2^-14 and scale = 1 this is bit-identical to the
+// softmax router above (q == p, and `* 1.0` is exact).
+//
 // GEOMETRY.  One workgroup of 512 threads per row, `n_expert <= 512` (the
 // model's 512 exactly) and `k <= n_expert`.  Everything lives in shared memory
-// (8 KiB), so the whole router is one dispatch with 10 barriers per row.
+// (10 KiB), so the whole router is one dispatch with 10 barriers per row.
 
 layout(local_size_x = 512) in;
 
 layout(std430, binding = 0) readonly buffer Logits { float L[]; };
 layout(std430, binding = 1) writeonly buffer Ids { uint ID[]; };
 layout(std430, binding = 2) writeonly buffer Weights { float W[]; };
+layout(std430, binding = 3) readonly buffer Bias { float B[]; }; // n_expert, iff flag BIAS
 
 layout(push_constant) uniform Params {
     uint rows;     // tokens
     uint n_expert; // experts (<= 512)
     uint k;        // experts to select (<= n_expert)
-    uint pad0;
+    uint flags;    // bit 0: sigmoid gate, bit 1: selection bias, bit 2: eps added
+    float eps;     // renorm eps: lower clamp, or added (flag bit 2)
+    float scale;   // final weight scale
 } pc;
+
+#include "ops_math.glsl"
 
 #define WG_X_MAX 65535u
 #define NEG -3.0e38
 
 shared float s_v[512];  // scratch: max / sum / argmax value
 shared uint  s_i[512];  // scratch: argmax index
-shared float s_p[512];  // probabilities
+shared float s_p[512];  // probabilities (gathered into the weights)
+shared float s_q[512];  // selection scores: p, or p + bias
 shared uint  s_taken[512];
 shared uint  s_id[16];  // selected ids (k <= 16)
 shared float s_sel[16]; // selected probabilities, renormalised at the end
@@ -98,13 +117,15 @@ void main() {
     }
     float sum = s_v[0];
     barrier();
-    s_p[tid] = live ? e / sum : NEG;
+    float p = (pc.flags & 1u) != 0u ? breccia_sigmoid(l) : e / sum;
+    s_p[tid] = live ? p : NEG;
+    s_q[tid] = live ? ((pc.flags & 2u) != 0u ? p + B[tid] : p) : NEG;
     s_taken[tid] = 0u;
     barrier();
 
     // ---- k passes of a block-wide argmax (ties keep the lowest index)
     for (uint i = 0u; i < k; ++i) {
-        s_v[tid] = s_taken[tid] == 0u ? s_p[tid] : NEG;
+        s_v[tid] = s_taken[tid] == 0u ? s_q[tid] : NEG;
         s_i[tid] = tid;
         barrier();
         for (uint off = 256u; off > 0u; off >>= 1u) {
@@ -124,23 +145,23 @@ void main() {
             uint id = s_i[0];
             if (id < n) {
                 s_id[i] = id;
-                s_sel[i] = s_v[0];
+                s_sel[i] = s_p[id];
                 s_taken[id] = 1u;
             }
         }
         barrier();
     }
 
-    // ---- renormalise with ggml's lower clamp (2^-14), ascending on one thread
+    // ---- renormalise (ggml: clamp at eps, or + eps), ascending on one thread
     if (tid == 0u) {
         float s = 0.0;
         for (uint i = 0u; i < k; ++i) {
             s += s_sel[i];
         }
-        float sc = max(s, 6.103515625e-05);
+        float sc = (pc.flags & 4u) != 0u ? s + pc.eps : max(s, pc.eps);
         for (uint i = 0u; i < k; ++i) {
             ID[row * k + i] = s_id[i];
-            W[row * k + i] = s_sel[i] / sc;
+            W[row * k + i] = s_sel[i] / sc * pc.scale;
         }
     }
 }

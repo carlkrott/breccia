@@ -187,7 +187,8 @@ pub fn softmax(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 pub struct Route {
     /// Selected expert ids, descending probability, ties by ascending id.
     pub ids: Vec<u32>,
-    /// `p[ids] / max(sum(p[ids]), 2^-14)`.
+    /// `p[ids] / max(sum(p[ids]), 2^-14)` (softmax), or
+    /// `p[ids] / (sum + eps) * scale` ([`router_sigmoid`]).
     pub weights: Vec<f64>,
 }
 
@@ -227,6 +228,38 @@ pub fn router(logits: &[f32], n_expert: usize, k: usize) -> Route {
     Route {
         ids,
         weights: sel.iter().map(|w| w / s).collect(),
+    }
+}
+
+/// Sigmoid-gated router, `f64`: `p = sigmoid(logits)`, top-k of `p + bias`
+/// (ties by ascending id), weights `p[ids] / (sum + eps) * scale` (unbiased).
+pub fn router_sigmoid(
+    logits: &[f32],
+    bias: Option<&[f32]>,
+    n_expert: usize,
+    k: usize,
+    eps: f64,
+    scale: f64,
+) -> Route {
+    assert!(logits.len() >= n_expert && k <= n_expert);
+    let p: Vec<f64> = logits[..n_expert]
+        .iter()
+        .map(|v| 1.0 / (1.0 + (-f64::from(*v)).exp()))
+        .collect();
+    let q: Vec<f64> = (0..n_expert)
+        .map(|e| p[e] + bias.map_or(0.0, |b| f64::from(b[e])))
+        .collect();
+    let mut order: Vec<usize> = (0..n_expert).collect();
+    order.sort_by(|&a, &b| {
+        q[b].partial_cmp(&q[a])
+            .expect("router scores are finite")
+            .then(a.cmp(&b))
+    });
+    let sel: Vec<f64> = order[..k].iter().map(|&i| p[i]).collect();
+    let s = sel.iter().sum::<f64>() + eps;
+    Route {
+        ids: order[..k].iter().map(|&i| i as u32).collect(),
+        weights: sel.iter().map(|w| w / s * scale).collect(),
     }
 }
 

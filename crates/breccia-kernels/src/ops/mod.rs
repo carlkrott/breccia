@@ -905,6 +905,10 @@ pub struct Router<'g> {
     pipe: Pipe<'g>,
     n_expert: usize,
     k: usize,
+    /// Shader flag bits: 1 sigmoid gate, 4 eps added (2, bias, is per run).
+    flags: u32,
+    eps: f32,
+    scale: f32,
 }
 
 impl<'g> Router<'g> {
@@ -925,12 +929,26 @@ impl<'g> Router<'g> {
             pipe: Pipe::new(
                 gpu,
                 include_bytes!(concat!(env!("OUT_DIR"), "/ops_router.spv")),
-                3,
+                4,
                 "router",
             )?,
             n_expert,
             k,
+            flags: 0,
+            eps: 6.103_515_625e-05,
+            scale: 1.0,
         })
+    }
+
+    /// Sigmoid-gated router (Inkling, DeepSeek-V3 family): weights are the
+    /// unbiased `p[ids] / (sum + eps) * scale`; a bias given to
+    /// [`Router::run_biased`] steers the selection only.
+    pub fn sigmoid(gpu: &'g Gpu, n_expert: usize, k: usize, eps: f32, scale: f32) -> Result<Self> {
+        let mut r = Self::new(gpu, n_expert, k)?;
+        r.flags = 1 | 4;
+        r.eps = eps;
+        r.scale = scale;
+        Ok(r)
     }
 
     /// The artifact's router: 512 experts, top-10.
@@ -956,17 +974,23 @@ impl<'g> Router<'g> {
     fn launch<'a>(
         &'a self,
         logits: &'a Buf,
+        bias: Option<&'a Buf>,
         ids: &'a Buf,
         weights: &'a Buf,
         rows: usize,
     ) -> (Vec<&'a Buf>, Pc, (u32, u32, u32)) {
         let (gx, gy) = grid_for(rows, 1);
+        let flags = self.flags | (u32::from(bias.is_some()) << 1);
         (
-            vec![logits, ids, weights],
+            // Without a bias the logits fill binding 3; the shader never reads it.
+            vec![logits, ids, weights, bias.unwrap_or(logits)],
             Pc::new()
                 .u(rows as u32)
                 .u(self.n_expert as u32)
-                .u(self.k as u32),
+                .u(self.k as u32)
+                .u(flags)
+                .f(self.eps)
+                .f(self.scale),
             (gx, gy, 1),
         )
     }
@@ -976,7 +1000,24 @@ impl<'g> Router<'g> {
         if rows == 0 {
             return Ok(());
         }
-        let (bufs, pc, grid) = self.launch(logits, ids, weights, rows);
+        let (bufs, pc, grid) = self.launch(logits, None, ids, weights, rows);
+        self.pipe.run(&bufs, &pc, grid)
+    }
+
+    /// [`Router::run`] with a per-expert selection bias (`n_expert` values,
+    /// shared by all rows) added to the gate before top-k.
+    pub fn run_biased(
+        &self,
+        logits: &Buf,
+        bias: &Buf,
+        ids: &Buf,
+        weights: &Buf,
+        rows: usize,
+    ) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let (bufs, pc, grid) = self.launch(logits, Some(bias), ids, weights, rows);
         self.pipe.run(&bufs, &pc, grid)
     }
 
@@ -992,7 +1033,7 @@ impl<'g> Router<'g> {
         if rows == 0 {
             return Err(anyhow!("router rows must be non-zero"));
         }
-        let (bufs, pc, grid) = self.launch(logits, ids, weights, rows);
+        let (bufs, pc, grid) = self.launch(logits, None, ids, weights, rows);
         self.pipe.run_timed(&bufs, &pc, grid, target_s)
     }
 }
