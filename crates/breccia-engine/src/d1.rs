@@ -224,7 +224,7 @@ pub fn build(
 /// Reload choice: uncached experts by descending `heat` against cached slots by
 /// ascending heat (empty slots first), while the newcomer is `ratio` x hotter.
 /// `busy`: moves still in flight (option 1 async), neither their experts nor slots are picked.
-fn pick(heat: &[f32], slot_of: &[u32], expert_of: &[u32], max: usize, ratio: f32, busy: &[(usize, usize)]) -> Vec<(usize, usize)> {
+pub(crate) fn pick(heat: &[f32], slot_of: &[u32], expert_of: &[u32], max: usize, ratio: f32, busy: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut hot: Vec<usize> =
         (0..heat.len()).filter(|&e| slot_of[e] == MISS && heat[e] > 0.0 && !busy.iter().any(|m| m.0 == e)).collect();
     hot.sort_by(|a, b| heat[*b].total_cmp(&heat[*a]));

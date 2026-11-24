@@ -378,3 +378,115 @@ fn batched_bitwise() {
         );
     }
 }
+
+/// Measurement, not a gate: how skewed the router is per weight layer over the
+/// long prompt (prefill) and 64 greedy decode tokens, and the expert bytes a
+/// hot-expert pool would hold. Prints the share of picks the top 10/20/30/50%
+/// of experts cover.
+#[test]
+#[ignore]
+fn expert_skew() {
+    let Some(e) = env() else {
+        eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
+        return;
+    };
+    let per: u64 = ["ffn_gate_up_exps.weight", "ffn_down_exps.weight"]
+        .iter()
+        .map(|s| e.shards.tensor(&format!("blk.6.{s}")).unwrap().n_bytes())
+        .sum::<u64>()
+        / e.cfg.n_expert as u64;
+    eprintln!("bytes per expert {per} ({:.2} MiB)", per as f64 / (1 << 20) as f64);
+    let prompt = long_prompt();
+    let mut fwd = placed(&e);
+    let mut seq = fwd.new_seq(prompt.len() + 64, 512).unwrap();
+    let mut l = fwd.forward(&mut seq, &prompt, None).unwrap();
+    let pre: Vec<Vec<u64>> = fwd.routed().to_vec();
+    for _ in 0..64 {
+        let top = argmax(&l) as u32;
+        l = fwd.forward(&mut seq, &[top], None).unwrap();
+    }
+    let cover = |c: &[u64]| -> Vec<f64> {
+        let mut v = c.to_vec();
+        v.sort_unstable_by(|a, b| b.cmp(a));
+        let tot = v.iter().sum::<u64>().max(1) as f64;
+        [10, 20, 30, 50]
+            .iter()
+            .map(|p| v[..v.len() * p / 100].iter().sum::<u64>() as f64 / tot)
+            .collect()
+    };
+    let fmt = |v: Vec<f64>| v.iter().map(|x| format!("{:.2}", x)).collect::<Vec<_>>().join(" ");
+    let (mut dsum, mut dtot) = (vec![0f64; 4], 0u64);
+    for (layer, (all, p)) in fwd.routed().iter().zip(&pre).enumerate() {
+        let dec: Vec<u64> = all.iter().zip(p).map(|(a, b)| a - b).collect();
+        let n: u64 = dec.iter().sum();
+        let c = cover(&dec);
+        for (s, x) in dsum.iter_mut().zip(&c) {
+            *s += x * n as f64;
+        }
+        dtot += n;
+        eprintln!("layer {layer:2}: prefill {} | decode {} ({n} picks)", fmt(cover(p)), fmt(c));
+    }
+    eprintln!("decode weighted top10/20/30/50%: {}", fmt(dsum.iter().map(|s| s / dtot as f64).collect()));
+}
+
+/// Hot pool on top of the CPU lane: seeded from the long prompt's routed
+/// counts, `BRECCIA_INKLING_HOT_MIB` (default 1024) of experts on the device.
+/// Gates: two runs with the same pool are bitwise equal, and greedy decode
+/// matches the CPU golden (hits run in GPU math, so not bitwise vs all-lane).
+#[test]
+fn hot_mixed() {
+    let Some(e) = env() else {
+        eprintln!("skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN");
+        return;
+    };
+    let s = std::fs::read_to_string(e.golden.join("greedy-32.txt")).expect("greedy-32.txt");
+    let want: Vec<u32> = s.trim().split(',').map(|x| x.trim().parse().unwrap()).collect();
+    let mut fwd = placed(&e);
+    // the lane must cover every layer the pool may pick
+    if std::env::var("BRECCIA_INKLING_HOST").ok().as_deref() != Some("1") {
+        eprintln!("skip: needs BRECCIA_INKLING_HOST=1");
+        return;
+    }
+    let prompt = long_prompt();
+    let mut warm = fwd.new_seq(prompt.len(), 512).unwrap();
+    fwd.forward(&mut warm, &prompt, None).unwrap();
+    drop(warm);
+    let mib: u64 = std::env::var("BRECCIA_INKLING_HOT_MIB").ok().and_then(|v| v.parse().ok()).unwrap_or(1024);
+    let heat = fwd.routed().to_vec();
+    let held = fwd.set_hot_experts(mib << 20, &heat).unwrap();
+    let per_layer: Vec<usize> = breccia_engine::inkling_forward::hot_pick(&heat, held).iter().map(Vec::len).collect();
+    eprintln!("hot pool: {held} experts in {mib} MiB, per layer {per_layer:?}");
+
+    let every: usize = std::env::var("BRECCIA_INKLING_HOT_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+    let mut runs = Vec::new();
+    for pass in 0..3 {
+        // passes 0/1 frozen (determinism gate), pass 2 with swaps
+        let frozen = breccia_engine::inkling_forward::HotSwaps { every: 0, max: 32 };
+        fwd.set_hot_swaps(if pass < 2 { frozen } else { breccia_engine::inkling_forward::HotSwaps { every, max: 32 } });
+        let before = fwd.hot_stats();
+        fwd.prof = [0.0; 3];
+        let mut seq = fwd.new_seq(PROMPT.len() + want.len(), 64).unwrap();
+        let mut l = fwd.forward(&mut seq, &PROMPT, None).unwrap();
+        let (mut got, mut logits) = (Vec::new(), vec![l.clone()]);
+        let t0 = std::time::Instant::now();
+        for &w in &want {
+            let top = argmax(&l) as u32;
+            if top != w {
+                let gap = l[top as usize] - l[w as usize];
+                eprintln!("diverged at {}: {top} vs {w}, gap {gap:.4}", got.len());
+                assert!(gap <= 0.1, "not a near-tie: got {got:?}");
+                break;
+            }
+            got.push(top);
+            l = fwd.forward(&mut seq, &[top], None).unwrap();
+            logits.push(l.clone());
+        }
+        let dt = t0.elapsed().as_secs_f64() / got.len().max(1) as f64;
+        let (h, r) = fwd.hot_stats();
+        let rate = (h - before.0) as f64 / (r - before.1).max(1) as f64;
+        eprintln!("pass {pass}: {}/{} greedy match; decode {dt:.3} s/token; hit rate {rate:.2}; swapped {}", got.len(), want.len(), fwd.hot_swapped());
+        eprintln!("  prof (s, whole pass): cpu lane {:.2}, moe {:.2}, reload {:.2}", fwd.prof[0], fwd.prof[1], fwd.prof[2]);
+        runs.push(logits);
+    }
+    assert!(runs[0].len() == runs[1].len() && runs[0].len() > 1 && runs[0].iter().zip(&runs[1]).all(|(a, b)| a == b), "hot pool not deterministic");
+}

@@ -170,6 +170,59 @@ pub struct InklingForward<'g> {
     fan: RefCell<HashMap<usize, [Owned<'g>; 3]>>,
     /// Host-visible staging (readback, upload) and its capacity in tokens.
     stage: RefCell<Option<(Owned<'g>, Owned<'g>, usize)>>,
+    /// Routed (token, expert) picks per weight layer: `routed[layer][expert]`.
+    /// Loop layers run several times per token, so they count once per pass.
+    routed: Vec<Vec<u64>>,
+    /// Hot experts held on the device per weight layer (host-lane layers only;
+    /// their misses still run on the lane), and `(hits, routed)` through them.
+    hot: Vec<Option<HotLayer<'g>>>,
+    hot_stats: (u64, u64),
+    hot_stage: RefCell<Vec<Option<Owned<'g>>>>,
+    hot_swaps: HotSwaps,
+    /// Tokens since the last reload, and experts swapped so far.
+    hot_tokens: usize,
+    hot_swapped: u64,
+    /// Seconds spent in the CPU lane, in `moe` overall, and in reloads.
+    pub prof: [f64; 3],
+}
+
+/// One weight layer's device copy of its hottest experts: raw GGUF blobs, slot
+/// `s` at blob offset `s`, and `slot_of[expert]` (`MISS` when not held).
+struct HotLayer<'g> {
+    gu: Owned<'g>,
+    dn: Owned<'g>,
+    slot_of: Vec<u32>,
+    expert_of: Vec<u32>,
+    /// Picks since the last reload (halved at each), what swaps rank by.
+    heat: Vec<f32>,
+}
+
+/// Swap policy: every `every` tokens, up to `max` experts in total move
+/// (D1's ratio rule per layer); `every` 0 = frozen.
+#[derive(Clone, Copy, Debug)]
+pub struct HotSwaps {
+    pub every: usize,
+    pub max: usize,
+}
+
+const MISS: u32 = u32::MAX;
+
+/// The `slots` hottest `(layer, expert)` pairs across all weight layers by
+/// routed count (never-picked experts are left out), as experts per layer.
+/// Ranking globally gives layers that run several times per token (loop
+/// layers) more slots without knowing why they are hot.
+pub fn hot_pick(heat: &[Vec<u64>], slots: usize) -> Vec<Vec<usize>> {
+    let mut all: Vec<(u64, usize, usize)> = heat
+        .iter()
+        .enumerate()
+        .flat_map(|(l, c)| c.iter().enumerate().filter(|(_, &n)| n > 0).map(move |(e, &n)| (n, l, e)))
+        .collect();
+    all.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    let mut out = vec![Vec::new(); heat.len()];
+    for &(_, l, e) in all.iter().take(slots) {
+        out[l].push(e);
+    }
+    out
 }
 
 impl Drop for InklingForward<'_> {
@@ -235,6 +288,14 @@ impl<'g> InklingForward<'g> {
             ctrl_ws: RefCell::new(HashMap::new()),
             fan: RefCell::new(HashMap::new()),
             stage: RefCell::new(None),
+            routed: vec![vec![0; cfg.n_expert]; cfg.n_layers],
+            hot: (0..cfg.n_layers).map(|_| None).collect(),
+            hot_stats: (0, 0),
+            hot_stage: RefCell::new(Vec::new()),
+            hot_swaps: HotSwaps { every: 8, max: 32 },
+            hot_tokens: 0,
+            hot_swapped: 0,
+            prof: [0.0; 3],
             cfg,
         })
     }
@@ -244,6 +305,128 @@ impl<'g> InklingForward<'g> {
     }
 
     /// Batch dispatches (default on); off submits every op on its own.
+    /// Routed picks per weight layer so far (`[layer][expert]`), the heat a
+    /// hot-expert placement ranks by.
+    pub fn routed(&self) -> &[Vec<u64>] {
+        &self.routed
+    }
+
+    /// `(hits, routed)` expert picks served by the hot pool so far.
+    pub fn hot_stats(&self) -> (u64, u64) {
+        self.hot_stats
+    }
+
+    /// Experts swapped into the hot pool so far.
+    pub fn hot_swapped(&self) -> u64 {
+        self.hot_swapped
+    }
+
+    pub fn set_hot_swaps(&mut self, s: HotSwaps) {
+        self.hot_swaps = s;
+    }
+
+    /// Reload step, between steps (batch closed): per held layer, D1's pick
+    /// (hottest uncached in, coldest held out, 1.5x rule), capped at `max`
+    /// experts in total, hottest moves first; then halve the heat.
+    fn hot_reload(&mut self) -> Result<()> {
+        let HotSwaps { every, max } = self.hot_swaps;
+        if every == 0 || self.hot_tokens < every || self.hot.iter().all(Option::is_none) {
+            return Ok(());
+        }
+        self.hot_tokens = 0;
+        let mut moves: Vec<(f32, usize, usize, usize)> = Vec::new();
+        for (l, h) in self.hot.iter_mut().enumerate() {
+            let Some(h) = h else { continue };
+            for (e, s) in crate::d1::pick(&h.heat, &h.slot_of, &h.expert_of, max, 1.5, &[]) {
+                moves.push((h.heat[e], l, e, s));
+            }
+            h.heat.iter_mut().for_each(|x| *x *= 0.5);
+        }
+        moves.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        moves.truncate(max);
+        if moves.is_empty() {
+            return Ok(());
+        }
+        let ne = self.cfg.n_expert;
+        let mut data = Vec::new();
+        let mut spans = Vec::new();
+        for &(_, l, e, s) in &moves {
+            for (role, name) in ["ffn_gate_up_exps.weight", "ffn_down_exps.weight"].iter().enumerate() {
+                let b = self.shards.tensor(&format!("blk.{l}.{name}")).ok_or_else(|| anyhow!("missing {name}"))?.as_slice();
+                let pe = b.len() / ne;
+                data.extend_from_slice(&b[e * pe..][..pe]);
+                spans.push((l, role, (s * pe) as u64, pe as u64));
+            }
+        }
+        let stage = Owned(self.gpu, gemv::staging(self.gpu, data.len() as u64)?);
+        let parts: Vec<(&Buf, u64, u64)> = spans
+            .iter()
+            .map(|&(l, role, off, len)| {
+                let h = self.hot[l].as_ref().expect("held");
+                (if role == 0 { &*h.gu } else { &*h.dn }, off, len)
+            })
+            .collect();
+        gemv::upload_scatter(self.gpu, &stage, &parts, &data)?;
+        drop(parts);
+        for &(_, l, e, s) in &moves {
+            let h = self.hot[l].as_mut().expect("held");
+            if h.expert_of[s] != MISS {
+                h.slot_of[h.expert_of[s] as usize] = MISS;
+            }
+            h.expert_of[s] = e as u32;
+            h.slot_of[e] = s as u32;
+        }
+        self.hot_swapped += moves.len() as u64;
+        Ok(())
+    }
+
+    /// Keep the hottest experts of the host-lane layers on the device, within
+    /// `budget` bytes, ranked by `heat` (`[layer][expert]` routed counts, e.g.
+    /// [`InklingForward::routed`] of a warm-up run). Misses still run on the
+    /// lane; hits run on the GPU and the two are summed. Returns the slots held.
+    pub fn set_hot_experts(&mut self, budget: u64, heat: &[Vec<u64>]) -> Result<usize> {
+        ensure!(heat.len() == self.cfg.n_layers, "heat has {} layers", heat.len());
+        let ne = self.cfg.n_expert as u64;
+        let bytes = |n: &str| -> Result<&'g [u8]> {
+            let t = self.shards.tensor(n).ok_or_else(|| anyhow!("missing tensor `{n}`"))?;
+            ensure!(t.as_slice().len() as u64 == t.n_bytes() && t.n_bytes() % ne == 0, "`{n}`: bad size");
+            Ok(t.as_slice())
+        };
+        let names = |l: usize| [format!("blk.{l}.ffn_gate_up_exps.weight"), format!("blk.{l}.ffn_down_exps.weight")];
+        let per = names(0).iter().map(|n| bytes(n).map(|b| b.len() as u64 / ne)).sum::<Result<u64>>()?;
+        let pick = hot_pick(heat, (budget / per) as usize);
+        let mut held = 0;
+        for (l, es) in pick.into_iter().enumerate() {
+            self.hot[l] = None;
+            if es.is_empty() {
+                continue;
+            }
+            ensure!(
+                self.host.as_ref().is_some_and(|(_, v)| v[l].is_some()),
+                "hot experts for layer {l}, which is not on the host lane"
+            );
+            let [gu, dn] = names(l).map(|n| bytes(&n));
+            let blobs = |b: &[u8]| -> Vec<u8> {
+                let pe = b.len() / ne as usize;
+                es.iter().flat_map(|&e| &b[e * pe..][..pe]).copied().collect()
+            };
+            let (gu, dn) = (blobs(gu?), blobs(dn?));
+            let mut slot_of = vec![MISS; ne as usize];
+            for (s, &e) in es.iter().enumerate() {
+                slot_of[e] = s as u32;
+            }
+            held += es.len();
+            self.hot[l] = Some(HotLayer {
+                gu: host(self.gpu, || self.bytes(&gu))?,
+                dn: host(self.gpu, || self.bytes(&dn))?,
+                slot_of,
+                expert_of: es.iter().map(|&e| e as u32).collect(),
+                heat: vec![0.0; ne as usize],
+            });
+        }
+        Ok(held)
+    }
+
     pub fn set_batching(&mut self, on: bool) {
         self.batching = on;
     }
@@ -580,6 +763,10 @@ impl<'g> InklingForward<'g> {
         bury(self.gpu);
         let out = r?;
         closed?;
+        self.hot_tokens += ids.len();
+        let t0 = std::time::Instant::now();
+        self.hot_reload()?;
+        self.prof[2] += t0.elapsed().as_secs_f64();
         Ok(out)
     }
 
@@ -951,7 +1138,9 @@ impl<'g> InklingForward<'g> {
         self.norm.run(&x, Some(&g), &fin, t)?;
         drop((x, g));
         self.tap(tap, "ffn_in", s, &fin, tn)?;
+        let t0 = std::time::Instant::now();
         let moe = self.moe(layer, &fin, t, slot, tap)?;
+        self.prof[1] += t0.elapsed().as_secs_f64();
         drop(fin);
         self.tap(tap, "ffn_moe_out", s, &moe, tn)?;
         let (fw, ..) = self.weight(&b("ffn_post_conv"))?;
@@ -1025,30 +1214,43 @@ impl<'g> InklingForward<'g> {
             sel.iter().all(|&e| (e as usize) < ne),
             "router id out of range"
         );
+        for &e in sel {
+            self.routed[layer][e as usize] += 1;
+        }
         if let Some(plan) = lane {
             let f = |w: &[u32]| -> Vec<f32> { w.iter().map(|&b| f32::from_bits(b)).collect() };
             let w = f(&words[pairs..2 * pairs]);
             let xs = f(&words[2 * pairs..]);
-            let ids: Vec<usize> = sel.iter().map(|&e| e as usize).collect();
-            let mut out = vec![0f32; t * n];
-            let pool = &mut self.host.as_mut().expect("lane").0;
-            if t == 1 {
-                pool.moe_topk(&plan, &ids, &w, &xs, &mut out)?;
-            } else {
-                let routes: Vec<ChunkRoute> = (0..t)
-                    .map(|i| ChunkRoute {
-                        ids: &ids[i * kx..][..kx],
-                        weights: &w[i * kx..][..kx],
-                    })
-                    .collect();
-                pool.moe_topk_chunk(&plan, &routes, &xs, &mut out)?;
+            // hot pool split: held experts run on the GPU, the rest on the lane
+            if let Some(h) = self.hot[layer].as_mut() {
+                for &e in sel {
+                    h.heat[e as usize] += 1.0;
+                }
             }
-            let stage = self.stage(t)?;
-            gpu.write_host(&stage.1, bytemuck_f32(&out))
+            let slot_of = self.hot[layer].as_ref().map(|h| &h.slot_of);
+            let mut hits: Vec<(usize, u32)> = Vec::new();
+            let (mut mid, mut mw) = (vec![Vec::new(); t], vec![Vec::new(); t]);
+            for (p, &e) in sel.iter().enumerate() {
+                match slot_of.map_or(MISS, |s| s[e as usize]) {
+                    MISS => {
+                        mid[p / kx].push(e as usize);
+                        mw[p / kx].push(w[p]);
+                    }
+                    s => hits.push((p, s)),
+                }
+            }
+            self.hot_stats.0 += hits.len() as u64;
+            self.hot_stats.1 += if slot_of.is_some() { pairs as u64 } else { 0 };
+            let lane = Lane { plan, ids: &mid, weights: &mw, x: &xs };
+            if !hits.is_empty() {
+                return self.moe_hot(layer, x, t, &w, &hits, lane, open);
+            }
+            let out = self.run_lane(lane, t)?;
+            gpu.write_host(&self.stage(t)?.1, bytemuck_f32(&out))
                 .map_err(|e| anyhow!("{e}"))?;
             resume(gpu, open)?;
             let o = self.buf(t * n)?;
-            gemv::copy_at(gpu, &o, 0, &stage.1, 0, (t * n * 4) as u64)?;
+            gemv::copy_at(gpu, &o, 0, &self.stage(t)?.1, 0, (t * n * 4) as u64)?;
             return Ok(o);
         }
 
@@ -1105,6 +1307,146 @@ impl<'g> InklingForward<'g> {
         let [slots, shared, gate0] = &self.fan.get_mut()[&t];
         self.fanin
             .run(&down, slots, &wts, shared, gate0, &out, t, kx, n)?;
+        Ok(out)
+    }
+}
+
+/// One CPU-lane MoE call: per-token expert ids/weights (any count, misses only
+/// under a hot pool) over the read-back activations.
+struct Lane<'a> {
+    plan: LayerPlan,
+    ids: &'a [Vec<usize>],
+    weights: &'a [Vec<f32>],
+    x: &'a [f32],
+}
+
+impl<'g> InklingForward<'g> {
+    fn run_lane(&mut self, l: Lane<'_>, t: usize) -> Result<Vec<f32>> {
+        let mut out = vec![0f32; t * self.cfg.n_embd];
+        if l.ids.iter().all(Vec::is_empty) {
+            return Ok(out);
+        }
+        let t0 = std::time::Instant::now();
+        let r = self.run_lane_inner(l, t, &mut out);
+        self.prof[0] += t0.elapsed().as_secs_f64();
+        r.map(|()| out)
+    }
+
+    fn run_lane_inner(&mut self, l: Lane<'_>, t: usize, out: &mut [f32]) -> Result<()> {
+        let pool = &mut self.host.as_mut().expect("lane").0;
+        if t == 1 {
+            pool.moe_topk(&l.plan, &l.ids[0], &l.weights[0], l.x, out)?;
+        } else {
+            let routes: Vec<ChunkRoute> = (0..t)
+                .map(|i| ChunkRoute {
+                    ids: &l.ids[i],
+                    weights: &l.weights[i],
+                })
+                .collect();
+            pool.moe_topk_chunk(&l.plan, &routes, l.x, out)?;
+        }
+        Ok(())
+    }
+
+    /// Host-visible scratch `i` holding `b`, copied into a fresh device buffer
+    /// by a recorded copy. Reuse is safe: every MoE step drains the batch before
+    /// the next one writes.
+    fn hot_put(&self, i: usize, b: &[u8]) -> Result<Owned<'g>> {
+        let mut st = self.hot_stage.borrow_mut();
+        if st.len() <= i {
+            st.resize_with(i + 1, || None);
+        }
+        if st[i].as_ref().is_none_or(|s: &Owned| s.size < b.len() as u64) {
+            st[i] = Some(Owned(self.gpu, gemv::staging(self.gpu, (b.len() as u64).next_power_of_two())?));
+        }
+        let s = st[i].as_ref().expect("set above");
+        self.gpu.write_host(s, b).map_err(|e| anyhow!("{e}"))?;
+        let d = Owned(self.gpu, gemv::alloc(self.gpu, b.len() as u64)?);
+        gemv::copy_at(self.gpu, &d, 0, s, 0, b.len() as u64)?;
+        Ok(d)
+    }
+
+    /// A hot-pool step, entered with the batch paused (`open`): the `hits`
+    /// (pair, slot) run through the layer's held blobs and are submitted; the
+    /// lane computes the misses meanwhile; the fan-in adds the lane's sum as
+    /// its shared row (gate σ(100) = 1) to the hits, misses weighted 0.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_hot(
+        &mut self,
+        layer: usize,
+        x: &Buf,
+        t: usize,
+        w: &[f32],
+        hits: &[(usize, u32)],
+        lane: Lane<'_>,
+        open: bool,
+    ) -> Result<Owned<'g>> {
+        let (kx, n) = (self.cfg.n_expert_used, self.cfg.n_embd);
+        let (pairs, h, gpu) = (t * kx, hits.len(), self.gpu);
+        let b = |s: &str| format!("blk.{layer}.{s}");
+        let dims = |name: &str| -> Result<Vec<usize>> {
+            let t = self.shards.tensor(name).ok_or_else(|| anyhow!("missing tensor `{name}`"))?;
+            Ok(t.dims().iter().map(|&d| d as usize).collect())
+        };
+        let (gu_name, dn_name) = (b("ffn_gate_up_exps.weight"), b("ffn_down_exps.weight"));
+        let (gu_dims, dn_dims) = (dims(&gu_name)?, dims(&dn_name)?);
+        let (gu_ty, dn_ty) = (Self::ty_of(self.shards, &gu_name)?, Self::ty_of(self.shards, &dn_name)?);
+        let (gu_rows, cols) = (gu_dims[1], gu_dims[0]);
+        let half = gu_rows / 2;
+        ensure!(dn_dims[0] == half && dn_dims[1] == n, "ffn_down_exps shape {dn_dims:?}");
+        let gu_map = {
+            let g = self.gemv(gu_ty, gu_rows, cols)?;
+            let words: Vec<u32> = hits.iter().map(|&(_, s)| s * g.blob_words()).collect();
+            let mut map = g.map_for_blobs(&words, XLayout::PerExpert);
+            let (rows, stride) = (g.rows(h), (g.padded_cols() / 4) as u32);
+            // hit q = pair p reads activation row p / k
+            for (q, &(p, _)) in hits.iter().enumerate() {
+                for r in 0..gu_rows {
+                    map[rows + q * gu_rows + r] = stride * (p / kx) as u32;
+                }
+            }
+            breccia_kernels::batch::map_to_bytes(&map)
+        };
+        let dn_map = {
+            let g = self.gemv(dn_ty, n, half)?;
+            let words: Vec<u32> = hits.iter().map(|&(_, s)| s * g.blob_words()).collect();
+            let map = g.map_for_blobs(&words, XLayout::PerExpert);
+            breccia_kernels::batch::map_to_bytes(&map)
+        };
+        let (mut slots, mut wv) = (vec![0u32; pairs], vec![0f32; pairs]);
+        for (q, &(p, _)) in hits.iter().enumerate() {
+            slots[p] = q as u32;
+            wv[p] = w[p];
+        }
+        resume(gpu, open)?;
+        let gu_map = self.hot_put(0, &gu_map)?;
+        let dn_map = self.hot_put(1, &dn_map)?;
+        let slots = self.hot_put(2, &ops::u32_to_bytes(&slots))?;
+        let wv = self.hot_put(3, bytemuck_f32(&wv))?;
+        let one = self.hot_put(4, bytemuck_f32(&vec![100.0; t]))?;
+        let hl = self.hot[layer].as_ref().expect("hot layer");
+        let gu = self.buf(h * gu_rows)?;
+        self.gemvs[&(gu_ty, gu_rows, cols)].run(&hl.gu, x, &gu, &gu_map, h)?;
+        let situ = self.buf(h * half)?;
+        self.glu.run_fused(&gu, &situ, h, half)?;
+        let down = self.buf(h * n)?;
+        self.gemvs[&(dn_ty, n, half)].run(&hl.dn, &situ, &down, &dn_map, h)?;
+        // overlap: the hits run while the lane computes the misses. Nothing
+        // recorded above may drop before the wait (no batch open to defer it).
+        let seg = if open { Some(batch_cmd::end_submit(gpu, None)?) } else { None };
+        let lane_out = self.run_lane(lane, t);
+        if let Some(seg) = seg {
+            batch_cmd::wait(&[gpu], seg)?;
+            bury(gpu);
+        }
+        let lane_out = lane_out?;
+        gpu.write_host(&self.stage(t)?.1, bytemuck_f32(&lane_out))
+            .map_err(|e| anyhow!("{e}"))?;
+        resume(gpu, open)?;
+        let shared = self.buf(t * n)?;
+        gemv::copy_at(gpu, &shared, 0, &self.stage(t)?.1, 0, (t * n * 4) as u64)?;
+        let out = self.buf(t * n)?;
+        self.fanin.run(&down, &slots, &wv, &shared, &one, &out, t, kx, n)?;
         Ok(out)
     }
 }
