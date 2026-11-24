@@ -22,6 +22,7 @@ use breccia_kernels::ops::{
     ControlWs, GluMode, LowRankControl, RelBias, RmsNorm, Router, RowClip, ShortConv, Sink,
 };
 use breccia_kernels::cpu::{ChunkRoute, ExpertPool, GluAct, LayerPlan};
+use breccia_kernels::gemm::GemmMany;
 use breccia_kernels::{batch_cmd, gemv, proj, GemvBatch, MoeFanIn, MoeMap, QuantType, XLayout};
 use breccia_kernels::qsa::VLayout;
 use breccia_vk::ctx::{Buf, Gpu};
@@ -157,6 +158,10 @@ pub struct InklingForward<'g> {
     cfg: InklingConfig,
     /// Batched GEMV per `(type, rows, cols)`.
     gemvs: HashMap<(QuantType, usize, usize), GemvBatch<'g>>,
+    /// Multi-user GEMM per type for dense projections: decodes each weight block
+    /// once for every row of the step (GemvBatch re-reads it per row). `None` =
+    /// no shader for the type, GemvBatch serves it. `BRECCIA_INKLING_GEMM=0` = off.
+    gemm: HashMap<QuantType, Option<GemmMany<'g>>>,
     norm: RmsNorm<'g>,
     head_norm: RmsNorm<'g>,
     mix: DepthMix<'g>,
@@ -278,6 +283,7 @@ impl<'g> InklingForward<'g> {
             gpu,
             shards,
             gemvs: HashMap::new(),
+            gemm: HashMap::new(),
             norm: RmsNorm::with_eps(gpu, n, 1, cfg.eps)?,
             head_norm: RmsNorm::with_eps(gpu, hd, 0, cfg.eps)?,
             mix: DepthMix::new(gpu, n, 1e-6)?,
@@ -594,6 +600,15 @@ impl<'g> InklingForward<'g> {
         let (cols, rows) = (dims[0], dims[1]);
         let out = self.buf(tokens * rows)?;
         let gpu = self.gpu;
+        if std::env::var("BRECCIA_INKLING_GEMM").map_or(true, |v| v != "0") {
+            let g = self.gemm.entry(ty).or_insert_with(|| GemmMany::new(gpu, ty).ok());
+            if let Some(g) = g {
+                // every token count, 1 included: the per-user dot is the same
+                // whatever the batch, so batched decode stays bit-equal to sequential
+                g.run(&w, x, &out, rows, cols, tokens)?;
+                return Ok((out, rows));
+            }
+        }
         let k = (ty, rows, cols, tokens);
         if !self.maps.get_mut().contains_key(&k) {
             let g = self.gemv(ty, rows, cols)?;
