@@ -206,6 +206,8 @@ pub struct InklingForward<'g> {
     /// their misses still run on the lane), and `(hits, routed)` through them.
     hot: Vec<Option<HotLayer<'g>>>,
     hot_stats: (u64, u64),
+    /// Multi-row MoE calls with host-visible ids: (pairs, distinct experts).
+    overlap: (u64, u64),
     hot_stage: RefCell<Vec<Option<Owned<'g>>>>,
     hot_swaps: HotSwaps,
     /// Tokens since the last reload, and experts swapped so far.
@@ -330,6 +332,7 @@ impl<'g> InklingForward<'g> {
             routed: vec![vec![0; cfg.n_expert]; cfg.n_layers],
             hot: (0..cfg.n_layers).map(|_| None).collect(),
             hot_stats: (0, 0),
+            overlap: (0, 0),
             hot_stage: RefCell::new(Vec::new()),
             hot_swaps: HotSwaps { every: 8, max: 32 },
             hot_tokens: 0,
@@ -354,6 +357,12 @@ impl<'g> InklingForward<'g> {
     /// `(hits, routed)` expert picks served by the hot pool so far.
     pub fn hot_stats(&self) -> (u64, u64) {
         self.hot_stats
+    }
+
+    /// `(pairs, distinct experts)` summed over multi-row MoE calls whose ids were
+    /// read back (lane or host-map layers): how much a per-expert group could share.
+    pub fn overlap_stats(&self) -> (u64, u64) {
+        self.overlap
     }
 
     /// Experts swapped into the hot pool so far.
@@ -1354,6 +1363,13 @@ impl<'g> InklingForward<'g> {
         );
         for &e in sel {
             self.routed[layer][e as usize] += 1;
+        }
+        if t > 1 && !sel.is_empty() {
+            let mut d = sel.to_vec();
+            d.sort_unstable();
+            d.dedup();
+            self.overlap.0 += sel.len() as u64;
+            self.overlap.1 += d.len() as u64;
         }
         if let Some(plan) = lane {
             let f = |w: &[u32]| -> Vec<f32> { w.iter().map(|&b| f32::from_bits(b)).collect() };

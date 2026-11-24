@@ -764,6 +764,7 @@ fn batch_decode() {
         _ => 3e-2,
     };
     let mut worst = 0f32;
+    let ov0 = fwd.overlap_stats();
     let (mut t0, mut s0) = (std::time::Instant::now(), breccia_vk::ctx::submit_stats());
     for (step, ids) in fed.iter().enumerate() {
         if step == 1 {
@@ -808,6 +809,15 @@ fn batch_decode() {
             1e3 * st.wait_s / per,
             st.submits as f64 / per,
             st.waits as f64 / per
+        );
+    }
+    let ov = fwd.overlap_stats();
+    if ov.0 > ov0.0 {
+        eprintln!(
+            "  batched MoE (read-back layers): {} pairs, {} distinct experts ({:.2} pairs per expert)",
+            ov.0 - ov0.0,
+            ov.1 - ov0.1,
+            (ov.0 - ov0.0) as f64 / (ov.1 - ov0.1) as f64
         );
     }
 }
