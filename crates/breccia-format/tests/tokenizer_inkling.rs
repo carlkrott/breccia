@@ -118,3 +118,18 @@ fn inkling_encode_long_prompt() {
         want.len()
     );
 }
+
+#[test]
+fn inkling_long_runs_are_linear() {
+    let Some(tok) = tokenizer() else { return };
+    let digits = "7".repeat(300_000);
+    let t0 = std::time::Instant::now();
+    assert_eq!(tok.encode(&digits).len(), 100_000);
+    let caps = "A".repeat(300_000);
+    tok.encode(&caps);
+    assert!(
+        t0.elapsed().as_secs() < 5,
+        "pre-tokenizer is not linear: {:?}",
+        t0.elapsed()
+    );
+}

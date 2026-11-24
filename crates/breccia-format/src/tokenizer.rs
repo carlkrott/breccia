@@ -257,7 +257,8 @@ impl Tokenizer {
         for word in words {
             let encoded = self.byte_encode(&word);
             if ignore_merges {
-                if let Some(&id) = self.ids.get(&encoded) {
+                // never a control/user-defined token: client text must not mint one
+                if let Some(&id) = self.ids.get(&encoded).filter(|&&id| !self.special(id)) {
                     out.push(id);
                     continue;
                 }
@@ -307,23 +308,46 @@ impl Tokenizer {
     }
 
     /// Rank-ordered BPE merges over one byte-encoded word.
+    /// Lowest-rank merge first, leftmost on ties (llama.cpp `llm_tokenizer_bpe`): a
+    /// linked list of symbols plus a heap of candidate pairs, O(n log n) per word.
     fn bpe(&self, word: &str) -> Vec<String> {
-        let mut syms: Vec<String> = word.chars().map(|c| c.to_string()).collect();
-        while syms.len() > 1 {
-            let mut best: Option<(u32, usize)> = None;
-            for i in 0..syms.len() - 1 {
-                let key = (syms[i].clone(), syms[i + 1].clone());
-                if let Some(&r) = self.merges.get(&key) {
-                    if best.is_none_or(|(br, _)| r < br) {
-                        best = Some((r, i));
-                    }
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut syms: Vec<Option<String>> = word.chars().map(|c| Some(c.to_string())).collect();
+        let n = syms.len();
+        let mut next: Vec<usize> = (1..=n).collect();
+        let mut prev: Vec<Option<usize>> = (0..n).map(|i| i.checked_sub(1)).collect();
+        // (rank, left, right, left len, right len): stale once either side changed
+        let mut heap = BinaryHeap::new();
+        let push = |heap: &mut BinaryHeap<_>, syms: &[Option<String>], l: usize, r: usize| {
+            if let (Some(a), Some(b)) = (&syms[l], syms.get(r).and_then(|x| x.as_ref())) {
+                if let Some(&rank) = self.merges.get(&(a.clone(), b.clone())) {
+                    heap.push(Reverse((rank, l, r, a.len(), b.len())));
                 }
             }
-            let Some((_, i)) = best else { break };
-            let merged = format!("{}{}", syms[i], syms[i + 1]);
-            syms.splice(i..i + 2, [merged]);
+        };
+        for i in 0..n.saturating_sub(1) {
+            push(&mut heap, &syms, i, i + 1);
         }
-        syms
+        while let Some(Reverse((_, l, r, la, lb))) = heap.pop() {
+            let live = next[l] == r
+                && syms[l].as_ref().is_some_and(|a| a.len() == la)
+                && syms[r].as_ref().is_some_and(|b| b.len() == lb);
+            if !live {
+                continue;
+            }
+            let b = syms[r].take().expect("live right symbol");
+            syms[l].as_mut().expect("live left symbol").push_str(&b);
+            next[l] = next[r];
+            if next[l] < n {
+                prev[next[l]] = Some(l);
+            }
+            if let Some(p) = prev[l] {
+                push(&mut heap, &syms, p, l);
+            }
+            push(&mut heap, &syms, l, next[l]);
+        }
+        syms.into_iter().flatten().collect()
     }
 
     /// The `qwen35` pre-tokenizer, ported branch for branch from llama.cpp's
@@ -532,7 +556,7 @@ fn split_gpt4o(text: &str) -> Vec<String> {
             }
         }
         // 3: \p{N}{1,3}
-        let nn = run(p, &|i| k(i) == Some(Cls::Num)).min(3);
+        let nn = (0..3).take_while(|&d| k(p + d) == Some(Cls::Num)).count();
         if nn > 0 {
             return nn;
         }
