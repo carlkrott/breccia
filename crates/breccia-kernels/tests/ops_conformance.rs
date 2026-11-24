@@ -9,7 +9,7 @@
 //! | IMRoPE | 1e-5 rel | pure f32 rotation over an fp32 table |
 //! | SwiGLU | 1e-5 rel | one transcendental + one multiply |
 //! | Softmax | 1e-5 rel | two f32 reductions per row |
-//! | Router | **ids exactly equal**, weights 1e-5 rel | the production kernel accumulates in f64, this one cannot (see `ops::Router`) |
+//! | Router | **ids exactly equal** (Inkling sigmoid: id sets), weights 1e-5 rel | the production kernel accumulates in f64, this one cannot (see `ops::Router`) |
 //! | EmbGather | 1e-6 rel | the decode units are bit-exact; the gather adds no arithmetic |
 //! | HC mixer | 1e-5 rel on `mixed`/`inject`, 1e-5 on HC_WRITE | a chain of RMSNorm + two GEMVs + sigmoid |
 //! | Add / Act | 1e-6 rel | one add / one transcendental |
