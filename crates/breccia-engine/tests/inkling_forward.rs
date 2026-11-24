@@ -71,7 +71,7 @@ struct Env {
     dev: Device,
     shards: ShardSet,
     cfg: InklingConfig,
-    golden: HashMap<(String, i32), PathBuf>,
+    golden: PathBuf,
 }
 
 fn env() -> Option<Env> {
@@ -81,32 +81,33 @@ fn env() -> Option<Env> {
     let shards = ShardSet::open_family(&gguf).expect("open gguf");
     let cfg = InklingConfig::from_metadata(&shards.metadata().unwrap()).expect("config");
     inkling::bind(&shards, &cfg).expect("bind");
-    let golden = golden_index(&Path::new(&golden).join("dump"));
     Some(Env {
         dev,
         shards,
         cfg,
-        golden,
+        golden: PathBuf::from(golden),
     })
 }
 
-fn run(force: bool) {
+/// Run `prompt` against golden `dir`; `tol` = worst allowed node error, if any.
+fn run(dir: &str, prompt: &[u32], force: bool, tol: Option<f64>) -> Vec<(String, i32, f64)> {
     let Some(e) = env() else {
         eprintln!(
             "skip: set BRECCIA_INKLING_GGUF + BRECCIA_INKLING_GOLDEN (+ BRECCIA_KERNEL_DEVICE)"
         );
-        return;
+        return Vec::new();
     };
+    let golden = golden_index(&e.golden.join(dir));
     let mut fwd = InklingForward::new(e.dev.gpu(), &e.shards, e.cfg.clone()).unwrap();
     let mut seen: Vec<(String, i32, f64)> = Vec::new();
     let mut tap = |name: &str, slot: i32, v: &[f32]| -> Option<Vec<f32>> {
-        let g = read_f32(e.golden.get(&(name.to_string(), slot))?);
+        let g = read_f32(golden.get(&(name.to_string(), slot))?);
         let r = rel(v, &g);
         seen.push((name.to_string(), slot, r));
         (force && g.len() == v.len()).then_some(g)
     };
     let t0 = std::time::Instant::now();
-    let logits = fwd.prefill(&PROMPT, Some(&mut tap)).unwrap();
+    let logits = fwd.prefill(prompt, Some(&mut tap)).unwrap();
     let secs = t0.elapsed().as_secs_f64();
 
     let first_bad = seen.iter().find(|x| x.2 > 2e-2);
@@ -130,36 +131,69 @@ fn run(force: bool) {
     for w in worst.iter().take(5) {
         eprintln!("  {:<24} slot {:>2}  {:.3e}", w.0, w.1, w.2);
     }
+    // not tapped: raw embd, kq_b (fused into attention), and the expert-order nodes
+    let skip = ["embd", "kq_b", "ffn_moe_situ", "ffn_moe_weights_scaled"];
+    let missed: Vec<_> = golden
+        .keys()
+        .filter(|k| !skip.contains(&k.0.as_str()) && !seen.iter().any(|s| s.0 == k.0 && s.1 == k.1))
+        .collect();
+    assert!(missed.is_empty(), "golden nodes never tapped: {missed:?}");
+    assert!(logits.iter().all(|x| x.is_finite()), "non-finite logits");
+    if let Some(tol) = tol {
+        assert!(worst[0].2 <= tol, "worst node {:?} > {tol}", worst[0]);
+    }
+    let Some(gp) = golden.get(&("result_output".to_string(), -1)) else {
+        return seen;
+    };
     let top = |l: &[f32]| {
         let mut i: Vec<usize> = (0..l.len()).collect();
         i.sort_by(|&a, &b| l[b].total_cmp(&l[a]));
         (i[0], i[1], l[i[0]] - l[i[1]])
     };
-    let gl = read_f32(&e.golden[&("result_output".to_string(), -1)]);
-    let (g1, g2, gm) = top(&gl);
+    let (g1, g2, gm) = top(&read_f32(gp));
     let (b1, b2, bm) = top(&logits);
     eprintln!("golden top {g1}/{g2} margin {gm:.3}; breccia top {b1}/{b2} margin {bm:.3}");
-    assert!(logits.iter().all(|x| x.is_finite()), "non-finite logits");
     assert_eq!(g1, TOP1, "golden top-1 changed");
-    // not tapped: raw embd, kq_b (fused into attention), and the expert-order nodes
-    let skip = ["embd", "kq_b", "ffn_moe_situ", "ffn_moe_weights_scaled"];
-    let missed: Vec<_> = e
-        .golden
-        .keys()
-        .filter(|k| !skip.contains(&k.0.as_str()) && !seen.iter().any(|s| s.0 == k.0 && s.1 == k.1))
-        .collect();
-    assert!(missed.is_empty(), "golden nodes never tapped: {missed:?}");
     if !force {
         assert_eq!(b1, TOP1, "free-running top-1");
     }
+    seen
 }
 
+fn long_prompt() -> Vec<u32> {
+    let p = std::env::var("BRECCIA_INKLING_GOLDEN").unwrap_or_default();
+    let s = std::fs::read_to_string(Path::new(&p).join("tokens-long.txt")).unwrap_or_default();
+    s.trim()
+        .trim_matches(['[', ']'])
+        .split(',')
+        .filter_map(|x| x.trim().parse().ok())
+        .collect()
+}
+
+// Tolerances: quantized GEMV outputs differ ~2e-2 from the CPU golden (Q8_K
+// activations there, f32 here); free-running error grows over 48 slots.
 #[test]
 fn forced() {
-    run(true);
+    run("dump", &PROMPT, true, Some(8e-2));
 }
 
 #[test]
 fn free() {
-    run(false);
+    run("dump", &PROMPT, false, None);
+}
+
+/// 1415 tokens, slots 0 and 5: SWA edge (1024), tau and the rel-bias overflow bucket.
+/// Only kqv_out has all its inputs forced here (no pre-clip nodes in dump-long):
+/// it must sit at the golden's f16 KV floor; Q/K/V/R carry 5 layers of drift.
+#[test]
+fn long_forced() {
+    let seen = run("dump-long", &long_prompt(), true, Some(1e-1));
+    for (n, s, r) in seen.iter().filter(|x| x.0 == "kqv_out") {
+        assert!(*r <= 5e-3, "{n}-{s} {r:.3e} over the f16 KV floor");
+    }
+}
+
+#[test]
+fn long_free() {
+    run("dump-long", &long_prompt(), false, Some(1e-1));
 }

@@ -546,9 +546,11 @@ impl<'g> InklingForward<'g> {
         self.tap(tap, "Qcur", s, &qcur, t * qd)?;
         self.tap(tap, "Kcur", s, &kcur, t * kv)?;
         self.tap(tap, "Vcur", s, &vcur, t * kv)?;
+        self.tap(tap, "Rcur", s, &rcur, t * cfg.n_rel * h)?;
 
         // attention: rel bias + per-token sink logit
         let (sinks, _) = self.proj(&b("attn_sink_proj"), in_q, t)?;
+        self.tap(tap, "attn_sink", s, &sinks, t * h)?;
         let (bias, bdims, _) = self.weight(&b("attn_rel_bias"))?;
         let kqv = self.buf(t * qd)?;
         self.attn.run(
