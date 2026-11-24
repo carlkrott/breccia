@@ -213,7 +213,10 @@ impl Tokenizer {
         while i < b.len() {
             if b[i] == 0xF3 {
                 let c = text[i..].chars().next().map_or(0, |c| c as u32);
-                if let Some(lit) = c.checked_sub(LITERAL_BASE).and_then(|k| literals.get(k as usize)) {
+                if let Some(lit) = c
+                    .checked_sub(LITERAL_BASE)
+                    .and_then(|k| literals.get(k as usize))
+                {
                     self.encode_plain(&text[start..i], &mut out);
                     self.encode_plain(lit, &mut out);
                     i += 4;
@@ -221,7 +224,10 @@ impl Tokenizer {
                     continue;
                 }
             }
-            match self.specials[b[i] as usize].iter().find(|(t, _)| text[i..].starts_with(t.as_str())) {
+            match self.specials[b[i] as usize]
+                .iter()
+                .find(|(t, _)| text[i..].starts_with(t.as_str()))
+            {
                 Some((t, id)) => {
                     self.encode_plain(&text[start..i], &mut out);
                     out.push(*id);
@@ -240,8 +246,22 @@ impl Tokenizer {
     }
 
     fn encode_plain(&self, text: &str, out: &mut Vec<u32>) {
-        for word in self.split(text) {
+        let gpt4o = matches!(self.pre.as_str(), "inkling2" | "gpt-4o" | "llama4");
+        // llama.cpp `ignore_merges`: a pre-token that is already a vocab entry is one token.
+        let ignore_merges = self.pre == "inkling2";
+        let words = if gpt4o {
+            split_gpt4o(text)
+        } else {
+            self.split(text)
+        };
+        for word in words {
             let encoded = self.byte_encode(&word);
+            if ignore_merges {
+                if let Some(&id) = self.ids.get(&encoded) {
+                    out.push(id);
+                    continue;
+                }
+            }
             for sym in self.bpe(&encoded) {
                 match self.ids.get(&sym) {
                     Some(&id) => out.push(id),
@@ -403,6 +423,150 @@ impl Tokenizer {
         }
         out
     }
+}
+
+/// llama.cpp's code-point class for the GPT-4o regex. llama.cpp runs that regex on a
+/// "collapsed" text (every non-ASCII code point -> one byte per Unicode category), so
+/// non-ASCII letters are neither upper nor lower case: they pass both letter classes.
+#[derive(Clone, Copy, PartialEq)]
+enum Cls {
+    Ws,
+    Letter,
+    Mark,
+    Num,
+    Other,
+}
+
+fn cls(c: char) -> Cls {
+    if c.is_ascii() {
+        return match c {
+            ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r' => Cls::Ws,
+            'A'..='Z' | 'a'..='z' => Cls::Letter,
+            '0'..='9' => Cls::Num,
+            _ => Cls::Other,
+        };
+    }
+    // shortcut: Rust's Unicode tables stand in for llama.cpp's unicode_cpt_flags; exotic
+    // scripts may differ at the edges, revisit if a non-Latin parity test fails.
+    if c.is_whitespace() {
+        Cls::Ws
+    } else if c.is_numeric() {
+        Cls::Num
+    } else if unicode_normalization::char::is_combining_mark(c) {
+        Cls::Mark
+    } else if c.is_alphabetic() {
+        Cls::Letter
+    } else {
+        Cls::Other
+    }
+}
+
+/// The GPT-4o pre-tokenizer (llama.cpp `LLAMA_VOCAB_PRE_TYPE_GPT4O`, used by inkling2),
+/// a backtracking port of the collapsed regex, alternatives in order:
+///   1 `[^\r\n\p{L}\p{N}]? U* L+ ('s|'t|'re|'ve|'m|'ll|'d)?`
+///   2 `[^\r\n\p{L}\p{N}]? U+ L* (contraction)?`
+///   3 `\p{N}{1,3}`   4 ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+///   5 `\s*[\r\n]+`   6 `\s+(?!\S)`   7 `\s+`
+/// with U = letter or mark but not a-z, L = letter or mark but not A-Z.
+fn split_gpt4o(text: &str) -> Vec<String> {
+    let cps: Vec<char> = text.chars().collect();
+    let n = cps.len();
+    let c = |i: usize| cps.get(i).copied();
+    let k = |i: usize| c(i).map(cls);
+    let upper = |i: usize| {
+        c(i).is_some_and(|ch| {
+            matches!(cls(ch), Cls::Letter | Cls::Mark) && !ch.is_ascii_lowercase()
+        })
+    };
+    let lower = |i: usize| {
+        c(i).is_some_and(|ch| {
+            matches!(cls(ch), Cls::Letter | Cls::Mark) && !ch.is_ascii_uppercase()
+        })
+    };
+    let run = |mut i: usize, f: &dyn Fn(usize) -> bool| {
+        let s = i;
+        while i < n && f(i) {
+            i += 1;
+        }
+        i - s
+    };
+    let contraction = |i: usize| -> usize {
+        if c(i) != Some('\'') {
+            return 0;
+        }
+        let a = c(i + 1).map(|x| x.to_ascii_lowercase());
+        let b = c(i + 2).map(|x| x.to_ascii_lowercase());
+        match (a, b) {
+            (Some('s' | 't' | 'm' | 'd'), _) => 2,
+            (Some('r' | 'v'), Some('e')) | (Some('l'), Some('l')) => 3,
+            _ => 0,
+        }
+    };
+    let prefix_ok = |i: usize| {
+        c(i).is_some_and(|ch| {
+            ch != '\r' && ch != '\n' && !matches!(cls(ch), Cls::Letter | Cls::Num)
+        })
+    };
+    let ws = |i: usize| k(i) == Some(Cls::Ws);
+
+    let match_at = |p: usize| -> usize {
+        let prefixes: &[usize] = if prefix_ok(p) { &[1, 0] } else { &[0] };
+        // 1: U* L+ — U* backtracks from longest until L+ can take at least one.
+        for &pre in prefixes {
+            let s = p + pre;
+            for u in (0..=run(s, &upper)).rev() {
+                let l = run(s + u, &lower);
+                if l > 0 {
+                    let e = s + u + l;
+                    return e + contraction(e) - p;
+                }
+            }
+        }
+        // 2: U+ L*
+        for &pre in prefixes {
+            let s = p + pre;
+            let u = run(s, &upper);
+            if u > 0 {
+                let e = s + u + run(s + u, &lower);
+                return e + contraction(e) - p;
+            }
+        }
+        // 3: \p{N}{1,3}
+        let nn = run(p, &|i| k(i) == Some(Cls::Num)).min(3);
+        if nn > 0 {
+            return nn;
+        }
+        // 4: ` ?[^\s\p{L}\p{N}]+[\r\n/]*`
+        let punct = |i: usize| matches!(k(i), Some(Cls::Mark | Cls::Other));
+        let s = p + usize::from(c(p) == Some(' ') && punct(p + 1));
+        let pp = run(s, &punct);
+        if pp > 0 {
+            let e = s + pp;
+            return e + run(e, &|i| matches!(c(i), Some('\r' | '\n' | '/'))) - p;
+        }
+        // 5-7: whitespace
+        let w = run(p, &ws);
+        if w == 0 {
+            return 1; // unreachable: every class matches one of the alternatives
+        }
+        if let Some(last) = (p..p + w).rev().find(|&i| matches!(cps[i], '\r' | '\n')) {
+            return last + 1 - p;
+        }
+        if p + w < n && w > 1 {
+            w - 1
+        } else {
+            w
+        }
+    };
+
+    let mut out = Vec::new();
+    let mut p = 0;
+    while p < n {
+        let len = match_at(p);
+        out.push(cps[p..p + len].iter().collect());
+        p += len;
+    }
+    out
 }
 
 /// GPT-2's `bytes_to_unicode` and its inverse.
