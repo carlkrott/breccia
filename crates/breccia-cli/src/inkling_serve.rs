@@ -145,6 +145,10 @@ impl breccia_server::Backend for InklingBackend<'_> {
         self.feeds[slot] = Some((ids, end));
         Ok(None)
     }
+    /// One chunk for every feeding slot, so a short prompt is not queued behind a long one.
+    fn feed_many(&mut self, slots: &[usize], decoding: usize) -> Vec<Result<Option<u32>, String>> {
+        slots.iter().map(|&s| self.feed(s, decoding)).collect()
+    }
     fn step(&mut self, rows: &[(usize, u32)]) -> Result<Vec<u32>, String> {
         let mut by: Vec<Option<&mut InklingSeq>> = self.seqs.iter_mut().map(Option::as_mut).collect();
         let mut refs = Vec::with_capacity(rows.len());
