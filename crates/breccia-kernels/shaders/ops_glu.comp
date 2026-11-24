@@ -1,0 +1,58 @@
+#version 450
+//
+// Gated activation `out = act(gate) * lin(up)`, elementwise, fp32, with gate
+// and up either in two buffers or fused per row (`[gate half | up half]`, the
+// merged gate_up expert GEMV of llama.cpp `build_moe_ffn`).
+//
+//   mode 0 SwiGLU:  act = silu(g),                         lin = u
+//   mode 1 SITU:    act = beta * tanh(g/beta) * sigmoid(g), lin = lb * tanh(u/lb)  (lb > 0, else u)
+//
+// SITU is Inkling's expert activation (llama.cpp llama-graph.cpp LLM_FFN_SITU,
+// `docs/specs/inkling2-loop-port.md` S6).
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer GateVec { float G[]; };
+layout(std430, binding = 1) readonly buffer UpVec { float U[]; };
+layout(std430, binding = 2) writeonly buffer OVec { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint  n;     // output elements
+    uint  width; // 0: separate G/U; else fused rows of 2*width in G (U unused)
+    uint  mode;
+    uint  pad0;
+    float beta;
+    float lb;
+} pc;
+
+// x * (1/beta), not x / beta: the same rounding as ggml_scale(x, 1.0f/beta).
+#include "ops_math.glsl"
+
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint i = wg * 256u + gl_LocalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    float g, u;
+    if (pc.width == 0u) {
+        g = G[i];
+        u = U[i];
+    } else {
+        uint gi = (i / pc.width) * 2u * pc.width + i % pc.width;
+        g = G[gi];
+        u = G[gi + pc.width];
+    }
+    float a;
+    if (pc.mode == 1u) {
+        a = pc.beta * breccia_tanh(g * (1.0 / pc.beta)) * breccia_sigmoid(g);
+        if (pc.lb > 0.0) {
+            u = pc.lb * breccia_tanh(u * (1.0 / pc.lb));
+        }
+    } else {
+        a = breccia_silu(g);
+    }
+    O[i] = a * u;
+}

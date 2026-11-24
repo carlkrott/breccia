@@ -399,6 +399,21 @@ pub fn sigmoid_vec(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| sigmoid(f64::from(*v)) as f32).collect()
 }
 
+/// SITU (llama.cpp `LLM_FFN_SITU`), `f64`:
+/// `beta*tanh(g/beta)*sigmoid(g) * (lb > 0 ? lb*tanh(u/lb) : u)`.
+pub fn situ(gate: &[f32], up: &[f32], beta: f32, lb: f32) -> Vec<f32> {
+    assert!(gate.len() == up.len(), "gate/up length");
+    let (b, l) = (f64::from(beta), f64::from(lb));
+    gate.iter()
+        .zip(up.iter())
+        .map(|(g, u)| {
+            let (g, u) = (f64::from(*g), f64::from(*u));
+            let lin = if l > 0.0 { l * (u / l).tanh() } else { u };
+            (b * (g / b).tanh() * sigmoid(g) * lin) as f32
+        })
+        .collect()
+}
+
 /// `out[i] = s * tanh(x[i] / s)` (ggml `scale(tanh(scale(x, 1/s)), s)`).
 pub fn tanh_cap(x: &[f32], s: f32) -> Vec<f32> {
     let s = f64::from(s);

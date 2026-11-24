@@ -35,6 +35,7 @@ use breccia_kernels::ops::{
     self, cpu, Act, ActMode, Add, EmbGather, HcMixer, HcWeights, RmsNorm, Rope, RopeTable, Router,
     RowClip, Softmax, SwiGlu,
 };
+use breccia_kernels::ops::{Glu, GluMode};
 use breccia_kernels::{Device, QuantType};
 
 /// One device for the whole test binary, serialised: `ctx::Gpu` owns a single
@@ -1107,6 +1108,85 @@ fn inkling_router() {
         }
     }
     println!("golden ffn_moe ids + weights_scaled, 48 slots: worst max rel {worst:.2e}");
+}
+
+/// Inkling S6: SITU over split and fused `[gate | up]` rows against the f64
+/// reference, `GluMode::SwiGlu` bit-identical to [`SwiGlu`]; then, with
+/// `BRECCIA_INKLING_GOLDEN`, golden `ffn_moe_gate_up` (dump-s6) -> `ffn_moe_situ`
+/// for all 48 slots.
+#[test]
+fn inkling_situ() {
+    let fx = need_gpu!("inkling_situ");
+    let gpu = fx.dev.gpu();
+    let (beta, lb) = (4.0f32, 25.0f32);
+    let situ = Glu::new(gpu, GluMode::Situ { beta, lb }).expect("situ");
+    let read = |b: &breccia_vk::ctx::Buf, n: usize| ops::download_f32(gpu, b, n).expect("read");
+    let (rows, half) = (37usize, 1152usize);
+    // Wide range: saturates both tanh caps (|g| >> 4, |u| >> 25).
+    let gu: Vec<f32> = normalish(0x51, rows * 2 * half)
+        .into_iter()
+        .map(|v| v * 12.0)
+        .collect();
+    let (mut g, mut u) = (Vec::new(), Vec::new());
+    for r in gu.chunks_exact(2 * half) {
+        g.extend_from_slice(&r[..half]);
+        u.extend_from_slice(&r[half..]);
+    }
+    let n = rows * half;
+    let want = as_f64(&cpu::situ(&g, &u, beta, lb));
+    let (gub, gb, ub) = (
+        ops::upload_f32(gpu, &gu).expect("gu"),
+        ops::upload_f32(gpu, &g).expect("g"),
+        ops::upload_f32(gpu, &u).expect("u"),
+    );
+    let ob = breccia_kernels::gemv::alloc(gpu, (n * 4) as u64).expect("out");
+    situ.run_fused(&gub, &ob, rows, half).expect("fused");
+    let fused = max_rel(&read(&ob, n), &want);
+    situ.run(&gb, &ub, &ob, n).expect("split");
+    let split = max_rel(&read(&ob, n), &want);
+    // lb = 0: plain up.
+    let nolb = Glu::new(gpu, GluMode::Situ { beta, lb: 0.0 }).expect("situ lb0");
+    nolb.run(&gb, &ub, &ob, n).expect("lb0");
+    let plain = max_rel(&read(&ob, n), &as_f64(&cpu::situ(&g, &u, beta, 0.0)));
+    for (label, e) in [("fused", fused), ("split", split), ("lb=0", plain)] {
+        println!("inkling situ {label:<6} n={n} max rel {e:.2e}");
+        assert!(e <= 1e-5, "situ {label}: {e:e} > 1e-5");
+    }
+    // SwiGlu mode == the SwiGlu op, bit for bit (same silu helper).
+    let sw = Glu::new(gpu, GluMode::SwiGlu).expect("glu swiglu");
+    sw.run_fused(&gub, &ob, rows, half).expect("glu swiglu");
+    let a = read(&ob, n);
+    SwiGlu::new(gpu)
+        .expect("swiglu")
+        .run(&gb, &ub, &ob, n)
+        .expect("swiglu");
+    assert_eq!(a, read(&ob, n), "GluMode::SwiGlu fused == SwiGlu");
+    for b in [&gub, &gb, &ub, &ob] {
+        gpu.destroy_buf(b);
+    }
+
+    let Ok(golden) = std::env::var("BRECCIA_INKLING_GOLDEN") else {
+        eprintln!("inkling situ golden parity: SKIPPED (set BRECCIA_INKLING_GOLDEN)");
+        return;
+    };
+    let golden = std::path::PathBuf::from(golden);
+    let rows = 8 * 13; // experts used x tokens
+    let mut worst = 0.0f64;
+    for slot in 0..48usize {
+        let gu = golden_f32(&golden, "dump-s6", &format!("ffn_moe_gate_up-{slot}_"));
+        let want = golden_f32(&golden, "dump", &format!("ffn_moe_situ-{slot}_"));
+        assert_eq!((gu.len(), want.len()), (rows * 2 * half, rows * half));
+        let gub = ops::upload_f32(gpu, &gu).expect("gu");
+        let ob = breccia_kernels::gemv::alloc(gpu, (rows * half * 4) as u64).expect("out");
+        situ.run_fused(&gub, &ob, rows, half).expect("situ");
+        let e = max_rel(&read(&ob, rows * half), &as_f64(&want));
+        assert!(e <= 1e-5, "golden situ slot {slot}: {e:e} > 1e-5");
+        worst = worst.max(e);
+        for b in [&gub, &ob] {
+            gpu.destroy_buf(b);
+        }
+    }
+    println!("golden ffn_moe_situ from fused gate_up, 48 slots: worst max rel {worst:.2e}");
 }
 
 #[test]

@@ -82,6 +82,7 @@ const SHADERS: &[&str] = &[
     "ops_rmsnorm",
     "ops_rope",
     "ops_swiglu",
+    "ops_glu",
     "ops_softmax",
     "ops_router",
     "ops_act",

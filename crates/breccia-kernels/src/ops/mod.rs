@@ -12,6 +12,7 @@
 //! | [`RmsNorm`] | `ops_rmsnorm.comp` | `docs/specs/qwen4exp-architecture.md` §13 ops 3/4/5, §14 (`eps = 1e-6`) |
 //! | [`Rope`] + [`RopeTable`] | `ops_rope.comp` | §13 op 13, §10.2-§10.3 (NEOX-paired partial rope, `n_rot = 64` of 256, base 1e7) |
 //! | [`SwiGlu`] | `ops_swiglu.comp` | §5.4 (`silu(gate) * up`, 640-wide) |
+//! | [`Glu`] | `ops_glu.comp` | SwiGLU / SITU, split or fused gate_up rows |
 //! | [`Softmax`] | `ops_softmax.comp` | §5.4 (512 router), §10.4 (512..2048 attention) |
 //! | [`Router`] | `ops_router.comp` | §5.4/§8 (softmax(all) → top-10 → `max(sum, 2^-14)`) |
 //! | [`EmbGather`] | `ops_gather_<type>.comp` | §6.5, §9.1 (`token_embd` IQ3_S, PLE IQ4_NL) |
@@ -766,6 +767,82 @@ impl<'g> SwiGlu<'g> {
         }
         let (bufs, pc, grid) = self.launch(gate, up, out, n);
         self.pipe.run_timed(&bufs, &pc, grid, target_s)
+    }
+}
+
+/// Gated activation of a [`Glu`] dispatch: `out = act(gate) * lin(up)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GluMode {
+    /// `silu(gate) * up` (same math as [`SwiGlu`]).
+    SwiGlu,
+    /// `beta*tanh(gate/beta)*sigmoid(gate) * lb*tanh(up/lb)` (`lb <= 0`: plain
+    /// `up`); llama.cpp `LLM_FFN_SITU`, Inkling's experts (beta 4, lb 25).
+    Situ { beta: f32, lb: f32 },
+}
+
+/// Gated activation over separate `gate`/`up` buffers or one fused buffer of
+/// `[gate | up]` rows (the merged gate_up expert GEMV), `ops_glu.comp`.
+pub struct Glu<'g> {
+    pipe: Pipe<'g>,
+    mode: GluMode,
+}
+
+impl<'g> Glu<'g> {
+    pub fn new(gpu: &'g Gpu, mode: GluMode) -> Result<Self> {
+        Ok(Glu {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_glu.spv")),
+                3,
+                "glu",
+            )?,
+            mode,
+        })
+    }
+
+    fn launch<'a>(
+        &'a self,
+        gate: &'a Buf,
+        up: &'a Buf,
+        out: &'a Buf,
+        n: usize,
+        half: usize,
+    ) -> (Vec<&'a Buf>, Pc, (u32, u32, u32)) {
+        let (code, beta, lb) = match self.mode {
+            GluMode::SwiGlu => (0, 1.0, 0.0),
+            GluMode::Situ { beta, lb } => (1, beta, lb),
+        };
+        let (gx, gy) = grid_for(n, 256);
+        let pc = Pc::new()
+            .u(n as u32)
+            .u(half as u32)
+            .u(code)
+            .u(0)
+            .f(beta)
+            .f(lb);
+        (vec![gate, up, out], pc, (gx, gy, 1))
+    }
+
+    /// `out[i] = act(gate[i]) * lin(up[i])`; `out` may alias either input.
+    pub fn run(&self, gate: &Buf, up: &Buf, out: &Buf, n: usize) -> Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let (bufs, pc, grid) = self.launch(gate, up, out, n, 0);
+        self.pipe.run(&bufs, &pc, grid)
+    }
+
+    /// Fused rows: `gate_up` is `[gate(half) | up(half)]` per row, `out` is
+    /// `rows * half`. `out` must not alias `gate_up`.
+    pub fn run_fused(&self, gate_up: &Buf, out: &Buf, rows: usize, half: usize) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if half == 0 {
+            return Err(anyhow!("glu fused half must be non-zero"));
+        }
+        let (bufs, pc, grid) = self.launch(gate_up, gate_up, out, rows * half, half);
+        self.pipe.run(&bufs, &pc, grid)
     }
 }
 
