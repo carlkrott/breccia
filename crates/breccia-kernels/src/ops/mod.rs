@@ -15,6 +15,7 @@
 //! | [`Glu`] | `ops_glu.comp` | SwiGLU / SITU, split or fused gate_up rows |
 //! | [`DepthMix`] | `ops_depth_mix.comp` | Inkling AttnRes / message-bank mix |
 //! | [`ShortConv`] | `ops_shortconv.comp` | causal short conv + residual, optional dynamic taps |
+//! | [`AttnDense`] | `ops_attn_dense.comp` | dense GQA attention: causal/window mask, rel-position bias, sink logit |
 //! | [`Softmax`] | `ops_softmax.comp` | §5.4 (512 router), §10.4 (512..2048 attention) |
 //! | [`Router`] | `ops_router.comp` | §5.4/§8 (softmax(all) → top-10 → `max(sum, 2^-14)`) |
 //! | [`EmbGather`] | `ops_gather_<type>.comp` | §6.5, §9.1 (`token_embd` IQ3_S, PLE IQ4_NL) |
@@ -986,6 +987,116 @@ impl<'g> ShortConv<'g> {
         let dynb = dyn_taps.map_or(w, |(b, _)| b);
         let (gx, gy) = grid_for(channels, 128);
         self.pipe.run(&[state, x, w, dynb, out], &pc, (gx, gy, 1))
+    }
+}
+
+/// Shape of one [`AttnDense`] call: `heads` q heads over `kv_heads` (GQA,
+/// `heads % kv_heads == 0`), `head_dim <= 256`, `window` 0 = full causal.
+#[derive(Clone, Copy, Debug)]
+pub struct AttnShape {
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub window: usize,
+    pub scale: f32,
+}
+
+/// Learned relative-position bias, added to the logit after the QK scale: `r`
+/// is `[T, heads, rel_dim]`, `bias` is `[extent, rel_dim]`; distance `d >= extent`
+/// adds 0.
+pub struct RelBias<'b> {
+    pub r: &'b Buf,
+    pub bias: &'b Buf,
+    pub rel_dim: usize,
+    pub extent: usize,
+}
+
+/// A sink logit `scale * sink` (no value row): `[T, heads]` when `per_token`,
+/// else `[heads]`.
+pub struct Sink<'b> {
+    pub sink: &'b Buf,
+    pub per_token: bool,
+    pub scale: f32,
+}
+
+/// Dense attention (`ops_attn_dense.comp`): online softmax over KV cells with
+/// per-cell positions (`kpos < 0` = empty), causal + optional sliding window,
+/// optional [`RelBias`] and [`Sink`]. Model-agnostic; Inkling S9 is one caller.
+pub struct AttnDense<'g> {
+    pipe: Pipe<'g>,
+}
+
+impl<'g> AttnDense<'g> {
+    pub const MAX_HEAD_DIM: usize = 256;
+    pub const MAX_REL_DIM: usize = 64;
+
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Ok(AttnDense {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_attn_dense.spv")),
+                9,
+                "attn_dense",
+            )?,
+        })
+    }
+
+    /// `q`/`out` `[tokens, heads, head_dim]` at positions `qpos` (i32),
+    /// `k`/`v` `[cells, kv_heads, head_dim]` at positions `kpos` (i32).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        shape: &AttnShape,
+        q: &Buf,
+        qpos: &Buf,
+        tokens: usize,
+        k: &Buf,
+        v: &Buf,
+        kpos: &Buf,
+        cells: usize,
+        rel: Option<&RelBias>,
+        sink: Option<&Sink>,
+        out: &Buf,
+    ) -> Result<()> {
+        let s = shape;
+        let rel_dim = rel.map_or(0, |r| r.rel_dim);
+        if s.kv_heads == 0
+            || !s.heads.is_multiple_of(s.kv_heads)
+            || s.head_dim == 0
+            || s.head_dim > Self::MAX_HEAD_DIM
+            || rel_dim > Self::MAX_REL_DIM
+        {
+            return Err(anyhow!(
+                "attn_dense: {} heads / {} kv heads, head_dim {} (<= {}), rel_dim {rel_dim} (<= {})",
+                s.heads,
+                s.kv_heads,
+                s.head_dim,
+                Self::MAX_HEAD_DIM,
+                Self::MAX_REL_DIM
+            ));
+        }
+        if tokens == 0 || s.heads == 0 {
+            return Ok(());
+        }
+        let flags = sink.map_or(0u32, |k| 1 | if k.per_token { 2 } else { 0 });
+        let pc = Pc::new()
+            .u(tokens as u32)
+            .u(s.heads as u32)
+            .u(s.kv_heads as u32)
+            .u(s.head_dim as u32)
+            .u(cells as u32)
+            .u(s.window as u32)
+            .u(rel.map_or(0, |r| r.extent) as u32)
+            .u(rel_dim as u32)
+            .u(flags)
+            .f(s.scale)
+            .f(sink.map_or(0.0, |k| k.scale))
+            .u(0);
+        let (rb, bb) = rel.map_or((q, q), |r| (r.r, r.bias));
+        let sb = sink.map_or(q, |k| k.sink);
+        let (gx, gy) = grid_for(tokens * s.heads, 1);
+        self.pipe
+            .run(&[q, k, v, qpos, kpos, rb, bb, sb, out], &pc, (gx, gy, 1))
     }
 }
 

@@ -710,3 +710,78 @@ pub fn shortconv(
         .collect();
     (out, new_past)
 }
+
+/// Dense attention reference for [`super::AttnDense`], `f64`, plain softmax:
+/// `scale * q.k + rel`, the rel bias added after the scale.
+/// `q` `[T, heads, hd]`, `k`/`v` `[cells, kv_heads, hd]`, `rel` =
+/// `(r [T, heads, rel_dim], bias [extent, rel_dim], rel_dim, extent)`,
+/// `sink` = `(values, per_token, scale)`. Returns `[T, heads, hd]`.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_dense(
+    s: &super::AttnShape,
+    q: &[f32],
+    qpos: &[i32],
+    k: &[f32],
+    v: &[f32],
+    kpos: &[i32],
+    rel: Option<(&[f32], &[f32], usize, usize)>,
+    sink: Option<(&[f32], bool, f32)>,
+) -> Vec<f32> {
+    let (hd, kvh) = (s.head_dim, s.kv_heads);
+    let group = s.heads / kvh;
+    let mut out = vec![0f32; qpos.len() * s.heads * hd];
+    for (t, &qp) in qpos.iter().enumerate() {
+        for h in 0..s.heads {
+            let row = t * s.heads + h;
+            let qr = &q[row * hd..(row + 1) * hd];
+            let kh = h / group;
+            // (logit, cell) of the live cells; the sink logit has no cell.
+            let mut lg: Vec<(f64, Option<usize>)> = Vec::new();
+            if let Some((sv, per_tok, sc)) = sink {
+                lg.push((
+                    f64::from(sc) * f64::from(sv[if per_tok { row } else { h }]),
+                    None,
+                ));
+            }
+            for (j, &kp) in kpos.iter().enumerate() {
+                let d = i64::from(qp) - i64::from(kp);
+                if kp < 0 || d < 0 || (s.window > 0 && d >= s.window as i64) {
+                    continue;
+                }
+                let kr = &k[(j * kvh + kh) * hd..][..hd];
+                let mut x: f64 = f64::from(s.scale)
+                    * qr.iter()
+                        .zip(kr)
+                        .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                        .sum::<f64>();
+                if let Some((r, b, rd, ext)) = rel {
+                    if (d as usize) < ext {
+                        let rr = &r[row * rd..][..rd];
+                        let br = &b[d as usize * rd..][..rd];
+                        x += rr
+                            .iter()
+                            .zip(br)
+                            .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                            .sum::<f64>();
+                    }
+                }
+                lg.push((x, Some(j)));
+            }
+            let m = lg.iter().map(|x| x.0).fold(f64::NEG_INFINITY, f64::max);
+            let l: f64 = lg.iter().map(|x| (x.0 - m).exp()).sum();
+            let mut acc = vec![0f64; hd];
+            for &(x, j) in &lg {
+                let Some(j) = j else { continue };
+                let p = (x - m).exp() / l;
+                let vr = &v[(j * kvh + kh) * hd..][..hd];
+                for (a, vv) in acc.iter_mut().zip(vr) {
+                    *a += p * f64::from(*vv);
+                }
+            }
+            for (o, a) in out[row * hd..(row + 1) * hd].iter_mut().zip(&acc) {
+                *o = *a as f32;
+            }
+        }
+    }
+    out
+}

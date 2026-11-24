@@ -35,7 +35,9 @@ use breccia_kernels::ops::{
     self, cpu, Act, ActMode, Add, EmbGather, HcMixer, HcWeights, RmsNorm, Rope, RopeTable, Router,
     RowClip, Softmax, SwiGlu,
 };
-use breccia_kernels::ops::{DepthMix, Glu, GluMode, ShortConv};
+use breccia_kernels::ops::{
+    AttnDense, AttnShape, DepthMix, Glu, GluMode, RelBias, ShortConv, Sink,
+};
 use breccia_kernels::{Device, QuantType};
 
 /// One device for the whole test binary, serialised: `ctx::Gpu` owns a single
@@ -1780,5 +1782,240 @@ fn inkling_shortconv() {
     }
     println!(
         "golden shortconv ({checked} convs, dynamic on full layers): worst max rel {worst:.2e}"
+    );
+}
+
+/// Generic dense attention (S9): random cases against the CPU reference (window,
+/// rel bias, per-head / per-token / no sink, empty cells, an all-masked row,
+/// several tiles), then Inkling's golden `kqv_out` on 48 slots at 13 tokens and
+/// on slots 0 (SWA 1024) and 5 (full) at 1415 tokens, each as one prefill, two
+/// chunks and single-token decodes. Golden K/V/Q are rounded to f16 first: the
+/// llama.cpp golden ran an f16 KV cache (and f16 softmax probs into V, which is
+/// not emulated, hence the 4e-3 golden bar; the CPU-reference bar is 1e-4, f32
+/// logits of magnitude ~10).
+#[test]
+fn inkling_rel_attn() {
+    let fx = need_gpu!("inkling_rel_attn");
+    let gpu = fx.dev.gpu();
+    let at = AttnDense::new(gpu).expect("attn");
+    let up = |v: &[f32]| ops::upload_f32(gpu, v).expect("upload");
+    let upi = |v: &[i32]| breccia_kernels::gemv::upload(gpu, &i32_bytes(v)).expect("upload");
+    type Rel<'a> = Option<(&'a [f32], &'a [f32], usize, usize)>;
+    type Snk<'a> = Option<(&'a [f32], bool, f32)>;
+    let run = |s: &AttnShape,
+               q: &[f32],
+               qpos: &[i32],
+               k: &[f32],
+               v: &[f32],
+               kpos: &[i32],
+               rel: Rel,
+               sink: Snk| {
+        let t = qpos.len();
+        let (qb, qpb, kb, vb, kpb) = (up(q), upi(qpos), up(k), up(v), upi(kpos));
+        let rb = rel.map(|(r, b, rd, ext)| (up(r), up(b), rd, ext));
+        let rel_b = rb.as_ref().map(|(r, b, rd, ext)| RelBias {
+            r,
+            bias: b,
+            rel_dim: *rd,
+            extent: *ext,
+        });
+        let sb = sink.map(|(x, p, sc)| (up(x), p, sc));
+        let sink_b = sb.as_ref().map(|(x, p, sc)| Sink {
+            sink: x,
+            per_token: *p,
+            scale: *sc,
+        });
+        let n = t * s.heads * s.head_dim;
+        let ob = breccia_kernels::gemv::alloc(gpu, (n * 4) as u64).expect("out");
+        at.run(
+            s,
+            &qb,
+            &qpb,
+            t,
+            &kb,
+            &vb,
+            &kpb,
+            kpos.len(),
+            rel_b.as_ref(),
+            sink_b.as_ref(),
+            &ob,
+        )
+        .expect("attn run");
+        ops::download_f32(gpu, &ob, n).expect("read")
+    };
+
+    // (heads, kv_heads, hd, qpos, kpos, window, rel (rel_dim, extent), sink)
+    let mut worst_ref = 0.0f64;
+    let empty_kpos: Vec<i32> = (0..300).map(|j| if j % 37 == 5 { -1 } else { j }).collect();
+    let cases: Vec<(
+        usize,
+        usize,
+        usize,
+        Vec<i32>,
+        Vec<i32>,
+        usize,
+        Option<(usize, usize)>,
+        u8,
+    )> = vec![
+        (
+            24,
+            8,
+            128,
+            (0..13).collect(),
+            (0..13).collect(),
+            0,
+            Some((16, 1024)),
+            2,
+        ),
+        (
+            4,
+            1,
+            64,
+            (293..300).collect(),
+            empty_kpos,
+            50,
+            Some((8, 20)),
+            1,
+        ),
+        (2, 2, 256, vec![599, 300, 5], (0..600).collect(), 0, None, 0),
+        (
+            6,
+            3,
+            32,
+            vec![10, 20, 39, 60, 2],
+            (0..40).collect(),
+            7,
+            Some((64, 5)),
+            0,
+        ),
+        (
+            8,
+            2,
+            128,
+            (1020..1030).collect(),
+            (0..1030).collect(),
+            1024,
+            Some((16, 1024)),
+            2,
+        ),
+    ];
+    for (ci, (heads, kvh, hd, qpos, kpos, window, rel, sink)) in cases.into_iter().enumerate() {
+        let s = AttnShape {
+            heads,
+            kv_heads: kvh,
+            head_dim: hd,
+            window,
+            scale: 1.0 / (hd as f32).sqrt(),
+        };
+        let t = qpos.len();
+        let seed = 0xa77e + ci as u64;
+        let q: Vec<f32> = normalish(seed, t * heads * hd)
+            .iter()
+            .map(|x| x * 2.0)
+            .collect();
+        let k = normalish(seed + 1, kpos.len() * kvh * hd);
+        let v = normalish(seed + 2, kpos.len() * kvh * hd);
+        let (rd, ext) = rel.unwrap_or((0, 0));
+        let r = normalish(seed + 3, t * heads * rd.max(1));
+        let b = normalish(seed + 4, ext.max(1) * rd.max(1));
+        let snk = normalish(seed + 5, t * heads);
+        let relv = rel.map(|_| (&r[..], &b[..], rd, ext));
+        let sinkv = match sink {
+            1 => Some((&snk[..heads], false, 1.0f32)),
+            2 => Some((&snk[..], true, 1.0f32)),
+            _ => None,
+        };
+        let got = run(&s, &q, &qpos, &k, &v, &kpos, relv, sinkv);
+        let want = ops::cpu::attn_dense(&s, &q, &qpos, &k, &v, &kpos, relv, sinkv);
+        let e = max_rel(&got, &as_f64(&want));
+        println!("attn random case {ci}: max rel {e:.2e}");
+        assert!(e < 1e-4, "attn random case {ci}: max rel {e}");
+        worst_ref = worst_ref.max(e);
+        if ci == 3 {
+            // qpos 60 sees no cell inside window 7 and has no sink: exact zeros.
+            assert!(got[3 * heads * hd..4 * heads * hd]
+                .iter()
+                .all(|x| *x == 0.0));
+        }
+    }
+
+    let Ok(golden) = std::env::var("BRECCIA_INKLING_GOLDEN") else {
+        eprintln!("inkling rel attn golden parity: SKIPPED (set BRECCIA_INKLING_GOLDEN)");
+        return;
+    };
+    let golden = std::path::PathBuf::from(golden);
+    let g = |dir: &str, name: &str| golden_f32(&golden, dir, &format!("{name}_"));
+    let f16 = |v: Vec<f32>| -> Vec<f32> {
+        v.into_iter()
+            .map(breccia_kernels::qsa::cpu::to_f16)
+            .collect()
+    };
+    let (heads, kvh, hd, rd, ext) = (24usize, 8usize, 128usize, 16usize, 1024usize);
+    let (qw, kw) = (heads * hd, kvh * hd);
+    let mut worst_gold = 0.0f64;
+    let mut runs = 0usize;
+    let mut sets: Vec<(&str, &str, &str, usize, usize, usize)> = (0..48)
+        .map(|s| ("dump", "dump-s4", "dump-s9", s, 13usize, 5usize))
+        .collect();
+    sets.push(("dump-long", "dump-long", "dump-long", 0, 1415, 1100));
+    sets.push(("dump-long", "dump-long", "dump-long", 5, 1415, 1100));
+    for (d, d4, d9, slot, tokens, split) in sets {
+        let ip = if slot < 24 {
+            slot
+        } else {
+            6 + (slot - 24) % 12
+        };
+        let full = ip % 6 == 5;
+        let s = AttnShape {
+            heads,
+            kv_heads: kvh,
+            head_dim: hd,
+            window: if full { 0 } else { 1024 },
+            scale: 1.0 / (hd as f32).sqrt(),
+        };
+        let q = f16(g(d, &format!("Qcur-{slot}")));
+        let k = f16(g(d, &format!("Kcur-{slot}")));
+        let v = f16(g(d, &format!("Vcur-{slot}")));
+        let r = g(d4, &format!("Rcur-{slot}"));
+        let sk = g(d9, &format!("attn_sink-{slot}"));
+        let want = g(d, &format!("kqv_out-{slot}"));
+        let bias = g("weights", &format!("blk.{ip}.attn_rel_bias.weight"));
+        assert_eq!(
+            (q.len(), want.len(), bias.len()),
+            (tokens * qw, tokens * qw, ext * rd)
+        );
+        let pos: Vec<i32> = (0..tokens as i32).collect();
+        // (first query, end query, cells): one prefill, two chunks, 8 decodes.
+        let mut calls = vec![
+            (0, tokens, tokens),
+            (0, split, split),
+            (split, tokens, tokens),
+        ];
+        calls.extend((tokens - 8..tokens).map(|t| (t, t + 1, t + 1)));
+        for (t0, t1, c) in calls {
+            let rel = Some((&r[t0 * heads * rd..t1 * heads * rd], &bias[..], rd, ext));
+            let sink = Some((&sk[t0 * heads..t1 * heads], true, 1.0f32));
+            let (qs, ks, vs) = (&q[t0 * qw..t1 * qw], &k[..c * kw], &v[..c * kw]);
+            let got = run(&s, qs, &pos[t0..t1], ks, vs, &pos[..c], rel, sink);
+            let eg = max_rel(&got, &as_f64(&want[t0 * qw..t1 * qw]));
+            assert!(
+                eg < 4e-3,
+                "slot {slot} rows {t0}..{t1}: golden max rel {eg}"
+            );
+            worst_gold = worst_gold.max(eg);
+            if tokens < 100 || t1 - t0 == 1 {
+                let wr = ops::cpu::attn_dense(&s, qs, &pos[t0..t1], ks, vs, &pos[..c], rel, sink);
+                let er = max_rel(&got, &as_f64(&wr));
+                assert!(
+                    er < 2e-5,
+                    "slot {slot} rows {t0}..{t1}: reference max rel {er}"
+                );
+                worst_ref = worst_ref.max(er);
+            }
+            runs += 1;
+        }
+    }
+    println!(
+        "inkling rel attn: {runs} calls, golden worst {worst_gold:.2e}, reference worst {worst_ref:.2e}"
     );
 }

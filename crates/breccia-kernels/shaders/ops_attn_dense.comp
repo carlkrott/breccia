@@ -1,0 +1,135 @@
+#version 450
+//
+// Generic dense attention, one workgroup per (query token, q head), online
+// softmax over 256-cell tiles (`docs/specs/inkling2-loop-port.md` S9).
+//
+//   score(t, j) = scale * q[t,h] . k[j,h/group] + rel(t, h, d)   d = qpos[t] - kpos[j]
+//   rel         = R[t,h] . BIAS[d]  if rel_dim > 0 and d < extent, else 0 (added after scale)
+//   masked      if kpos[j] < 0 (empty), d < 0 (causal), or window > 0 and d >= window
+//   sink        an extra logit z = sink_scale * SINK[t,h] (or SINK[h]) with no value row
+//
+// Inkling (llama.cpp src/models/inkling2.cpp) writes the sink into the bias,
+// scale * qk + rel - s plus a zero logit; exp(a - s) / (1 + sum exp(b - s)) is
+// the same softmax as a sink logit s (sink_scale 1), which is what this kernel takes.
+//
+// Layouts: Q/O [T, heads, hd], K/V [cells, kv_heads, hd], R [T, heads, rel_dim],
+// BIAS [extent, rel_dim]. Workgroups wrap over grid.y.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer QB { float Q[]; };
+layout(std430, binding = 1) readonly buffer KB { float K[]; };
+layout(std430, binding = 2) readonly buffer VB { float V[]; };
+layout(std430, binding = 3) readonly buffer QP { int QPOS[]; };
+layout(std430, binding = 4) readonly buffer KP { int KPOS[]; };
+layout(std430, binding = 5) readonly buffer RB { float R[]; };
+layout(std430, binding = 6) readonly buffer BB { float BIAS[]; };
+layout(std430, binding = 7) readonly buffer SB { float SINK[]; };
+layout(std430, binding = 8) writeonly buffer OB { float O[]; };
+
+layout(push_constant) uniform Params {
+    uint  tokens;
+    uint  heads;
+    uint  kv_heads;
+    uint  head_dim;   // <= 256
+    uint  cells;
+    uint  window;     // 0 = no sliding window
+    uint  extent;     // rel bias rows; d >= extent gets 0
+    uint  rel_dim;    // 0 = no rel bias, <= 64
+    uint  flags;      // bit 0: sink, bit 1: sink is per token ([T, heads])
+    float scale;
+    float sink_scale;
+    uint  pad0;
+} pc;
+
+#define WG_X_MAX 65535u
+#define TILE 256u
+#define NEG -3.0e38
+
+shared float s_q[256];
+shared float s_r[64];
+shared float s_s[TILE];
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    if (wg >= pc.tokens * pc.heads) {
+        return;
+    }
+    uint tid = gl_LocalInvocationID.x;
+    uint t = wg / pc.heads;
+    uint h = wg % pc.heads;
+    uint kh = h / (pc.heads / pc.kv_heads);
+    uint hd = pc.head_dim;
+    uint kstride = pc.kv_heads * hd;
+
+    if (tid < hd) {
+        s_q[tid] = Q[wg * hd + tid];
+    }
+    if (tid < pc.rel_dim) {
+        s_r[tid] = R[wg * pc.rel_dim + tid];
+    }
+    int qp = QPOS[t];
+
+    float m = NEG;
+    float l = 0.0;
+    if ((pc.flags & 1u) != 0u) {
+        m = pc.sink_scale * SINK[(pc.flags & 2u) != 0u ? wg : h];
+        l = 1.0;
+    }
+    float acc = 0.0;
+    barrier();
+
+    // shortcut: walks every cell even under a sliding window; bound the range in S14.
+    for (uint base = 0u; base < pc.cells; base += TILE) {
+        uint j = base + tid;
+        float s = NEG;
+        if (j < pc.cells) {
+            int kp = KPOS[j];
+            int d = qp - kp;
+            if (kp >= 0 && d >= 0 && (pc.window == 0u || uint(d) < pc.window)) {
+                uint kb = j * kstride + kh * hd;
+                float dot = 0.0;
+                for (uint i = 0u; i < hd; i++) {
+                    dot += s_q[i] * K[kb + i];
+                }
+                dot *= pc.scale;
+                if (pc.rel_dim > 0u && uint(d) < pc.extent) {
+                    uint bb = uint(d) * pc.rel_dim;
+                    for (uint i = 0u; i < pc.rel_dim; i++) {
+                        dot += s_r[i] * BIAS[bb + i];
+                    }
+                }
+                s = dot;
+            }
+        }
+        s_s[tid] = s;
+        barrier();
+
+        uint n = min(TILE, pc.cells - base);
+        float mt = m;
+        for (uint k = 0u; k < n; k++) {
+            mt = max(mt, s_s[k]);
+        }
+        if (mt > NEG) {
+            float corr = exp(m - mt);
+            l *= corr;
+            acc *= corr;
+            for (uint k = 0u; k < n; k++) {
+                float sk = s_s[k];
+                if (sk > NEG) {
+                    float p = exp(sk - mt);
+                    l += p;
+                    if (tid < hd) {
+                        acc += p * V[(base + k) * kstride + kh * hd + tid];
+                    }
+                }
+            }
+            m = mt;
+        }
+        barrier();
+    }
+
+    if (tid < hd) {
+        O[wg * hd + tid] = l > 0.0 ? acc / l : 0.0;
+    }
+}
