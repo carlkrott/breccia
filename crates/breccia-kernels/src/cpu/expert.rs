@@ -1208,24 +1208,23 @@ impl ExpertPool {
         let done2 = self.run_phase(heaviest_first(tasks2))?;
         // add in router j order per token, as moe_topk does, so a token's sum is
         // bit-identical whatever else shares its chunk (batched decode == sequential)
-        let mut parts: Vec<Vec<(usize, usize, usize, usize)>> = vec![Vec::new(); t * k];
+        // (one flat sort: shards of one slot cover disjoint rows, so their order is free)
+        let mut parts: Vec<(usize, usize, usize, usize, usize, f32)> = Vec::new();
         for (seq, &(_, r0, r1, ref users)) in second.iter().enumerate() {
-            for (u, &(_, act_off, _)) in users.iter().enumerate() {
-                parts[act_off / n_ff].push((seq, u, r0, r1));
+            for (u, &(token, act_off, w)) in users.iter().enumerate() {
+                parts.push((act_off / n_ff, token, seq, u, r0, w));
             }
         }
-        for (slot, list) in parts.iter().enumerate() {
-            let (token, j) = (slot / k, slot % k);
-            let w = routes[token].weights.get(j).copied().unwrap_or(0.0);
-            for &(seq, u, r0, r1) in list {
-                let values = done2[seq]
-                    .as_ref()
-                    .with_context(|| format!("chunk phase-2 shard {seq} never returned"))?;
-                let rows = r1 - r0;
-                let dst = &mut out[token * n_embd + r0..token * n_embd + r1];
-                for (o, v) in dst.iter_mut().zip(&values[u * rows..(u + 1) * rows]) {
-                    *o += w * v;
-                }
+        parts.sort_unstable_by_key(|p| p.0);
+        for &(_, token, seq, u, r0, w) in &parts {
+            let r1 = second[seq].2;
+            let values = done2[seq]
+                .as_ref()
+                .with_context(|| format!("chunk phase-2 shard {seq} never returned"))?;
+            let rows = r1 - r0;
+            let dst = &mut out[token * n_embd + r0..token * n_embd + r1];
+            for (o, v) in dst.iter_mut().zip(&values[u * rows..(u + 1) * rows]) {
+                *o += w * v;
             }
         }
         Ok(plan.expert_kernel_bytes() * k * t)
