@@ -35,7 +35,7 @@ use breccia_kernels::ops::{
     self, cpu, Act, ActMode, Add, EmbGather, HcMixer, HcWeights, RmsNorm, Rope, RopeTable, Router,
     RowClip, Softmax, SwiGlu,
 };
-use breccia_kernels::ops::{DepthMix, Glu, GluMode};
+use breccia_kernels::ops::{DepthMix, Glu, GluMode, ShortConv};
 use breccia_kernels::{Device, QuantType};
 
 /// One device for the whole test binary, serialised: `ctx::Gpu` owns a single
@@ -1585,4 +1585,200 @@ fn cpu_reference_self_checks() {
     let route = cpu::router(&normalish(0xaaa, 512), 512, 10);
     assert_eq!(route.ids.len(), 10);
     assert_eq!(route.weights.len(), 10);
+}
+
+/// S8: Inkling short conv (static taps, per-head dynamic taps, carried state,
+/// scaled residual). Random cases incl. a split prefill; golden over all four
+/// convs of every slot (dynamic taps on full layers, phys % 6 == 5).
+#[test]
+fn inkling_shortconv() {
+    let fx = need_gpu!("inkling_shortconv");
+    let gpu = fx.dev.gpu();
+    let sc = ShortConv::new(gpu).expect("shortconv");
+    let read = |b: &breccia_vk::ctx::Buf, n: usize| ops::download_f32(gpu, b, n).expect("read");
+    // Runs x (in chunks) through one conv living at `off` of a `stride`-wide
+    // state; returns (out, final past) from the GPU.
+    let run = |past: &[f32],
+               x: &[f32],
+               w: &[f32],
+               k: usize,
+               dyn_taps: Option<(&[f32], usize)>,
+               c: usize,
+               chunks: &[usize],
+               in_place: bool| {
+        let (stride, off) = (c + 40, 17usize);
+        let mut st = normalish(0x57a7e, (k - 1) * stride);
+        for i in 0..(k - 1) * c {
+            st[(i / c) * stride + off + i % c] = past[i];
+        }
+        let fence = st.clone();
+        let (sb, wb) = (
+            ops::upload_f32(gpu, &st).expect("state"),
+            ops::upload_f32(gpu, w).expect("w"),
+        );
+        let mut out = Vec::new();
+        let mut t0 = 0usize;
+        for &tn in chunks {
+            let xb = ops::upload_f32(gpu, &x[t0 * c..(t0 + tn) * c]).expect("x");
+            let db = dyn_taps.map(|(d, h)| {
+                (
+                    ops::upload_f32(gpu, &d[t0 * h * k..(t0 + tn) * h * k]).expect("dyn"),
+                    h,
+                )
+            });
+            let ob = if in_place {
+                None
+            } else {
+                Some(breccia_kernels::gemv::alloc(gpu, (tn * c * 4) as u64).expect("out"))
+            };
+            let o = ob.as_ref().unwrap_or(&xb);
+            sc.run(
+                &sb,
+                stride,
+                off,
+                &xb,
+                &wb,
+                k,
+                db.as_ref().map(|(b, h)| (b, *h)),
+                o,
+                c,
+                tn,
+            )
+            .expect("shortconv");
+            out.extend(read(o, tn * c));
+            for b in [Some(xb), ob, db.map(|(b, _)| b)].into_iter().flatten() {
+                gpu.destroy_buf(&b);
+            }
+            t0 += tn;
+        }
+        let stv = read(&sb, (k - 1) * stride);
+        for b in [&sb, &wb] {
+            gpu.destroy_buf(b);
+        }
+        let mut new_past = vec![0f32; (k - 1) * c];
+        for (i, s) in stv.iter().enumerate() {
+            let (r, col) = (i / stride, i % stride);
+            if (off..off + c).contains(&col) {
+                new_past[r * c + col - off] = *s;
+            } else {
+                assert_eq!(
+                    s.to_bits(),
+                    fence[i].to_bits(),
+                    "state outside the conv's channels changed"
+                );
+            }
+        }
+        (out, new_past)
+    };
+    for (c, k, heads, tokens) in [
+        (1000usize, 4usize, 8usize, 13usize),
+        (2304, 4, 0, 9),
+        (96, 3, 4, 7),
+        (64, 8, 2, 5),
+    ] {
+        let x = normalish(0x5c0 + c as u64, tokens * c);
+        let w: Vec<f32> = normalish(0x77, c * k)
+            .into_iter()
+            .map(|v| v * 0.3)
+            .collect();
+        let past = normalish(0x9a5, (k - 1) * c);
+        let d: Vec<f32> = normalish(0xd1, tokens * heads.max(1) * k)
+            .into_iter()
+            .map(|v| v * 0.3)
+            .collect();
+        let dt = (heads > 0).then_some((d.as_slice(), heads));
+        let (want, want_past) = cpu::shortconv(&past, &x, &w, k, dt, c);
+        for (chunks, in_place) in [(vec![tokens], false), (vec![2, tokens - 3, 1], true)] {
+            let (got, got_past) = run(&past, &x, &w, k, dt, c, &chunks, in_place);
+            let e = max_rel(&got, &as_f64(&want));
+            let ep = max_rel(&got_past, &as_f64(&want_past));
+            println!("shortconv C={c:<4} K={k} heads={heads} chunks={chunks:?}: max rel {e:.2e}, state {ep:.1e}");
+            assert!(
+                e <= 1e-5 && ep == 0.0,
+                "shortconv C={c} K={k} heads={heads} {chunks:?}: {e:e} / {ep:e}"
+            );
+        }
+    }
+
+    let Ok(golden) = std::env::var("BRECCIA_INKLING_GOLDEN") else {
+        eprintln!("inkling shortconv golden parity: SKIPPED (set BRECCIA_INKLING_GOLDEN)");
+        return;
+    };
+    let golden = std::path::PathBuf::from(golden);
+    let g = |dir: &str, name: &str| golden_f32(&golden, dir, &format!("{name}_"));
+    let (k, tokens) = (4usize, 13usize);
+    let mut worst = 0.0f64;
+    let mut checked = 0usize;
+    for slot in 0..48usize {
+        let ip = if slot < 24 {
+            slot
+        } else {
+            6 + (slot - 24) % 12
+        };
+        let full = ip % 6 == 5;
+        let blk = |n: &str| g("weights", &format!("blk.{ip}.{n}_conv.weight"));
+        let kd = full.then(|| g("dump-s8", &format!("Kdyn-{slot}")));
+        let vd = full.then(|| g("dump-s8", &format!("Vdyn-{slot}")));
+        // At a block start attn_out is not added to the residual, so it is ffn_inp.
+        let attn_out = if ip % 6 == 0 {
+            g("dump", &format!("ffn_inp-{slot}"))
+        } else {
+            g("dump", &format!("attn_out-{slot}"))
+        };
+        let cases = [
+            (
+                "attn_k",
+                g("dump", &format!("Kproj-{slot}")),
+                g("dump-s4", &format!("Kconv-{slot}")),
+                kd,
+            ),
+            (
+                "attn_v",
+                g("dump", &format!("Vproj-{slot}")),
+                g("dump", &format!("Vcur-{slot}")),
+                vd,
+            ),
+            (
+                "attn_post",
+                g("dump", &format!("attn_wo-{slot}")),
+                attn_out,
+                None,
+            ),
+            (
+                "ffn_post",
+                g("dump", &format!("ffn_moe_out-{slot}")),
+                g("dump", &format!("ffn_out-{slot}")),
+                None,
+            ),
+        ];
+        for (name, x, want, d) in cases {
+            let c = x.len() / tokens;
+            let dt = d.as_deref().map(|d| (d, d.len() / (tokens * k)));
+            let (mut got, _) = run(
+                &vec![0f32; (k - 1) * c],
+                &x,
+                &blk(name),
+                k,
+                dt,
+                c,
+                &[tokens],
+                false,
+            );
+            if name == "attn_v" {
+                // golden Vcur is after a weightless per-head (128) RMS norm, eps 1e-6
+                for h in got.chunks_mut(128) {
+                    let ms = h.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / 128.0;
+                    let r = 1.0 / (ms + 1e-6).sqrt();
+                    h.iter_mut().for_each(|v| *v = (f64::from(*v) * r) as f32);
+                }
+            }
+            let e = max_rel(&got, &as_f64(&want));
+            assert!(e <= 1e-5, "golden {name}-{slot}: {e:e} > 1e-5");
+            worst = worst.max(e);
+            checked += 1;
+        }
+    }
+    println!(
+        "golden shortconv ({checked} convs, dynamic on full layers): worst max rel {worst:.2e}"
+    );
 }

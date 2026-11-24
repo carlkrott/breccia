@@ -14,6 +14,7 @@
 //! | [`SwiGlu`] | `ops_swiglu.comp` | §5.4 (`silu(gate) * up`, 640-wide) |
 //! | [`Glu`] | `ops_glu.comp` | SwiGLU / SITU, split or fused gate_up rows |
 //! | [`DepthMix`] | `ops_depth_mix.comp` | Inkling AttnRes / message-bank mix |
+//! | [`ShortConv`] | `ops_shortconv.comp` | causal short conv + residual, optional dynamic taps |
 //! | [`Softmax`] | `ops_softmax.comp` | §5.4 (512 router), §10.4 (512..2048 attention) |
 //! | [`Router`] | `ops_router.comp` | §5.4/§8 (softmax(all) → top-10 → `max(sum, 2^-14)`) |
 //! | [`EmbGather`] | `ops_gather_<type>.comp` | §6.5, §9.1 (`token_embd` IQ3_S, PLE IQ4_NL) |
@@ -917,6 +918,74 @@ impl<'g> DepthMix<'g> {
             .f(self.scale);
         let (gx, gy) = grid_for(tokens * 256, 256);
         self.pipe.run(&[stack, cur, query, out], &pc, (gx, gy, 1))
+    }
+}
+
+/// Causal short conv with residual (`ops_shortconv.comp`), llama.cpp
+/// inkling2.cpp `convolve`: `K` static taps per channel (`w` is `[C, K]`,
+/// tap `K-1` = current token), optional per-head dynamic taps (`dyn_taps` is
+/// `[T, heads, K]`, lag 0 = current), `out = (x + conv) * scale`, no activation.
+/// `scale` is `1/sqrt(K+1)` static or `1/sqrt(2K+1)` with dynamic taps.
+///
+/// The carried state is `K-1` rows, oldest first, `state_stride` channels per
+/// row, this conv at channel `state_off`; it is updated in place.
+pub struct ShortConv<'g> {
+    pipe: Pipe<'g>,
+}
+
+impl<'g> ShortConv<'g> {
+    pub const MAX_K: usize = 8;
+
+    pub fn new(gpu: &'g Gpu) -> Result<Self> {
+        Ok(ShortConv {
+            pipe: Pipe::new(
+                gpu,
+                include_bytes!(concat!(env!("OUT_DIR"), "/ops_shortconv.spv")),
+                5,
+                "shortconv",
+            )?,
+        })
+    }
+
+    /// `x`/`out` are `[tokens, channels]`; `out` may alias `x`. `dyn_taps` is
+    /// `Some((buf, heads))` on layers with input-dependent taps.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run(
+        &self,
+        state: &Buf,
+        state_stride: usize,
+        state_off: usize,
+        x: &Buf,
+        w: &Buf,
+        k: usize,
+        dyn_taps: Option<(&Buf, usize)>,
+        out: &Buf,
+        channels: usize,
+        tokens: usize,
+    ) -> Result<()> {
+        let heads = dyn_taps.map_or(0, |(_, h)| h);
+        if k == 0 || k > Self::MAX_K || (heads != 0 && !channels.is_multiple_of(heads)) {
+            return Err(anyhow!(
+                "shortconv: k {k} (1..={}), {channels} channels / {heads} heads",
+                Self::MAX_K
+            ));
+        }
+        if tokens == 0 || channels == 0 {
+            return Ok(());
+        }
+        let scale = 1.0 / (((if heads != 0 { 2 } else { 1 }) * k + 1) as f32).sqrt();
+        let pc = Pc::new()
+            .u(channels as u32)
+            .u(tokens as u32)
+            .u(k as u32)
+            .u(heads as u32)
+            .u(state_stride as u32)
+            .u(state_off as u32)
+            .f(scale)
+            .u(0);
+        let dynb = dyn_taps.map_or(w, |(b, _)| b);
+        let (gx, gy) = grid_for(channels, 128);
+        self.pipe.run(&[state, x, w, dynb, out], &pc, (gx, gy, 1))
     }
 }
 

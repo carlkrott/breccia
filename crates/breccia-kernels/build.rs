@@ -84,6 +84,7 @@ const SHADERS: &[&str] = &[
     "ops_swiglu",
     "ops_glu",
     "ops_depth_mix",
+    "ops_shortconv",
     "ops_softmax",
     "ops_router",
     "ops_act",

@@ -1,0 +1,90 @@
+#version 450
+//
+// Causal short conv with residual and optional per-head dynamic taps (Inkling
+// K/V/attn_post/ffn_post conv, `docs/specs/inkling2-loop-port.md` S8). No
+// activation; the GDN conv with SiLU is `gdn_conv.comp`.
+//
+// ggml reference (llama.cpp src/models/inkling2.cpp `convolve`):
+//
+//   x(t-j)    = input j steps back (from the carried state when t-j < 0)
+//   out[t][c] = sum_k x(t - (K-1) + k)[c] * W[c*K + k]          (k = K-1 is current)
+//             + sum_lag x(t - lag)[c] * DYN[t*K*H + h*K + lag]   if heads > 0, h = c / (C/H)
+//   O[t][c]   = (X[t][c] + out[t][c]) * scale                    scale = 1/sqrt((dyn?2:1)*K + 1)
+//
+// State: K-1 rows, oldest first, row stride `state_stride` channels, channel
+// offset `state_off` (several convs share one state buffer). It is rewritten
+// with the last K-1 inputs. One invocation per channel walks the tokens, as in
+// gdn_conv.comp, so a chunked prefill equals the per-token recurrence.
+// In place: O may alias X.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) buffer ConvState { float STATE[]; };
+layout(std430, binding = 1) readonly buffer XVec { float X[]; };   // [T, C]
+layout(std430, binding = 2) readonly buffer WVec { float W[]; };   // [C, K]
+layout(std430, binding = 3) readonly buffer DVec { float DYN[]; }; // [T, H, K]
+layout(std430, binding = 4) writeonly buffer OVec { float O[]; };  // [T, C]
+
+layout(push_constant) uniform Params {
+    uint  channels;
+    uint  tokens;
+    uint  k;            // <= MAX_K
+    uint  heads;        // 0 = static only
+    uint  state_stride;
+    uint  state_off;
+    float scale;
+    uint  pad0;
+} pc;
+
+#define MAX_K 8u
+#define WG_X_MAX 65535u
+
+void main() {
+    uint wg = gl_WorkGroupID.y * WG_X_MAX + gl_WorkGroupID.x;
+    uint c = wg * 128u + gl_LocalInvocationID.x;
+    if (c >= pc.channels) {
+        return;
+    }
+    uint K = pc.k;
+    // win[j] = input j steps back from the current token (win[0] = current).
+    float win[MAX_K];
+    float w[MAX_K];
+    for (uint j = 0u; j < MAX_K; ++j) {
+        win[j] = 0.0;
+        w[j] = 0.0;
+        if (j < K) {
+            w[j] = W[c * K + (K - 1u - j)];
+        }
+        if (j >= 1u && j < K) {
+            win[j] = STATE[(K - 1u - j) * pc.state_stride + pc.state_off + c];
+        }
+    }
+    uint hd = pc.heads == 0u ? 0u : c / (pc.channels / pc.heads);
+
+    for (uint t = 0u; t < pc.tokens; ++t) {
+        uint at = t * pc.channels + c;
+        float xn = X[at];
+        win[0] = xn;
+        float y = 0.0;
+        for (uint j = 0u; j < MAX_K; ++j) {
+            y += win[j] * w[j];
+        }
+        if (pc.heads != 0u) {
+            uint db = (t * pc.heads + hd) * K;
+            for (uint j = 0u; j < MAX_K; ++j) {
+                if (j < K) {
+                    y += win[j] * DYN[db + j];
+                }
+            }
+        }
+        O[at] = (xn + y) * pc.scale;
+        for (uint j = MAX_K - 1u; j >= 1u; --j) {
+            win[j] = win[j - 1u];
+        }
+    }
+    for (uint j = 1u; j < MAX_K; ++j) {
+        if (j < K) {
+            STATE[(K - 1u - j) * pc.state_stride + pc.state_off + c] = win[j];
+        }
+    }
+}

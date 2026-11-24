@@ -669,3 +669,44 @@ mod tests {
         assert!(got.inject.is_none(), "final mixer has no inject");
     }
 }
+
+/// Inkling short conv (llama.cpp inkling2.cpp `convolve`), `f64`. `past` is
+/// `[K-1, C]` oldest first, `x` `[T, C]`, `w` `[C, K]` (tap K-1 = current),
+/// `dyn_taps` `[T, heads, K]` (lag 0 = current). Returns `(out, new_past)`.
+pub fn shortconv(
+    past: &[f32],
+    x: &[f32],
+    w: &[f32],
+    k: usize,
+    dyn_taps: Option<(&[f32], usize)>,
+    c: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let t_n = x.len() / c;
+    // full[i] = input row i of [past | x]
+    let row = |i: usize, ch: usize| -> f64 {
+        if i < k - 1 {
+            past[i * c + ch] as f64
+        } else {
+            x[(i - (k - 1)) * c + ch] as f64
+        }
+    };
+    let dynamic = dyn_taps.is_some();
+    let scale = 1.0 / (((if dynamic { 2 } else { 1 }) * k + 1) as f64).sqrt();
+    let mut out = vec![0f32; t_n * c];
+    for t in 0..t_n {
+        for ch in 0..c {
+            let mut y: f64 = (0..k).map(|j| row(t + j, ch) * w[ch * k + j] as f64).sum();
+            if let Some((d, heads)) = dyn_taps {
+                let h = ch / (c / heads);
+                for lag in 0..k {
+                    y += row(t + k - 1 - lag, ch) * d[(t * heads + h) * k + lag] as f64;
+                }
+            }
+            out[t * c + ch] = ((x[t * c + ch] as f64 + y) * scale) as f32;
+        }
+    }
+    let new_past = (0..(k - 1) * c)
+        .map(|i| row(t_n + i / c, i % c) as f32)
+        .collect();
+    (out, new_past)
+}
