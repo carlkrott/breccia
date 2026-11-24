@@ -7,7 +7,8 @@
 - **Correction:** the model input has an RMS norm `token_embd_norm.weight` (F32, 2304) after the embedding lookup (inkling2.cpp:96, :268). Sections 1.2 and 1.10 miss it; S11 must apply it.
 - `output.weight` and `token_embd.weight` have 201024 rows; logits are sliced to `vocab_size_unpadded` = 200058.
 - **S1 done** (`crates/breccia-engine/src/inkling.rs`): `InklingConfig::from_metadata` (per-layer head arrays must be uniform), `LoopPlan` (48 slots; execution order prelude 0-5, pass 0 slots 6-17, pass 1 slots 24-35, pass 2 slots 36-47, post 18-23; full-attention slots 5/11/17/23/29/35/41/47), and `bind` (exact shape and type of all 704 tensors). `Model::load` binds an inkling2_loop file and then refuses it until the graph exists. Real-file test: `BRECCIA_INKLING_GGUF=<path> cargo test -p breccia-engine --lib inkling`.
-- Next: S4 onward. S2/S3 became the conformance runs above (done). The golden now names the norm/conv/AttnRes/loop nodes (llama.cpp b8f1aefa0, see golden/README.md).
+- **S4 done** (3a731e5): `ActMode::TanhCap` (`s*tanh(x/s)`: loop-control tanh at s=1, softcap at s=30) and `RowClip` (`ops_row_clip.comp`: channel scale, L2 clip, tau). On both cards, max rel vs the f64 CPU reference is <= 3e-7 and vs the golden Qcur/Kcur/Rcur for all 48 slots is 3.16e-7 (inputs from the golden's pre-clip nodes, `dump-s4/`). Tau is exactly 1 below pos 8192, so only the CPU reference covers it (positions to 1M). A >8192-token golden must also check tau end to end, and a >1024-token prompt must check SWA. Known limit, to fix by S11: `RmsNorm` dispatches `(rows,1,1)` with no grid_for wrap, so it fails above 65535 rows (24 heads x 4096-token chunk).
+- Next: S5 onward. S2/S3 became the conformance runs above (done). The golden now names the norm/conv/AttnRes/loop nodes (llama.cpp b8f1aefa0, see golden/README.md).
 
 Date: 2026-11-23. Read-only analysis. No edits, builds, GPU runs or commits in the Breccia repo. The GGUF was only read.
 
